@@ -17,21 +17,60 @@
 //!
 //! ## Boot Flow
 //!
-//! 1. Bootloader loads the kernel and hands off control
-//! 2. Architecture-specific init (`arch::init`) sets up CPU state, page tables, interrupts
-//! 3. Kernel main (`kmain`) initializes subsystems in order
-//! 4. Scheduler starts and begins running userspace processes
+//! 1. Limine bootloader loads the kernel ELF into higher-half memory
+//! 2. Bootloader sets up page tables, stack, and 64-bit long mode
+//! 3. Bootloader jumps to `kmain` (our entry point)
+//! 4. `kmain` initializes serial output and prints boot message
+//! 5. (Future phases) Initialize subsystems and start scheduler
 
 // This is a freestanding binary — no standard library, no main function.
-// The `no_std` attribute disables the standard library (which requires an OS).
-// The `no_main` attribute tells the compiler we provide our own entry point.
+// `no_std` disables the standard library (which requires an OS).
+// `no_main` tells the compiler we provide our own entry point via the linker script.
 #![no_std]
 #![no_main]
+
+use core::fmt::Write;
+
+// --- Limine boot protocol setup ---
+//
+// The Limine bootloader communicates with the kernel through "requests":
+// static data structures that the bootloader scans for and fills in at boot time.
+// These must be placed in special ELF sections so the bootloader can find them.
+//
+// The `#[used]` attribute prevents the compiler from optimizing away these statics
+// (since nothing in our code reads them directly — the bootloader does).
+//
+// The `#[link_section]` attribute places the static in a specific ELF section,
+// which the linker script maps into the binary. The bootloader scans the region
+// between the start and end markers for request structures.
+
+use limine::BaseRevision;
+use limine::request::{RequestsStartMarker, RequestsEndMarker};
+
+/// Mark the beginning of the Limine requests region in the ELF binary.
+/// The bootloader uses this marker to know where to start scanning for requests.
+#[used]
+#[link_section = ".requests_start_marker"]
+static _REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
+
+/// Mark the end of the Limine requests region.
+/// The bootloader stops scanning for requests when it hits this marker.
+#[used]
+#[link_section = ".requests_end_marker"]
+static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
+
+/// Declare the base protocol revision we support.
+/// The bootloader checks this and confirms it can speak our protocol version.
+/// `BaseRevision::new()` requests the latest revision supported by the crate.
+/// After boot, `is_supported()` returns true if the bootloader accepted it.
+#[used]
+#[link_section = ".requests"]
+static BASE_REVISION: BaseRevision = BaseRevision::new();
 
 // ----- Kernel subsystem modules -----
 
 /// Architecture-specific code (x86_64, aarch64).
-/// Each architecture implements CPU init, interrupt handling, paging, and other
+/// Each architecture implements CPU operations, serial I/O, and other
 /// hardware-specific functionality behind a common interface.
 mod arch;
 
@@ -71,45 +110,87 @@ mod fs;
 /// TCP/IP implementation for container networking and the management API.
 mod net;
 
-// ----- Panic handler -----
+// ----- Kernel entry point -----
 
-/// Called when the kernel panics. In a bare-metal environment there's no OS to
-/// catch us, so we halt the CPU. In later phases this will print diagnostic
-/// information to the serial console before halting.
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // TODO(phase-0): Print panic info to serial console before halting.
-    loop {
-        // Halt the CPU to save power while we spin.
-        // Architecture-specific halt will be used once arch module is implemented.
-        core::hint::spin_loop();
+/// The kernel entry point. Limine bootloader jumps here after loading the
+/// kernel into higher-half memory and setting up a valid stack.
+///
+/// This function is referenced by the linker script (`ENTRY(kmain)`) and
+/// must have C calling convention so the bootloader can call it.
+/// `#[no_mangle]` prevents Rust from mangling the symbol name.
+///
+/// By the time `kmain` runs, the Limine bootloader has already:
+/// - Loaded the kernel ELF at 0xffffffff80000000 (higher half)
+/// - Set up 4-level page tables with identity + higher-half mappings
+/// - Allocated and set up a stack
+/// - Entered 64-bit long mode
+/// - Filled in our boot protocol request structures
+#[no_mangle]
+extern "C" fn kmain() -> ! {
+    // Verify that the bootloader supports our protocol revision.
+    // The base revision request was placed in the .requests section above;
+    // Limine fills it in at boot time. If the bootloader doesn't support
+    // our revision, we can't rely on any boot info being correct.
+    assert!(BASE_REVISION.is_supported());
+
+    // Initialize the serial port (COM1 at 0x3F8) for debug output.
+    // QEMU maps this to the host terminal via the `-serial stdio` flag.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut serial = arch::x86_64::serial::SerialPort::com1();
+        serial.init();
+
+        // Print our boot banner
+        let _ = writeln!(serial);
+        let _ = writeln!(serial, "============================================");
+        let _ = writeln!(serial, "  ThemeliOS v{}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(serial, "  An experimental capability-based microkernel");
+        let _ = writeln!(serial, "============================================");
+        let _ = writeln!(serial);
+        let _ = writeln!(serial, "Hello from ThemeliOS!");
+        let _ = writeln!(serial, "Kernel booted successfully on x86_64.");
+        let _ = writeln!(serial, "Limine boot protocol revision supported.");
+        let _ = writeln!(serial);
+        let _ = writeln!(serial, "Phase 0 complete. Halting.");
     }
+
+    // Nothing left to do — halt the CPU in a loop.
+    // `hlt` puts the CPU to sleep until an interrupt arrives, saving power
+    // compared to a busy `loop {}`.
+    hcf();
 }
 
-/// The architecture-independent kernel entry point. Called by the arch-specific
-/// boot code after basic hardware initialization is complete.
-///
-/// By the time `kmain` runs, the following should be set up:
-/// - A valid stack
-/// - Serial/console output (for debug printing)
-/// - Basic interrupt handling
-/// - Identity-mapped or higher-half page tables
-///
-/// `kmain` then initializes the rest of the kernel subsystems and starts
-/// the scheduler.
-fn kmain() -> ! {
-    // This is where the kernel comes to life. Each phase will add
-    // initialization steps here:
-    //
-    // Phase 0: Print "Hello from ThemeliOS" to serial console
-    // Phase 1: Initialize memory allocator, scheduler, interrupts
-    // Phase 2: Initialize capability system, create first processes
-    // Phase 3: Mount root filesystem, initialize block driver
-    // Phase 4: Bring up network stack
-    // Phase 5: Start container runtime
-    // Phase 6: Start management API server
+// ----- Panic handler -----
 
+/// Called when the kernel panics (e.g., `assert!` fails, `unwrap()` on None).
+/// In a bare-metal environment there's no OS to catch us, so we print the
+/// panic message to serial and halt the CPU.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Try to print the panic info to serial. If serial isn't initialized yet,
+    // this might not produce output, but that's OK — we halt either way.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut serial = arch::x86_64::serial::SerialPort::com1();
+        let _ = writeln!(serial);
+        let _ = writeln!(serial, "!!! KERNEL PANIC !!!");
+        let _ = writeln!(serial, "{}", info);
+    }
+
+    hcf();
+}
+
+/// Halt and Catch Fire — stop the CPU permanently.
+///
+/// This is the kernel's "I'm done" function. It disables interrupts would
+/// normally wake the CPU from `hlt`, but since we haven't set up interrupts
+/// yet in Phase 0, a simple hlt loop suffices.
+fn hcf() -> ! {
     loop {
+        #[cfg(target_arch = "x86_64")]
+        arch::x86_64::cpu::halt();
+
+        #[cfg(not(target_arch = "x86_64"))]
         core::hint::spin_loop();
     }
 }
