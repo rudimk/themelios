@@ -319,6 +319,31 @@ fn cmd_build(args: &[String]) {
     println!("Build complete: target/{target}/debug/themelios");
 }
 
+/// Build the kernel and create a bootable ISO (without launching QEMU).
+///
+/// This is useful when you want to run QEMU manually, e.g. with a display
+/// window:
+///
+/// ```sh
+/// cargo xtask iso
+/// qemu-system-x86_64 -M q35 -cdrom target/themelios.iso -serial stdio -no-reboot
+/// ```
+fn cmd_iso(args: &[String]) {
+    let (arch, _remaining) = parse_arch(args);
+    let target = resolve_target(&arch);
+    let root = workspace_root();
+
+    cmd_build(args);
+
+    let kernel_binary = root.join(format!("target/{target}/debug/themelios"));
+    let limine_dir = ensure_limine(&root);
+    let iso_path = create_iso(&root, &kernel_binary, &limine_dir);
+
+    println!();
+    println!("To boot headless:  cargo xtask run");
+    println!("To boot with GUI:  qemu-system-x86_64 -M q35 -cdrom {} -serial stdio -no-reboot", iso_path.display());
+}
+
 /// Build the kernel, create a bootable ISO, and launch it in QEMU.
 fn cmd_run(args: &[String]) {
     let (arch, _remaining) = parse_arch(args);
@@ -440,7 +465,8 @@ Usage: cargo xtask <COMMAND> [OPTIONS]
 
 Commands:
     build    Build the kernel
-    run      Build, create ISO, and launch in QEMU
+    iso      Build the kernel and create a bootable ISO
+    run      Build, create ISO, and launch in QEMU (headless)
     test     Build and run tests in QEMU
     docs     Build mdbook and rustdoc
 
@@ -467,6 +493,7 @@ fn main() {
 
     match command.as_str() {
         "build" => cmd_build(rest),
+        "iso" => cmd_iso(rest),
         "run" => cmd_run(rest),
         "test" => cmd_test(rest),
         "docs" => cmd_docs(rest),
