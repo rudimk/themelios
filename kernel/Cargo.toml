@@ -1,0 +1,17 @@
+[package]
+name = "themelios"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Rudi MK"]
+description = "ThemeliOS — an experimental capability-based microkernel"
+
+[dependencies]
+# Dependencies will be added as subsystems are implemented.
+# Likely early additions:
+#   - spin (spinlock for no_std)
+#   - bitflags (hardware register manipulation)
+#   - linked_list_allocator (heap allocator)
+
+# Profile settings (panic = "abort") are in the workspace root Cargo.toml
+# because Cargo requires profiles to be defined at the workspace level.
