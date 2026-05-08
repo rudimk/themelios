@@ -10,6 +10,7 @@
 
 # Design
 
+- [Bootloader](./bootloader.md)
 - [Architecture Overview](./architecture.md)
 - [Capability System](./capabilities.md)
 - [Memory Management](./memory.md)

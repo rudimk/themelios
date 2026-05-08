@@ -38,6 +38,35 @@ brew install qemu
 
 This installs all QEMU system emulators.
 
+### 3. xorriso
+
+xorriso creates bootable ISO images. The build pipeline uses it to package the kernel with the Limine bootloader into a hybrid BIOS+UEFI ISO.
+
+**macOS (Homebrew):**
+
+```bash
+brew install xorriso
+```
+
+**Ubuntu/Debian:**
+
+```bash
+sudo apt install xorriso
+```
+
+**Fedora:**
+
+```bash
+sudo dnf install xorriso
+```
+
+### 4. C compiler (for Limine CLI tool)
+
+The first `cargo xtask run` downloads and builds the Limine bootloader's CLI tool, which is a small C program. This requires a C compiler.
+
+- **macOS**: Xcode Command Line Tools (`xcode-select --install`)
+- **Linux**: `gcc` or `clang` (usually pre-installed)
+
 **Ubuntu/Debian:**
 
 ```bash
