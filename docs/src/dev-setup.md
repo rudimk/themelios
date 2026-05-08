@@ -122,13 +122,25 @@ cargo xtask build --arch arm64
 cargo xtask run
 ```
 
-This builds the kernel and launches it in QEMU with serial output piped to your terminal. Press **Ctrl+A, X** to exit QEMU.
+This builds the kernel, creates a bootable ISO, and launches it in QEMU in **headless mode** — serial output is piped to your terminal, but no graphical window opens. Press **Ctrl+A, X** to exit QEMU.
 
-For arm64:
+For arm64 (not yet implemented):
 
 ```bash
 cargo xtask run --arch arm64
 ```
+
+### Run with QEMU display window
+
+To see the QEMU graphical window (shows the Limine bootloader screen and any framebuffer output), run QEMU directly:
+
+```bash
+qemu-system-x86_64 -M q35 -cdrom target/themelios.iso -serial stdio -no-reboot
+```
+
+This opens a QEMU window alongside serial output in your terminal. Omitting `-display none` lets QEMU use its default display backend (Cocoa on macOS, GTK/SDL on Linux).
+
+You must run `cargo xtask build` first (or `cargo xtask run` at least once) to generate the ISO at `target/themelios.iso`.
 
 ### Build documentation
 

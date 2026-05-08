@@ -16,14 +16,17 @@ Early development — Phase 0 (boot on QEMU).
 
 ## Quick start
 
-**Prerequisites:** Rust (installed via [rustup](https://rustup.rs/)), QEMU
+**Prerequisites:** Rust (installed via [rustup](https://rustup.rs/)), QEMU, xorriso
 
 ```bash
 # Build the kernel (x86_64)
 cargo xtask build
 
-# Build and run in QEMU
+# Build and run in QEMU (headless, serial output in terminal)
 cargo xtask run
+
+# Run with QEMU display window (after building the ISO)
+qemu-system-x86_64 -M q35 -cdrom target/themelios.iso -serial stdio -no-reboot
 
 # Build for arm64
 cargo xtask build --arch arm64
