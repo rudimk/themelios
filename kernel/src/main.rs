@@ -150,6 +150,7 @@ extern "C" fn kmain() -> ! {
         let _ = writeln!(serial, "Hello from ThemeliOS!");
         let _ = writeln!(serial, "Kernel booted successfully on x86_64.");
         let _ = writeln!(serial, "Limine boot protocol revision supported.");
+        let _ = writeln!(serial, "Build ULID: {}", env!("BUILD_ULID"));
         let _ = writeln!(serial);
         let _ = writeln!(serial, "Phase 0 complete. Halting.");
     }
