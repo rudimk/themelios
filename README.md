@@ -28,6 +28,9 @@ cargo xtask run
 # Same, but with a QEMU graphical window
 cargo xtask run --display
 
+# Build a bootable ISO without launching QEMU
+cargo xtask iso
+
 # Build for arm64
 cargo xtask build --arch arm64
 ```
