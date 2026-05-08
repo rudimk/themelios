@@ -301,6 +301,15 @@ fn cmd_build(args: &[String]) {
 
     println!("Building ThemeliOS kernel for {target}...");
 
+    // Clean the kernel crate's cached artifacts before building. This forces
+    // a full recompile every time, which ensures build.rs re-runs and generates
+    // a fresh ULID. Without this, cargo's caching would skip recompilation
+    // (and ULID regeneration) when no source files have changed.
+    let _ = Command::new("cargo")
+        .current_dir(&root)
+        .args(["clean", "--package", "themelios", "--target", target])
+        .status();
+
     // Build the kernel crate with the bare-metal target.
     // -Zbuild-std=core: build the core library from source for our target,
     //   since bare-metal targets don't have a pre-built standard library.
