@@ -7,11 +7,9 @@ authors = ["Rudi MK"]
 description = "ThemeliOS — an experimental capability-based microkernel"
 
 [dependencies]
-# Dependencies will be added as subsystems are implemented.
-# Likely early additions:
-#   - spin (spinlock for no_std)
-#   - bitflags (hardware register manipulation)
-#   - linked_list_allocator (heap allocator)
+# Limine boot protocol crate — provides the data structures and request types
+# that the Limine bootloader uses to communicate with the kernel at boot time.
+limine = "0.5"
 
 # Profile settings (panic = "abort") are in the workspace root Cargo.toml
 # because Cargo requires profiles to be defined at the workspace level.
