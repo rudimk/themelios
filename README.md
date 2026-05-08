@@ -25,9 +25,8 @@ cargo xtask build
 # Build and run in QEMU (headless, serial output in terminal)
 cargo xtask run
 
-# Build ISO only, then run with QEMU display window
-cargo xtask iso
-qemu-system-x86_64 -M q35 -cdrom target/themelios.iso -serial stdio -no-reboot
+# Same, but with a QEMU graphical window
+cargo xtask run --display
 
 # Build for arm64
 cargo xtask build --arch arm64

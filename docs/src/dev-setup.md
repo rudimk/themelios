@@ -143,11 +143,10 @@ This builds the kernel and creates a bootable ISO at `target/themelios.iso` with
 To see the QEMU graphical window (shows the Limine bootloader screen and any framebuffer output):
 
 ```bash
-cargo xtask iso
-qemu-system-x86_64 -M q35 -cdrom target/themelios.iso -serial stdio -no-reboot
+cargo xtask run --display
 ```
 
-The first command builds a fresh ISO. The second opens QEMU with its default display backend (Cocoa on macOS, GTK/SDL on Linux) alongside serial output in your terminal.
+This does everything `cargo xtask run` does but opens a QEMU window instead of running headless. Serial output still goes to your terminal.
 
 ### Build documentation
 

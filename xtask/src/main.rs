@@ -68,11 +68,18 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Parses the --arch flag from the argument list. Returns the architecture
-/// string and the remaining arguments with --arch consumed.
-fn parse_arch(args: &[String]) -> (String, Vec<String>) {
+/// Parsed command-line options shared across subcommands.
+struct Options {
+    /// Target architecture (default: x86_64).
+    arch: String,
+    /// Show the QEMU graphical display window instead of running headless.
+    display: bool,
+}
+
+/// Parses --arch and --display flags from the argument list.
+fn parse_options(args: &[String]) -> Options {
     let mut arch = "x86_64".to_string();
-    let mut remaining = Vec::new();
+    let mut display = false;
     let mut skip_next = false;
 
     for (i, arg) in args.iter().enumerate() {
@@ -90,12 +97,12 @@ fn parse_arch(args: &[String]) -> (String, Vec<String>) {
             }
         } else if let Some(value) = arg.strip_prefix("--arch=") {
             arch = value.to_string();
-        } else {
-            remaining.push(arg.clone());
+        } else if arg == "--display" {
+            display = true;
         }
     }
 
-    (arch, remaining)
+    Options { arch, display }
 }
 
 // ============================================================================
@@ -288,8 +295,8 @@ fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path) -> PathBuf {
 
 /// Build the kernel for the specified target architecture.
 fn cmd_build(args: &[String]) {
-    let (arch, _remaining) = parse_arch(args);
-    let target = resolve_target(&arch);
+    let opts = parse_options(args);
+    let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
     println!("Building ThemeliOS kernel for {target}...");
@@ -329,8 +336,8 @@ fn cmd_build(args: &[String]) {
 /// qemu-system-x86_64 -M q35 -cdrom target/themelios.iso -serial stdio -no-reboot
 /// ```
 fn cmd_iso(args: &[String]) {
-    let (arch, _remaining) = parse_arch(args);
-    let target = resolve_target(&arch);
+    let opts = parse_options(args);
+    let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
     cmd_build(args);
@@ -346,8 +353,8 @@ fn cmd_iso(args: &[String]) {
 
 /// Build the kernel, create a bootable ISO, and launch it in QEMU.
 fn cmd_run(args: &[String]) {
-    let (arch, _remaining) = parse_arch(args);
-    let target = resolve_target(&arch);
+    let opts = parse_options(args);
+    let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
     // Step 1: Build the kernel
@@ -360,35 +367,38 @@ fn cmd_run(args: &[String]) {
     let iso_path = create_iso(&root, &kernel_binary, &limine_dir);
 
     // Step 3: Launch QEMU
-    let qemu = qemu_binary(&arch);
-    println!("Launching QEMU ({arch})...");
+    let qemu = qemu_binary(&opts.arch);
+    let mode = if opts.display { "with display" } else { "headless" };
+    println!("Launching QEMU ({}, {mode})...", opts.arch);
     println!("Press Ctrl+A, X to exit QEMU.\n");
 
-    let status = match arch.as_str() {
+    let status = match opts.arch.as_str() {
         "x86_64" | "amd64" | "x86-64" => {
             // Boot the ISO in QEMU with BIOS firmware (the default).
             // -M q35: use the Q35 chipset (more modern than the default i440fx)
             // -cdrom: attach the ISO as a CD-ROM drive
             // -serial stdio: route the virtual COM1 port to our terminal
-            // -display none: headless mode, no graphical window
             // -no-reboot: don't reboot on triple fault (helps debugging crashes)
             // -no-shutdown: keep QEMU alive after guest shutdown
-            Command::new(qemu)
-                .current_dir(&root)
+            let mut cmd = Command::new(qemu);
+            cmd.current_dir(&root)
                 .args([
                     "-M", "q35",
                     "-cdrom", iso_path.to_str().unwrap(),
                     "-serial", "stdio",
-                    "-display", "none",
                     "-no-reboot",
                     "-no-shutdown",
-                ])
-                .status()
+                ]);
+
+            // In headless mode, suppress the QEMU graphical window.
+            // With --display, let QEMU use its default backend (Cocoa/GTK/SDL).
+            if !opts.display {
+                cmd.args(["-display", "none"]);
+            }
+
+            cmd.status()
         }
         "aarch64" | "arm64" => {
-            // aarch64 QEMU needs explicit machine type and CPU model.
-            // UEFI boot via OVMF firmware would be needed here.
-            // For now, this is a placeholder until aarch64 support is implemented.
             eprintln!("aarch64 boot is not yet implemented (Phase 0 is x86_64 only).");
             process::exit(1);
         }
@@ -472,6 +482,7 @@ Commands:
 
 Options:
     --arch <ARCH>  Target architecture: x86_64 (default), arm64
+    --display      Open QEMU with a graphical window (for run command)
 
 Prerequisites:
     QEMU:     brew install qemu
