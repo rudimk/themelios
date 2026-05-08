@@ -1,0 +1,58 @@
+# Build mdbook documentation and deploy to GitHub Pages.
+#
+# Triggers on pushes to main that change anything under docs/ or the workflow
+# itself. The built site is deployed via GitHub's Pages action, which requires
+# the repository's Pages source to be set to "GitHub Actions" in Settings →
+# Pages → Build and deployment → Source.
+
+name: Deploy docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  # Allow manual triggering from the Actions tab
+  workflow_dispatch:
+
+# Only one deployment at a time — cancel in-progress runs if a new push lands
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+# Permissions needed by the pages deploy action
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdbook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "latest"
+
+      - name: Build docs
+        run: mdbook build docs
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
