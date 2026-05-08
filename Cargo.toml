@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "xtask",
+]
+
+# Abort on panic in all profiles for the kernel — we can't unwind
+# without a runtime on bare metal. The panic handler in kernel/src/main.rs
+# takes over instead.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2

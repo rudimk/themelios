@@ -1,0 +1,14 @@
+# Workspace-level Cargo configuration for ThemeliOS.
+#
+# NOTE: We intentionally do NOT set a default build target here because
+# the workspace contains both the kernel (bare-metal target) and xtask
+# (host target). The xtask handles passing --target to kernel builds.
+#
+# Architecture-specific rustflags are applied by xtask via RUSTFLAGS
+# environment variable or cargo arguments.
+
+[alias]
+# `cargo xtask build` is equivalent to `cargo run --package xtask -- build`
+xtask = "run --package xtask --"
+# Shorthand: `cargo xt build`
+xt = "run --package xtask --"

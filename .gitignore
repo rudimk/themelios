@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# mdbook output
+/docs/book/
+
+# QEMU state
+*.qcow2
+*.img
