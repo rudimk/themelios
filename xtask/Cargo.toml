@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Build, run, and test tooling for ThemeliOS"
+
+# xtask runs on the host machine (macOS/Linux), not bare-metal.
+# It orchestrates cross-compilation and QEMU invocation.
+
+[dependencies]
