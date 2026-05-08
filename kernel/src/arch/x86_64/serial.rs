@@ -1,0 +1,186 @@
+//! # 16550 UART Serial Driver
+//!
+//! Driver for the 16550 UART (Universal Asynchronous Receiver/Transmitter),
+//! the standard serial port on x86 PCs. This is our primary debug output
+//! channel — all kernel messages go through here.
+//!
+//! ## How it works
+//!
+//! The UART is accessed through x86 I/O ports. COM1 lives at base port 0x3F8
+//! with 8 registers at consecutive port addresses. We configure it for:
+//! - 115200 baud (fastest standard rate)
+//! - 8 data bits, no parity, 1 stop bit (8N1) — the universal default
+//! - FIFO enabled with 14-byte threshold
+//!
+//! When running in QEMU with `-serial stdio`, anything we write to the UART
+//! appears on the host terminal. This is how we see kernel output.
+//!
+//! ## Register map (relative to base port 0x3F8)
+//!
+//! | Offset | DLAB=0 Read     | DLAB=0 Write    | DLAB=1        |
+//! |--------|-----------------|-----------------|---------------|
+//! | +0     | Receive Buffer  | Transmit Hold   | Divisor (low) |
+//! | +1     | Interrupt Enable| Interrupt Enable| Divisor (high)|
+//! | +2     | Interrupt ID    | FIFO Control    | —             |
+//! | +3     | Line Control    | Line Control    | —             |
+//! | +4     | Modem Control   | Modem Control   | —             |
+//! | +5     | Line Status     | —               | —             |
+//! | +6     | Modem Status    | —               | —             |
+//! | +7     | Scratch         | Scratch         | —             |
+//!
+//! DLAB (Divisor Latch Access Bit) is bit 7 of the Line Control Register.
+//! When set, ports +0 and +1 access the baud rate divisor instead of
+//! the data/interrupt registers.
+
+use core::fmt;
+
+use super::cpu;
+
+/// Base I/O port address for COM1 (the first serial port).
+/// This is a standard x86 PC convention — COM1 is always at 0x3F8.
+const COM1_BASE: u16 = 0x3F8;
+
+/// Register offsets from the base port address.
+/// Each register is one byte, accessed via I/O port reads/writes.
+mod regs {
+    /// Data register: write bytes here to transmit, read to receive.
+    /// When DLAB=1, this becomes the low byte of the baud rate divisor.
+    pub const DATA: u16 = 0;
+
+    /// Interrupt Enable Register. We disable all UART interrupts since
+    /// we poll for transmit readiness instead.
+    /// When DLAB=1, this becomes the high byte of the baud rate divisor.
+    pub const INTERRUPT_ENABLE: u16 = 1;
+
+    /// FIFO Control Register (write-only). Controls the built-in FIFO
+    /// buffers that smooth out byte-at-a-time I/O.
+    pub const FIFO_CONTROL: u16 = 2;
+
+    /// Line Control Register. Sets data format (bits, parity, stop bits)
+    /// and controls DLAB access to the baud rate divisor.
+    pub const LINE_CONTROL: u16 = 3;
+
+    /// Modem Control Register. Controls hardware flow control signals
+    /// (DTR, RTS) and loopback mode for testing.
+    pub const MODEM_CONTROL: u16 = 4;
+
+    /// Line Status Register (read-only). Reports transmitter/receiver
+    /// status. Bit 5 (THRE) tells us when we can send the next byte.
+    pub const LINE_STATUS: u16 = 5;
+}
+
+/// Bit 5 of the Line Status Register: Transmitter Holding Register Empty.
+/// When this bit is set, the UART is ready to accept another byte for
+/// transmission. We poll this before each write.
+const LINE_STATUS_THRE: u8 = 1 << 5;
+
+/// A handle to a 16550 UART serial port at a given I/O base address.
+///
+/// This struct doesn't hold any state beyond the port address — all state
+/// lives in the hardware registers. Multiple instances pointing to the same
+/// port are fine (they're just different handles to the same hardware).
+pub struct SerialPort {
+    /// The base I/O port address (e.g., 0x3F8 for COM1).
+    base: u16,
+}
+
+impl SerialPort {
+    /// Create a new serial port handle for COM1 (0x3F8).
+    pub const fn com1() -> Self {
+        Self { base: COM1_BASE }
+    }
+
+    /// Initialize the UART hardware.
+    ///
+    /// This configures the serial port for 115200 baud, 8N1, with FIFO enabled.
+    /// Must be called before any read/write operations.
+    ///
+    /// The initialization sequence follows the standard 16550 UART setup:
+    /// 1. Disable interrupts (we use polling, not interrupt-driven I/O)
+    /// 2. Set baud rate via the divisor latch
+    /// 3. Configure data format (8 data bits, no parity, 1 stop bit)
+    /// 4. Enable and clear FIFOs
+    /// 5. Assert DTR and RTS modem control signals
+    pub fn init(&self) {
+        unsafe {
+            // Step 1: Disable all UART interrupts.
+            // We'll poll the Line Status Register instead of using interrupts.
+            cpu::outb(self.base + regs::INTERRUPT_ENABLE, 0x00);
+
+            // Step 2: Enable DLAB (Divisor Latch Access Bit) to set baud rate.
+            // Setting bit 7 of Line Control makes ports +0/+1 access the
+            // 16-bit baud rate divisor instead of the data/interrupt registers.
+            cpu::outb(self.base + regs::LINE_CONTROL, 0x80);
+
+            // Step 3: Set baud rate divisor.
+            // Divisor = 115200 / desired_baud. For 115200 baud: divisor = 1.
+            // Low byte goes to port +0, high byte to port +1.
+            cpu::outb(self.base + regs::DATA, 0x01);             // Divisor low byte
+            cpu::outb(self.base + regs::INTERRUPT_ENABLE, 0x00); // Divisor high byte
+
+            // Step 4: Set data format and disable DLAB.
+            // 0x03 = 8 data bits, no parity, 1 stop bit (8N1).
+            // This also clears the DLAB bit, returning ports +0/+1 to normal.
+            cpu::outb(self.base + regs::LINE_CONTROL, 0x03);
+
+            // Step 5: Enable FIFOs with 14-byte threshold.
+            // 0xC7 = enable FIFOs, clear both buffers, 14-byte trigger level.
+            // The FIFO buffers incoming/outgoing bytes so we don't lose data
+            // if we don't read/write fast enough.
+            cpu::outb(self.base + regs::FIFO_CONTROL, 0xC7);
+
+            // Step 6: Assert DTR (Data Terminal Ready) and RTS (Request To Send).
+            // 0x03 = DTR + RTS. These modem control signals tell the other end
+            // that we're ready to communicate.
+            cpu::outb(self.base + regs::MODEM_CONTROL, 0x03);
+        }
+    }
+
+    /// Check if the transmit holding register is empty (ready for next byte).
+    fn is_transmit_ready(&self) -> bool {
+        // Read the Line Status Register and check the THRE bit.
+        // When THRE is set, the UART has finished sending the previous byte
+        // and is ready for the next one.
+        unsafe { cpu::inb(self.base + regs::LINE_STATUS) & LINE_STATUS_THRE != 0 }
+    }
+
+    /// Write a single byte to the serial port, blocking until ready.
+    ///
+    /// This polls the Line Status Register until the transmitter is ready,
+    /// then writes the byte. In practice, at 115200 baud each byte takes
+    /// ~87 microseconds, so the busy-wait is very short.
+    pub fn write_byte(&self, byte: u8) {
+        // Wait for the UART to finish transmitting the previous byte
+        while !self.is_transmit_ready() {
+            core::hint::spin_loop();
+        }
+
+        // Write the byte to the data register for transmission
+        unsafe {
+            cpu::outb(self.base + regs::DATA, byte);
+        }
+    }
+}
+
+/// Implement `core::fmt::Write` so we can use Rust's formatting macros
+/// (`write!`, `writeln!`) with the serial port.
+///
+/// This lets us do things like:
+/// ```
+/// writeln!(serial, "Value: {}", 42).unwrap();
+/// ```
+///
+/// Each character in the string is sent as a single byte to the UART.
+impl fmt::Write for SerialPort {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            // Convert \n to \r\n for proper terminal line endings.
+            // Serial terminals expect carriage return + line feed (CRLF).
+            if byte == b'\n' {
+                self.write_byte(b'\r');
+            }
+            self.write_byte(byte);
+        }
+        Ok(())
+    }
+}

@@ -3,12 +3,8 @@
 //! This module contains all code specific to the x86_64 (Intel/AMD 64-bit)
 //! architecture. It handles:
 //!
-//! - **Boot sequence**: Transition from bootloader to kernel, stack setup
-//! - **GDT/IDT**: Global Descriptor Table and Interrupt Descriptor Table
-//! - **Paging**: 4-level page tables (PML4 → PDPT → PD → PT)
-//! - **Interrupts**: APIC configuration, exception handlers, IRQ routing
+//! - **CPU operations**: I/O port access, halt, and other low-level instructions
 //! - **Serial output**: 16550 UART (COM1) for early debug printing
-//! - **Context switching**: Register save/restore for task switching
 //!
 //! ## Memory model
 //!
@@ -18,13 +14,17 @@
 //!
 //! ## Boot protocol
 //!
-//! The bootloader (TBD — likely Limine or a custom UEFI loader) loads the
-//! kernel ELF into memory, sets up an initial page table and stack, and
-//! jumps to our entry point with boot information (memory map, framebuffer, etc.).
+//! The Limine bootloader loads the kernel ELF into the higher half
+//! (0xffffffff80000000), sets up initial page tables and a stack, then
+//! jumps to our `kmain` entry point.
 
-// Sub-modules will be added as Phase 0 implementation proceeds:
-// pub mod boot;    — entry point, early init
+/// Low-level CPU instructions (I/O ports, halt, etc.).
+pub mod cpu;
+
+/// 16550 UART serial driver for debug output via COM1.
+pub mod serial;
+
+// Future sub-modules:
 // pub mod gdt;     — Global Descriptor Table setup
 // pub mod idt;     — Interrupt Descriptor Table, exception handlers
-// pub mod serial;  — 16550 UART driver for debug output
 // pub mod paging;  — page table management
