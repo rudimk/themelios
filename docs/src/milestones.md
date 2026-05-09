@@ -15,6 +15,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **8** | Testing and benchmarks | Not started |
 | **9** | Kubernetes worker node | Not started |
 | **10** | GPU support across clouds | Not started |
+| **11** | Production operations (observability, updates) | Not started |
 
 ---
 
@@ -51,6 +52,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Process creation with isolated address spaces
 - Capability grant, transfer, and revocation
 - Synchronous IPC (message passing between processes)
+- Audit logging (tamper-evident record of capability usage for compliance and security)
 - First userspace process (init)
 
 ## Phase 3 — Storage (Not started)
@@ -88,6 +90,8 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Container networking (virtual interfaces, isolation)
 - Log streaming from containers (stdout/stderr capture)
 - Resource limits (CPU, memory) enforced via capabilities
+- Container image registry support (Docker Hub, ECR, GCR, ACR)
+- Registry authentication, TLS, and cloud-specific credential helpers
 
 ## Phase 6 — Management (Not started)
 
@@ -114,6 +118,8 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - AMI creation for AWS (raw disk import via `aws ec2 import-image`)
 - GCP image creation (raw disk tarball + `gcloud compute images create`)
 - Azure VHD image creation
+- UEFI Secure Boot chain verification and kernel image signing
+- Measured boot (TPM support)
 - Boot validation on each provider's compute instances
 - GitHub Actions workflow to build downloadable QEMU ISOs (x86_64, aarch64)
 - GitHub Actions workflows to build and publish cloud-specific machine images
@@ -169,3 +175,18 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Validation on GCP GPU instances (A2/G2 series)
 - Validation on Azure GPU instances (NC/ND series)
 - Cloud-specific accelerator support (AWS Inferentia/Trainium, GCP TPU, Azure AMD GPUs)
+
+## Phase 11 — Production operations (Not started)
+
+**Goal**: Day-2 operational tooling for running ThemeliOS nodes in production.
+
+**Deliverables**:
+- Metrics export in Prometheus format (node-exporter compatible)
+- Log forwarding to external collectors (CloudWatch, Stackdriver, Fluentd)
+- Health endpoints for load balancers and orchestrators
+- Distributed tracing support for container workloads
+- A/B partition scheme for whole-image OS updates
+- Automatic rollback on failed updates
+- Zero-downtime node upgrades (drain → swap image → rejoin cluster)
+- OS update tooling (`cargo xtask image --update` or equivalent)
+- Update coordination with K8s (respect PodDisruptionBudgets during upgrades)

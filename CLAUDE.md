@@ -139,6 +139,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **8** | Testing and benchmarks | Not started |
 | **9** | Kubernetes worker node (full parity) | Not started |
 | **10** | GPU support across clouds | Not started |
+| **11** | Production operations (observability, updates) | Not started |
 
 ## License
 
