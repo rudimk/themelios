@@ -2,7 +2,20 @@
 
 ThemeliOS development is organized into phases. Each phase builds on the previous one and produces a working, testable artifact.
 
-## Phase 0 — Boot
+| Phase | Goal | Status |
+|-------|------|--------|
+| **0** | Boot on QEMU, serial output | Complete |
+| **1** | Memory allocator, scheduler, interrupts | Not started |
+| **2** | Capability system, process isolation, IPC | Not started |
+| **3** | VirtIO block driver, read-only filesystem | Not started |
+| **4** | VirtIO net driver, TCP/IP stack | Not started |
+| **5** | OCI container support | Not started |
+| **6** | Management API | Not started |
+| **Future** | Kubernetes worker node | Not started |
+
+---
+
+## Phase 0 — Boot (Complete)
 
 **Goal**: Get the kernel booting on QEMU and printing to the serial console.
 
@@ -13,9 +26,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - "Hello from ThemeliOS" printed on boot
 - `cargo xtask run` boots the kernel in QEMU end-to-end
 
-**What you'll learn**: Bare-metal Rust, the boot process, how hardware/QEMU works at the lowest level.
-
-## Phase 1 — Kernel basics
+## Phase 1 — Kernel basics (Not started)
 
 **Goal**: A kernel that can manage memory and schedule tasks.
 
@@ -28,7 +39,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Basic kernel shell over serial (for debugging, will be removed later)
 - aarch64 port of Phase 0 + Phase 1
 
-## Phase 2 — Isolation
+## Phase 2 — Isolation (Not started)
 
 **Goal**: Implement the capability system and process isolation.
 
@@ -39,7 +50,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Synchronous IPC (message passing between processes)
 - First userspace process (init)
 
-## Phase 3 — Storage
+## Phase 3 — Storage (Not started)
 
 **Goal**: Read from a virtual disk and present a filesystem.
 
@@ -49,7 +60,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - RAM-backed ephemeral writable layer
 - Immutable root image creation tooling
 
-## Phase 4 — Networking
+## Phase 4 — Networking (Not started)
 
 **Goal**: TCP/IP connectivity.
 
@@ -60,7 +71,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Basic socket-like API via capabilities
 - DHCP client
 
-## Phase 5 — Containers
+## Phase 5 — Containers (Not started)
 
 **Goal**: Run OCI container images.
 
@@ -71,7 +82,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Container networking (virtual interfaces, isolation)
 - Log streaming from containers
 
-## Phase 6 — Management
+## Phase 6 — Management (Not started)
 
 **Goal**: External API for managing the node.
 
@@ -82,7 +93,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Configuration injection at boot time
 - No SSH — API is the only interface
 
-## Future — Kubernetes
+## Future — Kubernetes (Not started)
 
 **Goal**: Serve as a K8s/K3s worker node.
 

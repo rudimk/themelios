@@ -122,7 +122,7 @@ See the [development setup guide](docs/src/dev-setup.md) in the mdbook for detai
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **0** | Boot on QEMU, serial output | Not started |
+| **0** | Boot on QEMU, serial output | Complete |
 | **1** | Memory allocator, scheduler, interrupts | Not started |
 | **2** | Capability system, process isolation, IPC | Not started |
 | **3** | VirtIO block driver, read-only FS, ephemeral layers | Not started |
