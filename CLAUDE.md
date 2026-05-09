@@ -136,8 +136,8 @@ When starting or completing a phase, update all three locations (this table, the
 | **5** | OCI containers, Linux syscall compat, exec | Not started |
 | **6** | Docker-compatible management API | Not started |
 | **7** | Hyperscaler support (AWS, GCP, Azure) | Not started |
-| **8** | Kubernetes worker node (full parity) | Not started |
-| **9** | Testing and benchmarks | Not started |
+| **8** | Testing and benchmarks | Not started |
+| **9** | Kubernetes worker node (full parity) | Not started |
 
 ## License
 

@@ -12,8 +12,8 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **5** | OCI container support | Not started |
 | **6** | Management API (Docker-compatible) | Not started |
 | **7** | Hyperscaler support (AWS, GCP, Azure) | Not started |
-| **8** | Kubernetes worker node | Not started |
-| **9** | Testing and benchmarks | Not started |
+| **8** | Testing and benchmarks | Not started |
+| **9** | Kubernetes worker node | Not started |
 
 ---
 
@@ -117,25 +117,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - GitHub Actions workflow to build downloadable QEMU ISOs (x86_64, aarch64)
 - GitHub Actions workflows to build and publish cloud-specific machine images
 
-## Phase 8 — Kubernetes (Not started)
-
-**Goal**: Full drop-in K8s/K3s/RKE2 worker node. Any pod that runs on an Ubuntu or Flatcar node must run identically on ThemeliOS.
-
-**Deliverables**:
-- Full Linux syscall coverage for real-world K8s workloads (databases, language runtimes, service meshes, logging agents, init systems)
-- CRI (Container Runtime Interface) gRPC API implementation
-- CNI (Container Network Interface) plugin support (Flannel, Calico, Cilium)
-- CSI (Container Storage Interface) driver support for persistent volumes
-- Pod semantics (groups of containers sharing network and storage namespaces)
-- kubelet (standard binary or compatible custom implementation)
-- kube-proxy equivalent for service networking and load balancing
-- Node registration, capacity reporting, and health conditions
-- `kubectl exec -it` with full interactive shell support
-- `kubectl logs`, `kubectl cp`, `kubectl port-forward`
-- Pod resource management (CPU/memory requests and limits, QoS classes)
-- DNS resolution for K8s service discovery
-
-## Phase 9 — Testing and benchmarks (Not started)
+## Phase 8 — Testing and benchmarks (Not started)
 
 **Goal**: Comprehensive test suite and performance benchmarks to validate the OS works correctly end-to-end.
 
@@ -154,3 +136,21 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Cloud validation tests (boot on each hyperscaler, IMDS, networking, container workloads)
 - Benchmarks: boot time, context switch latency, IPC throughput, memory allocation speed, container cold-start time
 - Benchmark history tracking for regression detection
+
+## Phase 9 — Kubernetes (Not started)
+
+**Goal**: Full drop-in K8s/K3s/RKE2 worker node. Any pod that runs on an Ubuntu or Flatcar node must run identically on ThemeliOS.
+
+**Deliverables**:
+- Full Linux syscall coverage for real-world K8s workloads (databases, language runtimes, service meshes, logging agents, init systems)
+- CRI (Container Runtime Interface) gRPC API implementation
+- CNI (Container Network Interface) plugin support (Flannel, Calico, Cilium)
+- CSI (Container Storage Interface) driver support for persistent volumes
+- Pod semantics (groups of containers sharing network and storage namespaces)
+- kubelet (standard binary or compatible custom implementation)
+- kube-proxy equivalent for service networking and load balancing
+- Node registration, capacity reporting, and health conditions
+- `kubectl exec -it` with full interactive shell support
+- `kubectl logs`, `kubectl cp`, `kubectl port-forward`
+- Pod resource management (CPU/memory requests and limits, QoS classes)
+- DNS resolution for K8s service discovery
