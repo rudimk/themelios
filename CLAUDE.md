@@ -135,6 +135,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **4** | VirtIO net driver, TCP/IP stack | Not started |
 | **5** | OCI image support, container lifecycle | Not started |
 | **6** | Management API server | Not started |
+| **7** | Hyperscaler support (AWS, GCP, Azure) | Not started |
 
 ## License
 

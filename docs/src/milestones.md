@@ -11,6 +11,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **4** | VirtIO net driver, TCP/IP stack | Not started |
 | **5** | OCI container support | Not started |
 | **6** | Management API | Not started |
+| **7** | Hyperscaler support (AWS, GCP, Azure) | Not started |
 | **Future** | Kubernetes worker node | Not started |
 
 ---
@@ -93,6 +94,19 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Configuration injection at boot time
 - No SSH — API is the only interface
 
+## Phase 7 — Hyperscaler support (Not started)
+
+**Goal**: Boot and run on AWS, GCP, and Azure.
+
+**Deliverables**:
+- Instance metadata service (IMDS) clients for all three providers
+- Cloud-aware configuration injection at boot time
+- Machine image tooling (`cargo xtask image --cloud aws/gcp/azure`)
+- AMI creation for AWS (raw disk import via `aws ec2 import-image`)
+- GCP image creation (raw disk tarball + `gcloud compute images create`)
+- Azure VHD image creation
+- Boot validation on each provider's compute instances
+
 ## Future — Kubernetes (Not started)
 
 **Goal**: Serve as a K8s/K3s worker node.
@@ -104,4 +118,4 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Node registration with K8s control plane
 - Pod lifecycle management
 
-This phase is explicitly not v1 and will be scoped in detail after Phase 6 is complete.
+This phase is explicitly not v1 and will be scoped in detail after Phase 7 is complete.
