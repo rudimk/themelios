@@ -138,6 +138,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **7** | Hyperscaler support (AWS, GCP, Azure) | Not started |
 | **8** | Testing and benchmarks | Not started |
 | **9** | Kubernetes worker node (full parity) | Not started |
+| **10** | GPU support across clouds | Not started |
 
 ## License
 

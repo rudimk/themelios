@@ -14,6 +14,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **7** | Hyperscaler support (AWS, GCP, Azure) | Not started |
 | **8** | Testing and benchmarks | Not started |
 | **9** | Kubernetes worker node | Not started |
+| **10** | GPU support across clouds | Not started |
 
 ---
 
@@ -154,3 +155,17 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - `kubectl logs`, `kubectl cp`, `kubectl port-forward`
 - Pod resource management (CPU/memory requests and limits, QoS classes)
 - DNS resolution for K8s service discovery
+
+## Phase 10 — GPU support (Not started)
+
+**Goal**: GPU passthrough and accelerator support for containerized workloads across all major cloud providers.
+
+**Deliverables**:
+- VFIO/IOMMU support for GPU device passthrough to containers
+- NVIDIA driver ioctl compatibility in the syscall layer
+- K8s device plugin API support for GPU resource scheduling
+- GPU resource requests and limits in pod specs
+- Validation on AWS GPU instances (P/G series)
+- Validation on GCP GPU instances (A2/G2 series)
+- Validation on Azure GPU instances (NC/ND series)
+- Cloud-specific accelerator support (AWS Inferentia/Trainium, GCP TPU, Azure AMD GPUs)
