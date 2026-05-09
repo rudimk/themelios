@@ -120,6 +120,12 @@ See the [development setup guide](docs/src/dev-setup.md) in the mdbook for detai
 
 ## Milestone Roadmap
 
+**Important**: Milestone status is tracked in two places that must be kept in sync:
+1. This table below
+2. `docs/src/milestones.md` — both the summary table at the top and the inline status label on each phase heading
+
+When starting or completing a phase, update all three locations (this table, the docs summary table, and the docs phase heading).
+
 | Phase | Goal | Status |
 |-------|------|--------|
 | **0** | Boot on QEMU, serial output | Complete |
