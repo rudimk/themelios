@@ -106,6 +106,8 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - GCP image creation (raw disk tarball + `gcloud compute images create`)
 - Azure VHD image creation
 - Boot validation on each provider's compute instances
+- GitHub Actions workflow to build downloadable QEMU ISOs (x86_64, aarch64)
+- GitHub Actions workflows to build and publish cloud-specific machine images
 
 ## Future — Kubernetes (Not started)
 
