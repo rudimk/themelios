@@ -12,7 +12,7 @@ The long-term goal is a minimal, immutable OS that boots, runs OCI-compatible co
 
 ## Status
 
-Early development — Phase 0 (boot on QEMU).
+Early development — Phase 0 (boot on QEMU) complete. Phase 1 (memory, scheduler, interrupts) up next.
 
 ## Quick start
 
