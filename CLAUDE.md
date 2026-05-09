@@ -130,12 +130,12 @@ When starting or completing a phase, update all three locations (this table, the
 |-------|------|--------|
 | **0** | Boot on QEMU, serial output | Complete |
 | **1** | Memory allocator, scheduler, interrupts | Not started |
-| **2** | Capability system, process isolation, IPC | Not started |
+| **2** | Capability system, process isolation, IPC, audit logging | Not started |
 | **3** | VirtIO block driver, read-only FS, ephemeral layers | Not started |
 | **4** | VirtIO net driver, TCP/IP stack | Not started |
-| **5** | OCI containers, Linux syscall compat, exec | Not started |
+| **5** | OCI containers, Linux syscall compat, exec, registries | Not started |
 | **6** | Docker-compatible management API | Not started |
-| **7** | Hyperscaler support (AWS, GCP, Azure) | Not started |
+| **7** | Hyperscaler support (AWS, GCP, Azure), secure boot | Not started |
 | **8** | Testing and benchmarks | Not started |
 | **9** | Kubernetes worker node (full parity) | Not started |
 | **10** | GPU support across clouds | Not started |
