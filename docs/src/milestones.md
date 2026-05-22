@@ -5,17 +5,18 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | Phase | Goal | Status |
 |-------|------|--------|
 | **0** | Boot on QEMU, serial output | Complete |
-| **1** | Memory allocator, scheduler, interrupts | Not started |
+| **1** | Memory allocator, scheduler, interrupts (x86_64) | Not started |
 | **2** | Capability system, process isolation, IPC | Not started |
 | **3** | VirtIO block driver, read-only filesystem | Not started |
 | **4** | VirtIO net driver, TCP/IP stack | Not started |
 | **5** | OCI container support | Not started |
 | **6** | Management API (Docker-compatible) | Not started |
-| **7** | Hyperscaler support (AWS, GCP, Azure) | Not started |
-| **8** | Testing and benchmarks | Not started |
-| **9** | Kubernetes worker node | Not started |
-| **10** | GPU support across clouds | Not started |
-| **11** | Production operations (observability, updates) | Not started |
+| **7** | aarch64 port | Not started |
+| **8** | Hyperscaler support (AWS, GCP, Azure) | Not started |
+| **9** | Testing and benchmarks | Not started |
+| **10** | Kubernetes worker node | Not started |
+| **11** | GPU support across clouds | Not started |
+| **12** | Production operations (observability, updates) | Not started |
 
 ---
 
@@ -32,27 +33,28 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 
 ## Phase 1 — Kernel basics (Not started)
 
-**Goal**: A kernel that can manage memory and schedule tasks.
+**Goal**: A kernel that can manage memory and schedule tasks. x86_64 only — aarch64 is deferred to Phase 7.
 
 **Deliverables**:
 - Physical frame allocator (bitmap-based)
-- Virtual memory manager (page table setup, higher-half kernel)
 - Kernel heap allocator
-- Interrupt handling (IDT on x86_64, GIC on aarch64)
+- Interrupt handling (GDT, IDT, 8259 PIC on x86_64)
 - Timer-driven preemptive scheduler (round-robin)
 - Basic kernel shell over serial (for debugging, will be removed later)
-- aarch64 port of Phase 0 + Phase 1
+- Automated test infrastructure (`isa-debug-exit`, `cargo xtask test`, GitHub Actions CI)
 
 ## Phase 2 — Isolation (Not started)
 
 **Goal**: Implement the capability system and process isolation.
 
 **Deliverables**:
+- Custom page tables replacing Limine's (required for per-process address spaces)
 - Capability types and capability space (CSpace)
 - Process creation with isolated address spaces
 - Capability grant, transfer, and revocation
 - Synchronous IPC (message passing between processes)
 - Audit logging (tamper-evident record of capability usage for compliance and security)
+- Reclaim bootloader-reclaimable memory (safe once we own GDT, page tables, and stack)
 - First userspace process (init)
 
 ## Phase 3 — Storage (Not started)
@@ -107,7 +109,23 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - No SSH — API is the only interface
 - Standard Docker tooling works out of the box (`docker exec`, `docker ps`, `docker logs`, etc.)
 
-## Phase 7 — Hyperscaler support (Not started)
+## Phase 7 — aarch64 port (Not started)
+
+**Goal**: Port all Phase 0 and Phase 1 functionality to aarch64 (ARM64), enabling ThemeliOS to run on ARM-based hardware and cloud instances (e.g., AWS Graviton).
+
+**Deliverables**:
+- aarch64 boot via Limine (UEFI on ARM)
+- PL011 UART serial driver for debug output
+- GIC (Generic Interrupt Controller) initialization and exception handling
+- ARM generic timer for scheduler preemption
+- Physical frame allocator (same bitmap design, architecture-independent)
+- Kernel heap (architecture-independent, just works)
+- Scheduler and context switch for aarch64 (different register set, different calling convention)
+- Serial debug shell (architecture-independent, just works)
+- `cargo xtask run --arch aarch64` boots and passes all tests
+- Automated tests on aarch64 QEMU in CI
+
+## Phase 8 — Hyperscaler support (Not started)
 
 **Goal**: Boot and run on AWS, GCP, and Azure.
 
@@ -124,7 +142,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - GitHub Actions workflow to build downloadable QEMU ISOs (x86_64, aarch64)
 - GitHub Actions workflows to build and publish cloud-specific machine images
 
-## Phase 8 — Testing and benchmarks (Not started)
+## Phase 9 — Testing and benchmarks (Not started)
 
 **Goal**: Comprehensive test suite and performance benchmarks to validate the OS works correctly end-to-end.
 
@@ -144,7 +162,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Benchmarks: boot time, context switch latency, IPC throughput, memory allocation speed, container cold-start time
 - Benchmark history tracking for regression detection
 
-## Phase 9 — Kubernetes (Not started)
+## Phase 10 — Kubernetes (Not started)
 
 **Goal**: Full drop-in K8s/K3s/RKE2 worker node. Any pod that runs on an Ubuntu or Flatcar node must run identically on ThemeliOS.
 
@@ -162,7 +180,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Pod resource management (CPU/memory requests and limits, QoS classes)
 - DNS resolution for K8s service discovery
 
-## Phase 10 — GPU support (Not started)
+## Phase 11 — GPU support (Not started)
 
 **Goal**: GPU passthrough and accelerator support for containerized workloads across all major cloud providers.
 
@@ -176,7 +194,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Validation on Azure GPU instances (NC/ND series)
 - Cloud-specific accelerator support (AWS Inferentia/Trainium, GCP TPU, Azure AMD GPUs)
 
-## Phase 11 — Production operations (Not started)
+## Phase 12 — Production operations (Not started)
 
 **Goal**: Day-2 operational tooling for running ThemeliOS nodes in production.
 
