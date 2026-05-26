@@ -135,49 +135,23 @@
 
 ---
 
-### Sub-phase 1.4 — Physical frame allocator
+### Sub-phase 1.4 — Physical frame allocator ✓ DONE
 
-**Why before heap**: The heap allocator needs physical frames to back its virtual memory region.
+> **Completed**: 2026-05-26
+> **Commits**: `f6afb55`, `f1a394e`, `c063dcf`, `80f6ef9`, `cf1452a`, `936da52`
 
-**Deliverables**:
-- Request Limine memory map, HHDM offset, and kernel address at boot
-- Store HHDM offset globally for phys-to-virt conversion
-- Use `ExecutableAddressRequest` (or `KernelFileRequest`) to determine kernel physical bounds
-- Bitmap frame allocator:
-  - One bit per 4 KiB frame across all physical memory
-  - Bitmap carved from the first sufficiently large usable memory region (not heap — heap doesn't exist yet)
-  - `allocate_frame() -> Option<PhysAddr>` — find and mark a free frame
-  - `deallocate_frame(addr: PhysAddr)` — mark a frame as free
-  - `free_frame_count() -> usize` — for diagnostics
-- Only `USABLE` memory map entries marked as free (NOT `BOOTLOADER_RECLAIMABLE`). Note: Limine's memory map already classifies kernel image frames as `EXECUTABLE_AND_MODULES`, not `USABLE`, so they are implicitly excluded. The `ExecutableAddressRequest` is still useful for diagnostics/logging, but explicit kernel-frame exclusion from the bitmap is redundant — verify this assumption during init and assert if it doesn't hold.
-- Frames containing the bitmap itself marked as allocated
-- Memory map entries rounded to 4 KiB boundaries (round start up, round end down)
-- Extract ALL needed info from Limine responses during early init (responses live in bootloader-reclaimable memory)
-- Protected by interrupt-disabling mutex (same pattern as heap)
+**Summary**:
+- Added Limine `MemoryMapRequest`, `HhdmRequest`, `ExecutableAddressRequest` to main.rs with documented request statics in `.requests` section
+- Added `-m 256M` to QEMU invocation in xtask for consistent 256 MiB guest memory
+- Created `mm/addr.rs`: type-safe `PhysAddr` and `VirtAddr` wrappers with HHDM-based conversion (`to_virt()`, `to_phys()`, `as_ptr()`, `as_mut_ptr()`), plus `align_up`/`align_down` utilities
+- Rewrote `mm/mod.rs`: HHDM offset global (`AtomicU64`), `PAGE_SIZE` constant, `init_hhdm()` and `hhdm_offset()` functions
+- Created `mm/frame.rs`: `BitmapFrameAllocator` with bootstrap sequence — finds highest phys addr, sizes bitmap, carves from first USABLE region, zeros (all allocated), marks USABLE frames free, re-marks bitmap frames allocated. Asserts kernel phys base not in USABLE region. Linear-scan `allocate_frame()`, `deallocate_frame()` with double-free protection
+- Wrapped allocator in `InterruptMutex<Option<BitmapFrameAllocator>>` with public free functions
+- Wired into kmain: prints full 16-entry memory map with types/sizes, shows 56099 free frames (~219 MiB usable), alloc/dealloc smoke test passes
+- Kernel frames correctly classified as `Executable & Modules` (verified by assertion)
+- Timer continues ticking after frame allocator init — no corruption or hangs
 
-**Files**:
-- `kernel/src/mm/mod.rs` — rewrite: re-export sub-modules, HHDM global
-- `kernel/src/mm/frame.rs` — new file: bitmap frame allocator
-- `kernel/src/mm/addr.rs` — new file: `PhysAddr` and `VirtAddr` types with HHDM-based conversion
-- `kernel/src/main.rs` — add Limine `MemoryMapRequest`, `HhdmRequest`, `ExecutableAddressRequest`; call frame allocator init
-- `xtask/src/main.rs` — add `-m 256M` to QEMU invocation
-
-**Commits**:
-1. Add Limine memory map, HHDM, and kernel address requests to main.rs
-2. Add `-m 256M` to QEMU invocation in xtask
-3. Create `PhysAddr`/`VirtAddr` types with HHDM-based conversion
-4. Implement bitmap frame allocator (init from memory map, bootstrap bitmap placement)
-5. Add interrupt-disabling mutex wrapper for the frame allocator
-6. Wire frame allocator init into kmain, print memory map and free frame count
-
-**Acceptance criteria**:
-- Kernel prints total usable memory and free frame count at boot (expect ~256 MiB worth of frames)
-- `allocate_frame()` returns valid physical addresses
-- `deallocate_frame()` returns frames to the free pool
-- Bootloader-reclaimable and kernel memory are NOT in the free pool
-- Bitmap does not overlap with any usable frames
-- All Limine response data copied to kernel-owned structures during init
-- No page faults or memory corruption
+**All acceptance criteria verified** ✓
 
 ---
 
