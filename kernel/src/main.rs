@@ -43,7 +43,10 @@
 // between the start and end markers for request structures.
 
 use limine::BaseRevision;
-use limine::request::{RequestsStartMarker, RequestsEndMarker};
+use limine::request::{
+    RequestsStartMarker, RequestsEndMarker,
+    MemoryMapRequest, HhdmRequest, ExecutableAddressRequest,
+};
 
 /// Mark the beginning of the Limine requests region in the ELF binary.
 /// The bootloader uses this marker to know where to start scanning for requests.
@@ -64,6 +67,31 @@ static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 #[used]
 #[link_section = ".requests"]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
+
+/// Request the memory map from the bootloader.
+/// The response contains an array of memory region descriptors, each with a
+/// physical base address, length, and type (USABLE, RESERVED, BOOTLOADER_RECLAIMABLE,
+/// EXECUTABLE_AND_MODULES, etc.). We use this to initialize the frame allocator.
+#[used]
+#[link_section = ".requests"]
+static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+/// Request the Higher-Half Direct Map (HHDM) offset from the bootloader.
+/// Limine maps ALL physical memory into the virtual address space at a
+/// high offset: virt_addr = phys_addr + hhdm_offset. This gives the kernel
+/// a convenient way to access any physical address without setting up custom
+/// page table entries. The offset is typically 0xffff800000000000 or similar.
+#[used]
+#[link_section = ".requests"]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+/// Request the physical and virtual base addresses of the loaded kernel image.
+/// Used for diagnostics and to verify that kernel frames are classified as
+/// EXECUTABLE_AND_MODULES (not USABLE) in the memory map — ensuring the
+/// frame allocator never hands out kernel memory.
+#[used]
+#[link_section = ".requests"]
+static EXECUTABLE_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
 
 // ----- Kernel subsystem modules -----
 
