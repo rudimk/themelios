@@ -41,6 +41,7 @@ use super::cpu;
 use super::gdt;
 use super::pic;
 use crate::println;
+use crate::sched;
 
 // --- IDT entry (gate descriptor) ---
 
@@ -427,7 +428,20 @@ extern "C" fn exception_handler(frame: &InterruptStackFrame) {
         irq_handler(irq);
 
         // Acknowledge the interrupt so the PIC delivers the next one.
+        // For IRQ0 (timer), EOI must be sent BEFORE calling schedule(),
+        // because schedule() may context-switch to a different task. If
+        // EOI were deferred until after the switch, the PIC would block
+        // all further timer interrupts until the original task resumes —
+        // preventing preemption of the new task.
         pic::send_eoi(irq);
+
+        // After EOI, let the scheduler preempt on timer ticks.
+        // The scheduler checks is_initialized() internally, but we gate
+        // here too to avoid even the function call overhead during early boot.
+        if irq == 0 && sched::is_initialized() {
+            sched::schedule();
+        }
+
         return;
     }
 

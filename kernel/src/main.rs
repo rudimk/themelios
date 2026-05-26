@@ -332,19 +332,46 @@ extern "C" fn kmain() -> ! {
         arch::x86_64::pic::unmask(0);
     }
 
+    // --- Scheduler initialization ---
+    //
+    // Set up the preemptive round-robin scheduler. This creates the bootstrap
+    // task (representing this execution context) and the idle task. After
+    // this, spawn() can be used to create new tasks.
+    //
+    // Must happen after heap init (scheduler uses Vec/VecDeque) and after
+    // PIC/PIT init (so timer-driven preemption will work once we enable
+    // interrupts).
+    sched::init();
+
+    // Spawn stress test tasks to verify the scheduler works. Each task
+    // prints its ID and a counter, then voluntarily yields. With 20+ tasks
+    // and timer preemption, the serial output should show interleaved lines
+    // from different tasks.
+    println!();
+    println!("Spawning stress test tasks...");
+    for i in 0..24 {
+        // Use a closure-like pattern: each task reads its own ID at runtime
+        // via sched::current_task_id(). We can't capture `i` in a fn pointer,
+        // so all tasks run the same function but identify themselves by ID.
+        let _ = i; // suppress unused warning — loop count is what matters
+        sched::spawn("stress", stress_test_entry);
+    }
+    println!("Spawned 24 stress test tasks.");
+
     // Enable maskable interrupts. From this point on, the PIT timer will
-    // fire IRQ0 at ~100 Hz, incrementing the global tick counter and
-    // printing a status line every second.
+    // fire IRQ0 at ~100 Hz. Each tick increments the global tick counter
+    // and calls schedule() for preemptive task switching.
     #[cfg(target_arch = "x86_64")]
     arch::x86_64::cpu::sti();
 
     println!();
-    println!("Interrupts enabled — timer is running.");
-    println!("Phase 1 in progress. Halting (with interrupts).");
+    println!("Interrupts enabled — scheduler is running.");
+    println!("Main task entering idle loop. Timer preemption will schedule tasks.");
 
-    // Halt the CPU in an interrupt-friendly loop. Unlike hcf() which
-    // disables interrupts, this loop lets interrupts wake the CPU from
-    // hlt so the timer handler keeps running.
+    // The main task (bootstrap, task 0) enters an idle loop. The timer will
+    // preempt it and run the stress test tasks. When all tasks finish, the
+    // scheduler falls back to the idle task and the main task continues
+    // running this loop.
     loop {
         #[cfg(target_arch = "x86_64")]
         arch::x86_64::cpu::halt();
@@ -352,6 +379,32 @@ extern "C" fn kmain() -> ! {
         #[cfg(not(target_arch = "x86_64"))]
         core::hint::spin_loop();
     }
+}
+
+// ----- Stress test task -----
+
+/// Entry function for stress test tasks.
+///
+/// Each task prints its ID and a counter 5 times, yielding between each
+/// iteration. With 24 tasks running, the serial output should show interleaved
+/// lines like:
+/// ```text
+/// [task 3] count 0
+/// [task 7] count 2
+/// [task 3] count 1
+/// ...
+/// ```
+///
+/// After the loop completes, the function returns. The task exit trampoline
+/// (`task_bootstrap` in context.rs) catches the return and calls `task_exit`,
+/// which marks the task as Dead and switches to the next ready task.
+fn stress_test_entry() {
+    let id = sched::current_task_id();
+    for i in 0..5 {
+        println!("[task {}] count {}", id, i);
+        sched::yield_now();
+    }
+    // Return → task_bootstrap calls task_exit → task marked Dead → rescheduled
 }
 
 // ----- Panic handler -----
