@@ -29,6 +29,11 @@
 #![no_std]
 #![no_main]
 
+// Enable the `alloc` crate so we can use Vec, Box, String, etc.
+// This requires a #[global_allocator] to be defined (see mm/heap.rs)
+// and `-Zbuild-std=core,alloc` in the build flags (see xtask).
+extern crate alloc;
+
 // --- Limine boot protocol setup ---
 //
 // The Limine bootloader communicates with the kernel through "requests":
@@ -284,6 +289,33 @@ extern "C" fn kmain() -> ! {
     let free_after = mm::frame::free_frame_count();
     assert!(free_after == free, "Free count mismatch after alloc/dealloc cycle");
     println!("  Alloc/dealloc cycle verified — count restored to {}", free_after);
+
+    // Initialize the kernel heap (1 MiB) backed by contiguous physical frames.
+    // After this, Vec, Box, String, and all alloc types are usable.
+    mm::heap::init();
+
+    // Smoke test the heap with Vec, Box, and String to verify dynamic allocation.
+    {
+        use alloc::vec::Vec;
+        use alloc::boxed::Box;
+        use alloc::string::String;
+
+        let mut v = Vec::new();
+        for i in 0..10 {
+            v.push(i);
+        }
+        assert!(v.iter().sum::<i32>() == 45, "Vec sum mismatch");
+
+        let b = Box::new(42u64);
+        assert!(*b == 42, "Box value mismatch");
+
+        let s = String::from("ThemeliOS heap works!");
+        assert!(s.len() == 21, "String length mismatch");
+
+        println!("Heap smoke test passed (Vec, Box, String all working)");
+        println!("  Heap used: {} bytes, free: {} bytes",
+            mm::heap::used(), mm::heap::free());
+    }
 
     // Initialize the 8259 PIC and remap hardware IRQs to vectors 32-47.
     // Must happen after IDT setup (so IRQ vectors have handlers installed).
