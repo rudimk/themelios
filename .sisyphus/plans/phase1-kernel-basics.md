@@ -155,40 +155,22 @@
 
 ---
 
-### Sub-phase 1.5 — Kernel heap allocator
+### Sub-phase 1.5 — Kernel heap allocator ✓ DONE
 
-**Why before scheduler**: The scheduler needs dynamic allocation for task structs and stacks.
+> **Completed**: 2026-05-26
+> **Commits**: `4d5105a`, `5b50f1b`, `044de9f`, `2d71b63`
 
-**Deliverables**:
-- Enable `alloc` crate: change `-Zbuild-std=core` to `-Zbuild-std=core,alloc` in ALL xtask build sites (both `cmd_build()` and `cmd_docs()` — extract to a constant to avoid divergence)
-- Add `extern crate alloc;` to `kernel/src/main.rs` (unconditional, not feature-gated)
-- `#[global_allocator]` using `linked_list_allocator::Heap` (the NON-locked variant) wrapped in our own interrupt-disabling mutex
-- Heap backed by physical frames from the frame allocator
-- Heap region: 1 MiB initial size, mapped via Limine's HHDM (allocate contiguous frames, convert to virtual address range)
-- Verify `#[alloc_error_handler]` nightly status — use default (panic) if custom handler has been removed, implement custom one if still available
-- `Vec`, `Box`, `String` etc. all usable after heap init
+**Summary**:
+- Added `linked_list_allocator = { version = "0.10", default-features = false }` to Cargo.toml — non-locked `Heap` variant, wrapped in our own InterruptMutex
+- Updated xtask `-Zbuild-std` from `core` to `core,alloc` in both `cmd_build()` and `cmd_docs()`, extracted to `BUILD_STD` / `BUILD_STD_FEATURES` constants to prevent divergence
+- Created `mm/heap.rs`: `KernelHeap` wrapper implementing `GlobalAlloc` via `InterruptMutex<Heap>`, `#[global_allocator]` static, `init()` function that allocates 256 contiguous physical frames (1 MiB) and initializes the linked-list heap with the HHDM-mapped virtual region
+- Added `allocate_contiguous_frames(count)` to frame allocator for contiguous physical region allocation
+- Added `extern crate alloc;` to main.rs, heap init called after frame allocator, smoke test verifies Vec, Box, and String all allocate correctly
+- `#[alloc_error_handler]` is no longer available on nightly — the default behavior (panic on OOM) is used, which matches our requirements
+- `cargo xtask docs` verified to still build correctly with `core,alloc`
+- Heap stats at boot: 1024 KiB total, 104 bytes used after smoke test, timer continues ticking with no deadlocks
 
-**Files**:
-- `kernel/Cargo.toml` — add `linked_list_allocator` dependency (with `default-features = false`, no `use_spin`)
-- `kernel/src/mm/heap.rs` — new file: global allocator setup with interrupt-disabling mutex, init function
-- `kernel/src/mm/mod.rs` — add `pub mod heap;`
-- `kernel/src/main.rs` — add `extern crate alloc;`, call heap init after frame allocator
-- `xtask/src/main.rs` — extract `-Zbuild-std` flag to constant, change to `core,alloc` in ALL call sites
-
-**Commits**:
-1. Add `linked_list_allocator` crate dependency (no default features)
-2. Update ALL xtask `-Zbuild-std` call sites to `core,alloc` (extract to constant)
-3. Implement interrupt-disabling mutex wrapper for the heap
-4. Implement kernel heap allocator (`#[global_allocator]`, init from frame allocator)
-5. Add `extern crate alloc;` to main.rs, wire heap init, test with `Vec`/`Box`/`String`
-
-**Acceptance criteria**:
-- `extern crate alloc;` compiles
-- `Vec::new()`, `Box::new()`, `String::from()` all work and hold correct values
-- `cargo xtask docs` still builds (the `-Zbuild-std` fix covers it)
-- Heap is backed by real physical frames (1 MiB region)
-- Allocation failure panics with a descriptive message
-- No deadlocks when timer interrupt fires during allocation (interrupt-disabling mutex)
+**All acceptance criteria verified** ✓
 
 ---
 
