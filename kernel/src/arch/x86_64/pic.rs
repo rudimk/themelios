@@ -73,6 +73,12 @@ const ICW4_8086: u8 = 0x01;
 /// the highest-priority interrupt currently in service.
 const EOI: u8 = 0x20;
 
+/// OCW3: Read the In-Service Register (ISR). Writing this to the command port
+/// makes the next read from the command port return the ISR contents.
+/// The ISR tells us which IRQs are currently being handled (handler running,
+/// EOI not yet sent). Used to distinguish real IRQs from spurious ones.
+const OCW3_READ_ISR: u8 = 0x0B;
+
 // --- Vector mapping ---
 
 /// Base vector for master PIC IRQs. IRQ0 maps to vector 32, IRQ1 to 33, etc.
@@ -221,5 +227,87 @@ pub fn mask(irq: u8) {
             let mask = cpu::inb(SLAVE_DATA) | (1 << (irq - 8));
             cpu::outb(SLAVE_DATA, mask);
         }
+    }
+}
+
+// --- Spurious IRQ detection ---
+//
+// The 8259 PIC can generate "spurious" interrupts — phantom IRQs that don't
+// correspond to any real hardware event. This happens when:
+// - An IRQ line is asserted and then de-asserted before the CPU acknowledges it
+// - Electrical noise on the IRQ line
+// - The PIC's internal priority logic resolves an ambiguity
+//
+// Spurious IRQs only appear on the lowest-priority line of each PIC:
+// **IRQ7** (master) and **IRQ15** (slave). No other IRQ lines produce spurious
+// interrupts because the 8259 resolves them before signaling the CPU.
+//
+// ## Detection method
+//
+// Read the In-Service Register (ISR) to check whether the PIC actually has
+// this IRQ in service. If the ISR bit for the IRQ is NOT set, the interrupt
+// is spurious — the PIC signaled the CPU but then realized no real IRQ was
+// pending.
+//
+// ## EOI rules for spurious IRQs
+//
+// - **Spurious IRQ7**: Don't send any EOI. The master never started servicing
+//   this IRQ, so there's nothing to acknowledge.
+// - **Spurious IRQ15**: Send EOI to the master only. The master IS servicing
+//   the IRQ2 cascade (it saw the slave assert IRQ2), but the slave never
+//   started servicing IRQ15. So the master needs its cascade cleared, but the
+//   slave must not receive an EOI it didn't earn.
+
+/// Read the In-Service Register (ISR) from the master PIC.
+///
+/// Sends OCW3 (read ISR command) to the command port, then reads the result
+/// back from the same port. Each bit in the returned byte corresponds to one
+/// IRQ line (bit 0 = IRQ0, bit 7 = IRQ7). A set bit means that IRQ's handler
+/// is currently executing (EOI not yet sent).
+fn read_master_isr() -> u8 {
+    unsafe {
+        cpu::outb(MASTER_COMMAND, OCW3_READ_ISR);
+        cpu::inb(MASTER_COMMAND)
+    }
+}
+
+/// Read the In-Service Register (ISR) from the slave PIC.
+///
+/// Same as `read_master_isr` but for the slave. Bit positions correspond to
+/// IRQ8-15 (bit 0 = IRQ8, bit 7 = IRQ15).
+fn read_slave_isr() -> u8 {
+    unsafe {
+        cpu::outb(SLAVE_COMMAND, OCW3_READ_ISR);
+        cpu::inb(SLAVE_COMMAND)
+    }
+}
+
+/// Check whether an IRQ is spurious and handle it appropriately.
+///
+/// Only IRQ7 and IRQ15 can be spurious. For all other IRQs, this function
+/// returns `false` immediately.
+///
+/// Returns `true` if the IRQ is spurious — in that case, the caller must
+/// **skip the normal handler** and **not send EOI** (this function handles
+/// any necessary EOI internally for spurious IRQ15).
+pub fn is_spurious(irq: u8) -> bool {
+    match irq {
+        7 => {
+            // Master PIC spurious: check if IRQ7 (bit 7) is actually in service.
+            // If not set → spurious. Don't send any EOI.
+            read_master_isr() & (1 << 7) == 0
+        }
+        15 => {
+            // Slave PIC spurious: check if IRQ15 (bit 7 of slave ISR) is in service.
+            if read_slave_isr() & (1 << 7) == 0 {
+                // Spurious IRQ15: the master IS servicing IRQ2 (cascade), so we
+                // must send EOI to the master to clear the cascade. But the slave
+                // never started servicing, so no EOI to the slave.
+                unsafe { cpu::outb(MASTER_COMMAND, EOI); }
+                return true;
+            }
+            false
+        }
+        _ => false,
     }
 }
