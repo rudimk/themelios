@@ -35,6 +35,7 @@
 use core::fmt;
 
 use super::cpu;
+use crate::sync::InterruptMutex;
 
 /// Base I/O port address for COM1 (the first serial port).
 /// This is a standard x86 PC convention — COM1 is always at 0x3F8.
@@ -183,4 +184,77 @@ impl fmt::Write for SerialPort {
         }
         Ok(())
     }
+}
+
+// --- Global serial writer facility ---
+//
+// The global SERIAL_WRITER provides a single point of access for all kernel
+// serial output. It's wrapped in an InterruptMutex (not a plain spin::Mutex)
+// because interrupt handlers may need to print — e.g., the timer interrupt
+// handler printing scheduler diagnostics, or an exception handler printing
+// a register dump. If we used a plain spinlock and an interrupt fired while
+// the lock was held, the handler would spin forever → deadlock.
+
+/// Global serial writer, accessible from anywhere in the kernel via the
+/// `print!` and `println!` macros.
+///
+/// Starts as `None` and is initialized to `Some(SerialPort)` by `init()`.
+/// The `Option` avoids requiring a way to construct `SerialPort` at compile
+/// time with initialization already done (hardware init must happen at runtime).
+static SERIAL_WRITER: InterruptMutex<Option<SerialPort>> = InterruptMutex::new(None);
+
+/// Initialize the global serial writer.
+///
+/// Creates a COM1 serial port, configures the hardware (115200 baud, 8N1,
+/// FIFO enabled), and installs it as the global writer. After this call,
+/// `print!` and `println!` macros will produce output on the serial console.
+///
+/// Must be called exactly once, early in the boot sequence (before any
+/// `println!` calls). Calling it again is harmless (just re-initializes
+/// the same hardware) but unnecessary.
+pub fn init() {
+    let serial = SerialPort::com1();
+    serial.init();
+    *SERIAL_WRITER.lock() = Some(serial);
+}
+
+/// Internal print function used by the `print!` and `println!` macros.
+///
+/// Acquires the global serial writer lock (with interrupts disabled) and
+/// writes the formatted arguments to the serial port. If the serial port
+/// hasn't been initialized yet, the output is silently dropped.
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    let mut guard = SERIAL_WRITER.lock();
+    if let Some(ref mut serial) = *guard {
+        // write_fmt returns Err only if the Write impl returns Err,
+        // and our Write impl always returns Ok(()). Unwrap is safe.
+        serial.write_fmt(args).unwrap();
+    }
+}
+
+/// Print formatted text to the serial console.
+///
+/// Works exactly like `std::print!` but outputs to the UART serial port.
+/// The global serial writer must be initialized via `serial::init()` first,
+/// otherwise output is silently dropped.
+///
+/// Uses `InterruptMutex` internally, so it's safe to call from interrupt
+/// handlers — interrupts are disabled while the serial lock is held.
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        $crate::arch::x86_64::serial::_print(format_args!($($arg)*));
+    }};
+}
+
+/// Print formatted text to the serial console, followed by a newline.
+///
+/// Works exactly like `std::println!` but outputs to the UART serial port.
+/// See `print!` for details on initialization and interrupt safety.
+#[macro_export]
+macro_rules! println {
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
