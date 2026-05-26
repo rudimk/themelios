@@ -16,5 +16,11 @@ limine = "0.5"
 # and (later) the kernel heap allocator.
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 
+# Linked-list-based heap allocator for no_std environments.
+# We use the non-locked `Heap` variant (default-features = false disables the
+# built-in spinlock wrapper) and wrap it in our own InterruptMutex to prevent
+# deadlocks when timer interrupts fire during allocation.
+linked_list_allocator = { version = "0.10", default-features = false }
+
 # Profile settings (panic = "abort") are in the workspace root Cargo.toml
 # because Cargo requires profiles to be defined at the workspace level.
