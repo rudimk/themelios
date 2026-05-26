@@ -126,6 +126,12 @@ mod sched;
 /// tasks, and kernel state at runtime via the serial console.
 mod shell;
 
+/// Automated test harness.
+/// When built with `--features test`, the kernel runs self-tests instead of
+/// the interactive shell and exits QEMU with a pass/fail exit code.
+#[cfg(feature = "test")]
+mod test_runner;
+
 /// Capability system.
 /// The core security primitive of ThemeliOS. All resource access is mediated
 /// by unforgeable capability tokens — processes can only use resources they've
@@ -348,33 +354,45 @@ extern "C" fn kmain() -> ! {
     // interrupts).
     sched::init();
 
-    // --- Shell initialization ---
-    //
-    // Initialize the interactive debug shell. This enables serial receive
-    // interrupts (IRQ4), unmasks IRQ4 in the PIC, and spawns the shell task.
-    // The shell task blocks until input arrives via IRQ4.
-    shell::init();
-
     // Enable maskable interrupts. From this point on:
     // - PIT timer (IRQ0) fires at ~100 Hz for preemptive scheduling
     // - COM1 serial (IRQ4) fires when the user types in the QEMU terminal
     #[cfg(target_arch = "x86_64")]
     arch::x86_64::cpu::sti();
 
-    println!();
-    println!("Interrupts enabled — scheduler is running.");
-    println!("Type 'help' for available commands.");
+    // --- Test mode vs interactive mode ---
+    //
+    // When built with --features test, run automated tests and exit QEMU
+    // instead of starting the interactive shell.
+    #[cfg(feature = "test")]
+    {
+        println!();
+        println!("Running in test mode...");
+        test_runner::run_tests();
+        // run_tests() exits QEMU — never returns
+    }
 
-    // The main task (bootstrap, task 0) enters an idle loop. The timer will
-    // preempt it and run the stress test tasks. When all tasks finish, the
-    // scheduler falls back to the idle task and the main task continues
-    // running this loop.
-    loop {
-        #[cfg(target_arch = "x86_64")]
-        arch::x86_64::cpu::halt();
+    // --- Normal mode: interactive shell ---
+    #[cfg(not(feature = "test"))]
+    {
+        // Initialize the interactive debug shell. This enables serial receive
+        // interrupts (IRQ4), unmasks IRQ4 in the PIC, and spawns the shell task.
+        // The shell task blocks until input arrives via IRQ4.
+        shell::init();
 
-        #[cfg(not(target_arch = "x86_64"))]
-        core::hint::spin_loop();
+        println!();
+        println!("Interrupts enabled — scheduler is running.");
+        println!("Type 'help' for available commands.");
+
+        // The main task (bootstrap, task 0) enters an idle loop. The timer will
+        // preempt it and schedule other tasks. The shell task handles input.
+        loop {
+            #[cfg(target_arch = "x86_64")]
+            arch::x86_64::cpu::halt();
+
+            #[cfg(not(target_arch = "x86_64"))]
+            core::hint::spin_loop();
+        }
     }
 }
 
