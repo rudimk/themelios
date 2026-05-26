@@ -252,6 +252,52 @@ pub unsafe fn ltr(selector: u16) {
     }
 }
 
+/// IDT Register descriptor — the exact layout the `lidt` instruction expects.
+///
+/// Identical format to `GdtRegister` (both use the same CPU descriptor table
+/// pointer format), but a separate type for clarity.
+#[repr(C, packed)]
+pub struct IdtRegister {
+    /// Size of the IDT in bytes minus 1. For a 256-entry IDT with 16-byte
+    /// entries: 256 * 16 - 1 = 4095.
+    pub limit: u16,
+    /// Virtual address of the first IDT entry.
+    pub base: u64,
+}
+
+/// Load a new Interrupt Descriptor Table.
+///
+/// Executes the `lidt` instruction to point the CPU at the IDT. After this,
+/// any interrupt or exception will be dispatched through the new IDT entries.
+///
+/// # Safety
+///
+/// - The `IdtRegister` must describe a valid IDT at a stable address.
+/// - The IDT must contain valid gate descriptors for all expected vectors.
+/// - The IDT must remain in memory for the lifetime of the kernel.
+#[inline(always)]
+pub unsafe fn lidt(idtr: &IdtRegister) {
+    unsafe {
+        asm!(
+            "lidt [{}]",
+            in(reg) idtr as *const IdtRegister,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Execute a software breakpoint (INT3 instruction).
+///
+/// Triggers exception vector 3 (Breakpoint, #BP). Used to test that the
+/// IDT and exception handlers are working correctly. The breakpoint handler
+/// should print diagnostics and return, allowing execution to continue.
+#[inline(always)]
+pub fn int3() {
+    unsafe {
+        asm!("int3", options(nomem, nostack));
+    }
+}
+
 /// Check whether maskable CPU interrupts are currently enabled.
 ///
 /// Reads the RFLAGS register and checks the IF (Interrupt Flag) at bit 9.
