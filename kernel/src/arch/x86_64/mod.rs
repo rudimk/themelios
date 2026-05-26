@@ -41,5 +41,10 @@ pub mod idt;
 /// masking/unmasking, and spurious IRQ detection.
 pub mod pic;
 
+/// 8254 Programmable Interval Timer driver.
+/// Configures channel 0 for ~100 Hz periodic interrupts on IRQ0,
+/// providing the system timer tick for preemptive scheduling.
+pub mod pit;
+
 // Future sub-modules:
 // pub mod paging;  — page table management
