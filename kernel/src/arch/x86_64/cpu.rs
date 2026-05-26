@@ -73,6 +73,29 @@ pub unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+/// Write a 32-bit (double word) value to an x86 I/O port.
+///
+/// This executes the `out dx, eax` instruction, which sends a 32-bit value
+/// to the I/O port number in `dx`. Used for devices with 32-bit I/O port
+/// interfaces, such as QEMU's `isa-debug-exit` device.
+///
+/// # Safety
+///
+/// Writing to an I/O port can have arbitrary side effects on hardware.
+/// The caller must ensure the port number is valid and the write is
+/// appropriate for the device at that port.
+#[inline(always)]
+pub unsafe fn outl(port: u16, value: u32) {
+    unsafe {
+        asm!(
+            "out dx, eax",
+            in("dx") port,
+            in("eax") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
 /// Halt the CPU until the next interrupt arrives.
 ///
 /// This executes the `hlt` instruction, which puts the CPU into a low-power
@@ -328,4 +351,36 @@ pub fn interrupts_enabled() -> bool {
         );
     }
     rflags & (1 << 9) != 0
+}
+
+// --- QEMU test infrastructure ---
+
+/// I/O port for the QEMU `isa-debug-exit` device.
+///
+/// When QEMU is launched with `-device isa-debug-exit,iobase=0xf4,iosize=0x04`,
+/// writing to this port causes QEMU to exit with exit code `(value << 1) | 1`.
+const QEMU_EXIT_PORT: u16 = 0xf4;
+
+/// Exit QEMU with a mapped exit code.
+///
+/// The `isa-debug-exit` device transforms the written value into QEMU's
+/// process exit code as: `exit_code = (value << 1) | 1`. We use:
+/// - `exit_qemu(0x01)` → QEMU exits with code `3` → **test success**
+/// - `exit_qemu(0x00)` → QEMU exits with code `1` → **test failure**
+///
+/// This function does not return. After writing to the exit port, the
+/// CPU enters an infinite halt loop as a safety net (the QEMU process
+/// should terminate before the halt is ever reached).
+pub fn exit_qemu(value: u32) -> ! {
+    // SAFETY: Writing to the isa-debug-exit port causes QEMU to terminate.
+    // This is only used in test mode — in normal operation this device
+    // isn't configured, and the write is harmless (ignored by hardware).
+    unsafe {
+        outb(QEMU_EXIT_PORT, value as u8);
+    }
+
+    // Unreachable — QEMU should have exited. Halt just in case.
+    loop {
+        halt();
+    }
 }
