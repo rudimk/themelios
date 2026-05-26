@@ -164,6 +164,22 @@ extern "C" fn kmain() -> ! {
     #[cfg(target_arch = "x86_64")]
     arch::x86_64::gdt::init();
 
+    // Set up the Interrupt Descriptor Table with exception handlers.
+    // After this, CPU exceptions (page fault, GPF, double fault, etc.) will
+    // be caught and print diagnostic info instead of silently triple-faulting.
+    // Must happen after GDT (IDT entries reference kernel code segment selector).
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::idt::init();
+
+    // Test the breakpoint exception handler. INT3 should trigger vector 3,
+    // the handler should print diagnostics and return, and execution should
+    // continue here. If this hangs or triple-faults, the IDT is broken.
+    println!();
+    println!("Testing breakpoint exception (INT3)...");
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::cpu::int3();
+    println!("Breakpoint handler returned — IDT is working!");
+
     println!();
     println!("Phase 1 in progress. Halting.");
 
