@@ -5,6 +5,8 @@
 //!
 //! - **CPU operations**: I/O port access, halt, and other low-level instructions
 //! - **Serial output**: 16550 UART (COM1) for early debug printing
+//! - **Interrupt controller**: 8259 PIC for hardware IRQ routing
+//! - **Timer**: 8254 PIT for periodic system timer interrupts
 //!
 //! ## Memory model
 //!
@@ -33,6 +35,11 @@ pub mod gdt;
 /// Handles CPU exceptions (divide error, page fault, GPF, double fault, etc.)
 /// and hardware IRQs (timer, serial, etc.) via ISR stubs and a common handler.
 pub mod idt;
+
+/// 8259 Programmable Interrupt Controller driver.
+/// Remaps hardware IRQs to vectors 32-47, provides EOI handling, IRQ
+/// masking/unmasking, and spurious IRQ detection.
+pub mod pic;
 
 // Future sub-modules:
 // pub mod paging;  — page table management
