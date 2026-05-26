@@ -40,6 +40,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::cpu;
 use super::gdt;
 use super::pic;
+use super::serial;
 use crate::println;
 use crate::sched;
 
@@ -516,7 +517,20 @@ fn irq_handler(irq: u8) {
             }
         }
 
-        // All other IRQs are unhandled for now. Log the first few to serial
+        // IRQ4 — COM1 serial: a byte has been received.
+        // Drain all available bytes from the UART receive buffer and push
+        // them into the shell's input ring buffer. Then wake the shell task
+        // so it can process the input.
+        4 => {
+            while let Some(byte) = serial::receive_byte() {
+                crate::shell::input::push_byte(byte);
+            }
+            if sched::is_initialized() {
+                crate::shell::input::wake_shell();
+            }
+        }
+
+        // All other IRQs are unhandled for now. Log them to serial
         // so we notice unexpected hardware activity.
         _ => {
             println!("[irq] unhandled IRQ{}", irq);

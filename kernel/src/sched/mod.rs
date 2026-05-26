@@ -336,6 +336,106 @@ pub fn total_task_slots() -> usize {
         .len()
 }
 
+/// Info about a task, returned by `task_list()` for display purposes.
+/// Copied out of the scheduler lock so callers can format at leisure.
+pub struct TaskInfo {
+    pub id: TaskId,
+    pub name: String,
+    pub state: TaskState,
+}
+
+/// Get a snapshot of all live tasks (non-None slots).
+///
+/// Returns a Vec of `TaskInfo` structs that can be printed outside the
+/// scheduler lock. Used by the shell's `tasks` command.
+pub fn task_list() -> Vec<TaskInfo> {
+    let guard = SCHEDULER.lock();
+    let sched = guard.as_ref().expect("Scheduler not initialized");
+    sched.tasks.iter()
+        .filter_map(|slot| {
+            slot.as_ref().map(|task| TaskInfo {
+                id: task.id,
+                name: task.name.clone(),
+                state: task.state,
+            })
+        })
+        .collect()
+}
+
+/// Kill a task by ID, marking it as Dead.
+///
+/// The task's stack will be freed on the next scheduling pass. Returns
+/// `true` if the task was found and killed, `false` if the ID is invalid
+/// or the task is already dead/cleaned-up.
+///
+/// Cannot kill the idle task or the currently running task.
+pub fn kill_task(id: TaskId) -> bool {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+
+    if id == sched.idle_id || id == sched.current_id {
+        return false;
+    }
+
+    if let Some(Some(task)) = sched.tasks.get_mut(id) {
+        if task.state == TaskState::Dead {
+            return false;
+        }
+        task.state = TaskState::Dead;
+        // Remove from ready queue if present
+        sched.ready_queue.retain(|&tid| tid != id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Block the current task until `wake_task()` is called with its ID.
+///
+/// Marks the current task as Blocked (so the scheduler won't put it in
+/// the ready queue) and calls `schedule()` to switch to another task.
+/// When another task (or an IRQ handler) calls `wake_task(id)`, the
+/// blocked task is moved back to Ready and will be scheduled again.
+///
+/// Must NOT be called from an interrupt handler — only from task context.
+pub fn block_current_task() {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::cpu::cli();
+
+    {
+        let mut guard = SCHEDULER.lock();
+        let sched = guard.as_mut().expect("Scheduler not initialized");
+        let current = sched.tasks[sched.current_id].as_mut().unwrap();
+        current.state = TaskState::Blocked;
+    }
+
+    schedule();
+
+    // When we return here, the task has been woken up.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::cpu::sti();
+}
+
+/// Wake a blocked task, moving it back to the Ready state.
+///
+/// If the task is Blocked, moves it to Ready and adds it to the ready
+/// queue. Called from IRQ handlers (e.g., IRQ4 waking the shell task
+/// when serial input arrives) or from other tasks.
+///
+/// Safe to call from interrupt context (acquires the scheduler lock
+/// which disables interrupts).
+pub fn wake_task(id: TaskId) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+
+    if let Some(Some(task)) = sched.tasks.get_mut(id) {
+        if task.state == TaskState::Blocked {
+            task.state = TaskState::Ready;
+            sched.ready_queue.push_back(id);
+        }
+    }
+}
+
 // ========================================================================
 // Internal helpers
 // ========================================================================

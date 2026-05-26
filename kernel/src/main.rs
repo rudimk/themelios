@@ -121,6 +121,11 @@ mod mm;
 /// and handles context switching.
 mod sched;
 
+/// Interactive debug shell.
+/// Runs as a scheduler task, provides commands for inspecting memory,
+/// tasks, and kernel state at runtime via the serial console.
+mod shell;
+
 /// Capability system.
 /// The core security primitive of ThemeliOS. All resource access is mediated
 /// by unforgeable capability tokens — processes can only use resources they've
@@ -343,30 +348,22 @@ extern "C" fn kmain() -> ! {
     // interrupts).
     sched::init();
 
-    // Spawn stress test tasks to verify the scheduler works. Each task
-    // prints its ID and a counter, then voluntarily yields. With 20+ tasks
-    // and timer preemption, the serial output should show interleaved lines
-    // from different tasks.
-    println!();
-    println!("Spawning stress test tasks...");
-    for i in 0..24 {
-        // Use a closure-like pattern: each task reads its own ID at runtime
-        // via sched::current_task_id(). We can't capture `i` in a fn pointer,
-        // so all tasks run the same function but identify themselves by ID.
-        let _ = i; // suppress unused warning — loop count is what matters
-        sched::spawn("stress", stress_test_entry);
-    }
-    println!("Spawned 24 stress test tasks.");
+    // --- Shell initialization ---
+    //
+    // Initialize the interactive debug shell. This enables serial receive
+    // interrupts (IRQ4), unmasks IRQ4 in the PIC, and spawns the shell task.
+    // The shell task blocks until input arrives via IRQ4.
+    shell::init();
 
-    // Enable maskable interrupts. From this point on, the PIT timer will
-    // fire IRQ0 at ~100 Hz. Each tick increments the global tick counter
-    // and calls schedule() for preemptive task switching.
+    // Enable maskable interrupts. From this point on:
+    // - PIT timer (IRQ0) fires at ~100 Hz for preemptive scheduling
+    // - COM1 serial (IRQ4) fires when the user types in the QEMU terminal
     #[cfg(target_arch = "x86_64")]
     arch::x86_64::cpu::sti();
 
     println!();
     println!("Interrupts enabled — scheduler is running.");
-    println!("Main task entering idle loop. Timer preemption will schedule tasks.");
+    println!("Type 'help' for available commands.");
 
     // The main task (bootstrap, task 0) enters an idle loop. The timer will
     // preempt it and run the stress test tasks. When all tasks finish, the
@@ -379,32 +376,6 @@ extern "C" fn kmain() -> ! {
         #[cfg(not(target_arch = "x86_64"))]
         core::hint::spin_loop();
     }
-}
-
-// ----- Stress test task -----
-
-/// Entry function for stress test tasks.
-///
-/// Each task prints its ID and a counter 5 times, yielding between each
-/// iteration. With 24 tasks running, the serial output should show interleaved
-/// lines like:
-/// ```text
-/// [task 3] count 0
-/// [task 7] count 2
-/// [task 3] count 1
-/// ...
-/// ```
-///
-/// After the loop completes, the function returns. The task exit trampoline
-/// (`task_bootstrap` in context.rs) catches the return and calls `task_exit`,
-/// which marks the task as Dead and switches to the next ready task.
-fn stress_test_entry() {
-    let id = sched::current_task_id();
-    for i in 0..5 {
-        println!("[task {}] count {}", id, i);
-        sched::yield_now();
-    }
-    // Return → task_bootstrap calls task_exit → task marked Dead → rescheduled
 }
 
 // ----- Panic handler -----

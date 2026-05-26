@@ -70,6 +70,10 @@ mod regs {
     pub const LINE_STATUS: u16 = 5;
 }
 
+/// Bit 0 of the Line Status Register: Data Ready.
+/// When set, a byte has been received and is available in the receive buffer.
+const LINE_STATUS_DR: u8 = 1 << 0;
+
 /// Bit 5 of the Line Status Register: Transmitter Holding Register Empty.
 /// When this bit is set, the UART is ready to accept another byte for
 /// transmission. We poll this before each write.
@@ -134,6 +138,37 @@ impl SerialPort {
             // 0x03 = DTR + RTS. These modem control signals tell the other end
             // that we're ready to communicate.
             cpu::outb(self.base + regs::MODEM_CONTROL, 0x03);
+        }
+    }
+
+    /// Enable the "Received Data Available" interrupt on this UART.
+    ///
+    /// After this call, the UART will assert IRQ4 (for COM1) whenever a byte
+    /// is received and ready to read. The IRQ4 handler should call
+    /// `receive_byte()` to drain the receive buffer.
+    ///
+    /// Bit 0 of the Interrupt Enable Register (IER) enables the receive
+    /// data available interrupt. We leave other interrupt sources disabled.
+    pub fn enable_receive_interrupt(&self) {
+        unsafe {
+            cpu::outb(self.base + regs::INTERRUPT_ENABLE, 0x01);
+        }
+    }
+
+    /// Check if the receive buffer has data ready to read.
+    pub fn data_ready(&self) -> bool {
+        unsafe { cpu::inb(self.base + regs::LINE_STATUS) & LINE_STATUS_DR != 0 }
+    }
+
+    /// Read a byte from the receive buffer.
+    ///
+    /// Returns `Some(byte)` if data is available, `None` otherwise.
+    /// Call this from the IRQ4 handler to drain all available bytes.
+    pub fn receive_byte(&self) -> Option<u8> {
+        if self.data_ready() {
+            Some(unsafe { cpu::inb(self.base + regs::DATA) })
+        } else {
+            None
         }
     }
 
@@ -231,6 +266,30 @@ pub fn _print(args: fmt::Arguments) {
         // write_fmt returns Err only if the Write impl returns Err,
         // and our Write impl always returns Ok(()). Unwrap is safe.
         serial.write_fmt(args).unwrap();
+    }
+}
+
+/// Enable receive interrupts on the global serial port.
+///
+/// After this call, IRQ4 fires when a byte is received on COM1.
+/// Must be called after `init()`.
+pub fn enable_receive_interrupt() {
+    let guard = SERIAL_WRITER.lock();
+    if let Some(ref serial) = *guard {
+        serial.enable_receive_interrupt();
+    }
+}
+
+/// Read a byte from the global serial port's receive buffer.
+///
+/// Returns `Some(byte)` if data is available, `None` otherwise.
+/// Called from the IRQ4 handler to drain received bytes.
+pub fn receive_byte() -> Option<u8> {
+    let guard = SERIAL_WRITER.lock();
+    if let Some(ref serial) = *guard {
+        serial.receive_byte()
+    } else {
+        None
     }
 }
 
