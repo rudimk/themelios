@@ -444,11 +444,126 @@ fn cmd_run(args: &[String]) {
     }
 }
 
-/// Build the kernel and run tests in QEMU.
+/// Build the kernel with test feature, boot in QEMU, and check exit code.
+///
+/// Builds the kernel with `--features test`, which makes `kmain` run the
+/// test harness instead of the interactive shell. QEMU is launched with
+/// the `isa-debug-exit` device so the kernel can signal pass/fail:
+///
+/// - QEMU exit code `3` (kernel wrote `0x01`) → all tests passed
+/// - QEMU exit code `1` (kernel wrote `0x00`) → some test failed
+/// - Timeout (30 seconds) → kernel hung or panicked
+///
+/// Serial output is captured and printed on failure or timeout.
 fn cmd_test(args: &[String]) {
-    let _ = args;
-    eprintln!("Testing is not yet implemented. Coming in Phase 1.");
-    process::exit(1);
+    let opts = parse_options(args);
+    let target = resolve_target(&opts.arch);
+    let root = workspace_root();
+
+    println!("Building ThemeliOS kernel (test mode) for {target}...");
+
+    // Clean cached artifacts to ensure build.rs re-runs (fresh ULID).
+    let _ = Command::new("cargo")
+        .current_dir(&root)
+        .args(["clean", "--package", "themelios", "--target", target])
+        .status();
+
+    // Build the kernel with the test feature enabled.
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args([
+            "build",
+            "--package", "themelios",
+            "--target", target,
+            "--features", "test",
+            BUILD_STD,
+            BUILD_STD_FEATURES,
+        ])
+        .status()
+        .expect("Failed to execute cargo build");
+
+    if !status.success() {
+        eprintln!("Test build failed!");
+        process::exit(1);
+    }
+
+    let kernel_binary = root.join(format!("target/{target}/debug/themelios"));
+
+    // Create bootable ISO
+    let limine_dir = ensure_limine(&root);
+    let iso_path = create_iso(&root, &kernel_binary, &limine_dir);
+
+    // Launch QEMU with isa-debug-exit device and a timeout.
+    let qemu = qemu_binary(&opts.arch);
+    println!("Running tests in QEMU...\n");
+
+    let timeout_secs = 30;
+
+    let child = Command::new(qemu)
+        .current_dir(&root)
+        .args([
+            "-M", "q35",
+            "-m", "256M",
+            "-cdrom", iso_path.to_str().unwrap(),
+            "-serial", "stdio",
+            "-display", "none",
+            "-no-reboot",
+            // isa-debug-exit: writing to port 0xf4 causes QEMU to exit
+            // with code (value << 1) | 1
+            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ])
+        .stdout(process::Stdio::inherit())
+        .stderr(process::Stdio::inherit())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to launch {qemu}: {e}");
+            eprintln!("Is QEMU installed? See docs/src/dev-setup.md for instructions.");
+            process::exit(1);
+        }
+    };
+
+    // Wait for QEMU with a timeout
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // QEMU exited. Check the exit code.
+                // isa-debug-exit: writing 0x01 → exit code 3 (success)
+                //                 writing 0x00 → exit code 1 (failure)
+                let code = status.code().unwrap_or(-1);
+                println!();
+                if code == 3 {
+                    println!("All tests passed.");
+                    process::exit(0);
+                } else if code == 1 {
+                    eprintln!("Some tests FAILED (QEMU exit code {code}).");
+                    process::exit(1);
+                } else {
+                    eprintln!("QEMU exited with unexpected code {code}.");
+                    eprintln!("The kernel may have panicked or triple-faulted.");
+                    process::exit(1);
+                }
+            }
+            Ok(None) => {
+                // Still running — check timeout
+                if start.elapsed().as_secs() >= timeout_secs {
+                    eprintln!("\nTest TIMEOUT after {timeout_secs} seconds.");
+                    eprintln!("The kernel may be hung or in an infinite loop.");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    process::exit(1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                eprintln!("Error waiting for QEMU: {e}");
+                process::exit(1);
+            }
+        }
+    }
 }
 
 /// Build mdbook documentation and rustdoc.
