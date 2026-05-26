@@ -150,12 +150,22 @@ extern "C" fn kmain() -> ! {
     println!("  An experimental capability-based microkernel");
     println!("============================================");
     println!();
-    println!("Hello from ThemeliOS!");
     println!("Kernel booted successfully on x86_64.");
     println!("Limine boot protocol revision supported.");
     println!("Build ULID: {}", env!("BUILD_ULID"));
     println!();
-    println!("Phase 0 complete. Halting.");
+
+    // --- Initialize kernel subsystems ---
+
+    // Set up the Global Descriptor Table and Task State Segment.
+    // This replaces Limine's GDT with our own and configures the TSS
+    // with an IST stack for the double-fault handler.
+    // Must happen before IDT setup (IDT entries reference GDT selectors and IST indices).
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::gdt::init();
+
+    println!();
+    println!("Phase 1 in progress. Halting.");
 
     // Nothing left to do — halt the CPU in a loop.
     hcf();
