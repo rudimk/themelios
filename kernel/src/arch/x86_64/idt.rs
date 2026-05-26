@@ -507,14 +507,8 @@ extern "C" fn exception_handler(frame: &InterruptStackFrame) {
 fn irq_handler(irq: u8) {
     match irq {
         // IRQ0 — PIT timer: increment the global tick counter.
-        // Print a status line every 100 ticks (~1 second at 100 Hz) as proof
-        // of life during early boot. This periodic printing will be removed
-        // once the scheduler is running.
         0 => {
-            let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if ticks % 100 == 0 {
-                println!("[timer] tick {}", ticks);
-            }
+            TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         }
 
         // IRQ4 — COM1 serial: a byte has been received.
