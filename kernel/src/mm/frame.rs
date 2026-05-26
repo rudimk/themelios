@@ -223,6 +223,43 @@ impl BitmapFrameAllocator {
         self.bitmap_slice()[frame_idx / 8] & (1 << (frame_idx % 8)) != 0
     }
 
+    /// Allocate `count` contiguous 4 KiB physical frames.
+    ///
+    /// Scans the bitmap for a run of `count` consecutive free frames, marks them
+    /// all as allocated, and returns the physical address of the first frame.
+    /// Returns `None` if no contiguous run of sufficient length exists.
+    ///
+    /// Used by the heap allocator to get a contiguous virtual region (contiguous
+    /// physical frames = contiguous HHDM virtual addresses).
+    pub fn allocate_contiguous_frames(&mut self, count: usize) -> Option<PhysAddr> {
+        if count == 0 {
+            return None;
+        }
+
+        let mut run_start = 0;
+        let mut run_len = 0;
+
+        for frame_idx in 0..self.frame_count {
+            if self.is_free(frame_idx) {
+                if run_len == 0 {
+                    run_start = frame_idx;
+                }
+                run_len += 1;
+                if run_len == count {
+                    for i in run_start..run_start + count {
+                        self.mark_allocated(i as u64);
+                    }
+                    self.free_count -= count;
+                    return Some(PhysAddr::new(run_start as u64 * PAGE_SIZE));
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+
+        None
+    }
+
     /// Allocate a single 4 KiB physical frame.
     ///
     /// Scans the bitmap for the first free frame, marks it as allocated, and
@@ -304,6 +341,18 @@ static FRAME_ALLOCATOR: InterruptMutex<Option<BitmapFrameAllocator>> = Interrupt
 pub fn init(entries: &[&Entry], hhdm_offset: u64, kernel_phys_base: u64) {
     let allocator = BitmapFrameAllocator::new(entries, hhdm_offset, kernel_phys_base);
     *FRAME_ALLOCATOR.lock() = Some(allocator);
+}
+
+/// Allocate `count` contiguous 4 KiB physical frames.
+///
+/// Returns the physical address of the first frame, or `None` if no
+/// contiguous run of that size exists.
+pub fn allocate_contiguous_frames(count: usize) -> Option<PhysAddr> {
+    FRAME_ALLOCATOR
+        .lock()
+        .as_mut()
+        .expect("Frame allocator not initialized")
+        .allocate_contiguous_frames(count)
 }
 
 /// Allocate a single 4 KiB physical frame.
