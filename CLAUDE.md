@@ -129,7 +129,7 @@ When starting or completing a phase, update all three locations (this table, the
 | Phase | Goal | Status |
 |-------|------|--------|
 | **0** | Boot on QEMU, serial output | Complete |
-| **1** | Memory allocator, scheduler, interrupts (x86_64) | Not started |
+| **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
 | **2** | Capability system, process isolation, IPC, audit logging | Not started |
 | **3** | VirtIO block driver, read-only FS, ephemeral layers | Not started |
 | **4** | VirtIO net driver, TCP/IP stack | Not started |

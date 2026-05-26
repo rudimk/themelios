@@ -5,7 +5,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | Phase | Goal | Status |
 |-------|------|--------|
 | **0** | Boot on QEMU, serial output | Complete |
-| **1** | Memory allocator, scheduler, interrupts (x86_64) | Not started |
+| **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
 | **2** | Capability system, process isolation, IPC | Not started |
 | **3** | VirtIO block driver, read-only filesystem | Not started |
 | **4** | VirtIO net driver, TCP/IP stack | Not started |
@@ -31,7 +31,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - "Hello from ThemeliOS" printed on boot
 - `cargo xtask run` boots the kernel in QEMU end-to-end
 
-## Phase 1 — Kernel basics (Not started)
+## Phase 1 — Kernel basics (Complete)
 
 **Goal**: A kernel that can manage memory and schedule tasks. x86_64 only — aarch64 is deferred to Phase 7.
 
