@@ -208,6 +208,83 @@ extern "C" fn kmain() -> ! {
     arch::x86_64::cpu::int3();
     println!("Breakpoint handler returned — IDT is working!");
 
+    // --- Memory management initialization ---
+    //
+    // Extract all needed info from Limine boot protocol responses and
+    // initialize the memory management subsystem. This must happen before
+    // interrupts are enabled, and before anything that needs physical frames.
+    //
+    // Limine responses live in bootloader-reclaimable memory, so we extract
+    // everything we need here and never reference the responses again.
+
+    // Get the HHDM offset — the virtual address offset where Limine maps
+    // all physical memory. Every physical address access in the kernel goes
+    // through this: virt = phys + hhdm_offset.
+    let hhdm_response = HHDM_REQUEST.get_response()
+        .expect("Limine HHDM request not answered");
+    let hhdm_offset = hhdm_response.offset();
+    mm::init_hhdm(hhdm_offset);
+    println!("HHDM offset: {:#x}", hhdm_offset);
+
+    // Get the kernel's physical and virtual base addresses (for diagnostics
+    // and to verify kernel frames aren't classified as USABLE).
+    let exec_response = EXECUTABLE_ADDRESS_REQUEST.get_response()
+        .expect("Limine ExecutableAddress request not answered");
+    println!("Kernel physical base: {:#x}", exec_response.physical_base());
+    println!("Kernel virtual base:  {:#x}", exec_response.virtual_base());
+
+    // Get the memory map and print it for diagnostics.
+    let mmap_response = MEMORY_MAP_REQUEST.get_response()
+        .expect("Limine MemoryMap request not answered");
+    let entries = mmap_response.entries();
+
+    println!();
+    println!("Memory map ({} entries):", entries.len());
+    for entry in entries.iter() {
+        let entry_type = match entry.entry_type {
+            limine::memory_map::EntryType::USABLE => "Usable",
+            limine::memory_map::EntryType::RESERVED => "Reserved",
+            limine::memory_map::EntryType::ACPI_RECLAIMABLE => "ACPI Reclaimable",
+            limine::memory_map::EntryType::ACPI_NVS => "ACPI NVS",
+            limine::memory_map::EntryType::BAD_MEMORY => "Bad Memory",
+            limine::memory_map::EntryType::BOOTLOADER_RECLAIMABLE => "Bootloader Reclaimable",
+            limine::memory_map::EntryType::EXECUTABLE_AND_MODULES => "Executable & Modules",
+            limine::memory_map::EntryType::FRAMEBUFFER => "Framebuffer",
+            _ => "Unknown",
+        };
+        let size_kb = entry.length / 1024;
+        println!("  {:#012x} - {:#012x} ({:>7} KiB) {}",
+            entry.base,
+            entry.base + entry.length,
+            size_kb,
+            entry_type,
+        );
+    }
+
+    // Initialize the physical frame allocator from the memory map.
+    mm::frame::init(entries, hhdm_offset, exec_response.physical_base());
+
+    let free = mm::frame::free_frame_count();
+    let total = mm::frame::total_frame_count();
+    let free_mib = (free as u64 * mm::PAGE_SIZE) / (1024 * 1024);
+    let total_mib = (total as u64 * mm::PAGE_SIZE) / (1024 * 1024);
+    println!();
+    println!("Frame allocator initialized:");
+    println!("  Total frames: {} ({} MiB address space)", total, total_mib);
+    println!("  Free frames:  {} ({} MiB usable)", free, free_mib);
+
+    // Quick smoke test: allocate and deallocate a frame to verify the
+    // allocator works end-to-end.
+    let test_frame = mm::frame::allocate_frame()
+        .expect("Failed to allocate test frame");
+    println!("  Test alloc:   {} (OK)", test_frame);
+    mm::frame::deallocate_frame(test_frame);
+    println!("  Test dealloc: {} (OK)", test_frame);
+
+    let free_after = mm::frame::free_frame_count();
+    assert!(free_after == free, "Free count mismatch after alloc/dealloc cycle");
+    println!("  Alloc/dealloc cycle verified — count restored to {}", free_after);
+
     // Initialize the 8259 PIC and remap hardware IRQs to vectors 32-47.
     // Must happen after IDT setup (so IRQ vectors have handlers installed).
     // After this, all IRQ lines are masked — individual IRQs are unmasked
