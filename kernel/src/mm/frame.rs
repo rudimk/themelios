@@ -33,6 +33,7 @@ use limine::memory_map::{Entry, EntryType};
 
 use super::PAGE_SIZE;
 use super::addr::{PhysAddr, align_up, align_down};
+use crate::sync::InterruptMutex;
 
 /// A bitmap-based physical frame allocator.
 ///
@@ -276,4 +277,75 @@ impl BitmapFrameAllocator {
     pub fn total_frame_count(&self) -> usize {
         self.frame_count
     }
+}
+
+// ==========================================================================
+// Global frame allocator behind InterruptMutex
+// ==========================================================================
+//
+// The frame allocator is a global resource: any kernel code that needs a
+// physical frame calls `frame::allocate_frame()`. We protect it with an
+// InterruptMutex (not a plain spinlock) because the timer interrupt handler
+// may indirectly trigger allocation in future phases (e.g., scheduler
+// creating a new task). If a plain spinlock were held during allocation
+// and the timer fired, the handler would spin forever → deadlock.
+
+/// Global frame allocator, protected by an interrupt-disabling mutex.
+///
+/// Starts as `None` and is initialized by `init()`. After initialization,
+/// every call to `allocate_frame()` / `deallocate_frame()` locks this mutex,
+/// which disables interrupts for the duration of the operation.
+static FRAME_ALLOCATOR: InterruptMutex<Option<BitmapFrameAllocator>> = InterruptMutex::new(None);
+
+/// Initialize the global frame allocator from the Limine memory map.
+///
+/// Must be called exactly once during early boot, after `mm::init_hhdm()`.
+/// After this call, `allocate_frame()` and `deallocate_frame()` are available.
+pub fn init(entries: &[&Entry], hhdm_offset: u64, kernel_phys_base: u64) {
+    let allocator = BitmapFrameAllocator::new(entries, hhdm_offset, kernel_phys_base);
+    *FRAME_ALLOCATOR.lock() = Some(allocator);
+}
+
+/// Allocate a single 4 KiB physical frame.
+///
+/// Returns `Some(PhysAddr)` on success, `None` if memory is exhausted.
+/// Disables interrupts while the allocator lock is held.
+///
+/// Panics if the frame allocator hasn't been initialized yet.
+pub fn allocate_frame() -> Option<PhysAddr> {
+    FRAME_ALLOCATOR
+        .lock()
+        .as_mut()
+        .expect("Frame allocator not initialized")
+        .allocate_frame()
+}
+
+/// Return a physical frame to the free pool.
+///
+/// The address must be page-aligned and previously returned by `allocate_frame()`.
+/// Panics on double-free or if the allocator is uninitialized.
+pub fn deallocate_frame(addr: PhysAddr) {
+    FRAME_ALLOCATOR
+        .lock()
+        .as_mut()
+        .expect("Frame allocator not initialized")
+        .deallocate_frame(addr)
+}
+
+/// Get the number of currently free physical frames.
+pub fn free_frame_count() -> usize {
+    FRAME_ALLOCATOR
+        .lock()
+        .as_ref()
+        .expect("Frame allocator not initialized")
+        .free_frame_count()
+}
+
+/// Get the total number of physical frames tracked by the allocator.
+pub fn total_frame_count() -> usize {
+    FRAME_ALLOCATOR
+        .lock()
+        .as_ref()
+        .expect("Frame allocator not initialized")
+        .total_frame_count()
 }
