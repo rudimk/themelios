@@ -24,7 +24,11 @@ pub mod cpu;
 /// 16550 UART serial driver for debug output via COM1.
 pub mod serial;
 
+/// Global Descriptor Table and Task State Segment setup.
+/// Defines kernel code/data segments and the TSS (with IST stacks for
+/// critical exception handlers like double fault).
+pub mod gdt;
+
 // Future sub-modules:
-// pub mod gdt;     — Global Descriptor Table setup
 // pub mod idt;     — Interrupt Descriptor Table, exception handlers
 // pub mod paging;  — page table management
