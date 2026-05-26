@@ -85,3 +85,77 @@ pub fn halt() {
         asm!("hlt", options(nomem, nostack, preserves_flags));
     }
 }
+
+/// Disable maskable CPU interrupts.
+///
+/// Executes the `CLI` (Clear Interrupt Flag) instruction, which clears the IF
+/// flag in the RFLAGS register. While IF is clear, the CPU ignores all maskable
+/// hardware interrupts (IRQs). Non-maskable interrupts (NMIs) and exceptions
+/// are unaffected.
+///
+/// This is used to protect critical sections where an interrupt handler might
+/// try to acquire a lock that the current code path already holds, which would
+/// deadlock on a single-core system.
+///
+/// Always pair with a corresponding `sti()` call, or better yet, use
+/// `InterruptMutex` which saves/restores the interrupt state automatically.
+#[inline(always)]
+pub fn cli() {
+    // CLI clears the IF (Interrupt Flag) in RFLAGS. This is a privileged
+    // instruction — it only works in ring 0 (kernel mode).
+    // We do NOT mark this as preserves_flags because it modifies RFLAGS.IF.
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+    }
+}
+
+/// Enable maskable CPU interrupts.
+///
+/// Executes the `STI` (Set Interrupt Flag) instruction, which sets the IF flag
+/// in RFLAGS. The CPU will begin responding to maskable interrupts again.
+///
+/// Note: the x86 architecture guarantees that the instruction immediately
+/// following STI executes before any pending interrupt is delivered. This
+/// one-instruction window allows patterns like `sti; hlt` to atomically
+/// enable interrupts and halt (without risking an interrupt sneaking in
+/// between the two instructions and causing `hlt` to sleep forever).
+#[inline(always)]
+pub fn sti() {
+    // STI sets the IF (Interrupt Flag) in RFLAGS. Like CLI, this is a
+    // privileged ring 0 instruction.
+    unsafe {
+        asm!("sti", options(nomem, nostack));
+    }
+}
+
+/// Check whether maskable CPU interrupts are currently enabled.
+///
+/// Reads the RFLAGS register and checks the IF (Interrupt Flag) at bit 9.
+/// Returns `true` if interrupts are enabled (IF=1), `false` if disabled (IF=0).
+///
+/// Used by `InterruptMutex` to save the interrupt state before disabling
+/// interrupts, so it can restore the exact same state when the lock is released.
+/// This is important for nested critical sections — if interrupts were already
+/// disabled by an outer lock, the inner lock should NOT re-enable them on release.
+#[inline(always)]
+pub fn interrupts_enabled() -> bool {
+    let rflags: u64;
+    // PUSHFQ pushes the full 64-bit RFLAGS register onto the stack, then
+    // we POP it into a general-purpose register so Rust can inspect it.
+    // We check bit 9 (IF — Interrupt Flag) to determine the interrupt state.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {}",
+            out(reg) rflags,
+            // nomem: we don't access any Rust-visible memory (the stack push/pop
+            // is invisible to the compiler's memory model).
+            // No nostack: we do use the stack (push/pop), so the compiler must
+            // account for stack usage.
+            // No preserves_flags: pushfq reads flags, doesn't modify them, but
+            // we omit the annotation to be conservative.
+            options(nomem)
+        );
+    }
+    rflags & (1 << 9) != 0
+}
