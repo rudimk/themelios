@@ -393,6 +393,7 @@ fn cmd_run(args: &[String]) {
             cmd.current_dir(&root)
                 .args([
                     "-M", "q35",
+                    "-m", "256M",
                     "-cdrom", iso_path.to_str().unwrap(),
                     "-serial", "stdio",
                     "-no-reboot",
