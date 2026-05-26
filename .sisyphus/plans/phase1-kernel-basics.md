@@ -304,7 +304,7 @@
 
 ---
 
-### Sub-phase 1.8 — Automated test infrastructure
+### Sub-phase 1.8 — Automated test infrastructure ✅ DONE
 
 **Why last**: Tests verify all the subsystems built above. Having them last means we can write comprehensive tests for everything.
 
