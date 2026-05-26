@@ -29,8 +29,6 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Write;
-
 // --- Limine boot protocol setup ---
 //
 // The Limine bootloader communicates with the kernel through "requests":
@@ -73,6 +71,12 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 /// Each architecture implements CPU operations, serial I/O, and other
 /// hardware-specific functionality behind a common interface.
 mod arch;
+
+/// Kernel synchronization primitives.
+/// Provides `InterruptMutex` — a spinlock wrapper that disables interrupts
+/// while held, preventing deadlocks when interrupt handlers need to acquire
+/// the same lock as the interrupted code.
+mod sync;
 
 /// Memory management subsystem.
 /// Handles physical frame allocation, virtual address spaces (page tables),
@@ -133,31 +137,27 @@ extern "C" fn kmain() -> ! {
     // our revision, we can't rely on any boot info being correct.
     assert!(BASE_REVISION.is_supported());
 
-    // Initialize the serial port (COM1 at 0x3F8) for debug output.
+    // Initialize the global serial writer (COM1 at 0x3F8) for debug output.
     // QEMU maps this to the host terminal via the `-serial stdio` flag.
+    // After this call, the `println!` macro works everywhere in the kernel.
     #[cfg(target_arch = "x86_64")]
-    {
-        let mut serial = arch::x86_64::serial::SerialPort::com1();
-        serial.init();
+    arch::x86_64::serial::init();
 
-        // Print our boot banner
-        let _ = writeln!(serial);
-        let _ = writeln!(serial, "============================================");
-        let _ = writeln!(serial, "  ThemeliOS v{}", env!("CARGO_PKG_VERSION"));
-        let _ = writeln!(serial, "  An experimental capability-based microkernel");
-        let _ = writeln!(serial, "============================================");
-        let _ = writeln!(serial);
-        let _ = writeln!(serial, "Hello from ThemeliOS!");
-        let _ = writeln!(serial, "Kernel booted successfully on x86_64.");
-        let _ = writeln!(serial, "Limine boot protocol revision supported.");
-        let _ = writeln!(serial, "Build ULID: {}", env!("BUILD_ULID"));
-        let _ = writeln!(serial);
-        let _ = writeln!(serial, "Phase 0 complete. Halting.");
-    }
+    // Print the boot banner
+    println!();
+    println!("============================================");
+    println!("  ThemeliOS v{}", env!("CARGO_PKG_VERSION"));
+    println!("  An experimental capability-based microkernel");
+    println!("============================================");
+    println!();
+    println!("Hello from ThemeliOS!");
+    println!("Kernel booted successfully on x86_64.");
+    println!("Limine boot protocol revision supported.");
+    println!("Build ULID: {}", env!("BUILD_ULID"));
+    println!();
+    println!("Phase 0 complete. Halting.");
 
     // Nothing left to do — halt the CPU in a loop.
-    // `hlt` puts the CPU to sleep until an interrupt arrives, saving power
-    // compared to a busy `loop {}`.
     hcf();
 }
 
@@ -166,27 +166,42 @@ extern "C" fn kmain() -> ! {
 /// Called when the kernel panics (e.g., `assert!` fails, `unwrap()` on None).
 /// In a bare-metal environment there's no OS to catch us, so we print the
 /// panic message to serial and halt the CPU.
+///
+/// Disables interrupts immediately to prevent further execution of interrupt
+/// handlers that might panic themselves or corrupt state. The `println!` macro
+/// is interrupt-safe (uses `InterruptMutex`), so it's fine to call even after
+/// CLI — the lock will simply see that interrupts are already disabled.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Try to print the panic info to serial. If serial isn't initialized yet,
-    // this might not produce output, but that's OK — we halt either way.
+    // Disable interrupts immediately — we don't want any more interrupt
+    // handlers running after a panic. This must happen BEFORE printing,
+    // in case a timer or other interrupt tries to use panicked state.
     #[cfg(target_arch = "x86_64")]
-    {
-        let mut serial = arch::x86_64::serial::SerialPort::com1();
-        let _ = writeln!(serial);
-        let _ = writeln!(serial, "!!! KERNEL PANIC !!!");
-        let _ = writeln!(serial, "{}", info);
-    }
+    arch::x86_64::cpu::cli();
+
+    // Print the panic info to the global serial writer. If the serial port
+    // hasn't been initialized yet (panic very early in boot), the output
+    // is silently dropped — but we halt either way.
+    println!();
+    println!("!!! KERNEL PANIC !!!");
+    println!("{}", info);
 
     hcf();
 }
 
 /// Halt and Catch Fire — stop the CPU permanently.
 ///
-/// This is the kernel's "I'm done" function. It disables interrupts would
-/// normally wake the CPU from `hlt`, but since we haven't set up interrupts
-/// yet in Phase 0, a simple hlt loop suffices.
+/// Disables interrupts (CLI) and then enters an infinite halt loop. With
+/// interrupts disabled, `hlt` will never wake up — the CPU is fully stopped.
+/// The loop is a safety net in case an NMI (non-maskable interrupt) wakes
+/// the CPU despite CLI; we just halt again.
 fn hcf() -> ! {
+    // Disable interrupts so that `hlt` truly halts — without CLI, any
+    // pending interrupt would wake the CPU from `hlt` and we'd resume
+    // execution, which we don't want after a panic or clean shutdown.
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::cpu::cli();
+
     loop {
         #[cfg(target_arch = "x86_64")]
         arch::x86_64::cpu::halt();
