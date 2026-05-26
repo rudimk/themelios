@@ -239,7 +239,22 @@
 
 ---
 
-### Sub-phase 1.7 — Interrupt-driven serial shell
+### Sub-phase 1.7 — Interrupt-driven serial shell ✓ DONE
+
+> **Completed**: 2026-05-26
+> **Commits**: `09a5ecb`
+
+**Summary**:
+- Created `shell/mod.rs`: shell task entry with line editing (backspace/echo), command parser, dispatch table, `init()` enables IRQ4 receive interrupts + unmasks IRQ4 in PIC + spawns shell task
+- Created `shell/input.rs`: 256-byte ring buffer with `push_byte()`/`pop_byte()`, shell task ID stored in AtomicUsize for IRQ4 handler to wake via `sched::wake_task()`
+- Created `shell/commands.rs`: 6 commands — `help` (list commands), `mem` (frame/heap stats), `tasks` (task table with ID/state/name/current marker), `spawn` (test task with 10 iterations), `kill` (marks Dead, cleaned up by scheduler), `peek` (hex+ASCII dump with address validation against HHDM and kernel image ranges)
+- Updated `serial.rs`: added `enable_receive_interrupt()`, `receive_byte()`, `data_ready()` for IRQ4-driven input
+- Updated `idt.rs`: IRQ4 handler drains UART receive buffer into ring buffer, wakes shell task
+- Updated `sched/mod.rs`: added `task_list()` (copies task info outside lock), `kill_task()` (marks Dead, removes from ready queue), `block_current_task()` (sets Blocked, yields), `wake_task()` (sets Ready, enqueues)
+- Updated `main.rs`: replaced stress test with `shell::init()`, added `mod shell`
+- Verified in QEMU: all 6 commands work correctly, shell blocks until input (no busy-wait), kill stops running task mid-execution, peek on invalid address prints error (no page fault), echo and backspace work, timer continues running alongside shell
+
+**All acceptance criteria verified** ✓
 
 **Why now**: All infrastructure (interrupts, allocator, scheduler) is in place. The shell provides interactive debugging for everything built so far and all future phases.
 
