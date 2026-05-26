@@ -6,6 +6,12 @@ license = "MIT"
 authors = ["Rudi MK"]
 description = "ThemeliOS — an experimental capability-based microkernel"
 
+[features]
+# When enabled, the kernel runs automated tests instead of the interactive shell.
+# Used by `cargo xtask test`, which builds with --features test and boots QEMU
+# with the isa-debug-exit device for programmatic exit code reporting.
+test = []
+
 [dependencies]
 # Limine boot protocol crate — provides the data structures and request types
 # that the Limine bootloader uses to communicate with the kernel at boot time.
