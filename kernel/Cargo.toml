@@ -11,5 +11,10 @@ description = "ThemeliOS — an experimental capability-based microkernel"
 # that the Limine bootloader uses to communicate with the kernel at boot time.
 limine = "0.5"
 
+# Spinlock-based synchronization primitives for no_std environments.
+# Used inside our InterruptMutex wrapper for the global serial writer
+# and (later) the kernel heap allocator.
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+
 # Profile settings (panic = "abort") are in the workspace root Cargo.toml
 # because Cargo requires profiles to be defined at the workspace level.
