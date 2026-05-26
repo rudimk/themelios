@@ -26,6 +26,21 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 // ============================================================================
+// Build constants
+// ============================================================================
+
+/// The `-Zbuild-std` flag for building the kernel. We build `core` (the no_std
+/// standard library) and `alloc` (dynamic allocation: Vec, Box, String, etc.)
+/// from source for the bare-metal target. This flag must be the same everywhere
+/// we invoke `cargo build` or `cargo doc` for the kernel.
+const BUILD_STD: &str = "-Zbuild-std=core,alloc";
+
+/// The `-Zbuild-std-features` flag. Enables `compiler-builtins-mem` which
+/// provides memory intrinsics (memcpy, memset, etc.) that the compiler may
+/// generate calls to. Without this, linking fails on bare-metal targets.
+const BUILD_STD_FEATURES: &str = "-Zbuild-std-features=compiler-builtins-mem";
+
+// ============================================================================
 // Architecture helpers
 // ============================================================================
 
@@ -321,8 +336,8 @@ fn cmd_build(args: &[String]) {
             "build",
             "--package", "themelios",
             "--target", target,
-            "-Zbuild-std=core",
-            "-Zbuild-std-features=compiler-builtins-mem",
+            BUILD_STD,
+            BUILD_STD_FEATURES,
         ])
         .status()
         .expect("Failed to execute cargo build");
@@ -461,8 +476,8 @@ fn cmd_docs(_args: &[String]) {
             "doc",
             "--package", "themelios",
             "--target", "x86_64-unknown-none",
-            "-Zbuild-std=core",
-            "-Zbuild-std-features=compiler-builtins-mem",
+            BUILD_STD,
+            BUILD_STD_FEATURES,
             "--no-deps",
         ])
         .status();
