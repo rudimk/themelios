@@ -35,9 +35,11 @@
 //! 8 (#DF), 10 (#TS), 11 (#NP), 12 (#SS), 13 (#GP), 14 (#PF), 17 (#AC), 21 (#CP)
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::cpu;
 use super::gdt;
+use super::pic;
 use crate::println;
 
 // --- IDT entry (gate descriptor) ---
@@ -254,6 +256,30 @@ isr_stub_no_error!(isr_19, 19);  // #XF — SIMD Floating-Point Error
 isr_stub_no_error!(isr_20, 20);  // Virtualization Exception
 isr_stub_error!(isr_21, 21);     // #CP — Control Protection Exception
 
+// --- Generate ISR stubs for hardware IRQ vectors 32-47 ---
+//
+// Hardware IRQs (from the 8259 PIC) are mapped to vectors 32-47 by the PIC
+// initialization code in pic.rs. IRQs never push error codes, so all stubs
+// use the no-error variant. These share the same isr_common handler as
+// exceptions — the Rust handler dispatches based on vector number.
+
+isr_stub_no_error!(isr_32, 32);  // IRQ0  — PIT timer
+isr_stub_no_error!(isr_33, 33);  // IRQ1  — Keyboard
+isr_stub_no_error!(isr_34, 34);  // IRQ2  — Cascade (slave PIC)
+isr_stub_no_error!(isr_35, 35);  // IRQ3  — COM2
+isr_stub_no_error!(isr_36, 36);  // IRQ4  — COM1 (serial)
+isr_stub_no_error!(isr_37, 37);  // IRQ5  — LPT2
+isr_stub_no_error!(isr_38, 38);  // IRQ6  — Floppy
+isr_stub_no_error!(isr_39, 39);  // IRQ7  — LPT1 / spurious
+isr_stub_no_error!(isr_40, 40);  // IRQ8  — RTC
+isr_stub_no_error!(isr_41, 41);  // IRQ9  — ACPI
+isr_stub_no_error!(isr_42, 42);  // IRQ10 — Available
+isr_stub_no_error!(isr_43, 43);  // IRQ11 — Available
+isr_stub_no_error!(isr_44, 44);  // IRQ12 — PS/2 mouse
+isr_stub_no_error!(isr_45, 45);  // IRQ13 — FPU
+isr_stub_no_error!(isr_46, 46);  // IRQ14 — Primary ATA
+isr_stub_no_error!(isr_47, 47);  // IRQ15 — Secondary ATA / spurious
+
 // --- Common ISR handler (assembly) ---
 
 /// Common interrupt handler entered by all ISR stubs via `jmp`.
@@ -350,17 +376,63 @@ const EXCEPTION_NAMES: [&str; 22] = [
     "Control Protection (#CP)",          // 21
 ];
 
-/// Rust-level exception handler called from `isr_common` assembly.
+// --- Global tick counter ---
+
+/// Monotonically increasing tick counter, incremented by the IRQ0 (PIT timer)
+/// handler. At 100 Hz, this wraps after ~5.8 billion years, so u64 is fine.
 ///
-/// Receives a pointer to the complete interrupt stack frame (all saved
-/// registers + vector + error code + CPU-pushed state). Prints diagnostic
-/// information to the serial console.
+/// Uses `AtomicU64` with `Relaxed` ordering because there's only one writer
+/// (the IRQ0 handler, which runs with interrupts disabled on a single core)
+/// and readers just want the latest value — no happens-before relationship
+/// is needed.
+static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current tick count (number of PIT timer interrupts since boot).
 ///
-/// For recoverable exceptions (breakpoint), this function returns and
-/// execution continues. For fatal exceptions (everything else in kernel
-/// mode), it halts the CPU.
+/// At the default 100 Hz rate, 1 tick ≈ 10 ms. The value is monotonically
+/// increasing and never wraps in practice (u64 overflow at ~5.8 billion years).
+pub fn tick_count() -> u64 {
+    TICK_COUNT.load(Ordering::Relaxed)
+}
+
+// --- Interrupt dispatcher ---
+//
+// All interrupts — both CPU exceptions (vectors 0-31) and hardware IRQs
+// (vectors 32-47) — flow through isr_common and into this single Rust
+// handler. We dispatch based on vector number:
+//
+//   0-31:  CPU exception → print diagnostics, recover or halt
+//   32-47: Hardware IRQ  → check spurious, handle, send EOI
+
+/// Unified interrupt handler called from `isr_common` assembly.
+///
+/// Dispatches CPU exceptions (vectors 0-31) and hardware IRQs (vectors 32-47).
+/// For exceptions: prints diagnostic info, recovers from breakpoints, halts on
+/// fatal errors. For IRQs: checks for spurious interrupts, runs the device
+/// handler, and sends EOI to the PIC.
 extern "C" fn exception_handler(frame: &InterruptStackFrame) {
     let vector = frame.vector as usize;
+
+    // --- Hardware IRQ dispatch (vectors 32-47) ---
+    if vector >= 32 && vector < 48 {
+        let irq = (vector - 32) as u8;
+
+        // Check for spurious IRQs before doing anything else.
+        // Spurious IRQs on IRQ7/IRQ15 are phantom signals from the PIC.
+        // is_spurious() handles any necessary EOI internally.
+        if pic::is_spurious(irq) {
+            return;
+        }
+
+        irq_handler(irq);
+
+        // Acknowledge the interrupt so the PIC delivers the next one.
+        pic::send_eoi(irq);
+        return;
+    }
+
+    // --- CPU exception dispatch (vectors 0-31) ---
+
     let name = if vector < EXCEPTION_NAMES.len() {
         EXCEPTION_NAMES[vector]
     } else {
@@ -413,6 +485,31 @@ extern "C" fn exception_handler(frame: &InterruptStackFrame) {
     }
 }
 
+/// Handle a hardware IRQ after spurious check has passed.
+///
+/// Called from the unified interrupt dispatcher with the IRQ number (0-15).
+/// Each IRQ line gets its own handling logic here.
+fn irq_handler(irq: u8) {
+    match irq {
+        // IRQ0 — PIT timer: increment the global tick counter.
+        // Print a status line every 100 ticks (~1 second at 100 Hz) as proof
+        // of life during early boot. This periodic printing will be removed
+        // once the scheduler is running.
+        0 => {
+            let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if ticks % 100 == 0 {
+                println!("[timer] tick {}", ticks);
+            }
+        }
+
+        // All other IRQs are unhandled for now. Log the first few to serial
+        // so we notice unexpected hardware activity.
+        _ => {
+            println!("[irq] unhandled IRQ{}", irq);
+        }
+    }
+}
+
 // --- Static IDT ---
 
 /// The full 256-entry IDT. Only vectors 0-21 are populated initially
@@ -423,18 +520,18 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry::EMPTY; 256];
 
 /// Initialize the IDT and load it into the CPU.
 ///
-/// Sets up gate descriptors for all CPU exception vectors (0-21), with the
-/// double fault handler (#DF, vector 8) using IST entry 1 for a dedicated
-/// stack. All other exception handlers use the current stack.
+/// Sets up gate descriptors for:
+/// - CPU exception vectors 0-21 (with double fault on IST1)
+/// - Hardware IRQ vectors 32-47 (from the 8259 PIC)
 ///
 /// Must be called after `gdt::init()` (since IDT entries reference the kernel
 /// code segment selector from the GDT and the double-fault IST from the TSS).
 pub fn init() {
-    // Table of ISR stub addresses and their IST indices.
+    // Exception handlers (vectors 0-21): each entry is (stub_fn, IST_index).
     // Most exceptions use IST 0 (= don't switch stacks, use current stack).
     // Double fault uses IST 1 (= dedicated stack from TSS) because the
     // kernel stack might be corrupted when a double fault fires.
-    let handlers: [(unsafe extern "C" fn(), u8); 22] = [
+    let exception_handlers: [(unsafe extern "C" fn(), u8); 22] = [
         (isr_0, 0),                              // 0:  #DE
         (isr_1, 0),                              // 1:  #DB
         (isr_2, 0),                              // 2:  NMI
@@ -459,13 +556,43 @@ pub fn init() {
         (isr_21, 0),                             // 21: #CP
     ];
 
+    // Hardware IRQ handlers (vectors 32-47): all use IST 0 (current stack).
+    // These stubs all flow through isr_common → exception_handler, which
+    // dispatches to irq_handler() for vectors 32-47.
+    let irq_handlers: [unsafe extern "C" fn(); 16] = [
+        isr_32,  // IRQ0  — PIT timer
+        isr_33,  // IRQ1  — Keyboard
+        isr_34,  // IRQ2  — Cascade
+        isr_35,  // IRQ3  — COM2
+        isr_36,  // IRQ4  — COM1
+        isr_37,  // IRQ5  — LPT2
+        isr_38,  // IRQ6  — Floppy
+        isr_39,  // IRQ7  — LPT1 / spurious
+        isr_40,  // IRQ8  — RTC
+        isr_41,  // IRQ9  — ACPI
+        isr_42,  // IRQ10 — Available
+        isr_43,  // IRQ11 — Available
+        isr_44,  // IRQ12 — PS/2 mouse
+        isr_45,  // IRQ13 — FPU
+        isr_46,  // IRQ14 — Primary ATA
+        isr_47,  // IRQ15 — Secondary ATA / spurious
+    ];
+
     // SAFETY: Single-threaded early boot, no interrupts enabled yet.
     unsafe {
         let idt = &raw mut IDT;
 
-        for (vector, &(handler, ist)) in handlers.iter().enumerate() {
+        // Register exception handlers (vectors 0-21)
+        for (vector, &(handler, ist)) in exception_handlers.iter().enumerate() {
             let addr = handler as usize as u64;
             (*idt)[vector] = IdtEntry::new(addr, gdt::KERNEL_CODE_SELECTOR, ist);
+        }
+
+        // Register IRQ handlers (vectors 32-47)
+        for (i, &handler) in irq_handlers.iter().enumerate() {
+            let vector = 32 + i;
+            let addr = handler as usize as u64;
+            (*idt)[vector] = IdtEntry::new(addr, gdt::KERNEL_CODE_SELECTOR, 0);
         }
 
         // Load the IDT into the CPU
@@ -476,5 +603,5 @@ pub fn init() {
         cpu::lidt(&idtr);
     }
 
-    println!("IDT loaded (22 exception handlers, double fault on IST1)");
+    println!("IDT loaded (22 exception handlers + 16 IRQ handlers, double fault on IST1)");
 }

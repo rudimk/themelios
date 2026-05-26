@@ -180,11 +180,41 @@ extern "C" fn kmain() -> ! {
     arch::x86_64::cpu::int3();
     println!("Breakpoint handler returned — IDT is working!");
 
-    println!();
-    println!("Phase 1 in progress. Halting.");
+    // Initialize the 8259 PIC and remap hardware IRQs to vectors 32-47.
+    // Must happen after IDT setup (so IRQ vectors have handlers installed).
+    // After this, all IRQ lines are masked — individual IRQs are unmasked
+    // as their devices are initialized.
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::pic::init();
 
-    // Nothing left to do — halt the CPU in a loop.
-    hcf();
+    // Configure the PIT to fire IRQ0 at ~100 Hz, then unmask IRQ0 so the
+    // timer interrupts can reach the CPU.
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::x86_64::pit::init();
+        arch::x86_64::pic::unmask(0);
+    }
+
+    // Enable maskable interrupts. From this point on, the PIT timer will
+    // fire IRQ0 at ~100 Hz, incrementing the global tick counter and
+    // printing a status line every second.
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::cpu::sti();
+
+    println!();
+    println!("Interrupts enabled — timer is running.");
+    println!("Phase 1 in progress. Halting (with interrupts).");
+
+    // Halt the CPU in an interrupt-friendly loop. Unlike hcf() which
+    // disables interrupts, this loop lets interrupts wake the CPU from
+    // hlt so the timer handler keeps running.
+    loop {
+        #[cfg(target_arch = "x86_64")]
+        arch::x86_64::cpu::halt();
+
+        #[cfg(not(target_arch = "x86_64"))]
+        core::hint::spin_loop();
+    }
 }
 
 // ----- Panic handler -----
