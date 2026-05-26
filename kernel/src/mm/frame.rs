@@ -1,0 +1,279 @@
+//! # Bitmap frame allocator
+//!
+//! Tracks which 4 KiB physical memory frames are free or allocated using a
+//! bitmap — one bit per frame across the entire physical address space.
+//!
+//! ## Bitmap encoding
+//!
+//! - Bit = 1 → frame is **free** (available for allocation)
+//! - Bit = 0 → frame is **allocated** (in use or reserved)
+//!
+//! Frame index `N` corresponds to the physical address `N * 4096`. The bit for
+//! frame N is at byte `N / 8`, bit position `N % 8`.
+//!
+//! ## Bootstrap
+//!
+//! The allocator faces a chicken-and-egg problem: it needs memory for its bitmap,
+//! but it IS the memory allocator. We solve this by:
+//!
+//! 1. Scanning the Limine memory map to find the highest physical address
+//! 2. Computing the bitmap size (1 bit per frame)
+//! 3. Finding a USABLE memory region large enough to hold the bitmap
+//! 4. Placing the bitmap there (accessed via HHDM)
+//! 5. Marking only USABLE frames as free (all others start allocated)
+//! 6. Marking the bitmap's own frames as allocated (so they're never handed out)
+//!
+//! ## Thread safety
+//!
+//! The `BitmapFrameAllocator` struct itself is not thread-safe. It's wrapped in
+//! an `InterruptMutex` by the public API in this module, which disables interrupts
+//! while the lock is held to prevent deadlock from timer interrupt handlers.
+
+use limine::memory_map::{Entry, EntryType};
+
+use super::PAGE_SIZE;
+use super::addr::{PhysAddr, align_up, align_down};
+
+/// A bitmap-based physical frame allocator.
+///
+/// Tracks frame availability using a bitmap stored in HHDM-mapped physical
+/// memory. Each bit represents one 4 KiB frame: set = free, clear = allocated.
+pub struct BitmapFrameAllocator {
+    /// Pointer to the bitmap in HHDM-mapped virtual memory.
+    bitmap: *mut u8,
+    /// Size of the bitmap in bytes.
+    bitmap_len: usize,
+    /// Total number of frames tracked (= highest_phys_addr / PAGE_SIZE).
+    frame_count: usize,
+    /// Number of currently free frames.
+    free_count: usize,
+}
+
+// SAFETY: The bitmap pointer targets HHDM-mapped memory that is stable for the
+// kernel's lifetime. All access is serialized by the InterruptMutex wrapper,
+// so no data races are possible. Send is needed to store this in a static Mutex.
+unsafe impl Send for BitmapFrameAllocator {}
+
+impl BitmapFrameAllocator {
+    /// Create a new frame allocator from the Limine memory map.
+    ///
+    /// This is the bootstrap sequence:
+    /// 1. Find the highest physical address → compute bitmap size
+    /// 2. Find a USABLE region for the bitmap itself
+    /// 3. Zero the bitmap (all frames marked allocated)
+    /// 4. Walk the memory map, marking USABLE frames as free
+    /// 5. Mark the bitmap's own frames as allocated
+    /// 6. Count free frames
+    ///
+    /// The `hhdm_offset` is used to access the bitmap via virtual addresses.
+    /// The `kernel_phys_base` is used to verify the kernel isn't in a USABLE region.
+    pub fn new(entries: &[&Entry], hhdm_offset: u64, kernel_phys_base: u64) -> Self {
+        // --- Step 1: Determine bitmap size ---
+
+        // Find the highest physical address in the memory map. This determines
+        // how many frames we need to track (and thus how large the bitmap is).
+        let max_phys = entries.iter()
+            .map(|e| e.base + e.length)
+            .max()
+            .expect("Memory map is empty");
+
+        let frame_count = (max_phys / PAGE_SIZE) as usize;
+        // Round up: if frame_count isn't a multiple of 8, we need an extra byte.
+        // The trailing bits in the last byte will stay 0 (allocated) since no
+        // real frames correspond to them.
+        let bitmap_len = (frame_count + 7) / 8;
+
+        // --- Step 2: Find a home for the bitmap ---
+
+        // The bitmap needs to live in a USABLE region (since that's the only
+        // memory we're allowed to use). We find the first region large enough
+        // and place the bitmap at its page-aligned start.
+        let bitmap_phys = Self::find_bitmap_region(entries, bitmap_len);
+
+        // Access the bitmap through the HHDM. The bootloader mapped all physical
+        // memory at virtual address (phys + hhdm_offset), so we can just add.
+        let bitmap_virt = (bitmap_phys + hhdm_offset) as *mut u8;
+
+        // --- Step 3: Zero the bitmap (all frames = allocated) ---
+
+        // SAFETY: bitmap_virt points to HHDM-mapped memory within a USABLE
+        // region of size >= bitmap_len.
+        unsafe {
+            core::ptr::write_bytes(bitmap_virt, 0, bitmap_len);
+        }
+
+        let mut allocator = Self {
+            bitmap: bitmap_virt,
+            bitmap_len,
+            frame_count,
+            free_count: 0,
+        };
+
+        // --- Verify kernel frames are not USABLE ---
+
+        // The plan's design decision: Limine classifies kernel frames as
+        // EXECUTABLE_AND_MODULES, not USABLE. If this assumption is wrong,
+        // we'd hand out kernel memory as free frames → instant corruption.
+        for entry in entries.iter() {
+            if entry.entry_type == EntryType::USABLE {
+                let entry_end = entry.base + entry.length;
+                assert!(
+                    !(kernel_phys_base >= entry.base && kernel_phys_base < entry_end),
+                    "BUG: Kernel physical base ({:#x}) found in a USABLE memory region! \
+                     Expected EXECUTABLE_AND_MODULES.",
+                    kernel_phys_base
+                );
+            }
+        }
+
+        // --- Step 4: Mark USABLE frames as free ---
+
+        // Walk every USABLE entry in the memory map and set the corresponding
+        // bits. Entries are page-aligned per the plan: round start up, end down.
+        for entry in entries.iter() {
+            if entry.entry_type == EntryType::USABLE {
+                let start = align_up(entry.base, PAGE_SIZE);
+                let end = align_down(entry.base + entry.length, PAGE_SIZE);
+                let mut addr = start;
+                while addr < end {
+                    allocator.mark_free(addr / PAGE_SIZE);
+                    addr += PAGE_SIZE;
+                }
+            }
+        }
+
+        // --- Step 5: Mark bitmap's own frames as allocated ---
+
+        // The bitmap sits inside a USABLE region, so step 4 marked its frames
+        // as free. We undo that here so the allocator never hands out the
+        // memory it's using for its own bookkeeping.
+        let bitmap_pages = align_up(bitmap_len as u64, PAGE_SIZE) / PAGE_SIZE;
+        for i in 0..bitmap_pages {
+            allocator.mark_allocated((bitmap_phys + i * PAGE_SIZE) / PAGE_SIZE);
+        }
+
+        // --- Step 6: Count free frames ---
+
+        allocator.free_count = allocator.bitmap_slice()
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum();
+
+        allocator
+    }
+
+    /// Find the first USABLE region large enough to hold `bitmap_len` bytes.
+    ///
+    /// Returns the page-aligned physical start address for the bitmap.
+    /// Panics if no suitable region exists.
+    fn find_bitmap_region(entries: &[&Entry], bitmap_len: usize) -> u64 {
+        let bitmap_size = align_up(bitmap_len as u64, PAGE_SIZE);
+
+        for entry in entries.iter() {
+            if entry.entry_type == EntryType::USABLE {
+                let start = align_up(entry.base, PAGE_SIZE);
+                let end = align_down(entry.base + entry.length, PAGE_SIZE);
+                if end > start && end - start >= bitmap_size {
+                    return start;
+                }
+            }
+        }
+
+        panic!(
+            "No usable memory region large enough for the frame bitmap ({} bytes needed)",
+            bitmap_len
+        );
+    }
+
+    /// Get a read-only view of the bitmap.
+    fn bitmap_slice(&self) -> &[u8] {
+        // SAFETY: bitmap points to HHDM-mapped memory of bitmap_len bytes,
+        // and all access is serialized by the InterruptMutex wrapper.
+        unsafe { core::slice::from_raw_parts(self.bitmap, self.bitmap_len) }
+    }
+
+    /// Get a mutable view of the bitmap.
+    fn bitmap_slice_mut(&mut self) -> &mut [u8] {
+        // SAFETY: same as bitmap_slice, plus we have &mut self.
+        unsafe { core::slice::from_raw_parts_mut(self.bitmap, self.bitmap_len) }
+    }
+
+    /// Mark a frame as free (set its bit to 1).
+    fn mark_free(&mut self, frame_idx: u64) {
+        let idx = frame_idx as usize;
+        if idx < self.frame_count {
+            self.bitmap_slice_mut()[idx / 8] |= 1 << (idx % 8);
+        }
+    }
+
+    /// Mark a frame as allocated (clear its bit to 0).
+    fn mark_allocated(&mut self, frame_idx: u64) {
+        let idx = frame_idx as usize;
+        if idx < self.frame_count {
+            self.bitmap_slice_mut()[idx / 8] &= !(1 << (idx % 8));
+        }
+    }
+
+    /// Check whether a frame is free.
+    fn is_free(&self, frame_idx: usize) -> bool {
+        if frame_idx >= self.frame_count {
+            return false;
+        }
+        self.bitmap_slice()[frame_idx / 8] & (1 << (frame_idx % 8)) != 0
+    }
+
+    /// Allocate a single 4 KiB physical frame.
+    ///
+    /// Scans the bitmap for the first free frame, marks it as allocated, and
+    /// returns its physical address. Returns `None` if no free frames remain.
+    ///
+    /// Uses a simple linear scan — O(n) in the number of frames. This is fine
+    /// for Phase 1; a more sophisticated allocator (buddy system, free lists)
+    /// can be added later if allocation speed becomes a bottleneck.
+    pub fn allocate_frame(&mut self) -> Option<PhysAddr> {
+        for byte_idx in 0..self.bitmap_len {
+            let byte = self.bitmap_slice()[byte_idx];
+            if byte != 0 {
+                // Found a byte with at least one free frame. Find the
+                // lowest-numbered free frame in this byte.
+                let bit = byte.trailing_zeros() as usize;
+                let frame_idx = byte_idx * 8 + bit;
+
+                if frame_idx >= self.frame_count {
+                    return None;
+                }
+
+                self.bitmap_slice_mut()[byte_idx] &= !(1 << bit);
+                self.free_count -= 1;
+
+                return Some(PhysAddr::new(frame_idx as u64 * PAGE_SIZE));
+            }
+        }
+        None
+    }
+
+    /// Return a previously allocated frame to the free pool.
+    ///
+    /// The address must be page-aligned and must have been previously returned
+    /// by `allocate_frame()`. Double-freeing a frame panics.
+    pub fn deallocate_frame(&mut self, addr: PhysAddr) {
+        assert!(addr.is_page_aligned(), "Deallocating non-page-aligned address: {}", addr);
+
+        let frame_idx = (addr.as_u64() / PAGE_SIZE) as usize;
+        assert!(frame_idx < self.frame_count, "Frame index {} out of range (max {})", frame_idx, self.frame_count);
+        assert!(!self.is_free(frame_idx), "Double free of frame at {}", addr);
+
+        self.bitmap_slice_mut()[frame_idx / 8] |= 1 << (frame_idx % 8);
+        self.free_count += 1;
+    }
+
+    /// Get the number of currently free frames.
+    pub fn free_frame_count(&self) -> usize {
+        self.free_count
+    }
+
+    /// Get the total number of frames tracked by this allocator.
+    pub fn total_frame_count(&self) -> usize {
+        self.frame_count
+    }
+}
