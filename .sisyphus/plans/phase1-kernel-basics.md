@@ -174,7 +174,20 @@
 
 ---
 
-### Sub-phase 1.6 — Preemptive round-robin scheduler
+### Sub-phase 1.6 — Preemptive round-robin scheduler ✓ DONE
+
+> **Completed**: 2026-05-26
+> **Commits**: `c9e5da1`
+
+**Summary**:
+- Created `sched/task.rs`: Task struct (ID, name, state, context, stack info), TaskId type, TaskState enum (Ready/Running/Blocked/Dead), TaskContext (rsp only), stack allocation constants (4 pages usable + 1 page padding)
+- Created `sched/context.rs`: `switch_context` naked_asm (save/restore rbx, rbp, r12-r15 via push/pop, rsp swap via mov), `task_bootstrap` naked fn (sti → call r12 → call task_exit), `task_exit` trampoline
+- Rewrote `sched/mod.rs`: Scheduler struct with tasks Vec + VecDeque ready queue, `init()` creates bootstrap (task 0, uses boot stack) + idle task (halt loop, never queued), `spawn()` allocates 5 contiguous frames + sets up initial stack frame with entry fn in r12 slot, `schedule()` does round-robin pick + releases lock before switch_context (raw pointers safe with interrupts disabled on single core), `yield_now()` for cooperative yielding, `exit_current_task()` marks Dead + reschedules, dead task cleanup frees stack frames
+- Updated `idt.rs`: IRQ0 sends EOI before calling schedule() (prevents PIC from blocking timer to switched-to task), gated by `sched::is_initialized()`
+- Updated `main.rs`: scheduler init after PIC/PIT, spawns 24 stress test tasks (print ID + counter, yield between iterations)
+- Verified in QEMU: 24 tasks interleave output correctly, all complete 5 iterations, tasks exit cleanly via trampoline, timer continues ticking after all tasks finish, no triple faults or corruption
+
+**All acceptance criteria verified** ✓
 
 **Why before shell**: The shell runs as a task managed by the scheduler. The scheduler is also the final "big" kernel subsystem for Phase 1.
 
