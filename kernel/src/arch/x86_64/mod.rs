@@ -29,6 +29,10 @@ pub mod serial;
 /// critical exception handlers like double fault).
 pub mod gdt;
 
+/// Interrupt Descriptor Table and exception handlers.
+/// Handles CPU exceptions (divide error, page fault, GPF, double fault, etc.)
+/// and hardware IRQs (timer, serial, etc.) via ISR stubs and a common handler.
+pub mod idt;
+
 // Future sub-modules:
-// pub mod idt;     — Interrupt Descriptor Table, exception handlers
 // pub mod paging;  — page table management
