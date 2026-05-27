@@ -39,6 +39,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_page_tables",      func: test_page_tables },
     TestCase { name: "test_heap_growth",      func: test_heap_growth },
     TestCase { name: "test_syscall",          func: test_syscall },
+    TestCase { name: "test_capabilities",    func: test_capabilities },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -471,4 +472,255 @@ fn test_heap_growth() -> Result<(), &'static str> {
 ///    report the result back to the kernel
 fn test_syscall() -> Result<(), &'static str> {
     crate::arch::x86_64::syscall::test_syscall_round_trip()
+}
+
+/// Test the capability system: CSpace, handles, grant, and revoke.
+///
+/// Verifies:
+/// 1. Creating a CSpace and inserting capabilities
+/// 2. Looking up capabilities by handle returns correct type and rights
+/// 3. Removing a capability increments generation (stale handle detection)
+/// 4. Granting with reduced rights succeeds
+/// 5. Granting with expanded rights fails (rights escalation)
+/// 6. Granting without GRANT right fails
+/// 7. Revoking cascades to all descendants
+/// 8. Global object registry tracks reference counts
+fn test_capabilities() -> Result<(), &'static str> {
+    use crate::cap::{Capability, CapHandle, CapRights, CapType};
+    use crate::cap::cspace::{CSpace, CapError};
+    use crate::cap::object;
+
+    // --- 1. CSpace creation and basic insert/lookup ---
+
+    let mut cspace = CSpace::new();
+
+    // Slot 0 should be the Null capability
+    let null_cap = cspace.lookup(CapHandle::NULL)
+        .map_err(|_| "lookup of NULL handle failed")?;
+    if null_cap.cap_type != CapType::Null {
+        return Err("slot 0 is not Null");
+    }
+    if null_cap.rights != CapRights::NONE {
+        return Err("Null capability has non-zero rights");
+    }
+
+    // Insert a Memory capability with all rights
+    let mem_cap = Capability {
+        cap_type: CapType::Memory { base: 0x1000, page_count: 4 },
+        rights: CapRights::ALL,
+        parent: None,
+    };
+    let mem_handle = cspace.insert(mem_cap.clone())
+        .map_err(|_| "insert Memory cap failed")?;
+
+    // Lookup should return the same capability
+    let looked_up = cspace.lookup(mem_handle)
+        .map_err(|_| "lookup Memory cap failed")?;
+    if looked_up.cap_type != (CapType::Memory { base: 0x1000, page_count: 4 }) {
+        return Err("looked up Memory cap has wrong type");
+    }
+    if looked_up.rights != CapRights::ALL {
+        return Err("looked up Memory cap has wrong rights");
+    }
+
+    // --- 2. Insert an endpoint capability ---
+
+    let ep_cap = Capability {
+        cap_type: CapType::Endpoint { endpoint_id: 42, badge: 0 },
+        rights: CapRights::READ | CapRights::WRITE | CapRights::GRANT,
+        parent: None,
+    };
+    let ep_handle = cspace.insert(ep_cap)
+        .map_err(|_| "insert Endpoint cap failed")?;
+
+    // Verify it's at a different index than the Memory cap
+    if ep_handle.index() == mem_handle.index() {
+        return Err("endpoint and memory caps have same index");
+    }
+
+    // Active count should be 2 (not counting the Null slot)
+    if cspace.active_count() != 2 {
+        return Err("active_count should be 2 after two inserts");
+    }
+
+    // --- 3. Remove and stale generation detection ---
+
+    let removed = cspace.remove(mem_handle)
+        .map_err(|_| "remove Memory cap failed")?;
+    if removed.cap_type != (CapType::Memory { base: 0x1000, page_count: 4 }) {
+        return Err("removed cap has wrong type");
+    }
+
+    // The old handle should now be stale (generation mismatch)
+    match cspace.lookup(mem_handle) {
+        Err(CapError::StaleGeneration) => { /* expected */ }
+        Ok(_) => return Err("stale handle lookup should have failed"),
+        Err(_) => return Err("stale handle returned unexpected error"),
+    }
+
+    // Inserting a new cap should reuse the freed slot
+    let new_cap = Capability {
+        cap_type: CapType::Irq { irq_number: 5 },
+        rights: CapRights::READ | CapRights::MANAGE,
+        parent: None,
+    };
+    let irq_handle = cspace.insert(new_cap)
+        .map_err(|_| "insert IRQ cap failed")?;
+
+    // It should reuse index 1 (the freed Memory slot), but with generation 1
+    if irq_handle.index() != mem_handle.index() {
+        return Err("insert did not reuse freed slot");
+    }
+    if irq_handle.generation() != mem_handle.generation() + 1 {
+        return Err("reused slot generation not incremented");
+    }
+
+    // --- 4. Grant with reduced rights ---
+
+    // First, create a fresh capability with GRANT right for the grant test
+    let grant_source = Capability {
+        cap_type: CapType::Memory { base: 0x2000, page_count: 8 },
+        rights: CapRights::ALL,
+        parent: None,
+    };
+    let source_handle = cspace.insert(grant_source)
+        .map_err(|_| "insert grant source failed")?;
+
+    // Grant with reduced rights (READ + WRITE only, no EXECUTE/GRANT/MANAGE)
+    let reduced_rights = CapRights::READ | CapRights::WRITE;
+    let derived_handle = cspace.grant(source_handle, reduced_rights)
+        .map_err(|_| "grant with reduced rights failed")?;
+
+    // Verify the derived capability
+    let derived = cspace.lookup(derived_handle)
+        .map_err(|_| "lookup derived cap failed")?;
+    if derived.rights != reduced_rights {
+        return Err("derived cap has wrong rights");
+    }
+    if derived.cap_type != (CapType::Memory { base: 0x2000, page_count: 8 }) {
+        return Err("derived cap has wrong type");
+    }
+    if derived.parent != Some(source_handle) {
+        return Err("derived cap parent does not match source");
+    }
+
+    // --- 5. Grant with expanded rights should fail ---
+
+    // Try to grant with rights the source doesn't have — but wait, source
+    // has ALL. So let's use the derived cap (which only has READ|WRITE and
+    // no GRANT right) to test both escalation and no-grant-right errors.
+
+    // The derived cap doesn't have GRANT, so granting from it should fail
+    match cspace.grant(derived_handle, CapRights::READ) {
+        Err(CapError::NoGrantRight) => { /* expected */ }
+        Ok(_) => return Err("grant without GRANT right should have failed"),
+        Err(e) => {
+            let _ = e;
+            return Err("grant without GRANT right returned unexpected error");
+        }
+    }
+
+    // Create a cap with GRANT but limited other rights, then try to escalate
+    let limited_cap = Capability {
+        cap_type: CapType::Process { pid: 1 },
+        rights: CapRights::READ | CapRights::GRANT,
+        parent: None,
+    };
+    let limited_handle = cspace.insert(limited_cap)
+        .map_err(|_| "insert limited cap failed")?;
+
+    // Try to grant WRITE (which the limited cap doesn't have)
+    match cspace.grant(limited_handle, CapRights::READ | CapRights::WRITE) {
+        Err(CapError::RightsEscalation) => { /* expected */ }
+        Ok(_) => return Err("rights escalation should have been rejected"),
+        Err(_) => return Err("rights escalation returned unexpected error"),
+    }
+
+    // Granting with equal or fewer rights should work
+    let sub_handle = cspace.grant(limited_handle, CapRights::READ)
+        .map_err(|_| "grant with equal rights failed")?;
+    let sub = cspace.lookup(sub_handle)
+        .map_err(|_| "lookup sub-granted cap failed")?;
+    if sub.rights != CapRights::READ {
+        return Err("sub-granted cap has wrong rights");
+    }
+
+    // --- 6. Revocation cascades to descendants ---
+
+    // Build a chain: root -> child -> grandchild
+    let root_cap = Capability {
+        cap_type: CapType::Endpoint { endpoint_id: 99, badge: 0 },
+        rights: CapRights::ALL,
+        parent: None,
+    };
+    let root_handle = cspace.insert(root_cap)
+        .map_err(|_| "insert root cap failed")?;
+
+    let child_handle = cspace.grant(root_handle, CapRights::READ | CapRights::WRITE | CapRights::GRANT)
+        .map_err(|_| "grant child cap failed")?;
+
+    let grandchild_handle = cspace.grant(child_handle, CapRights::READ | CapRights::GRANT)
+        .map_err(|_| "grant grandchild cap failed")?;
+
+    // All three should be lookupable
+    cspace.lookup(root_handle).map_err(|_| "root lookup before revoke failed")?;
+    cspace.lookup(child_handle).map_err(|_| "child lookup before revoke failed")?;
+    cspace.lookup(grandchild_handle).map_err(|_| "grandchild lookup before revoke failed")?;
+
+    let count_before = cspace.active_count();
+
+    // Revoke the root — should cascade to child and grandchild
+    cspace.revoke(root_handle).map_err(|_| "revoke failed")?;
+
+    // All three should now be gone
+    if cspace.lookup(root_handle).is_ok() {
+        return Err("root still accessible after revoke");
+    }
+    if cspace.lookup(child_handle).is_ok() {
+        return Err("child still accessible after revoke");
+    }
+    if cspace.lookup(grandchild_handle).is_ok() {
+        return Err("grandchild still accessible after revoke");
+    }
+
+    // Active count should have decreased by 3
+    let count_after = cspace.active_count();
+    if count_before - count_after != 3 {
+        return Err("revoke did not remove exactly 3 capabilities");
+    }
+
+    // --- 7. Global object registry ---
+
+    let initial_count = object::object_count();
+
+    let obj_id = object::register(CapType::Endpoint { endpoint_id: 100, badge: 0 });
+    if object::object_count() != initial_count + 1 {
+        return Err("object registry count not incremented after register");
+    }
+
+    // Add a reference (simulating another cap pointing to the same object)
+    object::add_ref(obj_id);
+
+    // Release once — should not destroy (ref_count was 2, now 1)
+    if object::release(obj_id) {
+        return Err("object destroyed with ref_count > 0");
+    }
+    if object::object_count() != initial_count + 1 {
+        return Err("object removed despite remaining references");
+    }
+
+    // Release again — should destroy (ref_count drops to 0)
+    if !object::release(obj_id) {
+        return Err("object not destroyed when ref_count hit 0");
+    }
+    if object::object_count() != initial_count {
+        return Err("object registry count not decremented after destroy");
+    }
+
+    // Lookup destroyed object should return None
+    if object::lookup(obj_id).is_some() {
+        return Err("destroyed object still in registry");
+    }
+
+    Ok(())
 }
