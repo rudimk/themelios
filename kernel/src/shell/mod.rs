@@ -74,6 +74,8 @@ fn shell_entry() {
             "kill" => commands::cmd_kill(args),
             "peek" => commands::cmd_peek(args),
             "pgtable" => commands::cmd_pgtable(args),
+            "procs" => commands::cmd_procs(args),
+            "caps" => commands::cmd_caps(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
             }
@@ -148,6 +150,9 @@ pub fn init() {
     // Spawn the shell task and register its ID for IRQ4 wakeup
     let shell_id = sched::spawn("shell", shell_entry);
     input::set_shell_task_id(shell_id);
+
+    // Assign the shell task to the kernel process (PID 0)
+    crate::process::assign_task_to_kernel(shell_id);
 
     println!("Shell initialized (task {}, IRQ4 enabled)", shell_id);
 }

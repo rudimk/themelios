@@ -62,6 +62,7 @@ use crate::sync::InterruptMutex;
 pub mod context;
 pub mod task;
 
+use crate::process::ProcessId;
 use task::{Task, TaskContext, TaskId, TaskState, TOTAL_STACK_PAGES};
 
 /// Whether the scheduler has been initialized. Checked by the timer interrupt
@@ -146,6 +147,7 @@ pub fn init() {
         context: TaskContext::empty(),
         stack_phys_base: None,
         kernel_stack_top: 0, // Bootstrap uses Limine's stack; never returns from ring 3
+        process_id: ProcessId::KERNEL,
     }));
     sched.current_id = bootstrap_id;
     sched.next_id = 1;
@@ -257,6 +259,22 @@ pub fn schedule() {
             }
         }
 
+        // Switch CR3 if the next task belongs to a different process.
+        // Changing CR3 flushes the user-half TLB entries (kernel-half entries
+        // are shared across all address spaces via the same PML4 upper-half
+        // entries, but the CPU flushes everything on CR3 write). We skip the
+        // CR3 write if both tasks are in the same process (same address space)
+        // or if both are in the kernel process (PID 0, which has no separate
+        // address space).
+        let current_pid = sched.tasks[current_id].as_ref().unwrap().process_id;
+        let next_pid = sched.tasks[next_id].as_ref().unwrap().process_id;
+        if current_pid != next_pid {
+            if let Some(pml4_phys) = crate::process::process_pml4(next_pid) {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { crate::arch::x86_64::cpu::write_cr3(pml4_phys); }
+            }
+        }
+
         // Get raw pointers to the task contexts. These point into the Vec's
         // buffer, which won't be reallocated because:
         // 1. Interrupts are disabled — no other code can push to the Vec.
@@ -331,6 +349,32 @@ pub fn current_task_id() -> TaskId {
         .as_ref()
         .expect("Scheduler not initialized")
         .current_id
+}
+
+/// Get the current task's process ID.
+pub fn current_process_id() -> ProcessId {
+    let guard = SCHEDULER.lock();
+    let sched = guard.as_ref().expect("Scheduler not initialized");
+    sched.tasks[sched.current_id].as_ref().unwrap().process_id
+}
+
+/// Spawn a new task within a specific process.
+///
+/// Like `spawn()`, but assigns the task to the given process instead of
+/// the kernel process (PID 0). Also adds the task ID to the process's
+/// task list so the process tracks ownership.
+pub fn spawn_in_process(name: &str, entry: fn(), pid: ProcessId) -> TaskId {
+    let id = {
+        let mut guard = SCHEDULER.lock();
+        let sched = guard.as_mut().expect("Scheduler not initialized");
+        let id = create_task(sched, name, entry);
+        // Override the default kernel PID with the target process
+        sched.tasks[id].as_mut().unwrap().process_id = pid;
+        id
+    };
+    crate::process::add_task_to_process(pid, id);
+    println!("  Spawned task {} (\"{}\") in {}", id, name, pid);
+    id
 }
 
 /// Get the number of live tasks (non-None, non-Dead).
@@ -500,6 +544,7 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
         context: TaskContext { rsp: initial_rsp },
         stack_phys_base: Some(phys_base),
         kernel_stack_top: stack_top_virt.as_u64(),
+        process_id: ProcessId::KERNEL, // Default to kernel process; caller can override
     };
 
     // Place the task in its slot (either reusing an empty one or the new end)

@@ -40,6 +40,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_heap_growth",      func: test_heap_growth },
     TestCase { name: "test_syscall",          func: test_syscall },
     TestCase { name: "test_capabilities",    func: test_capabilities },
+    TestCase { name: "test_process",         func: test_process },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -720,6 +721,97 @@ fn test_capabilities() -> Result<(), &'static str> {
     // Lookup destroyed object should return None
     if object::lookup(obj_id).is_some() {
         return Err("destroyed object still in registry");
+    }
+
+    Ok(())
+}
+
+/// Test the process abstraction: create, inspect, and destroy.
+///
+/// Verifies:
+/// 1. Kernel process (PID 0) exists and owns boot-time tasks
+/// 2. Creating a new process allocates an address space and CSpace
+/// 3. Process list reflects the new process
+/// 4. Destroying a process frees all associated resources
+/// 5. Frame count is stable across create/destroy cycles (no leaks)
+fn test_process() -> Result<(), &'static str> {
+    use crate::process;
+    use crate::mm;
+
+    // 1. Verify kernel process exists
+    let procs = process::process_list();
+    let kernel = procs.iter().find(|p| p.pid == process::ProcessId::KERNEL);
+    if kernel.is_none() {
+        return Err("kernel process (PID 0) not found");
+    }
+    let kernel = kernel.unwrap();
+    if kernel.task_count == 0 {
+        return Err("kernel process has no tasks");
+    }
+
+    // 2. Create a new process and verify resources are allocated
+    let free_before = mm::frame::free_frame_count();
+    let initial_proc_count = process::process_count();
+
+    let (pid, _cap_handle) = process::create_process("test-proc", None);
+
+    // Verify the process was created
+    if process::process_count() != initial_proc_count + 1 {
+        return Err("process count did not increase after create");
+    }
+
+    // Creating a process allocates at least 1 frame (the PML4 for the
+    // user address space). Verify free count decreased.
+    let free_after_create = mm::frame::free_frame_count();
+    if free_after_create >= free_before {
+        return Err("create_process did not allocate any frames");
+    }
+
+    // 3. Verify the process appears in the process list
+    let procs = process::process_list();
+    let new_proc = procs.iter().find(|p| p.pid == pid);
+    if new_proc.is_none() {
+        return Err("new process not found in process list");
+    }
+    let new_proc = new_proc.unwrap();
+    if new_proc.name != "test-proc" {
+        return Err("new process has wrong name");
+    }
+
+    // 4. Destroy the process and verify resources are freed
+    if !process::destroy_process(pid) {
+        return Err("destroy_process returned false");
+    }
+
+    // After destroy, the process should be gone from the list
+    let procs = process::process_list();
+    if procs.iter().any(|p| p.pid == pid) {
+        return Err("destroyed process still in process list");
+    }
+
+    // 5. Verify frame count is restored (no leaks)
+    let free_after_destroy = mm::frame::free_frame_count();
+    if free_after_destroy != free_before {
+        return Err("frame leak: free count not restored after destroy");
+    }
+
+    // Run multiple create/destroy cycles to stress-test for leaks
+    for i in 0..5 {
+        let free_loop_before = mm::frame::free_frame_count();
+        let (loop_pid, _) = process::create_process("loop-test", None);
+        if !process::destroy_process(loop_pid) {
+            return Err("destroy in loop failed");
+        }
+        let free_loop_after = mm::frame::free_frame_count();
+        if free_loop_after != free_loop_before {
+            let _ = i;
+            return Err("frame leak in create/destroy loop");
+        }
+    }
+
+    // Verify the kernel process cannot be destroyed
+    if process::destroy_process(process::ProcessId::KERNEL) {
+        return Err("kernel process should not be destroyable");
     }
 
     Ok(())

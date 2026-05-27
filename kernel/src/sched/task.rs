@@ -36,6 +36,7 @@
 
 use alloc::string::String;
 use crate::mm::addr::PhysAddr;
+use crate::process::ProcessId;
 
 /// Unique identifier for each task.
 ///
@@ -138,4 +139,10 @@ pub struct Task {
     /// correct kernel stack. Zero for the bootstrap task (which uses Limine's
     /// boot stack and never transitions from ring 3).
     pub kernel_stack_top: u64,
+
+    /// The process this task belongs to. All boot-time tasks (main, idle, shell)
+    /// belong to PID 0 (the kernel process). User tasks belong to the process
+    /// that spawned them. The scheduler uses this to determine whether a CR3
+    /// switch is needed on context switch (different process → different address space).
+    pub process_id: ProcessId,
 }

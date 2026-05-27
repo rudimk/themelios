@@ -138,6 +138,11 @@ mod test_runner;
 /// been explicitly granted access to.
 mod cap;
 
+/// Process abstraction.
+/// Bundles an address space, capability space, and task list into a single
+/// unit of isolation. The kernel process (PID 0) owns all boot-time tasks.
+mod process;
+
 /// Inter-process communication.
 /// Message passing between processes. Since ThemeliOS is a microkernel,
 /// IPC is the backbone — drivers, filesystems, and services all communicate
@@ -382,6 +387,20 @@ extern "C" fn kmain() -> ! {
     // PIC/PIT init (so timer-driven preemption will work once we enable
     // interrupts).
     sched::init();
+
+    // --- Process table initialization ---
+    //
+    // Create the process table and the kernel process (PID 0). The kernel
+    // process owns all boot-time tasks (bootstrap, idle). The shell task
+    // is assigned later when it's spawned.
+    //
+    // Must happen after scheduler init (so we know the bootstrap and idle
+    // task IDs) and before syscall init.
+    process::init();
+    // Assign existing tasks to the kernel process (PID 0).
+    // Task 0 = bootstrap (main), Task 1 = idle.
+    process::assign_task_to_kernel(0);
+    process::assign_task_to_kernel(1);
 
     // --- Syscall/sysret initialization ---
     //

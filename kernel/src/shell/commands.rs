@@ -7,6 +7,9 @@ use crate::mm;
 use crate::println;
 use crate::sched;
 use crate::sched::task::TaskState;
+use crate::process;
+use crate::process::ProcessState;
+use crate::cap::CapType;
 
 /// Print a list of available commands.
 pub fn cmd_help(_args: &str) {
@@ -18,6 +21,8 @@ pub fn cmd_help(_args: &str) {
     println!("  kill <id>        — kill a task by ID");
     println!("  peek <addr> [n]  — hex dump n bytes at virtual address");
     println!("  pgtable <addr>   — walk page tables for a virtual address");
+    println!("  procs            — list all processes");
+    println!("  caps [pid]       — list capabilities in a process's CSpace");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -272,6 +277,77 @@ pub fn cmd_pgtable(args: &str) {
     // kernel_address_space() returns a lightweight handle — forgetting it
     // is correct because the kernel PML4 is managed globally.
     core::mem::forget(kernel_as);
+}
+
+/// List all processes with PID, name, task count, capability count, and state.
+pub fn cmd_procs(_args: &str) {
+    let procs = process::process_list();
+
+    println!("  {:>4}  {:>8}  {:>5}  {:>4}  {}", "PID", "STATE", "TASKS", "CAPS", "NAME");
+    println!("  {:->4}  {:->8}  {:->5}  {:->4}  {:->20}", "", "", "", "", "");
+    for info in &procs {
+        let state_str = match info.state {
+            ProcessState::Running => "running",
+            ProcessState::Exited => "exited",
+        };
+        println!("  {:>4}  {:>8}  {:>5}  {:>4}  {}",
+            info.pid.as_usize(), state_str, info.task_count, info.cap_count, info.name);
+    }
+    println!("  ({} processes)", procs.len());
+}
+
+/// List capabilities in a process's CSpace.
+///
+/// Usage: `caps [pid]` — defaults to PID 0 (kernel process) if no PID given.
+/// Shows each capability's handle, type, rights, and parent relationship.
+pub fn cmd_caps(args: &str) {
+    let args = args.trim();
+    let pid_val = if args.is_empty() {
+        0usize
+    } else {
+        match args.parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => {
+                println!("Invalid PID: '{}'", args);
+                return;
+            }
+        }
+    };
+
+    let pid = process::ProcessId::new(pid_val);
+    let caps = process::process_caps(pid);
+
+    if caps.is_empty() {
+        println!("  No capabilities (PID {} has no CSpace or is invalid)", pid_val);
+        return;
+    }
+
+    println!("  Capabilities for PID {}:", pid_val);
+    println!("  {:>12}  {:>16}  {:>8}  {}", "HANDLE", "TYPE", "RIGHTS", "DETAILS");
+    println!("  {:->12}  {:->16}  {:->8}  {:->30}", "", "", "", "");
+    for (handle, cap_type, rights) in &caps {
+        let type_str = match cap_type {
+            CapType::Null => "Null",
+            CapType::Memory { .. } => "Memory",
+            CapType::Endpoint { .. } => "Endpoint",
+            CapType::Process { .. } => "Process",
+            CapType::Irq { .. } => "IRQ",
+        };
+        let details = match cap_type {
+            CapType::Null => alloc::string::String::from("-"),
+            CapType::Memory { base, page_count } =>
+                alloc::format!("base={:#x} pages={}", base, page_count),
+            CapType::Endpoint { endpoint_id, badge } =>
+                alloc::format!("eid={} badge={}", endpoint_id, badge),
+            CapType::Process { pid } =>
+                alloc::format!("pid={}", pid),
+            CapType::Irq { irq_number } =>
+                alloc::format!("irq={}", irq_number),
+        };
+        println!("  {:>12}  {:>16}  {:>8}  {}",
+            handle, type_str, rights, details);
+    }
+    println!("  ({} capabilities)", caps.len());
 }
 
 /// We need alloc for Vec in argument parsing.
