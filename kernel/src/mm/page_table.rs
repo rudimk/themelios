@@ -36,7 +36,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::x86_64::cpu;
 use crate::mm::addr::{PhysAddr, VirtAddr};
 use crate::mm::frame;
-use crate::mm::PAGE_SIZE;
 use crate::println;
 
 /// The physical address of the kernel's PML4 table. Stored globally so that

@@ -36,6 +36,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_heap",             func: test_heap },
     TestCase { name: "test_scheduler",        func: test_scheduler },
     TestCase { name: "test_interrupts",       func: test_interrupts },
+    TestCase { name: "test_page_tables",      func: test_page_tables },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -288,4 +289,127 @@ fn test_interrupts() -> Result<(), &'static str> {
     {
         Err("interrupt test not implemented for this architecture")
     }
+}
+
+/// Test the page table manager.
+///
+/// Verifies:
+/// 1. The kernel is running on custom page tables (not Limine's)
+/// 2. Kernel addresses translate correctly (HHDM + kernel image)
+/// 3. Mapping a new page works and the data is accessible
+/// 4. Unmapping a page works and translate returns None
+/// 5. Creating and destroying a user address space doesn't leak frames
+fn test_page_tables() -> Result<(), &'static str> {
+    use crate::mm;
+    use crate::mm::addr::{PhysAddr, VirtAddr};
+    use crate::mm::page_table::{AddressSpace, PageFlags, kernel_address_space};
+
+    // 1. Verify we're on custom page tables (CR3 matches our kernel PML4)
+    let kernel_as = kernel_address_space();
+    let cr3 = crate::arch::x86_64::cpu::read_cr3() & !0xFFF;
+    if cr3 != kernel_as.pml4_phys().as_u64() {
+        core::mem::forget(kernel_as);
+        return Err("CR3 does not match kernel PML4");
+    }
+
+    // 2. Verify kernel HHDM addresses translate correctly.
+    // Pick a known physical address (the first page of usable memory)
+    // and verify translate() resolves the HHDM virtual address correctly.
+    let hhdm = mm::hhdm_offset();
+    let test_phys = PhysAddr::new(0x100000); // 1 MiB — should be in USABLE range
+    let test_virt = VirtAddr::new(test_phys.as_u64() + hhdm);
+    match kernel_as.translate(test_virt) {
+        Some(resolved) => {
+            // The resolved physical address should match (including page offset = 0).
+            if resolved.as_u64() != test_phys.as_u64() {
+                core::mem::forget(kernel_as);
+                return Err("translate: HHDM address resolved to wrong physical address");
+            }
+        }
+        None => {
+            core::mem::forget(kernel_as);
+            return Err("translate: HHDM address not mapped");
+        }
+    }
+
+    // 3. Map a new page, write to it, read back.
+    // Pick a virtual address in the kernel space that's unlikely to be mapped.
+    // We'll use an address in the upper half but not in the HHDM or kernel image.
+    // PML4 index 510, PDP index 0, PD index 0, PT index 0 → 0xFFFFFF0000000000
+    let map_virt = VirtAddr::new(0xFFFF_FF00_0000_0000);
+    let map_phys = mm::frame::allocate_frame()
+        .ok_or("test_page_tables: failed to allocate frame for map test")?;
+
+    // Map the page as writable
+    kernel_as.map_page(map_virt, map_phys, PageFlags::PRESENT | PageFlags::WRITABLE);
+
+    // Verify translate works for the newly mapped page
+    match kernel_as.translate(map_virt) {
+        Some(resolved) => {
+            if resolved.as_u64() != map_phys.as_u64() {
+                core::mem::forget(kernel_as);
+                return Err("translate: mapped page resolved to wrong address");
+            }
+        }
+        None => {
+            core::mem::forget(kernel_as);
+            return Err("translate: mapped page not found");
+        }
+    }
+
+    // Write a magic value through the mapped virtual address and read it back.
+    // SAFETY: we just mapped this page as writable, so the virtual address is valid.
+    unsafe {
+        let ptr = map_virt.as_u64() as *mut u64;
+        core::ptr::write_volatile(ptr, 0xDEAD_BEEF_CAFE_BABE);
+        let readback = core::ptr::read_volatile(ptr);
+        if readback != 0xDEAD_BEEF_CAFE_BABE {
+            core::mem::forget(kernel_as);
+            return Err("mapped page: write/read mismatch");
+        }
+    }
+
+    // 4. Unmap the page and verify translate returns None
+    let unmapped_phys = kernel_as.unmap_page(map_virt);
+    if unmapped_phys.is_none() {
+        core::mem::forget(kernel_as);
+        return Err("unmap_page returned None for a mapped page");
+    }
+    if unmapped_phys.unwrap().as_u64() != map_phys.as_u64() {
+        core::mem::forget(kernel_as);
+        return Err("unmap_page returned wrong physical address");
+    }
+
+    // After unmap, translate should return None
+    if kernel_as.translate(map_virt).is_some() {
+        core::mem::forget(kernel_as);
+        return Err("translate returned Some after unmap");
+    }
+
+    // Free the physical frame we used for the test
+    mm::frame::deallocate_frame(map_phys);
+
+    // 5. Test user address space create/destroy doesn't leak frames
+    let free_before = mm::frame::free_frame_count();
+
+    let user_as = AddressSpace::new_user(&kernel_as);
+    // Just creating a user address space allocates 1 frame (the PML4)
+    let free_after_create = mm::frame::free_frame_count();
+    if free_after_create >= free_before {
+        core::mem::forget(kernel_as);
+        return Err("new_user did not allocate any frames");
+    }
+
+    // Destroy it and verify frames are returned
+    user_as.destroy();
+    let free_after_destroy = mm::frame::free_frame_count();
+    if free_after_destroy != free_before {
+        core::mem::forget(kernel_as);
+        return Err("destroy did not return all frames");
+    }
+
+    // Don't drop the kernel AddressSpace (it's a global handle, not owned).
+    core::mem::forget(kernel_as);
+
+    Ok(())
 }

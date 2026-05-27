@@ -17,6 +17,7 @@ pub fn cmd_help(_args: &str) {
     println!("  spawn [name]     — spawn a test task");
     println!("  kill <id>        — kill a task by ID");
     println!("  peek <addr> [n]  — hex dump n bytes at virtual address");
+    println!("  pgtable <addr>   — walk page tables for a virtual address");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -235,6 +236,38 @@ fn hex_dump(addr: u64, count: usize) {
 
         offset += 16;
     }
+}
+
+/// Walk and print the page table entries for a virtual address.
+///
+/// Usage: `pgtable <hex_addr>`
+/// Shows the PML4, PDP, PD, and PT entries with their physical addresses,
+/// flags, and the final mapping (if present). Useful for debugging page
+/// table issues and verifying that mappings are correct.
+pub fn cmd_pgtable(args: &str) {
+    let args = args.trim();
+    if args.is_empty() {
+        println!("Usage: pgtable <addr>");
+        println!("  addr: virtual address in hex (e.g., 0xffff800000100000)");
+        return;
+    }
+
+    let addr_str = args.trim_start_matches("0x").trim_start_matches("0X");
+    let addr = match u64::from_str_radix(addr_str, 16) {
+        Ok(a) => a,
+        Err(_) => {
+            println!("Invalid address: '{}'", args);
+            return;
+        }
+    };
+
+    let kernel_as = mm::page_table::kernel_address_space();
+    kernel_as.walk_and_print(mm::addr::VirtAddr::new(addr));
+
+    // Don't let the AddressSpace drop (which would free the kernel PML4!).
+    // kernel_address_space() returns a lightweight handle — forgetting it
+    // is correct because the kernel PML4 is managed globally.
+    core::mem::forget(kernel_as);
 }
 
 /// We need alloc for Vec in argument parsing.

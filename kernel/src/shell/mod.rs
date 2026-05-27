@@ -73,6 +73,7 @@ fn shell_entry() {
             "spawn" => commands::cmd_spawn(args),
             "kill" => commands::cmd_kill(args),
             "peek" => commands::cmd_peek(args),
+            "pgtable" => commands::cmd_pgtable(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
             }
