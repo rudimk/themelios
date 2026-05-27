@@ -39,6 +39,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod addr;
 pub mod frame;
 pub mod heap;
+pub mod page_table;
 
 /// Page size: 4 KiB (4096 bytes).
 ///
