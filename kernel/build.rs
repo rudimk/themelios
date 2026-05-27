@@ -83,4 +83,10 @@ fn main() {
     // Pass the ULID to the kernel source via an environment variable.
     // In kernel code, use env!("BUILD_ULID") to access it at compile time.
     println!("cargo:rustc-env=BUILD_ULID={ulid}");
+
+    // Write the ULID to a well-known file in the workspace target directory.
+    // CI workflows and tooling read this to tag releases with the build identifier.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let ulid_path = std::path::Path::new(&manifest_dir).join("../target/build-ulid");
+    let _ = std::fs::write(&ulid_path, &ulid);
 }

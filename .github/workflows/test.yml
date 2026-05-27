@@ -1,4 +1,13 @@
-name: Kernel Tests
+# Single CI workflow for ThemeliOS:
+# - On pull requests: run kernel tests only.
+# - On push to main: run kernel tests, build the release ISO, and publish
+#   it as a GitHub Release tagged with the build ULID.
+#
+# The ULID (Universally Unique Lexicographically Sortable Identifier) is
+# produced by kernel/build.rs and written to target/build-ulid so the
+# release job can read it without parsing build output.
+
+name: CI
 
 on:
   push:
@@ -17,8 +26,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        # rust-toolchain.toml in the repo pins the nightly version.
-        # The action reads it automatically.
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
@@ -41,3 +48,59 @@ jobs:
 
       - name: Run kernel tests
         run: cargo xtask test
+
+  release:
+    name: Release ISO (x86_64)
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo registry and Limine
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/limine
+          key: ${{ runner.os }}-cargo-limine-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-limine-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 xorriso
+
+      - name: Build release ISO
+        run: cargo xtask iso
+
+      - name: Extract build ULID
+        id: ulid
+        run: |
+          ULID=$(cat target/build-ulid)
+          echo "ulid=$ULID" >> "$GITHUB_OUTPUT"
+          echo "Build ULID: $ULID"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.ulid.outputs.ulid }}
+          name: "ThemeliOS Build ${{ steps.ulid.outputs.ulid }}"
+          body: |
+            Automated build from commit ${{ github.sha }}.
+
+            Build ULID: `${{ steps.ulid.outputs.ulid }}`
+          files: target/themelios.iso
