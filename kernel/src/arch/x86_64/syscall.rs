@@ -107,6 +107,22 @@ const PERCPU_USER_RSP: usize = 8;
 /// SYS_NULL: no-op syscall that returns 0. Used to test the syscall path.
 pub const SYS_NULL: u64 = 0;
 
+/// SYS_SEND: send a message to an IPC endpoint (blocks until receiver ready).
+/// RDI = endpoint_id, RSI = pointer to IpcMessage in user memory.
+pub const SYS_SEND: u64 = 1;
+
+/// SYS_RECEIVE: receive a message from an IPC endpoint (blocks until sender ready).
+/// RDI = endpoint_id, RSI = pointer to buffer for received IpcMessage.
+pub const SYS_RECEIVE: u64 = 2;
+
+/// SYS_CALL: send a message and block waiting for reply (RPC pattern).
+/// RDI = endpoint_id, RSI = pointer to IpcMessage, RDX = pointer to reply buffer.
+pub const SYS_CALL: u64 = 3;
+
+/// SYS_REPLY: reply to a call, unblocking the caller.
+/// RDI = endpoint_id, RSI = reply_token, RDX = pointer to reply IpcMessage.
+pub const SYS_REPLY: u64 = 4;
+
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
 /// RDI = the SYS_NULL return value. The handler stores the result and
@@ -337,6 +353,12 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
         SYS_NULL => {
             // No-op syscall. Returns 0 to confirm the syscall path works.
             frame.rax = 0;
+        }
+        SYS_SEND | SYS_RECEIVE | SYS_CALL | SYS_REPLY => {
+            // IPC syscalls are defined for userspace use in later sub-phases.
+            // For Phase 2, IPC is tested kernel-side (direct function calls).
+            // Userspace IPC wiring will be completed in Sub-phase 2.8.
+            frame.rax = !0u64; // -1 = not yet implemented from userspace
         }
         SYS_TEST_COMPLETE => {
             // Internal test syscall: store the test result and kill the task.

@@ -41,6 +41,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_syscall",          func: test_syscall },
     TestCase { name: "test_capabilities",    func: test_capabilities },
     TestCase { name: "test_process",         func: test_process },
+    TestCase { name: "test_ipc",             func: test_ipc },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -812,6 +813,152 @@ fn test_process() -> Result<(), &'static str> {
     // Verify the kernel process cannot be destroyed
     if process::destroy_process(process::ProcessId::KERNEL) {
         return Err("kernel process should not be destroyable");
+    }
+
+    Ok(())
+}
+
+/// Test synchronous IPC: send/receive, call/reply, badge delivery.
+///
+/// Verifies:
+/// 1. Two kernel tasks can exchange messages via an endpoint
+/// 2. Sender blocks until receiver calls receive (rendezvous semantics)
+/// 3. Badge is correctly delivered to receiver
+/// 4. Call/reply pattern: caller blocks, server receives + replies, caller unblocks
+/// 5. Endpoint create/destroy lifecycle
+fn test_ipc() -> Result<(), &'static str> {
+    use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+    use crate::ipc;
+    use crate::sched;
+
+    // ---- Part 1: Basic send/receive ----
+
+    /// Shared state for the send/receive test.
+    static SEND_RECV_EP: AtomicU64 = AtomicU64::new(0);
+    static RECV_WORD0: AtomicU64 = AtomicU64::new(0);
+    static RECV_WORD1: AtomicU64 = AtomicU64::new(0);
+    static RECV_BADGE: AtomicU64 = AtomicU64::new(0);
+    static RECV_DONE: AtomicBool = AtomicBool::new(false);
+
+    /// Sender task: sends a message with a badge.
+    fn sender_task() {
+        let ep_id = SEND_RECV_EP.load(Ordering::SeqCst);
+        let msg = crate::ipc::IpcMessage::new([0xDEAD, 0xBEEF, 0, 0]);
+        crate::ipc::ipc_send(ep_id, msg, 42).expect("send failed");
+    }
+
+    /// Receiver task: receives a message and stores the result in globals.
+    fn receiver_task() {
+        let ep_id = SEND_RECV_EP.load(Ordering::SeqCst);
+        let msg = crate::ipc::ipc_receive(ep_id).expect("receive failed");
+        RECV_WORD0.store(msg.words[0], Ordering::SeqCst);
+        RECV_WORD1.store(msg.words[1], Ordering::SeqCst);
+        RECV_BADGE.store(msg.badge, Ordering::SeqCst);
+        RECV_DONE.store(true, Ordering::SeqCst);
+    }
+
+    // Create an endpoint
+    let ep_id = ipc::create_endpoint("test-ep");
+    SEND_RECV_EP.store(ep_id, Ordering::SeqCst);
+    RECV_DONE.store(false, Ordering::SeqCst);
+    RECV_WORD0.store(0, Ordering::SeqCst);
+    RECV_WORD1.store(0, Ordering::SeqCst);
+    RECV_BADGE.store(0, Ordering::SeqCst);
+
+    // Spawn receiver first (it will block waiting for a sender)
+    sched::spawn("ipc-recv", receiver_task);
+    // Spawn sender (it will find the blocked receiver and deliver immediately,
+    // or block until the receiver arrives)
+    sched::spawn("ipc-send", sender_task);
+
+    // Yield to let both tasks run
+    for _ in 0..10_000 {
+        if RECV_DONE.load(Ordering::SeqCst) {
+            break;
+        }
+        sched::yield_now();
+    }
+
+    if !RECV_DONE.load(Ordering::SeqCst) {
+        return Err("IPC send/receive: timed out");
+    }
+    if RECV_WORD0.load(Ordering::SeqCst) != 0xDEAD {
+        return Err("IPC send/receive: word[0] mismatch");
+    }
+    if RECV_WORD1.load(Ordering::SeqCst) != 0xBEEF {
+        return Err("IPC send/receive: word[1] mismatch");
+    }
+    if RECV_BADGE.load(Ordering::SeqCst) != 42 {
+        return Err("IPC send/receive: badge mismatch");
+    }
+
+    // ---- Part 2: Call/reply (RPC pattern) ----
+
+    static CALL_REPLY_EP: AtomicU64 = AtomicU64::new(0);
+    static CALL_RESULT: AtomicU64 = AtomicU64::new(0);
+    static CALL_DONE: AtomicBool = AtomicBool::new(false);
+
+    /// Client task: sends a "call" with a number and expects the square back.
+    fn client_task() {
+        let ep_id = CALL_REPLY_EP.load(Ordering::SeqCst);
+        let msg = crate::ipc::IpcMessage::new([7, 0, 0, 0]); // "compute square of 7"
+        let reply = crate::ipc::ipc_call(ep_id, msg, 0).expect("call failed");
+        CALL_RESULT.store(reply.words[0], Ordering::SeqCst);
+        CALL_DONE.store(true, Ordering::SeqCst);
+    }
+
+    /// Server task: receives a call, computes the square, and replies.
+    fn server_task() {
+        let ep_id = CALL_REPLY_EP.load(Ordering::SeqCst);
+        let request = crate::ipc::ipc_receive(ep_id).expect("server receive failed");
+        let value = request.words[0];
+        let reply_token = request.reply_token;
+
+        // Compute and reply
+        let reply = crate::ipc::IpcMessage::new([value * value, 0, 0, 0]);
+        crate::ipc::ipc_reply(ep_id, reply_token, reply).expect("reply failed");
+    }
+
+    let call_ep = ipc::create_endpoint("test-call");
+    CALL_REPLY_EP.store(call_ep, Ordering::SeqCst);
+    CALL_DONE.store(false, Ordering::SeqCst);
+    CALL_RESULT.store(0, Ordering::SeqCst);
+
+    // Spawn server first so it's ready to receive
+    sched::spawn("ipc-server", server_task);
+    // Spawn client that will call the server
+    sched::spawn("ipc-client", client_task);
+
+    for _ in 0..10_000 {
+        if CALL_DONE.load(Ordering::SeqCst) {
+            break;
+        }
+        sched::yield_now();
+    }
+
+    if !CALL_DONE.load(Ordering::SeqCst) {
+        return Err("IPC call/reply: timed out");
+    }
+    if CALL_RESULT.load(Ordering::SeqCst) != 49 {
+        return Err("IPC call/reply: expected 49 (7*7), got wrong value");
+    }
+
+    // ---- Part 3: Endpoint lifecycle ----
+
+    // Destroy the test endpoints
+    if !ipc::destroy_endpoint(ep_id) {
+        return Err("destroy_endpoint failed for send/recv endpoint");
+    }
+    if !ipc::destroy_endpoint(call_ep) {
+        return Err("destroy_endpoint failed for call/reply endpoint");
+    }
+
+    // Sending to a destroyed endpoint should fail
+    let msg = ipc::IpcMessage::new([0, 0, 0, 0]);
+    match ipc::ipc_send(ep_id, msg, 0) {
+        Err(ipc::IpcError::InvalidEndpoint) => { /* expected */ }
+        Ok(_) => return Err("send to destroyed endpoint should fail"),
+        Err(_) => return Err("send to destroyed endpoint returned wrong error"),
     }
 
     Ok(())
