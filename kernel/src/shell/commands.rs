@@ -10,6 +10,7 @@ use crate::sched::task::TaskState;
 use crate::process;
 use crate::process::ProcessState;
 use crate::cap::CapType;
+use crate::audit;
 
 /// Print a list of available commands.
 pub fn cmd_help(_args: &str) {
@@ -23,6 +24,7 @@ pub fn cmd_help(_args: &str) {
     println!("  pgtable <addr>   — walk page tables for a virtual address");
     println!("  procs            — list all processes");
     println!("  caps [pid]       — list capabilities in a process's CSpace");
+    println!("  audit [n]        — show last n audit log entries (default 20)");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -348,6 +350,58 @@ pub fn cmd_caps(args: &str) {
             handle, type_str, rights, details);
     }
     println!("  ({} capabilities)", caps.len());
+}
+
+/// Display the last N entries from the kernel audit log.
+///
+/// Usage: `audit [n]` where `n` is the number of entries to show (default 20).
+/// Shows sequence number, tick count, source PID, operation, capability type,
+/// and operation-specific detail.
+pub fn cmd_audit(args: &str) {
+    let args = args.trim();
+    let count = if args.is_empty() {
+        20usize
+    } else {
+        match args.parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => {
+                println!("Invalid count: '{}'", args);
+                return;
+            }
+        }
+    };
+
+    let entries = audit::last_entries(count);
+    let total = audit::total_event_count();
+
+    if entries.is_empty() {
+        println!("  Audit log is empty (0 events recorded)");
+        return;
+    }
+
+    println!("  Audit log ({} total events, showing last {}):", total, entries.len());
+    println!("  {:>6}  {:>8}  {:>6}  {:>14}  {:>10}  {:>12}",
+        "SEQ", "TICK", "PID", "OPERATION", "CAP_TYPE", "DETAIL");
+    println!("  {:->6}  {:->8}  {:->6}  {:->14}  {:->10}  {:->12}",
+        "", "", "", "", "", "");
+
+    for entry in &entries {
+        let type_str = match entry.cap_type {
+            CapType::Null => "Null",
+            CapType::Memory { .. } => "Memory",
+            CapType::Endpoint { .. } => "Endpoint",
+            CapType::Process { .. } => "Process",
+            CapType::Irq { .. } => "IRQ",
+        };
+
+        println!("  {:>6}  {:>8}  {:>6}  {:>14}  {:>10}  {:#012x}",
+            entry.seq,
+            entry.timestamp,
+            entry.source_pid.as_usize(),
+            entry.operation,
+            type_str,
+            entry.detail);
+    }
 }
 
 /// We need alloc for Vec in argument parsing.

@@ -149,6 +149,12 @@ mod process;
 /// through IPC channels.
 mod ipc;
 
+/// Audit logging.
+/// A tamper-evident ring buffer recording all security-relevant kernel
+/// operations: capability create/grant/revoke, IPC send/receive, and
+/// syscall invocations. Kernel-internal only in Phase 2.
+mod audit;
+
 /// Device drivers.
 /// VirtIO drivers for block devices, network interfaces, and console.
 /// Platform-specific drivers for timers, interrupt controllers, etc.

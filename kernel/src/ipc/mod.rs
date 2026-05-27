@@ -44,6 +44,8 @@ use crate::sync::InterruptMutex;
 use crate::sched;
 use crate::sched::task::TaskId;
 use crate::cap::CapHandle;
+use crate::cap::CapType;
+use crate::audit;
 
 use endpoint::{Endpoint, WaitingSender, WaitingReceiver, WaitingCaller};
 
@@ -229,6 +231,15 @@ pub fn ipc_send(endpoint_id: u64, mut message: IpcMessage, badge: u64) -> Result
     message.badge = badge;
     let current_task = sched::current_task_id();
 
+    // Audit log the send attempt. Logged before blocking so the event
+    // appears even if the sender waits a long time for a receiver.
+    audit::log_event(
+        sched::current_process_id(),
+        audit::AuditOp::IpcSend,
+        CapType::Endpoint { endpoint_id, badge },
+        endpoint_id,
+    );
+
     // Disable interrupts BEFORE acquiring the endpoint lock to prevent
     // a lost-wakeup race: if a timer interrupt fires between dropping
     // the lock (which would re-enable interrupts) and calling
@@ -292,6 +303,14 @@ pub fn ipc_send(endpoint_id: u64, mut message: IpcMessage, badge: u64) -> Result
 pub fn ipc_receive(endpoint_id: u64) -> Result<IpcMessage, IpcError> {
     let current_task = sched::current_task_id();
 
+    // Audit log the receive attempt.
+    audit::log_event(
+        sched::current_process_id(),
+        audit::AuditOp::IpcReceive,
+        CapType::Endpoint { endpoint_id, badge: 0 },
+        endpoint_id,
+    );
+
     // Disable interrupts to prevent lost-wakeup race (see ipc_send comment).
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::cpu::cli();
@@ -348,6 +367,14 @@ pub fn ipc_call(endpoint_id: u64, mut message: IpcMessage, badge: u64) -> Result
     message.badge = badge;
     let current_task = sched::current_task_id();
 
+    // Audit log the call attempt.
+    audit::log_event(
+        sched::current_process_id(),
+        audit::AuditOp::IpcCall,
+        CapType::Endpoint { endpoint_id, badge },
+        endpoint_id,
+    );
+
     // Disable interrupts to prevent lost-wakeup race (see ipc_send comment).
     // For call(), the caller ALWAYS blocks (waiting for reply), so we never
     // take a non-blocking early return — sti() happens inside block_current_task().
@@ -403,6 +430,14 @@ pub fn ipc_call(endpoint_id: u64, mut message: IpcMessage, badge: u64) -> Result
 /// The reply token is single-use: after the reply is delivered, the
 /// caller's wait entry is removed from the endpoint.
 pub fn ipc_reply(endpoint_id: u64, reply_token: u64, reply_msg: IpcMessage) -> Result<(), IpcError> {
+    // Audit log the reply.
+    audit::log_event(
+        sched::current_process_id(),
+        audit::AuditOp::IpcReply,
+        CapType::Endpoint { endpoint_id, badge: 0 },
+        endpoint_id,
+    );
+
     let mut registry = ENDPOINT_REGISTRY.lock();
     let ep = find_endpoint_mut(&mut registry, endpoint_id)
         .ok_or(IpcError::InvalidEndpoint)?;

@@ -76,6 +76,7 @@ fn shell_entry() {
             "pgtable" => commands::cmd_pgtable(args),
             "procs" => commands::cmd_procs(args),
             "caps" => commands::cmd_caps(args),
+            "audit" => commands::cmd_audit(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
             }

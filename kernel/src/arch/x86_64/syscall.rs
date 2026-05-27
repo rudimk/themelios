@@ -349,6 +349,15 @@ unsafe extern "C" fn syscall_entry() {
 /// interrupts should be re-enabled after the kernel stack switch is complete.
 #[no_mangle]
 extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
+    // Audit log every syscall invocation. The detail field carries the
+    // syscall number so the audit trail shows exactly what userspace requested.
+    crate::audit::log_event(
+        crate::sched::current_process_id(),
+        crate::audit::AuditOp::Syscall,
+        crate::cap::CapType::Null,
+        frame.rax,
+    );
+
     match frame.rax {
         SYS_NULL => {
             // No-op syscall. Returns 0 to confirm the syscall path works.

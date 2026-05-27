@@ -36,6 +36,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 use super::{Capability, CapHandle, CapRights, CapType, MAX_CSPACE_SIZE};
+use crate::audit;
 
 /// Error type for CSpace operations.
 ///
@@ -141,12 +142,21 @@ impl CSpace {
     /// appended. Returns a `CapHandle` encoding the slot index and current
     /// generation, or `Err(CapError::SpaceFull)` if the CSpace is at capacity.
     pub fn insert(&mut self, cap: Capability) -> Result<CapHandle, CapError> {
+        let cap_type = cap.cap_type;
+
         // Scan for the first free slot (skip index 0, which is always Null)
         for i in 1..self.slots.len() {
             if self.slots[i].capability.is_none() {
                 let gen = self.slots[i].generation;
                 self.slots[i].capability = Some(cap);
-                return Ok(CapHandle::new(i, gen));
+                let handle = CapHandle::new(i, gen);
+                audit::log_event(
+                    crate::sched::current_process_id(),
+                    audit::AuditOp::CapCreate,
+                    cap_type,
+                    handle.as_raw() as u64,
+                );
+                return Ok(handle);
             }
         }
 
@@ -160,7 +170,14 @@ impl CSpace {
             capability: Some(cap),
             generation: 0,
         });
-        Ok(CapHandle::new(index, 0))
+        let handle = CapHandle::new(index, 0);
+        audit::log_event(
+            crate::sched::current_process_id(),
+            audit::AuditOp::CapCreate,
+            cap_type,
+            handle.as_raw() as u64,
+        );
+        Ok(handle)
     }
 
     /// Look up a capability by handle.
@@ -285,6 +302,15 @@ impl CSpace {
             parent: Some(source_handle),
         };
 
+        // insert() logs CapCreate — we also log the grant relationship
+        // so the audit trail shows the derivation chain.
+        audit::log_event(
+            crate::sched::current_process_id(),
+            audit::AuditOp::CapGrant,
+            cap_type,
+            source_handle.as_raw() as u64,
+        );
+
         self.insert(derived)
     }
 
@@ -313,6 +339,15 @@ impl CSpace {
         if slot.capability.is_none() {
             return Err(CapError::SlotEmpty);
         }
+
+        // Log the revocation before we start invalidating capabilities.
+        let cap_type = slot.capability.as_ref().unwrap().cap_type;
+        audit::log_event(
+            crate::sched::current_process_id(),
+            audit::AuditOp::CapRevoke,
+            cap_type,
+            handle.as_raw() as u64,
+        );
 
         // Collect all handles that need to be revoked. We do this in rounds:
         // each round finds capabilities whose parent is in the "to revoke" set.
