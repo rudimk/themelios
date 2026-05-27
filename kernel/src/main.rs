@@ -328,6 +328,19 @@ extern "C" fn kmain() -> ! {
             mm::heap::used(), mm::heap::free());
     }
 
+    // --- Page table initialization ---
+    //
+    // Switch from Limine's page tables to our own. This creates a new PML4
+    // that clones Limine's kernel mappings (HHDM + kernel image) and writes
+    // it to CR3. After this, we own the page tables and can:
+    // - Map/unmap individual pages (guard pages, heap growth)
+    // - Create per-process address spaces (Phase 2 isolation)
+    // - Reclaim bootloader-reclaimable memory (Sub-phase 2.2)
+    //
+    // Must happen after heap init (allocates a PML4 frame from the frame
+    // allocator, and the AddressSpace methods use println! which needs heap).
+    mm::page_table::init();
+
     // Initialize the 8259 PIC and remap hardware IRQs to vectors 32-47.
     // Must happen after IDT setup (so IRQ vectors have handlers installed).
     // After this, all IRQ lines are masked — individual IRQs are unmasked

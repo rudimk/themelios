@@ -31,11 +31,85 @@
 //! The lower half (PML4 indices 0-255) is per-process and maps user code,
 //! data, and stack.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::arch::x86_64::cpu;
 use crate::mm::addr::{PhysAddr, VirtAddr};
 use crate::mm::frame;
 use crate::mm::PAGE_SIZE;
 use crate::println;
+
+/// The physical address of the kernel's PML4 table. Stored globally so that
+/// new user address spaces can copy the kernel upper-half entries, and so
+/// the page table manager can be used from anywhere in the kernel.
+///
+/// Set once during boot by `init()`, then read-only. Zero means uninitialized.
+static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the kernel's own page tables and switch away from Limine's.
+///
+/// Creates a new PML4 that clones Limine's upper-half entries (HHDM, kernel
+/// image, kernel heap) and writes it to CR3. After this call, Limine's page
+/// tables are no longer active and bootloader-reclaimable memory can be
+/// safely reclaimed (in Sub-phase 2.2).
+///
+/// Must be called after the frame allocator and heap are initialized (this
+/// function allocates a PML4 frame), but before the scheduler (which doesn't
+/// depend on page tables yet, but future sub-phases will modify the scheduler
+/// to switch CR3 on context switch).
+pub fn init() {
+    let kernel_as = AddressSpace::new_kernel();
+    let pml4_phys = kernel_as.pml4_phys().as_u64();
+
+    // Store the kernel PML4 address globally before switching, so that
+    // kernel_address_space() works immediately after the switch.
+    KERNEL_PML4_PHYS.store(pml4_phys, Ordering::Relaxed);
+
+    // The critical moment: switch CR3 from Limine's page tables to ours.
+    // If our PML4 is wrong (missing kernel mappings, bad addresses), the
+    // CPU will immediately triple-fault. The fact that we reach the next
+    // println! means the switch succeeded.
+    //
+    // SAFETY: kernel_as.pml4_phys is a valid page-aligned physical address
+    // of a PML4 that maps all kernel code and data identically to Limine's
+    // tables (we copied the upper-half entries). The currently executing code
+    // and stack are in the upper half, so they remain valid after the switch.
+    unsafe {
+        cpu::write_cr3(pml4_phys);
+    }
+
+    println!("[pgtable] Switched to kernel page tables (CR3 = {:#x})", pml4_phys);
+
+    // Verify the switch by reading back CR3 and checking it matches.
+    let readback = cpu::read_cr3() & !0xFFF;
+    assert!(
+        readback == pml4_phys,
+        "CR3 readback mismatch: expected {:#x}, got {:#x}",
+        pml4_phys, readback
+    );
+
+    // Note: we intentionally "forget" the AddressSpace struct here. The kernel's
+    // address space lives forever — it's never destroyed. The PML4 physical
+    // address is stored in KERNEL_PML4_PHYS for future access.
+    core::mem::forget(kernel_as);
+}
+
+/// Get an `AddressSpace` handle for the kernel's page tables.
+///
+/// This is used by other subsystems (guard pages, heap growth, process creation)
+/// to map/unmap pages in the kernel address space or to copy kernel PML4 entries
+/// into new user address spaces.
+///
+/// # Panics
+///
+/// Panics if called before `init()`.
+pub fn kernel_address_space() -> AddressSpace {
+    let phys = KERNEL_PML4_PHYS.load(Ordering::Relaxed);
+    assert!(phys != 0, "kernel_address_space: page table manager not initialized");
+    AddressSpace {
+        pml4_phys: PhysAddr::new(phys),
+    }
+}
 
 /// Number of entries in each page table level (PML4, PDP, PD, PT).
 /// x86_64 uses 9 bits per level → 2^9 = 512 entries.
