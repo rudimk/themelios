@@ -353,6 +353,99 @@ pub fn interrupts_enabled() -> bool {
     rflags & (1 << 9) != 0
 }
 
+// --- Page table / virtual memory support ---
+//
+// These functions provide the raw CPU operations for manipulating page tables:
+// reading/writing the CR3 register (which holds the physical address of the
+// active PML4 page table) and invalidating individual TLB entries.
+
+/// Read the current value of the CR3 register.
+///
+/// CR3 holds the physical address of the top-level page table (PML4) for the
+/// currently active address space. On x86_64, the lower 12 bits of CR3 contain
+/// flags (PCID, PWT, PCD) but the physical address portion is bits 12-51
+/// (the PML4 must be page-aligned, so the low 12 bits of the address are
+/// implicitly zero).
+///
+/// Returns the raw CR3 value including flags. Mask with `!0xFFF` to get
+/// just the PML4 physical address.
+#[inline(always)]
+pub fn read_cr3() -> u64 {
+    let value: u64;
+    // SAFETY: reading CR3 is a privileged but non-destructive operation.
+    // It simply returns the current page table base address.
+    unsafe {
+        asm!(
+            "mov {}, cr3",
+            out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
+/// Write a new value to the CR3 register, switching the active page table.
+///
+/// This causes the CPU to start using the PML4 at `value` (physical address)
+/// for all address translations. Writing CR3 also flushes all non-global TLB
+/// entries, ensuring stale translations from the old page table don't linger.
+///
+/// # Safety
+///
+/// - `value` must be the physical address of a valid, page-aligned PML4 table.
+/// - The new page table must correctly map the currently executing code and
+///   stack, or execution will immediately fault.
+/// - The new page table must map the kernel's HHDM and code regions identically
+///   to the current table (for the kernel upper-half, this is guaranteed by
+///   copying PML4 entries 256-511).
+#[inline(always)]
+pub unsafe fn write_cr3(value: u64) {
+    // SAFETY: caller guarantees the page table is valid and maps
+    // currently executing code correctly. The `volatile` nature of CR3
+    // writes means we must not let the compiler reorder or eliminate this.
+    unsafe {
+        asm!(
+            "mov cr3, {}",
+            in(reg) value,
+            // No nomem: writing CR3 changes the memory mapping, which affects
+            // how all subsequent memory accesses resolve. The compiler must not
+            // reorder loads/stores across this point.
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Invalidate the TLB entry for a single virtual address.
+///
+/// Executes the `invlpg` instruction, which removes the cached translation
+/// for the page containing `addr` from the TLB. This must be called after
+/// unmapping or modifying a page table entry to ensure the CPU uses the
+/// updated mapping.
+///
+/// On a multi-core system, `invlpg` only affects the current core's TLB —
+/// a TLB shootdown IPI would be needed for other cores. On our single-core
+/// Phase 2 system, this is sufficient.
+///
+/// # Safety
+///
+/// The address must be a valid virtual address. Invalidating a TLB entry for
+/// a mapped page is safe (the next access will re-walk the page table), but
+/// invalidating kernel code pages in a hot loop could cause performance issues.
+#[inline(always)]
+pub unsafe fn invlpg(addr: u64) {
+    // SAFETY: invlpg invalidates a single TLB entry. The CPU will re-walk
+    // the page tables on the next access to this address. This is safe
+    // but must be called at the right time (after modifying PTEs).
+    unsafe {
+        asm!(
+            "invlpg [{}]",
+            in(reg) addr,
+            // No nomem: the whole point is to change how memory is accessed.
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 // --- QEMU test infrastructure ---
 
 /// I/O port for the QEMU `isa-debug-exit` device.
