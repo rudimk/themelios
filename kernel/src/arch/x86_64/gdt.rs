@@ -14,16 +14,28 @@
 //!
 //! ## GDT layout
 //!
-//! Our GDT has 5 logical entries (occupying 5 u64 slots):
+//! Our GDT has 7 logical entries (occupying 7 u64 slots):
 //!
 //! | Index | Selector | Description |
 //! |-------|----------|-------------|
 //! | 0     | 0x00     | Null descriptor (required by CPU) |
-//! | 1     | 0x08     | Kernel code segment (64-bit, ring 0) |
-//! | 2     | 0x10     | Kernel data segment (ring 0) |
-//! | 3-4   | 0x18     | TSS descriptor (16 bytes, spans two slots) |
+//! | 1     | 0x08     | Kernel code segment (64-bit, ring 0, DPL=0) |
+//! | 2     | 0x10     | Kernel data segment (ring 0, DPL=0) |
+//! | 3     | 0x18     | User data segment (ring 3, DPL=3) |
+//! | 4     | 0x20     | User code segment (64-bit, ring 3, DPL=3) |
+//! | 5-6   | 0x28     | TSS descriptor (16 bytes, spans two slots) |
 //!
 //! The selector value = index * 8 (each GDT entry is 8 bytes).
+//!
+//! ## Why user data comes before user code
+//!
+//! The `sysret` instruction computes segment selectors from the STAR MSR:
+//! - SS = STAR[63:48] + 8 (ORed with RPL=3)
+//! - CS = STAR[63:48] + 16 (ORed with RPL=3)
+//!
+//! With STAR[63:48] = 0x10, sysret loads SS = 0x18|3 = 0x1B (user data) and
+//! CS = 0x20|3 = 0x23 (user code). This only works if user data is at 0x18
+//! and user code is at 0x20 — hence the ordering.
 //!
 //! ## TSS purpose
 //!
@@ -67,13 +79,22 @@ use crate::println;
 
 /// Segment selector for the kernel code segment (GDT index 1, RPL 0).
 #[allow(clippy::identity_op)]
-pub const KERNEL_CODE_SELECTOR: u16 = 1 * 8;
+pub const KERNEL_CODE_SELECTOR: u16 = 1 * 8;   // 0x08
 
 /// Segment selector for the kernel data segment (GDT index 2, RPL 0).
-pub const KERNEL_DATA_SELECTOR: u16 = 2 * 8;
+pub const KERNEL_DATA_SELECTOR: u16 = 2 * 8;   // 0x10
 
-/// Segment selector for the TSS (GDT index 3, RPL 0).
-const TSS_SELECTOR: u16 = 3 * 8;
+/// Segment selector for the user data segment (GDT index 3, RPL 3).
+/// RPL=3 is ORed in by `sysret` automatically — the raw selector is 0x18.
+pub const USER_DATA_SELECTOR: u16 = 3 * 8;     // 0x18
+
+/// Segment selector for the user code segment (GDT index 4, RPL 3).
+/// RPL=3 is ORed in by `sysret` automatically — the raw selector is 0x20.
+pub const USER_CODE_SELECTOR: u16 = 4 * 8;     // 0x20
+
+/// Segment selector for the TSS (GDT index 5, RPL 0).
+/// Moved from index 3 to index 5 to make room for user segments.
+const TSS_SELECTOR: u16 = 5 * 8;               // 0x28
 
 /// IST index for the double-fault handler (used in the IDT entry).
 ///
@@ -118,6 +139,24 @@ const KERNEL_CODE_64: u64 = 0x00209A0000000000;
 /// Base and limit = 0 (ignored in 64-bit mode).
 const KERNEL_DATA_64: u64 = 0x0000920000000000;
 
+/// User data segment descriptor (ring 3, DPL=3).
+///
+/// Identical to the kernel data segment except DPL is set to 3 (ring 3),
+/// allowing userspace code to use this segment for SS, DS, ES.
+///
+/// Access byte = 0xF2: Present=1, DPL=11, Type=1, Exec=0, Direction=0, Write=1, Access=0
+/// Flags = 0x0: Long=0 (not applicable to data), Size=0, Granularity=0
+const USER_DATA_64: u64 = 0x0000F20000000000;
+
+/// User code segment descriptor (64-bit, ring 3, DPL=3).
+///
+/// Identical to the kernel code segment except DPL is set to 3 (ring 3),
+/// allowing userspace code to execute in this segment.
+///
+/// Access byte = 0xFA: Present=1, DPL=11, Type=1, Exec=1, Conform=0, Read=1, Access=0
+/// Flags = 0x2: Long=1 (64-bit mode), Size=0, Granularity=0
+const USER_CODE_64: u64 = 0x0020FA0000000000;
+
 // --- Static structures ---
 //
 // These are `static mut` because they must live at fixed addresses for the
@@ -127,8 +166,8 @@ const KERNEL_DATA_64: u64 = 0x0000920000000000;
 // on every interrupt and privilege transition.
 
 /// Number of u64 entries in the GDT.
-/// 5 entries: null + kernel code + kernel data + TSS low + TSS high.
-const GDT_ENTRY_COUNT: usize = 5;
+/// 7 entries: null + kernel code + kernel data + user data + user code + TSS low + TSS high.
+const GDT_ENTRY_COUNT: usize = 7;
 
 /// The raw GDT table. Filled in during `init()`, then loaded with `lgdt`.
 static mut GDT: [u64; GDT_ENTRY_COUNT] = [0; GDT_ENTRY_COUNT];
@@ -256,7 +295,7 @@ fn make_tss_descriptor(base: u64, limit: u64) -> (u64, u64) {
 ///
 /// This sets up:
 /// 1. The double-fault IST stack in the TSS
-/// 2. The GDT entries (null, kernel code, kernel data, TSS descriptor)
+/// 2. The GDT entries (null, kcode, kdata, udata, ucode, TSS descriptor)
 /// 3. Loads the GDT via `lgdt`
 /// 4. Reloads CS/DS/ES/SS to use the new kernel segments
 /// 5. Loads the TSS via `ltr`
@@ -300,13 +339,21 @@ pub fn init() {
         // Entry 1: Kernel code segment — the segment we execute kernel code in.
         (*gdt)[1] = KERNEL_CODE_64;
 
-        // Entry 2: Kernel data segment — used for DS, ES, SS.
+        // Entry 2: Kernel data segment — used for DS, ES, SS in ring 0.
         (*gdt)[2] = KERNEL_DATA_64;
 
-        // Entries 3-4: TSS descriptor — spans two slots because the 64-bit
+        // Entry 3: User data segment (DPL=3) — loaded into SS by sysret
+        // (SS = STAR[63:48]+8 = 0x10+8 = 0x18, which is index 3).
+        (*gdt)[3] = USER_DATA_64;
+
+        // Entry 4: User code segment (DPL=3) — loaded into CS by sysret
+        // (CS = STAR[63:48]+16 = 0x10+16 = 0x20, which is index 4).
+        (*gdt)[4] = USER_CODE_64;
+
+        // Entries 5-6: TSS descriptor — spans two slots because the 64-bit
         // base address doesn't fit in a single 8-byte descriptor.
-        (*gdt)[3] = tss_low;
-        (*gdt)[4] = tss_high;
+        (*gdt)[5] = tss_low;
+        (*gdt)[6] = tss_high;
 
         // --- Step 3: Load the GDT ---
         //
@@ -335,4 +382,28 @@ pub fn init() {
 
     println!("GDT loaded (kernel code=0x{:02X}, data=0x{:02X}, TSS=0x{:02X})",
         KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR, TSS_SELECTOR);
+}
+
+/// Update the TSS RSP0 field to point to the given kernel stack top.
+///
+/// RSP0 is the stack pointer loaded by the CPU when transitioning from ring 3
+/// (user mode) to ring 0 (kernel mode) — e.g., on a syscall or interrupt while
+/// running userspace code. Each task needs its own kernel stack, so RSP0 must
+/// be updated on every context switch to the new task's kernel stack top.
+///
+/// # Safety
+///
+/// This function writes to `static mut TSS`. It is safe to call from the
+/// scheduler's context switch path because:
+/// - Interrupts are disabled during context switch (no concurrent access)
+/// - Only one core exists (single-core system)
+/// - The write is a single aligned u64 store (atomic on x86_64)
+pub fn set_tss_rsp0(stack_top: u64) {
+    // SAFETY: interrupts are disabled during context switch, ensuring
+    // exclusive access to the TSS. The TSS is at a fixed address in
+    // static memory that outlives the kernel.
+    unsafe {
+        let tss = &raw mut TSS;
+        (*tss).rsp[0] = stack_top;
+    }
 }

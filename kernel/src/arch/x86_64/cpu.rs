@@ -446,6 +446,97 @@ pub unsafe fn invlpg(addr: u64) {
     }
 }
 
+// --- Model-Specific Registers (MSRs) ---
+//
+// MSRs are CPU configuration registers accessed via `rdmsr` and `wrmsr` instructions.
+// Each MSR has a 32-bit address (specified in ECX) and a 64-bit value (split across
+// EDX:EAX for historical reasons — high 32 bits in EDX, low 32 bits in EAX).
+//
+// Key MSRs for syscall/sysret:
+// - IA32_EFER (0xC0000080): Extended Feature Enable Register (SCE bit enables syscall)
+// - IA32_STAR (0xC0000081): Segment selectors for syscall/sysret transitions
+// - IA32_LSTAR (0xC0000082): RIP target for syscall entry (64-bit mode)
+// - IA32_FMASK (0xC0000084): RFLAGS mask applied on syscall entry
+// - IA32_GS_BASE (0xC0000101): Current GS segment base (userspace GS)
+// - IA32_KERNEL_GS_BASE (0xC0000102): Kernel GS base (swapped in by swapgs)
+
+/// Read a Model-Specific Register (MSR).
+///
+/// Returns the 64-bit value of the MSR at the given address. The `rdmsr`
+/// instruction puts the low 32 bits in EAX and the high 32 bits in EDX;
+/// we combine them into a single u64.
+///
+/// # Safety
+///
+/// Reading an unimplemented or reserved MSR causes a #GP exception.
+/// The caller must ensure the MSR address is valid.
+#[inline(always)]
+pub unsafe fn rdmsr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+/// Write a value to a Model-Specific Register (MSR).
+///
+/// Writes a 64-bit value to the MSR at the given address. The `wrmsr`
+/// instruction takes the low 32 bits from EAX and the high 32 bits from EDX.
+///
+/// # Safety
+///
+/// - Writing to an unimplemented or reserved MSR causes a #GP exception.
+/// - Writing incorrect values to MSRs can crash the system or cause undefined
+///   behavior (e.g., a bad IA32_LSTAR causes syscall to jump to garbage).
+/// - The caller must ensure the MSR address and value are correct.
+#[inline(always)]
+pub unsafe fn wrmsr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+/// Execute the `swapgs` instruction.
+///
+/// Atomically swaps the values of `IA32_GS_BASE` (MSR 0xC0000101) and
+/// `IA32_KERNEL_GS_BASE` (MSR 0xC0000102). Used at syscall entry (swap
+/// user GS for kernel GS, giving access to the PerCpu struct) and syscall
+/// exit (swap kernel GS back to user GS before returning to ring 3).
+///
+/// After `swapgs` at syscall entry, `gs:0` points to the PerCpu struct
+/// containing the current task's kernel stack pointer.
+///
+/// # Safety
+///
+/// Must only be called at ring transitions (syscall entry/exit). Calling
+/// swapgs twice without an intervening ring transition leaves the GS bases
+/// in the wrong state (user GS in the kernel slot and vice versa).
+#[inline(always)]
+pub unsafe fn swapgs() {
+    unsafe {
+        asm!(
+            "swapgs",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
 // --- QEMU test infrastructure ---
 
 /// I/O port for the QEMU `isa-debug-exit` device.
