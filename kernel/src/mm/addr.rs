@@ -100,6 +100,69 @@ impl VirtAddr {
     pub fn as_mut_ptr<T>(self) -> *mut T {
         self.0 as *mut T
     }
+
+    // --- Page table index extraction ---
+    //
+    // A 48-bit virtual address is decomposed into indices for the 4-level page
+    // table walk. Each level uses 9 bits (512 entries per table):
+    //
+    //   63      48 47    39 38    30 29    21 20    12 11       0
+    //  ┌─────────┬────────┬────────┬────────┬────────┬──────────┐
+    //  │sign ext. │ PML4   │  PDP   │   PD   │   PT   │  offset  │
+    //  │ (16 bits)│(9 bits)│(9 bits)│(9 bits)│(9 bits)│ (12 bits)│
+    //  └─────────┴────────┴────────┴────────┴────────┴──────────┘
+    //
+    // The sign-extension bits (48-63) must match bit 47 for canonical addresses.
+
+    /// Extract the PML4 (Page Map Level 4) index from this virtual address.
+    ///
+    /// Bits 39-47 (9 bits) — selects one of 512 entries in the PML4 table.
+    /// Each PML4 entry covers 512 GiB of virtual address space.
+    pub const fn pml4_index(self) -> usize {
+        ((self.0 >> 39) & 0x1FF) as usize
+    }
+
+    /// Extract the PDP (Page Directory Pointer) index from this virtual address.
+    ///
+    /// Bits 30-38 (9 bits) — selects one of 512 entries in the PDP table.
+    /// Each PDP entry covers 1 GiB of virtual address space.
+    pub const fn pdp_index(self) -> usize {
+        ((self.0 >> 30) & 0x1FF) as usize
+    }
+
+    /// Extract the PD (Page Directory) index from this virtual address.
+    ///
+    /// Bits 21-29 (9 bits) — selects one of 512 entries in the PD table.
+    /// Each PD entry covers 2 MiB of virtual address space.
+    pub const fn pd_index(self) -> usize {
+        ((self.0 >> 21) & 0x1FF) as usize
+    }
+
+    /// Extract the PT (Page Table) index from this virtual address.
+    ///
+    /// Bits 12-20 (9 bits) — selects one of 512 entries in the PT (lowest
+    /// level page table). Each PT entry maps a single 4 KiB page.
+    pub const fn pt_index(self) -> usize {
+        ((self.0 >> 12) & 0x1FF) as usize
+    }
+
+    /// Extract the page offset from this virtual address.
+    ///
+    /// Bits 0-11 (12 bits) — the byte offset within the 4 KiB page.
+    /// Range: 0 to 4095.
+    pub const fn page_offset(self) -> usize {
+        (self.0 & 0xFFF) as usize
+    }
+
+    /// Check whether this address is page-aligned (low 12 bits are zero).
+    pub const fn is_page_aligned(self) -> bool {
+        self.0 & 0xFFF == 0
+    }
+
+    /// Align this address down to the nearest 4 KiB page boundary.
+    pub const fn page_align_down(self) -> Self {
+        Self(self.0 & !0xFFF)
+    }
 }
 
 // --- Display and Debug ---
