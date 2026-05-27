@@ -37,6 +37,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_scheduler",        func: test_scheduler },
     TestCase { name: "test_interrupts",       func: test_interrupts },
     TestCase { name: "test_page_tables",      func: test_page_tables },
+    TestCase { name: "test_heap_growth",      func: test_heap_growth },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -410,6 +411,51 @@ fn test_page_tables() -> Result<(), &'static str> {
 
     // Don't drop the kernel AddressSpace (it's a global handle, not owned).
     core::mem::forget(kernel_as);
+
+    Ok(())
+}
+
+/// Test that the kernel heap grows dynamically when exhausted.
+///
+/// Allocates enough memory to exceed the initial 1 MiB heap, then verifies
+/// that the heap grew (growth count > 0) and the allocation succeeded.
+fn test_heap_growth() -> Result<(), &'static str> {
+    use crate::mm;
+
+    let initial_growth = mm::heap::growth_count();
+    let initial_size = mm::heap::total_size();
+
+    // Allocate a series of large blocks that will exceed 1 MiB total.
+    // Each block is 128 KiB. 9 blocks = 1152 KiB > 1024 KiB initial heap.
+    let mut blocks: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    for _ in 0..9 {
+        let block = alloc::vec![0xABu8; 128 * 1024];
+        blocks.push(block);
+    }
+
+    // Verify all blocks are intact
+    for block in &blocks {
+        if block.len() != 128 * 1024 {
+            return Err("heap growth: block size mismatch");
+        }
+        if block[0] != 0xAB || block[block.len() - 1] != 0xAB {
+            return Err("heap growth: block content corrupted");
+        }
+    }
+
+    // Verify the heap grew
+    let final_growth = mm::heap::growth_count();
+    if final_growth <= initial_growth {
+        return Err("heap did not grow despite exceeding initial size");
+    }
+
+    let final_size = mm::heap::total_size();
+    if final_size <= initial_size {
+        return Err("heap total_size did not increase");
+    }
+
+    // Clean up — drop the blocks to free heap memory
+    drop(blocks);
 
     Ok(())
 }

@@ -314,6 +314,31 @@ impl BitmapFrameAllocator {
     pub fn total_frame_count(&self) -> usize {
         self.frame_count
     }
+
+    /// Mark a range of physical frames as free (reclaimable).
+    ///
+    /// Used to reclaim bootloader-reclaimable memory regions after the kernel
+    /// has set up its own page tables, GDT, and stack (so Limine's structures
+    /// are no longer needed). Only marks frames that are currently allocated
+    /// (avoids double-free of frames we already freed during init).
+    ///
+    /// `base` must be page-aligned. `length` is in bytes (rounded to page boundaries).
+    /// Returns the number of frames reclaimed.
+    pub fn reclaim_region(&mut self, base: u64, length: u64) -> usize {
+        let start_frame = (align_up(base, PAGE_SIZE) / PAGE_SIZE) as usize;
+        let end_frame = (align_down(base + length, PAGE_SIZE) / PAGE_SIZE) as usize;
+        let mut reclaimed = 0;
+
+        for frame_idx in start_frame..end_frame {
+            if frame_idx < self.frame_count && !self.is_free(frame_idx) {
+                self.mark_free(frame_idx as u64);
+                self.free_count += 1;
+                reclaimed += 1;
+            }
+        }
+
+        reclaimed
+    }
 }
 
 // ==========================================================================
@@ -397,4 +422,17 @@ pub fn total_frame_count() -> usize {
         .as_ref()
         .expect("Frame allocator not initialized")
         .total_frame_count()
+}
+
+/// Reclaim a physical memory region, marking its frames as free.
+///
+/// Used to reclaim bootloader-reclaimable memory after the kernel owns
+/// all hardware structures (GDT, page tables, stack). Returns the number
+/// of frames reclaimed.
+pub fn reclaim_region(base: u64, length: u64) -> usize {
+    FRAME_ALLOCATOR
+        .lock()
+        .as_mut()
+        .expect("Frame allocator not initialized")
+        .reclaim_region(base, length)
 }

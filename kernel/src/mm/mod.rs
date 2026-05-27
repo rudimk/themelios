@@ -34,12 +34,19 @@
 //! controls which memory regions a process can share or access. The MM subsystem
 //! enforces this at the hardware level via page table permissions.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use limine::memory_map::EntryType;
+
+use crate::sync::InterruptMutex;
 
 pub mod addr;
 pub mod frame;
 pub mod heap;
 pub mod page_table;
+
+extern crate alloc;
 
 /// Page size: 4 KiB (4096 bytes).
 ///
@@ -77,4 +84,70 @@ pub fn hhdm_offset() -> u64 {
     let offset = HHDM_OFFSET.load(Ordering::Relaxed);
     debug_assert!(offset != 0, "HHDM offset not initialized — call mm::init_hhdm() first");
     offset
+}
+
+// --- Saved memory map ---
+//
+// Limine's memory map lives in bootloader-reclaimable memory. We must copy
+// the entries we need into kernel-owned storage BEFORE reclaiming that memory.
+// This saved copy is used by reclaim_bootloader_memory() to know which regions
+// to reclaim.
+
+/// A saved memory map entry — just the fields we need.
+///
+/// We store the limine `EntryType` directly (it's `Copy` + `PartialEq`)
+/// rather than extracting the private inner `u64`. This lets us compare
+/// against the public constants like `EntryType::BOOTLOADER_RECLAIMABLE`.
+#[derive(Clone)]
+pub struct SavedMemoryRegion {
+    pub base: u64,
+    pub length: u64,
+    pub entry_type: EntryType,
+}
+
+/// Saved copy of the Limine memory map, stored in kernel heap memory.
+static SAVED_MEMORY_MAP: InterruptMutex<Option<Vec<SavedMemoryRegion>>> =
+    InterruptMutex::new(None);
+
+/// Save the Limine memory map into kernel-owned heap storage.
+///
+/// Must be called AFTER the heap is initialized but BEFORE reclaiming
+/// bootloader memory (which invalidates the Limine response structures).
+pub fn save_memory_map(entries: &[&limine::memory_map::Entry]) {
+    let saved: Vec<SavedMemoryRegion> = entries
+        .iter()
+        .map(|e| SavedMemoryRegion {
+            base: e.base,
+            length: e.length,
+            entry_type: e.entry_type,
+        })
+        .collect();
+    *SAVED_MEMORY_MAP.lock() = Some(saved);
+}
+
+/// Reclaim bootloader-reclaimable memory regions.
+///
+/// Walks the saved memory map and marks all BOOTLOADER_RECLAIMABLE regions
+/// as free in the frame allocator. Must be called AFTER:
+/// - The memory map has been saved (save_memory_map)
+/// - The kernel has switched to its own page tables (page_table::init)
+/// - The kernel has its own GDT loaded (gdt::init — already done in Phase 1)
+///
+/// After this call, the physical frames that held Limine's boot structures
+/// (page tables, GDT, stack, etc.) are available for general allocation.
+///
+/// Returns the total number of frames reclaimed.
+pub fn reclaim_bootloader_memory() -> usize {
+    let guard = SAVED_MEMORY_MAP.lock();
+    let map = guard.as_ref().expect("Memory map not saved — call save_memory_map() first");
+
+    let mut total_reclaimed = 0usize;
+    for region in map {
+        if region.entry_type == EntryType::BOOTLOADER_RECLAIMABLE {
+            let reclaimed = frame::reclaim_region(region.base, region.length);
+            total_reclaimed += reclaimed;
+        }
+    }
+
+    total_reclaimed
 }

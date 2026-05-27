@@ -32,8 +32,12 @@ pub fn cmd_mem(_args: &str) {
     println!("Memory:");
     println!("  Frames: {} free / {} total ({} MiB free, {} MiB used)",
         free_frames, total_frames, free_mib, used_mib);
-    println!("  Heap:   {} used, {} free (of {} KiB)",
-        mm::heap::used(), mm::heap::free(), (mm::heap::used() + mm::heap::free()) / 1024);
+    println!("  Heap:   {} used, {} free (of {} KiB total)",
+        mm::heap::used(), mm::heap::free(), mm::heap::total_size() / 1024);
+    let growth = mm::heap::growth_count();
+    if growth > 0 {
+        println!("  Heap growth events: {}", growth);
+    }
 }
 
 /// List all tasks with their ID, state, and name.

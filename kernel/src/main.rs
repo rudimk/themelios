@@ -328,6 +328,10 @@ extern "C" fn kmain() -> ! {
             mm::heap::used(), mm::heap::free());
     }
 
+    // Save the Limine memory map into kernel-owned storage before we reclaim
+    // bootloader memory (which would invalidate Limine's response structures).
+    mm::save_memory_map(entries);
+
     // --- Page table initialization ---
     //
     // Switch from Limine's page tables to our own. This creates a new PML4
@@ -340,6 +344,18 @@ extern "C" fn kmain() -> ! {
     // Must happen after heap init (allocates a PML4 frame from the frame
     // allocator, and the AddressSpace methods use println! which needs heap).
     mm::page_table::init();
+
+    // Reclaim bootloader-reclaimable memory now that we own the GDT, page
+    // tables, and stack. Limine's boot structures in those regions are no
+    // longer referenced — the frames can be returned to the free pool.
+    let free_before_reclaim = mm::frame::free_frame_count();
+    let reclaimed = mm::reclaim_bootloader_memory();
+    let free_after_reclaim = mm::frame::free_frame_count();
+    let reclaimed_kib = (reclaimed as u64 * mm::PAGE_SIZE) / 1024;
+    println!(
+        "[reclaim] {} frames ({} KiB) reclaimed from bootloader regions ({} -> {} free)",
+        reclaimed, reclaimed_kib, free_before_reclaim, free_after_reclaim
+    );
 
     // Initialize the 8259 PIC and remap hardware IRQs to vectors 32-47.
     // Must happen after IDT setup (so IRQ vectors have handlers installed).
