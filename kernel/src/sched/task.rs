@@ -24,15 +24,15 @@
 //! memory in the kernel). The layout is:
 //!
 //! ```text
-//! [padding page (4 KiB)] [usable stack (16 KiB, 4 pages)]
-//!  ^                      ^                               ^
-//!  phys_base              usable bottom                   stack_top (initial RSP)
+//! [guard page (4 KiB, UNMAPPED)] [usable stack (16 KiB, 4 pages)]
+//!  ^                              ^                               ^
+//!  phys_base                      usable bottom                   stack_top (initial RSP)
 //! ```
 //!
-//! The padding page is NOT a true guard page (it's still mapped and writable —
-//! unmapping requires page table modification, deferred to Phase 2). It just
-//! provides a buffer between adjacent allocations to reduce the blast radius
-//! of a stack overflow.
+//! The guard page is unmapped in the kernel page tables, so any access to it
+//! triggers a page fault — providing true stack overflow detection instead of
+//! silent memory corruption. The physical frame is still allocated (owned by
+//! the task); it gets re-mapped and freed when the task is cleaned up.
 
 use alloc::string::String;
 use crate::mm::addr::PhysAddr;
@@ -100,10 +100,9 @@ impl TaskContext {
 /// 4 pages = 16 KiB — enough for kernel task call stacks in Phase 1.
 pub const STACK_PAGES: usize = 4;
 
-/// Number of padding pages allocated below the stack.
-/// This is NOT a true guard page (it's still mapped) — just a buffer
-/// to reduce the chance of stack overflow corrupting adjacent allocations.
-/// True guard pages (unmapped) require page table modification (Phase 2).
+/// Number of guard pages allocated below the stack.
+/// Unmapped in the kernel page tables — any access triggers a page fault,
+/// catching stack overflows before they corrupt adjacent memory.
 pub const PADDING_PAGES: usize = 1;
 
 /// Total pages allocated per task stack (usable + padding).

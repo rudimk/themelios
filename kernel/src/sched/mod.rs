@@ -55,7 +55,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::mm;
-use crate::mm::addr::PhysAddr;
+use crate::mm::addr::{PhysAddr, VirtAddr};
 use crate::println;
 use crate::sync::InterruptMutex;
 
@@ -453,7 +453,21 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
     let phys_base = mm::frame::allocate_contiguous_frames(TOTAL_STACK_PAGES)
         .expect("Failed to allocate stack for new task");
 
-    // The usable stack starts after the padding page(s) and extends to the top.
+    // Unmap the guard page (the first frame, the "padding page") in the kernel
+    // page tables. The frame stays allocated (the allocator tracks it), but any
+    // access to its virtual address will trigger a page fault — giving us true
+    // stack overflow detection instead of silent memory corruption.
+    //
+    // We unmap via the HHDM virtual address since that's how all kernel memory
+    // is accessed. The physical frame remains owned by this task and will be
+    // freed (after being re-mapped) when the task is cleaned up.
+    let guard_virt = VirtAddr::new(phys_base.to_virt().as_u64());
+    let kernel_as = mm::page_table::kernel_address_space();
+    kernel_as.unmap_page(guard_virt);
+    // Don't drop the kernel AddressSpace handle — it doesn't own the PML4.
+    core::mem::forget(kernel_as);
+
+    // The usable stack starts after the guard page(s) and extends to the top.
     // Stack grows downward, so the initial RSP points to the top (highest address).
     let stack_top_phys = PhysAddr::new(
         phys_base.as_u64() + (TOTAL_STACK_PAGES as u64) * mm::PAGE_SIZE
@@ -559,6 +573,21 @@ fn cleanup_dead_tasks(sched: &mut Scheduler, current_id: TaskId) {
         if should_clean {
             let task = task_opt.take().unwrap();
             if let Some(phys_base) = task.stack_phys_base {
+                // Re-map the guard page before freeing. The guard page was unmapped
+                // in create_task() for stack overflow detection. We need to re-map it
+                // so the HHDM mapping is consistent when the frame allocator puts
+                // the frame back in the free pool (the allocator doesn't know about
+                // unmapped pages).
+                let guard_virt = VirtAddr::new(phys_base.to_virt().as_u64());
+                let kernel_as = mm::page_table::kernel_address_space();
+                kernel_as.map_page(
+                    guard_virt,
+                    phys_base,
+                    mm::page_table::PageFlags::PRESENT | mm::page_table::PageFlags::WRITABLE,
+                );
+                core::mem::forget(kernel_as);
+
+                // Free all stack frames (guard page + usable pages).
                 for i in 0..TOTAL_STACK_PAGES {
                     mm::frame::deallocate_frame(
                         PhysAddr::new(phys_base.as_u64() + i as u64 * mm::PAGE_SIZE)
