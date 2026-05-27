@@ -145,6 +145,7 @@ pub fn init() {
         state: TaskState::Running,
         context: TaskContext::empty(),
         stack_phys_base: None,
+        kernel_stack_top: 0, // Bootstrap uses Limine's stack; never returns from ring 3
     }));
     sched.current_id = bootstrap_id;
     sched.next_id = 1;
@@ -241,6 +242,20 @@ pub fn schedule() {
         // Mark the next task as Running and update current_id.
         sched.tasks[next_id].as_mut().unwrap().state = TaskState::Running;
         sched.current_id = next_id;
+
+        // Update TSS.RSP0 and PerCpu.kernel_stack_top for the new task.
+        // This must happen BEFORE the context switch so that if the new task
+        // is in ring 3 and gets interrupted (or does a syscall), the CPU uses
+        // the correct kernel stack. On a single-core system with interrupts
+        // disabled, there's no race — the values are set before the switch.
+        let next_stack_top = sched.tasks[next_id].as_ref().unwrap().kernel_stack_top;
+        if next_stack_top != 0 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
+                crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
+            }
+        }
 
         // Get raw pointers to the task contexts. These point into the Vec's
         // buffer, which won't be reallocated because:
@@ -484,6 +499,7 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
         state: TaskState::Ready,
         context: TaskContext { rsp: initial_rsp },
         stack_phys_base: Some(phys_base),
+        kernel_stack_top: stack_top_virt.as_u64(),
     };
 
     // Place the task in its slot (either reusing an empty one or the new end)

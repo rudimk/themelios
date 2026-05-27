@@ -383,6 +383,18 @@ extern "C" fn kmain() -> ! {
     // interrupts).
     sched::init();
 
+    // --- Syscall/sysret initialization ---
+    //
+    // Configure the MSRs that enable the fast syscall path: EFER.SCE,
+    // STAR (segment selectors), LSTAR (entry point), FMASK (interrupt mask),
+    // and IA32_KERNEL_GS_BASE (PerCpu struct address). After this, ring 3
+    // code can use `syscall` to enter the kernel.
+    //
+    // Must happen after GDT init (segment selectors must be valid) and
+    // after scheduler init (PerCpu.kernel_stack_top is set per-task).
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::syscall::init();
+
     // Enable maskable interrupts. From this point on:
     // - PIT timer (IRQ0) fires at ~100 Hz for preemptive scheduling
     // - COM1 serial (IRQ4) fires when the user types in the QEMU terminal

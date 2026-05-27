@@ -38,6 +38,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_interrupts",       func: test_interrupts },
     TestCase { name: "test_page_tables",      func: test_page_tables },
     TestCase { name: "test_heap_growth",      func: test_heap_growth },
+    TestCase { name: "test_syscall",          func: test_syscall },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -458,4 +459,16 @@ fn test_heap_growth() -> Result<(), &'static str> {
     drop(blocks);
 
     Ok(())
+}
+
+/// Test the syscall/sysret infrastructure.
+///
+/// Verifies the complete ring 3 system call path:
+/// 1. MSR configuration (EFER.SCE, STAR selectors, LSTAR entry, FMASK mask)
+/// 2. Dispatch function (SYS_NULL returns 0, unknown returns -1)
+/// 3. Full ring 3 round trip: spawns a task that transitions to ring 3 via
+///    iretq, executes SYS_NULL via `syscall`, then SYS_TEST_COMPLETE to
+///    report the result back to the kernel
+fn test_syscall() -> Result<(), &'static str> {
+    crate::arch::x86_64::syscall::test_syscall_round_trip()
 }

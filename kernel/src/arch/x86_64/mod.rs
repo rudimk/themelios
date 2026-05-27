@@ -46,5 +46,8 @@ pub mod pic;
 /// providing the system timer tick for preemptive scheduling.
 pub mod pit;
 
-// Future sub-modules:
-// pub mod paging;  — page table management
+/// System call entry/exit via syscall/sysret.
+/// Configures MSRs (STAR, LSTAR, FMASK), provides the naked assembly
+/// syscall entry stub with swapgs and PerCpu kernel stack switching,
+/// and dispatches syscalls to Rust handler functions.
+pub mod syscall;

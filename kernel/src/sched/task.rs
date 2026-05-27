@@ -131,4 +131,11 @@ pub struct Task {
     /// `None` for the bootstrap task which uses the Limine-provided boot stack.
     /// Used to free the stack frames when the task is cleaned up.
     pub stack_phys_base: Option<PhysAddr>,
+
+    /// Top of this task's kernel stack (highest valid address, stack grows down).
+    /// Written to TSS.RSP0 and PerCpu.kernel_stack_top on every context switch
+    /// so that ring 3 → ring 0 transitions (syscall, interrupt) land on the
+    /// correct kernel stack. Zero for the bootstrap task (which uses Limine's
+    /// boot stack and never transitions from ring 3).
+    pub kernel_stack_top: u64,
 }
