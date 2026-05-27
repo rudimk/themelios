@@ -17,7 +17,7 @@ on:
 
 jobs:
   test:
-    name: Build & Test (x86_64)
+    name: Build & Test (amd64)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -50,7 +50,7 @@ jobs:
         run: cargo xtask test
 
   release:
-    name: Release ISO (x86_64)
+    name: Release ISO (amd64)
     needs: test
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
