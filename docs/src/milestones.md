@@ -6,7 +6,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 |-------|------|--------|
 | **0** | Boot on QEMU, serial output | Complete |
 | **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
-| **2** | Capability system, process isolation, IPC | Not started |
+| **2** | Capability system, process isolation, IPC | Complete |
 | **3** | VirtIO block driver, read-only filesystem | Not started |
 | **4** | VirtIO net driver, TCP/IP stack | Not started |
 | **5** | OCI container support | Not started |
@@ -43,7 +43,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Basic kernel shell over serial (for debugging, will be removed later)
 - Automated test infrastructure (`isa-debug-exit`, `cargo xtask test`, GitHub Actions CI)
 
-## Phase 2 — Isolation (Not started)
+## Phase 2 — Isolation (Complete)
 
 **Goal**: Implement the capability system and process isolation.
 
