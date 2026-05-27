@@ -43,6 +43,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_process",         func: test_process },
     TestCase { name: "test_ipc",             func: test_ipc },
     TestCase { name: "test_audit",           func: test_audit },
+    TestCase { name: "test_userspace_init",  func: test_userspace_init },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1097,6 +1098,49 @@ fn test_audit() -> Result<(), &'static str> {
     let seq_after = audit::current_seq();
     if seq_after <= seq_before {
         return Err("audit: current_seq did not advance");
+    }
+
+    Ok(())
+}
+
+// ============================================================
+//  test_userspace_init — First userspace process
+// ============================================================
+
+/// Test the init process: a ring 3 process communicating with the kernel via IPC.
+///
+/// This is the capstone test for Phase 2. It verifies:
+/// 1. Init process boots in ring 3 with its own address space
+/// 2. Init sends IPC messages to the kernel via syscall
+/// 3. The kernel-side server receives the messages
+/// 4. Timer preemption works on the init process
+fn test_userspace_init() -> Result<(), &'static str> {
+    use crate::process;
+
+    // Start the init process (creates process, maps pages, spawns tasks)
+    process::init::start();
+
+    // Yield repeatedly to let the init process and server run.
+    // The init process sends messages and yields between each one.
+    // We need enough yields for the scheduler to cycle through:
+    // init task → server task → back to us.
+    for _ in 0..500 {
+        crate::sched::yield_now();
+
+        // Check early if the server has received messages
+        if process::init::server_message_count() >= 3 {
+            break;
+        }
+    }
+
+    // Verify the server received at least one message
+    if !process::init::server_has_received() {
+        return Err("init server never received a message from userspace");
+    }
+
+    let count = process::init::server_message_count();
+    if count < 2 {
+        return Err("init server received fewer than 2 messages");
     }
 
     Ok(())

@@ -446,6 +446,11 @@ extern "C" fn kmain() -> ! {
         // The shell task blocks until input arrives via IRQ4.
         shell::init();
 
+        // Boot the first userspace init process. This creates a ring 3 process
+        // with its own address space, maps code and stack pages, grants IPC
+        // capabilities, and spawns the init task plus a kernel-side server.
+        process::init::start();
+
         println!();
         println!("Interrupts enabled — scheduler is running.");
         println!("Type 'help' for available commands.");

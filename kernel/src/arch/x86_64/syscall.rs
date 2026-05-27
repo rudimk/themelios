@@ -123,6 +123,20 @@ pub const SYS_CALL: u64 = 3;
 /// RDI = endpoint_id, RSI = reply_token, RDX = pointer to reply IpcMessage.
 pub const SYS_REPLY: u64 = 4;
 
+/// SYS_YIELD: yield the calling task's time slice.
+/// No arguments. Returns 0.
+pub const SYS_YIELD: u64 = 5;
+
+/// SYS_EXIT: terminate the calling process.
+/// RDI = exit code (currently unused — logged for diagnostics).
+pub const SYS_EXIT: u64 = 6;
+
+/// SYS_DEBUG_PRINT: write a character to the serial console.
+/// RDI = ASCII character to print.
+/// Temporary syscall for Phase 2 debugging — will be removed when
+/// drivers move to userspace.
+pub const SYS_DEBUG_PRINT: u64 = 7;
+
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
 /// RDI = the SYS_NULL return value. The handler stores the result and
@@ -363,11 +377,69 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
             // No-op syscall. Returns 0 to confirm the syscall path works.
             frame.rax = 0;
         }
-        SYS_SEND | SYS_RECEIVE | SYS_CALL | SYS_REPLY => {
-            // IPC syscalls are defined for userspace use in later sub-phases.
-            // For Phase 2, IPC is tested kernel-side (direct function calls).
-            // Userspace IPC wiring will be completed in Sub-phase 2.8.
-            frame.rax = !0u64; // -1 = not yet implemented from userspace
+        SYS_SEND => {
+            // Userspace IPC send via registers.
+            // Convention: RDI = endpoint_id, RSI/RDX/R10/R9 = words[0..3], R8 = badge
+            let endpoint_id = frame.rdi;
+            let badge = frame.r8;
+            let msg = crate::ipc::IpcMessage::new([frame.rsi, frame.rdx, frame.r10, frame.r9]);
+
+            // Re-enable interrupts before the potentially-blocking IPC call.
+            // The syscall entry stub disabled interrupts (FMASK clears IF),
+            // but IPC blocking needs the timer to preempt and schedule.
+            cpu::sti();
+
+            match crate::ipc::ipc_send(endpoint_id, msg, badge) {
+                Ok(()) => frame.rax = 0,
+                Err(_) => frame.rax = !0u64,
+            }
+        }
+        SYS_RECEIVE => {
+            // RDI = endpoint_id. Returns word0 in RAX (or -1 on error).
+            // Full message would need a user buffer — for Phase 2, we return
+            // word0 in RAX to confirm the message arrived.
+            let endpoint_id = frame.rdi;
+
+            cpu::sti();
+
+            match crate::ipc::ipc_receive(endpoint_id) {
+                Ok(msg) => {
+                    frame.rax = msg.words[0];
+                    frame.rdi = msg.words[1];
+                    frame.rsi = msg.words[2];
+                    frame.rdx = msg.words[3];
+                    frame.r8 = msg.badge;
+                    frame.r9 = msg.reply_token;
+                }
+                Err(_) => frame.rax = !0u64,
+            }
+        }
+        SYS_CALL | SYS_REPLY => {
+            // Full IPC call/reply from userspace deferred to a later phase.
+            frame.rax = !0u64;
+        }
+        SYS_YIELD => {
+            // Yield the current task's time slice. Re-enable interrupts first
+            // since yield_now() calls schedule().
+            cpu::sti();
+            crate::sched::yield_now();
+            frame.rax = 0;
+        }
+        SYS_EXIT => {
+            // Terminate the calling process. RDI = exit code (logged).
+            crate::println!("[syscall] SYS_EXIT: task {} exit code {}",
+                crate::sched::current_task_id(), frame.rdi);
+
+            // Undo swapgs from syscall entry before exiting.
+            unsafe { cpu::swapgs(); }
+
+            crate::sched::exit_current_task();
+        }
+        SYS_DEBUG_PRINT => {
+            // Print a single character to serial. Temporary for Phase 2.
+            let ch = (frame.rdi & 0xFF) as u8 as char;
+            crate::print!("{}", ch);
+            frame.rax = 0;
         }
         SYS_TEST_COMPLETE => {
             // Internal test syscall: store the test result and kill the task.

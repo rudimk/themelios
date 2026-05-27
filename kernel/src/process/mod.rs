@@ -29,6 +29,7 @@
 extern crate alloc;
 
 pub mod pid;
+pub mod init;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -332,4 +333,35 @@ pub fn process_caps(pid: ProcessId) -> Vec<(CapHandle, CapType, CapRights)> {
 pub fn process_count() -> usize {
     let table = PROCESS_TABLE.lock();
     table.processes.iter().filter(|s| s.is_some()).count()
+}
+
+/// Execute a closure with access to a process's address space.
+///
+/// Returns `None` if the PID is invalid, the process is destroyed, or the
+/// process has no address space (kernel process). The closure receives the
+/// AddressSpace reference and can map/unmap pages.
+pub fn with_address_space<F, R>(pid: ProcessId, f: F) -> Option<R>
+where
+    F: FnOnce(&AddressSpace) -> R,
+{
+    let table = PROCESS_TABLE.lock();
+    table.processes.get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc| proc.address_space.as_ref())
+        .map(f)
+}
+
+/// Execute a closure with mutable access to a process's CSpace.
+///
+/// Returns `None` if the PID is invalid, the process is destroyed, or the
+/// process has no CSpace (kernel process).
+pub fn with_cspace_mut<F, R>(pid: ProcessId, f: F) -> Option<R>
+where
+    F: FnOnce(&mut CSpace) -> R,
+{
+    let mut table = PROCESS_TABLE.lock();
+    table.processes.get_mut(pid.as_usize())
+        .and_then(|slot| slot.as_mut())
+        .and_then(|proc| proc.cspace.as_mut())
+        .map(f)
 }
