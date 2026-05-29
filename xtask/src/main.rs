@@ -882,6 +882,11 @@ fn cmd_test(args: &[String]) {
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ]);
 
+    // Regenerate the ext2 data image fresh for every test run: the ext2 write
+    // tests mutate it, so a stale image from a previous run would make them
+    // non-deterministic. (The SquashFS root is read-only and is left cached.)
+    let _ = fs::remove_file(data_image_path(&root));
+
     // Attach VirtIO block disks (same order as `run`): scratch (writable),
     // SquashFS root (read-only), ext2 data volume. The kernel identifies each
     // by probing its on-disk magic, so order only fixes slot assignment.

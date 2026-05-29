@@ -53,6 +53,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_squashfs_server",  func: test_squashfs_server },
     TestCase { name: "test_overlay_server",   func: test_overlay_server },
     TestCase { name: "test_ext2_read",        func: test_ext2_read },
+    TestCase { name: "test_ext2_write",       func: test_ext2_write },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -2223,5 +2224,195 @@ fn test_ext2_read() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_ext2_read() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_ext2_write — ext2 server write path (Phase 3.7, step 2)
+// ============================================================
+
+/// Test the ext2 server's write path: create, write (incl. indirect blocks),
+/// mkdir, unlink, and inode/block reuse after unlink.
+#[cfg(target_arch = "x86_64")]
+fn test_ext2_write() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::ipc::{self, IpcMessage};
+    use crate::mm::shared::SharedRegion;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    const OP_OPEN: u64 = 1;
+    const OP_READ: u64 = 2;
+    const OP_WRITE: u64 = 3;
+    const OP_STAT: u64 = 5;
+    const OP_READDIR: u64 = 6;
+    const OP_CREATE: u64 = 7;
+    const OP_MKDIR: u64 = 8;
+    const OP_UNLINK: u64 = 9;
+    const STATUS_OK: u64 = 0;
+
+    // Bring up the ext2 server on the ext2 disk.
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let mut ext2_index = None;
+    for dev in devs.iter().filter(|d| d.class == 0x01) {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 512];
+        if blk.read_blocks(2, &mut buf).is_ok() && buf[56] == 0x53 && buf[57] == 0xEF {
+            ext2_index = Some(block::register("ext2-disk-w", Box::new(blk)));
+            break;
+        }
+    }
+    let idx = ext2_index.ok_or("no ext2 disk found")?;
+    let block_handle = block_server::start(idx);
+    let client = SharedRegion::alloc(128 * 1024).ok_or("client region alloc failed")?;
+    let fs_ep = ipc::create_endpoint("ext2-fs-w");
+    spawn_server(ServerConfig {
+        name: "ext2-server",
+        binary: embedded::EXT2_SERVER,
+        fs_endpoint: fs_ep,
+        block_endpoint: block_handle.endpoint,
+        shared: Some(block_handle.region),
+        client_shared: Some(client),
+        heap_bytes: 2 * 1024 * 1024,
+        arg0: 0,
+        arg1: 0,
+    });
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+
+    let put = |bytes: &[u8]| -> u64 {
+        let s = unsafe { client.as_slice_mut() };
+        s[..bytes.len()].copy_from_slice(bytes);
+        bytes.len() as u64
+    };
+    let call = |w: [u64; 4]| ipc::ipc_call(fs_ep, IpcMessage::new(w), 0);
+
+    // --- 1. Create a file, write, read back ---
+    let p = put(b"/wtest");
+    let r = call([OP_CREATE, p, 0, 0]).map_err(|_| "create failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 create /wtest failed");
+    }
+    let fd = r.words[1];
+    let msg = b"ext2 write works!";
+    let dlen = put(msg);
+    let r = call([OP_WRITE, fd, 0, dlen]).map_err(|_| "write failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != msg.len() as u64 {
+        return Err("ext2 write /wtest failed");
+    }
+    let r = call([OP_READ, fd, 0, msg.len() as u64]).map_err(|_| "read failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != msg.len() as u64 {
+        return Err("ext2 read-back /wtest wrong length");
+    }
+    {
+        let s = unsafe { client.as_slice_mut() };
+        if &s[..msg.len()] != msg {
+            return Err("ext2 /wtest content mismatch");
+        }
+    }
+    // STAT reflects the new size.
+    let p = put(b"/wtest");
+    let r = call([OP_STAT, p, 0, 0]).map_err(|_| "stat failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != msg.len() as u64 {
+        return Err("ext2 STAT /wtest wrong size");
+    }
+
+    // --- 2. Large write spanning direct + single-indirect blocks ---
+    let p = put(b"/wbig");
+    let r = call([OP_CREATE, p, 0, 0]).map_err(|_| "create wbig failed")?;
+    let fd = r.words[1];
+    // Write 20000 bytes in 4 KiB chunks (client region holds the chunk).
+    let pat = |i: u64| ((i as u32).wrapping_mul(53).wrapping_add(3) & 0xFF) as u8;
+    const BIG: usize = 20000;
+    let mut off = 0usize;
+    while off < BIG {
+        let len = (BIG - off).min(4096);
+        {
+            let s = unsafe { client.as_slice_mut() };
+            for j in 0..len {
+                s[j] = pat((off + j) as u64);
+            }
+        }
+        let r = call([OP_WRITE, fd, off as u64, len as u64]).map_err(|_| "wbig write failed")?;
+        if r.words[0] != STATUS_OK || r.words[1] != len as u64 {
+            return Err("ext2 wbig write wrong length");
+        }
+        off += len;
+    }
+    // Read back a slice from the single-indirect region (offset > 12 KiB).
+    let r = call([OP_READ, fd, 13000, 512]).map_err(|_| "wbig read failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 512 {
+        return Err("ext2 wbig read wrong length (indirect)");
+    }
+    {
+        let s = unsafe { client.as_slice_mut() };
+        for j in 0..512 {
+            if s[j] != pat(13000 + j as u64) {
+                return Err("ext2 wbig indirect pattern mismatch");
+            }
+        }
+    }
+
+    // --- 3. mkdir + readdir ---
+    let p = put(b"/wdir");
+    let r = call([OP_MKDIR, p, 0, 0]).map_err(|_| "mkdir failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 mkdir /wdir failed");
+    }
+    let p = put(b"/wdir");
+    let r = call([OP_OPEN, p, 0, 0]).map_err(|_| "open wdir failed")?;
+    let dfd = r.words[1];
+    let r = call([OP_READDIR, dfd, 16, 0]).map_err(|_| "readdir wdir failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] < 2 {
+        return Err("ext2 new dir missing . and ..");
+    }
+
+    // --- 4. Unlink, verify gone ---
+    let p = put(b"/wtest");
+    let r = call([OP_UNLINK, p, 0, 0]).map_err(|_| "unlink failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 unlink /wtest failed");
+    }
+    let p = put(b"/wtest");
+    let r = call([OP_STAT, p, 0, 0]).map_err(|_| "stat-after-unlink failed")?;
+    if r.words[0] == STATUS_OK {
+        return Err("ext2 /wtest still present after unlink");
+    }
+
+    // --- 5. Reuse after unlink: create again, write, read back ---
+    let p = put(b"/wtest2");
+    let r = call([OP_CREATE, p, 0, 0]).map_err(|_| "recreate failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 recreate failed");
+    }
+    let fd = r.words[1];
+    let msg2 = b"reused";
+    let dlen = put(msg2);
+    let r = call([OP_WRITE, fd, 0, dlen]).map_err(|_| "rewrite failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 rewrite failed");
+    }
+    let r = call([OP_READ, fd, 0, msg2.len() as u64]).map_err(|_| "reread failed")?;
+    {
+        let s = unsafe { client.as_slice_mut() };
+        if r.words[1] != msg2.len() as u64 || &s[..msg2.len()] != msg2 {
+            return Err("ext2 reuse-after-unlink content mismatch");
+        }
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_ext2_write() -> Result<(), &'static str> {
     Ok(())
 }
