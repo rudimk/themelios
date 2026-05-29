@@ -281,22 +281,191 @@ fn ensure_scratch_disk(root: &Path) -> PathBuf {
 /// Uses the explicit two-part form rather than the `if=virtio` shorthand so the
 /// device shows up as a `virtio-blk-pci` function on the Q35 PCI bus, which is
 /// what the kernel's PCI enumeration expects to find:
-/// - `-drive ...,if=none,id=blk0`: define the backing image without auto-
+/// - `-drive ...,if=none,id=<id>`: define the backing image without auto-
 ///   attaching it to any controller.
-/// - `-device virtio-blk-pci,drive=blk0`: create the VirtIO block PCI device
-///   backed by that drive.
-fn virtio_disk_args(disk_path: &Path) -> Vec<String> {
+/// - `-device virtio-blk-pci,drive=<id>`: create the VirtIO block PCI device.
+///
+/// `disable-legacy=on` forces the modern (VirtIO 1.0+) PCI interface (device ID
+/// 1af4:1042), which advertises its registers through PCI capabilities in MMIO
+/// BARs — the only interface the kernel's VirtIO transport speaks. `readonly`
+/// attaches the drive read-only (used for the immutable SquashFS root).
+///
+/// Devices are assigned PCI slots in command-line order, so callers control
+/// discovery order by the order they emit these arg groups.
+fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
+    let ro = if readonly { ",readonly=on" } else { "" };
     vec![
         "-drive".to_string(),
-        format!("file={},format=raw,if=none,id=blk0", disk_path.display()),
+        format!("file={},format=raw,if=none,id={id}{ro}", disk_path.display()),
         "-device".to_string(),
-        // disable-legacy=on forces the modern (VirtIO 1.0+) PCI interface:
-        // the device advertises its registers through PCI capability
-        // structures in MMIO BARs (device ID 1af4:1042) rather than the legacy
-        // I/O-port layout (1af4:1001). The kernel's VirtIO transport speaks the
-        // modern interface only.
-        "virtio-blk-pci,drive=blk0,disable-legacy=on".to_string(),
+        format!("virtio-blk-pci,drive={id},disable-legacy=on"),
     ]
+}
+
+/// Locate a host tool: try each candidate (a bare name resolved via `PATH`, or
+/// an absolute path) and return the first that exists/resolves.
+///
+/// Used to find `mkfs.ext2`, which Homebrew installs *keg-only* on macOS (Apple
+/// ships a conflicting version) and therefore does NOT symlink onto `PATH`. We
+/// fall back to the known keg locations so the developer never has to edit
+/// their `PATH`. See `docs/src/dev-setup.md` and the repo `Brewfile`.
+fn find_tool(candidates: &[&str]) -> Option<PathBuf> {
+    for cand in candidates {
+        let path = Path::new(cand);
+        if path.is_absolute() {
+            if path.exists() {
+                return Some(path.to_path_buf());
+            }
+        } else {
+            // Bare name: resolve via `which`.
+            if let Ok(out) = Command::new("which").arg(cand).output() {
+                if out.status.success() {
+                    let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !resolved.is_empty() {
+                        return Some(PathBuf::from(resolved));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Locate `mksquashfs` (from the `squashfs`/`squashfs-tools` package).
+fn find_mksquashfs() -> PathBuf {
+    find_tool(&["mksquashfs", "/opt/homebrew/bin/mksquashfs", "/usr/local/bin/mksquashfs"])
+        .unwrap_or_else(|| {
+            eprintln!("Error: mksquashfs not found.");
+            eprintln!("Install it:  macOS: brew install squashfs   Linux: apt install squashfs-tools");
+            eprintln!("(or run `brew bundle` from the repo root on macOS)");
+            process::exit(1);
+        })
+}
+
+/// Locate `mkfs.ext2` (from `e2fsprogs`). Keg-only on macOS, so we check the
+/// keg `sbin` directories in addition to `PATH`.
+fn find_mkfs_ext2() -> PathBuf {
+    find_tool(&[
+        "mkfs.ext2",
+        "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext2", // Homebrew on Apple Silicon
+        "/usr/local/opt/e2fsprogs/sbin/mkfs.ext2",    // Homebrew on Intel macOS
+        "/sbin/mkfs.ext2",
+        "/usr/sbin/mkfs.ext2",
+    ])
+    .unwrap_or_else(|| {
+        eprintln!("Error: mkfs.ext2 not found.");
+        eprintln!("Install it:  macOS: brew install e2fsprogs   Linux: apt install e2fsprogs");
+        eprintln!("(or run `brew bundle` from the repo root on macOS)");
+        process::exit(1);
+    })
+}
+
+// ============================================================================
+// Filesystem image creation (cargo xtask image)
+// ============================================================================
+
+/// Path to the SquashFS root image.
+fn root_image_path(root: &Path) -> PathBuf {
+    root.join("target/themelios-root.squashfs")
+}
+
+/// Path to the ext2 data volume image.
+fn data_image_path(root: &Path) -> PathBuf {
+    root.join("target/themelios-data.ext2")
+}
+
+/// Build the staging directory tree that becomes the SquashFS root, returning
+/// its path. Contents are deterministic so tests can assert exact bytes.
+fn build_rootfs_staging(root: &Path) -> PathBuf {
+    let staging = root.join("target/rootfs");
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(staging.join("etc")).expect("create rootfs/etc");
+    fs::create_dir_all(staging.join("docs")).expect("create rootfs/docs");
+    fs::create_dir_all(staging.join("data")).expect("create rootfs/data");
+
+    // Small files (these end up packed into a SquashFS fragment block).
+    fs::write(staging.join("version"), b"THEMELIOS_ROOT\n").unwrap();
+    fs::write(staging.join("etc/hostname"), b"themelios\n").unwrap();
+    fs::write(staging.join("hello.txt"), b"Hello from SquashFS!\n").unwrap();
+    fs::write(staging.join("docs/readme.txt"), b"nested file in /docs\n").unwrap();
+
+    // A large file spanning multiple data blocks, with a deterministic pattern
+    // the SquashFS server test reads back and verifies byte-for-byte.
+    let big: Vec<u8> = (0..300 * 1024u32).map(|i| (i.wrapping_mul(31).wrapping_add(7) & 0xFF) as u8).collect();
+    fs::write(staging.join("big.bin"), &big).unwrap();
+
+    staging
+}
+
+/// Create the SquashFS root image (gzip-compressed) from the staging tree.
+fn create_root_image(root: &Path) -> PathBuf {
+    let staging = build_rootfs_staging(root);
+    let out = root_image_path(root);
+    let _ = fs::remove_file(&out);
+    let mksquashfs = find_mksquashfs();
+
+    println!("Creating SquashFS root image...");
+    // -comp gzip: SquashFS default; matches the server's miniz_oxide inflate.
+    // -noappend: overwrite rather than append. -all-root: deterministic uid/gid.
+    // -no-xattrs: keep the on-disk format minimal for the server parser.
+    let status = Command::new(&mksquashfs)
+        .arg(&staging)
+        .arg(&out)
+        .args(["-comp", "gzip", "-noappend", "-all-root", "-no-xattrs"])
+        .status()
+        .expect("failed to run mksquashfs");
+    if !status.success() {
+        eprintln!("mksquashfs failed!");
+        process::exit(1);
+    }
+    println!("  {}", out.display());
+    out
+}
+
+/// Create the ext2 data volume image (16 MiB, 1 KiB blocks).
+fn create_data_image(root: &Path) -> PathBuf {
+    let out = data_image_path(root);
+    let mkfs = find_mkfs_ext2();
+
+    println!("Creating ext2 data image...");
+    // Zero-fill 16 MiB, then format ext2 with 1 KiB blocks (simple, predictable
+    // layout for the ext2 server). No journal (-O ^has_journal): ext2, not ext4.
+    let zeros = vec![0u8; 16 * 1024 * 1024];
+    fs::write(&out, &zeros).expect("failed to create ext2 backing file");
+    let status = Command::new(&mkfs)
+        .args(["-F", "-q", "-b", "1024", "-O", "^has_journal,^resize_inode"])
+        .arg(&out)
+        .status()
+        .expect("failed to run mkfs.ext2");
+    if !status.success() {
+        eprintln!("mkfs.ext2 failed!");
+        process::exit(1);
+    }
+    println!("  {}", out.display());
+    out
+}
+
+/// Ensure both filesystem images exist, creating any that are missing.
+///
+/// Called from run/test so disks are present without rebuilding every time
+/// (images are only created when absent). `cargo xtask image` forces a rebuild.
+fn ensure_images(root: &Path) -> (PathBuf, PathBuf) {
+    let squashfs = root_image_path(root);
+    let ext2 = data_image_path(root);
+    let squashfs = if squashfs.exists() { squashfs } else { create_root_image(root) };
+    let ext2 = if ext2.exists() { ext2 } else { create_data_image(root) };
+    (squashfs, ext2)
+}
+
+/// `cargo xtask image` — (re)create the SquashFS root and ext2 data images.
+fn cmd_image(_args: &[String]) {
+    let root = workspace_root();
+    let squashfs = create_root_image(&root);
+    let ext2 = create_data_image(&root);
+    println!();
+    println!("Images ready:");
+    println!("  root (SquashFS): {}", squashfs.display());
+    println!("  data (ext2):     {}", ext2.display());
 }
 
 // ============================================================================
@@ -534,9 +703,14 @@ fn cmd_run(args: &[String]) {
                     "-no-shutdown",
                 ]);
 
-            // Attach a VirtIO block disk so the kernel has storage to discover.
+            // Attach VirtIO block disks. Order fixes PCI slot assignment:
+            // scratch first (writable, lowest slot — used by block R/W tests),
+            // then the read-only SquashFS root, then the ext2 data volume.
             let scratch = ensure_scratch_disk(&root);
-            cmd.args(virtio_disk_args(&scratch));
+            cmd.args(virtio_disk_args(&scratch, "blkscratch", false));
+            let (squashfs, ext2) = ensure_images(&root);
+            cmd.args(virtio_disk_args(&squashfs, "blkroot", true));
+            cmd.args(virtio_disk_args(&ext2, "blkdata", false));
 
             // In headless mode, suppress the QEMU graphical window.
             // With --display, let QEMU use its default backend (Cocoa/GTK/SDL).
@@ -639,10 +813,14 @@ fn cmd_test(args: &[String]) {
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ]);
 
-    // Attach a VirtIO block disk so PCI/VirtIO/block tests have a device to
-    // discover and exercise.
+    // Attach VirtIO block disks (same order as `run`): scratch (writable),
+    // SquashFS root (read-only), ext2 data volume. The kernel identifies each
+    // by probing its on-disk magic, so order only fixes slot assignment.
     let scratch = ensure_scratch_disk(&root);
-    cmd.args(virtio_disk_args(&scratch));
+    cmd.args(virtio_disk_args(&scratch, "blkscratch", false));
+    let (squashfs, ext2) = ensure_images(&root);
+    cmd.args(virtio_disk_args(&squashfs, "blkroot", true));
+    cmd.args(virtio_disk_args(&ext2, "blkdata", false));
 
     let child = cmd
         .stdout(process::Stdio::inherit())
@@ -751,6 +929,7 @@ Commands:
     iso      Build the kernel and create a bootable ISO
     run      Build, create ISO, and launch in QEMU (headless)
     test     Build and run tests in QEMU
+    image    Create the SquashFS root and ext2 data disk images
     docs     Build mdbook and rustdoc
 
 Options:
@@ -780,6 +959,7 @@ fn main() {
         "iso" => cmd_iso(rest),
         "run" => cmd_run(rest),
         "test" => cmd_test(rest),
+        "image" => cmd_image(rest),
         "docs" => cmd_docs(rest),
         "help" | "--help" | "-h" => print_usage(),
         unknown => {

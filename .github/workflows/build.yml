@@ -44,7 +44,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 xorriso
+          sudo apt-get install -y qemu-system-x86 xorriso squashfs-tools e2fsprogs
 
       - name: Run kernel tests
         run: cargo xtask test
@@ -82,7 +82,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 xorriso
+          sudo apt-get install -y qemu-system-x86 xorriso squashfs-tools e2fsprogs
 
       - name: Build release ISO
         run: cargo xtask iso

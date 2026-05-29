@@ -98,6 +98,55 @@ qemu-system-aarch64 --version
 cargo install mdbook
 ```
 
+### 5. Filesystem image tools (squashfs, e2fsprogs)
+
+Phase 3 (storage) builds the disk images ThemeliOS boots from using two host
+tools, invoked by `cargo xtask image`:
+
+- **`mksquashfs`** (from `squashfs-tools`) — builds the compressed, read-only
+  SquashFS root image.
+- **`mkfs.ext2`** (from `e2fsprogs`) — formats the read-write ext2 data volume.
+
+**macOS (Homebrew):**
+
+```bash
+brew install squashfs e2fsprogs
+```
+
+> **Note:** `e2fsprogs` is *keg-only* on macOS (Apple ships conflicting
+> versions), so Homebrew does not symlink `mkfs.ext2` onto your `PATH`. `xtask`
+> handles this automatically — it looks for `mkfs.ext2` on `PATH` and falls back
+> to `/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext2` (and the Intel
+> `/usr/local/opt/...` location). You do **not** need to edit your `PATH`.
+
+**Ubuntu/Debian:**
+
+```bash
+sudo apt install squashfs-tools e2fsprogs
+```
+
+**Fedora:**
+
+```bash
+sudo dnf install squashfs-tools e2fsprogs
+```
+
+**Arch Linux:**
+
+```bash
+sudo pacman -S squashfs-tools e2fsprogs
+```
+
+### Installing everything at once (macOS)
+
+The repo ships a [`Brewfile`](https://github.com/Homebrew/homebrew-bundle) that
+declares every macOS host dependency (QEMU, xorriso, squashfs, e2fsprogs). From
+the repo root:
+
+```bash
+brew bundle
+```
+
 ## Building and running
 
 All build and run commands go through the `xtask` tool. You never need to invoke `cargo build` for the kernel directly.

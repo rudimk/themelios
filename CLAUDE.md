@@ -112,11 +112,20 @@ cargo xtask docs
 
 ### Prerequisites
 
+Host tools the build/test pipeline shells out to (Rust itself is managed by
+rustup via `rust-toolchain.toml`, not the OS package manager):
+
 - Rust nightly toolchain (pinned via `rust-toolchain.toml`)
 - QEMU: `qemu-system-x86_64` and `qemu-system-aarch64`
+- `xorriso` (bootable ISO creation)
+- `mksquashfs` from `squashfs` / `squashfs-tools` (SquashFS root image, Phase 3)
+- `mkfs.ext2` from `e2fsprogs` (ext2 data volume image, Phase 3; keg-only on
+  macOS — `xtask` resolves the keg path automatically)
 - mdbook (for documentation)
 
-See the [development setup guide](docs/src/dev-setup.md) in the mdbook for detailed instructions.
+On macOS these are declared in the repo's `Brewfile` — run `brew bundle` to
+install them all. See the [development setup guide](docs/src/dev-setup.md) in
+the mdbook for per-OS instructions.
 
 ## Milestone Roadmap
 
