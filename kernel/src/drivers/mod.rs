@@ -33,6 +33,11 @@
 /// block-server code from the specific hardware (VirtIO-blk now; NVMe later).
 pub mod block;
 
+/// Block server — kernel-side IPC endpoint exposing block I/O to userspace
+/// filesystem servers. Receives read/write/flush requests over IPC and performs
+/// them via the in-kernel `BlockDevice`, transferring data through shared memory.
+pub mod block_server;
+
 /// PCI bus enumeration (x86_64).
 ///
 /// Discovers the virtual hardware QEMU exposes on the PCI bus — most importantly

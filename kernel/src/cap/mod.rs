@@ -183,6 +183,22 @@ pub enum CapType {
         /// IRQ number (0-15 for the 8259 PIC, higher for APIC).
         irq_number: u8,
     },
+
+    /// A shared memory region for bulk data transfer between processes (and the
+    /// kernel). IPC messages carry only four machine words — far too small for
+    /// block data or filesystem buffers — so the storage stack moves payloads
+    /// through shared memory instead: the kernel allocates physical frames and
+    /// maps them into the address spaces of both endpoints (e.g. the block
+    /// server and a filesystem server). The capability names the region; a
+    /// holder with the right to it can have it mapped into its address space.
+    SharedMemory {
+        /// Physical base address of the region (page-aligned).
+        phys_base: u64,
+        /// Size of the region in bytes (a whole number of pages).
+        size: u64,
+        /// PID that allocated/owns the region, for accounting and revocation.
+        owner_pid: usize,
+    },
 }
 
 // --- Capability ---

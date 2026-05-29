@@ -334,6 +334,7 @@ pub fn cmd_caps(args: &str) {
             CapType::Endpoint { .. } => "Endpoint",
             CapType::Process { .. } => "Process",
             CapType::Irq { .. } => "IRQ",
+            CapType::SharedMemory { .. } => "ShMem",
         };
         let details = match cap_type {
             CapType::Null => alloc::string::String::from("-"),
@@ -345,6 +346,8 @@ pub fn cmd_caps(args: &str) {
                 alloc::format!("pid={}", pid),
             CapType::Irq { irq_number } =>
                 alloc::format!("irq={}", irq_number),
+            CapType::SharedMemory { phys_base, size, owner_pid } =>
+                alloc::format!("base={:#x} size={:#x} pid={}", phys_base, size, owner_pid),
         };
         println!("  {:>12}  {:>16}  {:>8}  {}",
             handle, type_str, rights, details);
@@ -392,6 +395,7 @@ pub fn cmd_audit(args: &str) {
             CapType::Endpoint { .. } => "Endpoint",
             CapType::Process { .. } => "Process",
             CapType::Irq { .. } => "IRQ",
+            CapType::SharedMemory { .. } => "ShMem",
         };
 
         println!("  {:>6}  {:>8}  {:>6}  {:>14}  {:>10}  {:#012x}",

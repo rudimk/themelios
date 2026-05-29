@@ -47,6 +47,8 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_pci_scan",        func: test_pci_scan },
     TestCase { name: "test_virtio_transport", func: test_virtio_transport },
     TestCase { name: "test_virtio_blk",       func: test_virtio_blk },
+    TestCase { name: "test_shared_memory",    func: test_shared_memory },
+    TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1356,5 +1358,166 @@ fn test_virtio_blk() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_virtio_blk() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_shared_memory — Shared memory regions (Phase 3.3)
+// ============================================================
+
+/// Test shared memory region allocation and mapping into an address space.
+///
+/// Verifies:
+/// 1. A region can be allocated and is zeroed and page-sized
+/// 2. The kernel can read/write it via the HHDM
+/// 3. It can be mapped into a (user) address space, and `translate` resolves
+///    each mapped page to the correct physical frame (the basis for handing a
+///    block-transfer window to a ring-3 filesystem server)
+fn test_shared_memory() -> Result<(), &'static str> {
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::page_table::{kernel_address_space, AddressSpace};
+    use crate::mm::shared::SharedRegion;
+
+    // 1. Allocate two pages' worth of shared memory.
+    let region = SharedRegion::alloc(8192).ok_or("shared alloc failed")?;
+    if region.size < 8192 {
+        return Err("shared region smaller than requested");
+    }
+
+    // Freshly allocated region must be zeroed.
+    // SAFETY: we own the region; no other task accesses it during this test.
+    unsafe {
+        let s = region.as_slice_mut();
+        if s.iter().any(|&b| b != 0) {
+            return Err("shared region not zeroed");
+        }
+        // 2. Kernel read/write via HHDM.
+        s[0] = 0xAB;
+        let last = region.size as usize - 1;
+        s[last] = 0xCD;
+        if s[0] != 0xAB || s[last] != 0xCD {
+            return Err("kernel shared-memory write/read mismatch");
+        }
+    }
+
+    // 3. Map into a fresh user address space and verify translation.
+    let kernel_as = kernel_address_space();
+    let user = AddressSpace::new_user(&kernel_as);
+    core::mem::forget(kernel_as);
+
+    let virt = VirtAddr::new(0x4000_0000);
+    region.map_into(&user, virt);
+
+    let r0 = user.translate(virt);
+    let r1 = user.translate(VirtAddr::new(virt.as_u64() + 0x1000));
+    // Don't destroy the user AS: it would free the shared region's frames
+    // (they're mapped as leaves). Leak the page tables instead — this is a test.
+    let ok0 = matches!(r0, Some(p) if p.as_u64() == region.phys_base.as_u64());
+    let ok1 = matches!(r1, Some(p) if p.as_u64() == region.phys_base.as_u64() + 0x1000);
+    core::mem::forget(user);
+
+    if !ok0 {
+        return Err("shared region page 0 translate mismatch");
+    }
+    if !ok1 {
+        return Err("shared region page 1 translate mismatch");
+    }
+
+    Ok(())
+}
+
+// ============================================================
+//  test_block_server_ipc — Block server over IPC (Phase 3.3)
+// ============================================================
+
+/// Test the block server's IPC interface end to end.
+///
+/// Brings up a block device, starts the block server on it, then acts as an IPC
+/// client: writes a pattern into the shared region and issues a WRITE request,
+/// clears the region and issues a READ request, and verifies the data round-trips
+/// through the device via IPC + shared memory.
+#[cfg(target_arch = "x86_64")]
+fn test_block_server_ipc() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::ipc::{self, IpcMessage};
+    use crate::sched;
+
+    // Bring up and register a block device for the server to drive.
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let dev = devs
+        .iter()
+        .find(|d| d.class == 0x01)
+        .ok_or("no VirtIO block device")?;
+    let blk = VirtioBlk::init_from_pci(dev).map_err(|_| "device init failed")?;
+    let idx = block::register("virtio-blk-srv", Box::new(blk));
+
+    // Start the server (spawns its task) and let it reach its receive loop.
+    let handle = block_server::start(idx);
+    for _ in 0..50 {
+        sched::yield_now();
+    }
+
+    const BLOCK_SIZE: usize = 512;
+    const TEST_LBA: u64 = 50;
+
+    // Fill the shared region [0, 512) with a known pattern, then WRITE it.
+    // SAFETY: the server is idle (we hold the only outstanding request) so no
+    // concurrent access to the shared region occurs.
+    unsafe {
+        let s = handle.region.as_slice_mut();
+        for (i, b) in s[..BLOCK_SIZE].iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+    }
+    // WRITE: op=1, lba=TEST_LBA, count=1, offset=0.
+    let write_req = IpcMessage::new([1, TEST_LBA, 1, 0]);
+    let resp = ipc::ipc_call(handle.endpoint, write_req, 0)
+        .map_err(|_| "WRITE ipc_call failed")?;
+    if resp.words[0] != 0 {
+        return Err("WRITE request returned error status");
+    }
+
+    // Clear the region so a successful READ must repopulate it.
+    unsafe {
+        let s = handle.region.as_slice_mut();
+        for b in s[..BLOCK_SIZE].iter_mut() {
+            *b = 0;
+        }
+    }
+    // READ: op=0, lba=TEST_LBA, count=1, offset=0.
+    let read_req = IpcMessage::new([0, TEST_LBA, 1, 0]);
+    let resp = ipc::ipc_call(handle.endpoint, read_req, 0)
+        .map_err(|_| "READ ipc_call failed")?;
+    if resp.words[0] != 0 {
+        return Err("READ request returned error status");
+    }
+
+    // The region should again hold the original pattern.
+    // SAFETY: the request completed; no concurrent access.
+    unsafe {
+        let s = handle.region.as_slice_mut();
+        for (i, &b) in s[..BLOCK_SIZE].iter().enumerate() {
+            if b != ((i as u8) ^ 0x5A) {
+                return Err("data mismatch after block-server round-trip");
+            }
+        }
+    }
+
+    // An out-of-range shared offset must be rejected by the server.
+    let bad_req = IpcMessage::new([0, TEST_LBA, 1, handle.region.size]);
+    let resp = ipc::ipc_call(handle.endpoint, bad_req, 0)
+        .map_err(|_| "bad-offset ipc_call failed")?;
+    if resp.words[0] == 0 {
+        return Err("out-of-range offset should have been rejected");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_block_server_ipc() -> Result<(), &'static str> {
     Ok(())
 }

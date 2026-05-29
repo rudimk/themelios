@@ -46,6 +46,7 @@ pub mod frame;
 pub mod heap;
 pub mod mmio;
 pub mod page_table;
+pub mod shared;
 
 extern crate alloc;
 
