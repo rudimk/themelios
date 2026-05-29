@@ -44,6 +44,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_ipc",             func: test_ipc },
     TestCase { name: "test_audit",           func: test_audit },
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
+    TestCase { name: "test_pci_scan",        func: test_pci_scan },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1143,5 +1144,54 @@ fn test_userspace_init() -> Result<(), &'static str> {
         return Err("init server received fewer than 2 messages");
     }
 
+    Ok(())
+}
+
+// ============================================================
+//  test_pci_scan — PCI bus enumeration (Phase 3.0)
+// ============================================================
+
+/// Test PCI bus enumeration.
+///
+/// The scan already ran during boot (in `kmain`), so the global registry is
+/// populated. This verifies:
+/// 1. At least one PCI device was discovered (QEMU always exposes a host
+///    bridge and other Q35 defaults)
+/// 2. A VirtIO device (vendor 0x1AF4) is present — QEMU is launched with a
+///    VirtIO disk attached
+/// 3. The VirtIO device has at least one implemented BAR with a non-zero size
+#[cfg(target_arch = "x86_64")]
+fn test_pci_scan() -> Result<(), &'static str> {
+    use crate::drivers::pci;
+
+    // QEMU's Q35 machine always exposes at least the host bridge and an ISA
+    // bridge, so an empty list means config-space access is broken.
+    if pci::device_count() == 0 {
+        return Err("PCI scan found no devices");
+    }
+
+    // The test harness launches QEMU with a VirtIO block disk attached, so we
+    // must find at least one VirtIO-vendor device.
+    let virtio = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    if virtio.is_empty() {
+        return Err("no VirtIO devices found (expected an attached VirtIO disk)");
+    }
+
+    // At least one VirtIO device should advertise a usable BAR window — the
+    // transport layer (3.1) needs this to reach the device's registers.
+    let has_bar = virtio
+        .iter()
+        .any(|dev| dev.bars.iter().any(|bar| bar.size != 0));
+    if !has_bar {
+        return Err("VirtIO device has no implemented BAR");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets — PCI enumeration is x86-specific in Phase 3
+/// (aarch64 uses memory-mapped ECAM, deferred to Phase 7).
+#[cfg(not(target_arch = "x86_64"))]
+fn test_pci_scan() -> Result<(), &'static str> {
     Ok(())
 }

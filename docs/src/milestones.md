@@ -7,7 +7,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **0** | Boot on QEMU, serial output | Complete |
 | **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
 | **2** | Capability system, process isolation, IPC | Complete |
-| **3** | VirtIO block driver, read-only filesystem | Not started |
+| **3** | VirtIO block driver, read-only filesystem | In progress |
 | **4** | VirtIO net driver, TCP/IP stack | Not started |
 | **5** | OCI container support | Not started |
 | **6** | Management API (Docker-compatible) | Not started |
@@ -57,7 +57,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Reclaim bootloader-reclaimable memory (safe once we own GDT, page tables, and stack)
 - First userspace process (init)
 
-## Phase 3 — Storage (Not started)
+## Phase 3 — Storage (In progress)
 
 **Goal**: Read from a virtual disk and present a filesystem.
 

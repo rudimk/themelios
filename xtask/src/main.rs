@@ -185,6 +185,54 @@ fn ensure_limine(root: &Path) -> PathBuf {
 }
 
 // ============================================================================
+// Virtual disks
+// ============================================================================
+
+/// Ensure a scratch VirtIO block disk exists, returning its path.
+///
+/// Phase 3 needs at least one VirtIO block device attached to QEMU so the
+/// kernel's PCI scan (sub-phase 3.0) and VirtIO-blk driver (sub-phase 3.2) have
+/// something to discover and drive. For now this is a small zero-filled raw
+/// image; sub-phase 3.9 ("image creation tooling") replaces it with real
+/// SquashFS and ext2 images.
+///
+/// The disk is created once and reused — it is only regenerated if missing, so
+/// repeated `cargo xtask run`/`test` invocations don't rewrite it.
+fn ensure_scratch_disk(root: &Path) -> PathBuf {
+    let disk_path = root.join("target/themelios-scratch.img");
+
+    if !disk_path.exists() {
+        // 4 MiB of zeros. Enough for the driver to report a sane capacity and
+        // for round-trip read/write sector tests in sub-phase 3.2.
+        const SIZE_BYTES: usize = 4 * 1024 * 1024;
+        let zeros = vec![0u8; SIZE_BYTES];
+        fs::write(&disk_path, &zeros)
+            .expect("Failed to create scratch disk image");
+        println!("Created scratch VirtIO disk: {}", disk_path.display());
+    }
+
+    disk_path
+}
+
+/// Append the QEMU flags that attach `disk_path` as a VirtIO block device.
+///
+/// Uses the explicit two-part form rather than the `if=virtio` shorthand so the
+/// device shows up as a `virtio-blk-pci` function on the Q35 PCI bus, which is
+/// what the kernel's PCI enumeration expects to find:
+/// - `-drive ...,if=none,id=blk0`: define the backing image without auto-
+///   attaching it to any controller.
+/// - `-device virtio-blk-pci,drive=blk0`: create the VirtIO block PCI device
+///   backed by that drive.
+fn virtio_disk_args(disk_path: &Path) -> Vec<String> {
+    vec![
+        "-drive".to_string(),
+        format!("file={},format=raw,if=none,id=blk0", disk_path.display()),
+        "-device".to_string(),
+        "virtio-blk-pci,drive=blk0".to_string(),
+    ]
+}
+
+// ============================================================================
 // ISO image creation
 // ============================================================================
 
@@ -415,6 +463,10 @@ fn cmd_run(args: &[String]) {
                     "-no-shutdown",
                 ]);
 
+            // Attach a VirtIO block disk so the kernel has storage to discover.
+            let scratch = ensure_scratch_disk(&root);
+            cmd.args(virtio_disk_args(&scratch));
+
             // In headless mode, suppress the QEMU graphical window.
             // With --display, let QEMU use its default backend (Cocoa/GTK/SDL).
             if !opts.display {
@@ -499,8 +551,8 @@ fn cmd_test(args: &[String]) {
 
     let timeout_secs = 30;
 
-    let child = Command::new(qemu)
-        .current_dir(&root)
+    let mut cmd = Command::new(qemu);
+    cmd.current_dir(&root)
         .args([
             "-M", "q35",
             "-m", "256M",
@@ -511,7 +563,14 @@ fn cmd_test(args: &[String]) {
             // isa-debug-exit: writing to port 0xf4 causes QEMU to exit
             // with code (value << 1) | 1
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-        ])
+        ]);
+
+    // Attach a VirtIO block disk so PCI/VirtIO/block tests have a device to
+    // discover and exercise.
+    let scratch = ensure_scratch_disk(&root);
+    cmd.args(virtio_disk_args(&scratch));
+
+    let child = cmd
         .stdout(process::Stdio::inherit())
         .stderr(process::Stdio::inherit())
         .spawn();

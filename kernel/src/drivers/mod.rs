@@ -25,3 +25,11 @@
 //! In later phases, drivers will be moved to userspace processes that communicate
 //! with the kernel via IPC. The kernel grants them capabilities for the specific
 //! hardware resources (MMIO regions, interrupt lines) they need — nothing more.
+
+/// PCI bus enumeration (x86_64).
+///
+/// Discovers the virtual hardware QEMU exposes on the PCI bus — most importantly
+/// VirtIO devices — by walking PCI configuration space via the 0xCF8/0xCFC I/O
+/// ports. The foundation the VirtIO transport and block driver build on.
+#[cfg(target_arch = "x86_64")]
+pub mod pci;

@@ -383,6 +383,16 @@ extern "C" fn kmain() -> ! {
         arch::x86_64::pic::unmask(0);
     }
 
+    // --- PCI bus enumeration ---
+    //
+    // Walk the PCI bus to discover the virtual hardware QEMU exposes — most
+    // importantly the VirtIO block device we'll drive in Phase 3. This is a
+    // read-only scan of PCI config space; it allocates a Vec of discovered
+    // devices, so it must run after heap init. It has no dependency on the
+    // scheduler or interrupts, so we do it here.
+    #[cfg(target_arch = "x86_64")]
+    drivers::pci::scan();
+
     // --- Scheduler initialization ---
     //
     // Set up the preemptive round-robin scheduler. This creates the bootstrap

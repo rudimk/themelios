@@ -96,6 +96,32 @@ pub unsafe fn outl(port: u16, value: u32) {
     }
 }
 
+/// Read a 32-bit (double word) value from an x86 I/O port.
+///
+/// This executes the `in eax, dx` instruction, which reads a 32-bit value
+/// from the I/O port number in `dx` into `eax`. Used for devices with 32-bit
+/// I/O port interfaces — notably the PCI configuration space data port
+/// (0xCFC), which always returns a full 32-bit register.
+///
+/// # Safety
+///
+/// Reading from an I/O port can have side effects on hardware. The caller
+/// must ensure the port number is valid and the read is appropriate for the
+/// device at that port.
+#[inline(always)]
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        asm!(
+            "in eax, dx",
+            in("dx") port,
+            out("eax") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
 /// Halt the CPU until the next interrupt arrives.
 ///
 /// This executes the `hlt` instruction, which puts the CPU into a low-power
