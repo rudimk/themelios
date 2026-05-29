@@ -55,6 +55,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_ext2_read",        func: test_ext2_read },
     TestCase { name: "test_ext2_write",       func: test_ext2_write },
     TestCase { name: "test_vfs_capability",   func: test_vfs_capability },
+    TestCase { name: "test_fs_syscalls",      func: test_fs_syscalls },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1560,6 +1561,7 @@ fn test_server_spawn() -> Result<(), &'static str> {
         heap_bytes: 256 * 1024,
         arg0: 0,
         arg1: 0,
+        filesystem_mount: None,
     });
 
     // Let the ring-3 server reach its receive loop. It must be scheduled, run
@@ -1662,6 +1664,7 @@ fn test_squashfs_server() -> Result<(), &'static str> {
         heap_bytes: 2 * 1024 * 1024,
         arg0: 0,
         arg1: 0,
+        filesystem_mount: None,
     });
 
     // Let the server boot and parse the superblock.
@@ -1886,6 +1889,7 @@ fn test_overlay_server() -> Result<(), &'static str> {
         heap_bytes: 2 * 1024 * 1024,
         arg0: 0,
         arg1: 0,
+        filesystem_mount: None,
     });
 
     // Overlay server: lower = SquashFS (arg0 = sqfs_ep, block-slot region =
@@ -1902,6 +1906,7 @@ fn test_overlay_server() -> Result<(), &'static str> {
         heap_bytes: 4 * 1024 * 1024,
         arg0: sqfs_ep,
         arg1: 0,
+        filesystem_mount: None,
     });
 
     // Let both servers boot (SquashFS parses its superblock; overlay is ready).
@@ -2098,6 +2103,7 @@ fn test_ext2_read() -> Result<(), &'static str> {
         heap_bytes: 2 * 1024 * 1024,
         arg0: 0,
         arg1: 0,
+        filesystem_mount: None,
     });
 
     for _ in 0..1000 {
@@ -2284,6 +2290,7 @@ fn test_ext2_write() -> Result<(), &'static str> {
         heap_bytes: 2 * 1024 * 1024,
         arg0: 0,
         arg1: 0,
+        filesystem_mount: None,
     });
     for _ in 0..1000 {
         sched::yield_now();
@@ -2466,6 +2473,7 @@ fn test_vfs_capability() -> Result<(), &'static str> {
         heap_bytes: 2 * 1024 * 1024,
         arg0: 0,
         arg1: 0,
+        filesystem_mount: None,
     });
     for _ in 0..1000 {
         sched::yield_now();
@@ -2533,5 +2541,100 @@ fn test_vfs_capability() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_vfs_capability() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_fs_syscalls — FS syscalls from ring 3 (Phase 3.8, step 2)
+// ============================================================
+
+/// Test the filesystem syscalls end to end from a real ring-3 process.
+///
+/// Brings up a SquashFS mount, spawns the `fstest-client` server with a granted
+/// `Filesystem` capability, and waits for its result code. The client performs
+/// `stat`/`open`/`read_file` syscalls (exercising user-pointer copy in/out and
+/// capability checks) and confirms a null-capability call is rejected.
+#[cfg(target_arch = "x86_64")]
+fn test_fs_syscalls() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::fs;
+    use crate::ipc;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    // SquashFS mount (lower-level data plane already proven; reused here).
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let mut sqfs_index = None;
+    for dev in devs.iter().filter(|d| d.class == 0x01) {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 512];
+        if blk.read_blocks(0, &mut buf).is_ok() && buf[0..4] == [0x68, 0x73, 0x71, 0x73] {
+            sqfs_index = Some(block::register("squashfs-sys", Box::new(blk)));
+            break;
+        }
+    }
+    let idx = sqfs_index.ok_or("no SquashFS disk for syscall test")?;
+    let block_handle = block_server::start(idx);
+    let sqfs_client = SharedRegion::alloc(128 * 1024).ok_or("client alloc failed")?;
+    let sqfs_ep = ipc::create_endpoint("sys-sqfs");
+    spawn_server(ServerConfig {
+        name: "squashfs-server",
+        binary: embedded::SQUASHFS_SERVER,
+        fs_endpoint: sqfs_ep,
+        block_endpoint: block_handle.endpoint,
+        shared: Some(block_handle.region),
+        client_shared: Some(sqfs_client),
+        heap_bytes: 2 * 1024 * 1024,
+        arg0: 0,
+        arg1: 0,
+        filesystem_mount: None,
+    });
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+    let mount_id = fs::register_mount(sqfs_ep, sqfs_client);
+
+    // Spawn the ring-3 client, granting it a Filesystem capability for the mount
+    // and a result endpoint to report back on.
+    let result_ep = ipc::create_endpoint("fstest-result");
+    spawn_server(ServerConfig {
+        name: "fstest-client",
+        binary: embedded::FSTEST_CLIENT,
+        fs_endpoint: result_ep,
+        block_endpoint: 0,
+        shared: None,
+        client_shared: None,
+        heap_bytes: 256 * 1024,
+        arg0: 0,
+        arg1: 0,
+        filesystem_mount: Some(mount_id),
+    });
+
+    // The client reports its result code on result_ep. 0 = all syscalls passed.
+    let msg = ipc::ipc_receive(result_ep).map_err(|_| "no result from fstest-client")?;
+    match msg.words[0] {
+        0 => Ok(()),
+        1 => Err("fstest-client: SYS_STAT failed"),
+        2 => Err("fstest-client: stat size wrong"),
+        3 => Err("fstest-client: SYS_OPEN failed"),
+        4 => Err("fstest-client: SYS_READ_FILE wrong length"),
+        5 => Err("fstest-client: read content mismatch"),
+        6 => Err("fstest-client: null-capability open was NOT rejected"),
+        100 => Err("fstest-client: no Filesystem capability granted"),
+        _ => Err("fstest-client: unknown failure"),
+    }
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_fs_syscalls() -> Result<(), &'static str> {
     Ok(())
 }

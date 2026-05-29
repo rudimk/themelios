@@ -23,6 +23,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fstest-client"
+version = "0.1.0"
+dependencies = [
+ "libthemelios",
+]
+
+[[package]]
 name = "libthemelios"
 version = "0.1.0"
 dependencies = [

@@ -82,6 +82,7 @@ struct ServerBootInfo {
     heap_size: u64,
     arg0: u64,
     arg1: u64,
+    fs_cap_handle: u64,
 }
 
 /// Configuration for spawning a server.
@@ -106,6 +107,9 @@ pub struct ServerConfig {
     pub arg0: u64,
     /// Server-specific argument 1.
     pub arg1: u64,
+    /// If set, grant the server a `Filesystem` capability for this mount id and
+    /// pass its handle to the server via `BootInfo.fs_cap_handle`.
+    pub filesystem_mount: Option<u64>,
 }
 
 /// Spawn a userspace server from an embedded flat binary.
@@ -200,6 +204,24 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
         .expect("spawn_server: no address space");
     }
 
+    // --- Optionally grant a Filesystem capability (before the boot-info write,
+    //     so its handle can be passed to the server). ---
+    let fs_cap_handle = if let Some(mount_id) = config.filesystem_mount {
+        process::with_cspace_mut(pid, |cspace| {
+            cspace
+                .insert(Capability {
+                    cap_type: CapType::Filesystem { mount_id },
+                    rights: CapRights::READ | CapRights::WRITE,
+                    parent: None,
+                })
+                .map(|h| h.as_raw() as u64)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+    } else {
+        0
+    };
+
     // --- Map and fill the boot-info page ---
     let bootinfo_phys = mm::frame::allocate_frame().expect("spawn_server: no frame for bootinfo");
     let boot_info = ServerBootInfo {
@@ -214,6 +236,7 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
         heap_size: (heap_pages as u64) * mm::PAGE_SIZE,
         arg0: config.arg0,
         arg1: config.arg1,
+        fs_cap_handle,
     };
     // SAFETY: bootinfo_phys is a fresh HHDM-mapped frame; ServerBootInfo fits in
     // one page.

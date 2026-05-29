@@ -1,0 +1,14 @@
+[package]
+name = "fstest-client"
+version = "0.1.0"
+edition = "2021"
+
+# A ring-3 client that exercises the filesystem syscalls (open/read/stat) end to
+# end, validating the kernel VFS syscall path and capability gating (sub-phase
+# 3.8). It reports a result code back to the kernel over IPC.
+[[bin]]
+name = "fstest-client"
+path = "src/main.rs"
+
+[dependencies]
+libthemelios = { path = "../libthemelios" }

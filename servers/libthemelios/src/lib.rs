@@ -90,6 +90,9 @@ pub struct BootInfo {
     pub arg0: u64,
     /// Server-specific argument 1.
     pub arg1: u64,
+    /// Capability handle of a `Filesystem` capability granted to this process
+    /// (0 if none). Used with the filesystem syscalls (`open`, `stat`, …).
+    pub fs_cap_handle: u64,
 }
 
 /// Read the boot-info page the kernel populated for this server.
@@ -338,6 +341,70 @@ pub mod syscall {
                 options(nostack, noreturn),
             );
         }
+    }
+
+    // --- Filesystem syscalls (Phase 3) ---
+    //
+    // Number in RAX, args in RDI/RSI/RDX/R10; result in RAX. A return value with
+    // the high bit set is an encoded `fs_proto::FsError`.
+
+    const SYS_OPEN: u64 = 8;
+    const SYS_READ_FILE: u64 = 9;
+    const SYS_WRITE_FILE: u64 = 10;
+    const SYS_CLOSE: u64 = 11;
+    const SYS_STAT: u64 = 12;
+    const SYS_READDIR: u64 = 13;
+
+    /// Raw 4-argument syscall helper for the filesystem calls.
+    #[inline]
+    fn fs_syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: a syscall with the kernel's documented FS register ABI.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") num => ret,
+                in("rdi") a1,
+                in("rsi") a2,
+                in("rdx") a3,
+                in("r10") a4,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Open `path` under the filesystem named by `fs_cap`. Returns a file
+    /// descriptor capability handle, or a high-bit-set error.
+    pub fn open(fs_cap: u64, path: *const u8, path_len: usize, flags: u64) -> u64 {
+        fs_syscall(SYS_OPEN, fs_cap, path as u64, path_len as u64, flags)
+    }
+
+    /// Read `len` bytes at `offset` from `fd` into `buf`. Returns bytes read.
+    pub fn read_file(fd: u64, buf: *mut u8, len: usize, offset: u64) -> u64 {
+        fs_syscall(SYS_READ_FILE, fd, buf as u64, len as u64, offset)
+    }
+
+    /// Write `len` bytes at `offset` from `buf` to `fd`. Returns bytes written.
+    pub fn write_file(fd: u64, buf: *const u8, len: usize, offset: u64) -> u64 {
+        fs_syscall(SYS_WRITE_FILE, fd, buf as u64, len as u64, offset)
+    }
+
+    /// Close a file descriptor capability.
+    pub fn close(fd: u64) -> u64 {
+        fs_syscall(SYS_CLOSE, fd, 0, 0, 0)
+    }
+
+    /// Stat `path` under `fs_cap`, writing `[size:u64, is_dir:u64]` to `stat_out`.
+    pub fn stat(fs_cap: u64, path: *const u8, path_len: usize, stat_out: *mut u8) -> u64 {
+        fs_syscall(SYS_STAT, fs_cap, path as u64, path_len as u64, stat_out as u64)
+    }
+
+    /// List directory `fd`: write up to `out_len` bytes of packed entries to
+    /// `entries_out`. Returns the entry count.
+    pub fn readdir(fd: u64, entries_out: *mut u8, max: u64, out_len: usize) -> u64 {
+        fs_syscall(SYS_READDIR, fd, entries_out as u64, max, out_len as u64)
     }
 
     /// Print a single byte to the kernel serial console (debugging only).

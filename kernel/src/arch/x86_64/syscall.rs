@@ -139,6 +139,32 @@ pub const SYS_EXIT: u64 = 6;
 /// drivers move to userspace.
 pub const SYS_DEBUG_PRINT: u64 = 7;
 
+// --- Filesystem syscalls (Phase 3) ---
+//
+// These route through the kernel VFS layer (`crate::fs`), which checks the
+// caller's capabilities and forwards to the ring-3 filesystem servers. Path
+// strings and data buffers are passed by user pointer and copied in/out by the
+// kernel after validation. All return a negative-encoded FsError (high bit set)
+// on failure.
+
+/// SYS_OPEN: open a path. RDI = Filesystem cap handle, RSI = path ptr,
+/// RDX = path len, R10 = flags. Returns RAX = FileDescriptor cap handle.
+pub const SYS_OPEN: u64 = 8;
+/// SYS_READ_FILE: RDI = fd cap, RSI = buf ptr, RDX = buf len, R10 = file offset.
+/// Returns RAX = bytes read.
+pub const SYS_READ_FILE: u64 = 9;
+/// SYS_WRITE_FILE: RDI = fd cap, RSI = buf ptr, RDX = buf len, R10 = file offset.
+/// Returns RAX = bytes written.
+pub const SYS_WRITE_FILE: u64 = 10;
+/// SYS_CLOSE: RDI = fd cap. Returns RAX = 0.
+pub const SYS_CLOSE: u64 = 11;
+/// SYS_STAT: RDI = Filesystem cap, RSI = path ptr, RDX = path len,
+/// R10 = stat-out ptr (writes [size:u64, is_dir:u64]). Returns RAX = 0.
+pub const SYS_STAT: u64 = 12;
+/// SYS_READDIR: RDI = fd cap, RSI = entries-out ptr, RDX = max entries,
+/// R10 = out buffer length. Returns RAX = entry count.
+pub const SYS_READDIR: u64 = 13;
+
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
 /// RDI = the SYS_NULL return value. The handler stores the result and
@@ -475,6 +501,11 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
             crate::print!("{}", ch);
             frame.rax = 0;
         }
+        SYS_OPEN | SYS_READ_FILE | SYS_WRITE_FILE | SYS_CLOSE | SYS_STAT | SYS_READDIR => {
+            // Filesystem syscalls block on the FS server, so enable interrupts.
+            cpu::sti();
+            dispatch_fs_syscall(frame);
+        }
         SYS_TEST_COMPLETE => {
             // Internal test syscall: store the test result and kill the task.
             // RDI contains the SYS_NULL return value from the test shellcode.
@@ -500,6 +531,162 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
             frame.rax = !0u64;
             crate::println!("[syscall] unknown syscall number: {}", unknown);
         }
+    }
+}
+
+// --- Filesystem syscall dispatch ---
+//
+// These thin handlers validate and copy user pointers, then delegate to the
+// capability-checked VFS operations in `crate::fs`. They run with interrupts
+// enabled (the VFS calls block on the ring-3 filesystem servers).
+
+/// Upper bound on the non-canonical user/kernel split — any user pointer at or
+/// above this is rejected. Userspace lives strictly in the lower half.
+const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+/// Cap on a single filesystem syscall transfer, to bound kernel allocation
+/// against a hostile or buggy user length.
+const FS_MAX_XFER: usize = 256 * 1024;
+
+/// Validate that `[uptr, uptr+len)` is wholly mapped in the current process's
+/// address space and lies in the user half. Returns false on any gap.
+fn user_range_ok(uptr: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let end = match uptr.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    if uptr == 0 || end > USER_ADDR_LIMIT {
+        return false;
+    }
+    let pid = crate::sched::current_process_id();
+    crate::process::with_address_space(pid, |a| {
+        let mut page = uptr & !0xFFF;
+        while page < end {
+            if a.translate(crate::mm::addr::VirtAddr::new(page)).is_none() {
+                return false;
+            }
+            page += 0x1000;
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Copy `len` bytes from a validated user pointer into a kernel `Vec`.
+fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    if len > FS_MAX_XFER || !user_range_ok(uptr, len) {
+        return None;
+    }
+    // SAFETY: we are in the calling process's address space (its CR3 is active
+    // during the syscall) and have verified every page of the range is mapped.
+    let slice = unsafe { core::slice::from_raw_parts(uptr as *const u8, len) };
+    Some(slice.to_vec())
+}
+
+/// Copy `data` to a validated user pointer. Returns false if the range is bad.
+fn copy_to_user(uptr: u64, data: &[u8]) -> bool {
+    if !user_range_ok(uptr, data.len()) {
+        return false;
+    }
+    // SAFETY: validated mapped user range in the active address space.
+    let dst = unsafe { core::slice::from_raw_parts_mut(uptr as *mut u8, data.len()) };
+    dst.copy_from_slice(data);
+    true
+}
+
+/// Dispatch a filesystem syscall (SYS_OPEN .. SYS_READDIR) from `frame`.
+fn dispatch_fs_syscall(frame: &mut SyscallFrame) {
+    use crate::cap::CapHandle;
+    use crate::fs::{self, FsError};
+
+    let pid = crate::sched::current_process_id();
+    crate::audit::log_event(pid, crate::audit::AuditOp::FsAccess, crate::cap::CapType::Null, frame.rax);
+    let bad_arg = FsError::InvalidArgument.as_syscall_ret();
+
+    match frame.rax {
+        SYS_OPEN => {
+            let fs_handle = CapHandle::from_raw(frame.rdi as u32);
+            match copy_from_user(frame.rsi, frame.rdx as usize) {
+                Some(path) => match fs::vfs_open(pid, fs_handle, &path) {
+                    Ok(fd_raw) => frame.rax = fd_raw as u64,
+                    Err(e) => frame.rax = e.as_syscall_ret(),
+                },
+                None => frame.rax = bad_arg,
+            }
+        }
+        SYS_READ_FILE => {
+            let fd = CapHandle::from_raw(frame.rdi as u32);
+            let len = (frame.rdx as usize).min(FS_MAX_XFER);
+            let off = frame.r10;
+            if !user_range_ok(frame.rsi, len) {
+                frame.rax = bad_arg;
+                return;
+            }
+            let mut kbuf = alloc::vec![0u8; len];
+            match fs::vfs_read(pid, fd, off, &mut kbuf) {
+                Ok(n) if copy_to_user(frame.rsi, &kbuf[..n]) => frame.rax = n as u64,
+                Ok(_) => frame.rax = bad_arg,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_WRITE_FILE => {
+            let fd = CapHandle::from_raw(frame.rdi as u32);
+            let off = frame.r10;
+            match copy_from_user(frame.rsi, frame.rdx as usize) {
+                Some(data) => match fs::vfs_write(pid, fd, off, &data) {
+                    Ok(n) => frame.rax = n as u64,
+                    Err(e) => frame.rax = e.as_syscall_ret(),
+                },
+                None => frame.rax = bad_arg,
+            }
+        }
+        SYS_CLOSE => {
+            let fd = CapHandle::from_raw(frame.rdi as u32);
+            match fs::vfs_close(pid, fd) {
+                Ok(()) => frame.rax = 0,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_STAT => {
+            let fs_handle = CapHandle::from_raw(frame.rdi as u32);
+            let stat_ptr = frame.r10;
+            match copy_from_user(frame.rsi, frame.rdx as usize) {
+                Some(path) => match fs::vfs_stat(pid, fs_handle, &path) {
+                    Ok((size, is_dir)) => {
+                        // Write [size:u64, is_dir:u64] to the user stat buffer.
+                        let mut out = [0u8; 16];
+                        out[0..8].copy_from_slice(&size.to_le_bytes());
+                        out[8..16].copy_from_slice(&(is_dir as u64).to_le_bytes());
+                        if copy_to_user(stat_ptr, &out) {
+                            frame.rax = 0;
+                        } else {
+                            frame.rax = bad_arg;
+                        }
+                    }
+                    Err(e) => frame.rax = e.as_syscall_ret(),
+                },
+                None => frame.rax = bad_arg,
+            }
+        }
+        SYS_READDIR => {
+            let fd = CapHandle::from_raw(frame.rdi as u32);
+            let entries_ptr = frame.rsi;
+            let max = frame.rdx;
+            let out_len = (frame.r10 as usize).min(FS_MAX_XFER);
+            if !user_range_ok(entries_ptr, out_len) {
+                frame.rax = bad_arg;
+                return;
+            }
+            let mut kbuf = alloc::vec![0u8; out_len];
+            match fs::vfs_readdir(pid, fd, max, &mut kbuf) {
+                Ok(count) if copy_to_user(entries_ptr, &kbuf) => frame.rax = count,
+                Ok(_) => frame.rax = bad_arg,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        _ => frame.rax = bad_arg,
     }
 }
 

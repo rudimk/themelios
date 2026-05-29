@@ -89,6 +89,10 @@ pub enum AuditOp {
     /// A syscall was invoked from userspace.
     /// Detail: the syscall number.
     Syscall,
+
+    /// A filesystem operation was dispatched through the VFS layer.
+    /// Detail: the filesystem syscall number (SYS_OPEN .. SYS_READDIR).
+    FsAccess,
 }
 
 impl core::fmt::Display for AuditOp {
@@ -103,6 +107,7 @@ impl core::fmt::Display for AuditOp {
             AuditOp::IpcCall     => write!(f, "ipc_call"),
             AuditOp::IpcReply    => write!(f, "ipc_reply"),
             AuditOp::Syscall     => write!(f, "syscall"),
+            AuditOp::FsAccess    => write!(f, "fs_access"),
         }
     }
 }

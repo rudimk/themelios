@@ -25,3 +25,6 @@ pub static OVERLAY_SERVER: &[u8] = include_bytes!("../../../target/servers/overl
 
 /// The ext2 server: read-write ext2 for persistent data volumes (3.7).
 pub static EXT2_SERVER: &[u8] = include_bytes!("../../../target/servers/ext2-server.bin");
+
+/// The filesystem syscall test client: exercises the VFS syscalls from ring 3 (3.8).
+pub static FSTEST_CLIENT: &[u8] = include_bytes!("../../../target/servers/fstest-client.bin");

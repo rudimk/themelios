@@ -20,6 +20,7 @@ members = [
     "squashfs-server",
     "overlay-server",
     "ext2-server",
+    "fstest-client",
 ]
 
 # Servers are freestanding ring-3 binaries: abort on panic (no unwinder), and
