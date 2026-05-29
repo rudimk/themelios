@@ -51,6 +51,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
     TestCase { name: "test_server_spawn",     func: test_server_spawn },
     TestCase { name: "test_squashfs_server",  func: test_squashfs_server },
+    TestCase { name: "test_overlay_server",   func: test_overlay_server },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1814,5 +1815,224 @@ fn test_squashfs_server() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_squashfs_server() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_overlay_server — Overlay filesystem server (Phase 3.6)
+// ============================================================
+
+/// Test the overlay server: a RAM upper layer merged over the SquashFS lower.
+///
+/// Brings up SquashFS (lower) and the overlay (upper) and verifies the
+/// overlayfs semantics end to end:
+/// 1. Read-through: a lower file is visible through the overlay
+/// 2. Create + write + read: a new file lives only in the RAM upper layer
+/// 3. Copy-up: writing a lower file copies it up and modifies the upper copy
+///    (the lower image is untouched)
+/// 4. Whiteout: deleting a lower file hides it from the merged view
+/// 5. Readdir merge: listing shows lower + upper entries, minus whiteouts
+#[cfg(target_arch = "x86_64")]
+fn test_overlay_server() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::ipc::{self, IpcMessage};
+    use crate::mm::shared::SharedRegion;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    const OP_OPEN: u64 = 1;
+    const OP_READ: u64 = 2;
+    const OP_WRITE: u64 = 3;
+    const OP_STAT: u64 = 5;
+    const OP_READDIR: u64 = 6;
+    const OP_CREATE: u64 = 7;
+    const OP_UNLINK: u64 = 9;
+    const STATUS_OK: u64 = 0;
+
+    // --- Locate the SquashFS disk and bring up the lower (SquashFS) server. ---
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let mut sqfs_index = None;
+    for dev in devs.iter().filter(|d| d.class == 0x01) {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 512];
+        if blk.read_blocks(0, &mut buf).is_ok() && buf[0..4] == [0x68, 0x73, 0x71, 0x73] {
+            sqfs_index = Some(block::register("squashfs-disk-ovl", Box::new(blk)));
+            break;
+        }
+    }
+    let idx = sqfs_index.ok_or("no SquashFS disk found")?;
+    let block_handle = block_server::start(idx);
+
+    // SquashFS server with its own client region (shared with the overlay).
+    let sqfs_client = SharedRegion::alloc(128 * 1024).ok_or("sqfs client alloc failed")?;
+    let sqfs_ep = ipc::create_endpoint("ovl-lower-sqfs");
+    spawn_server(ServerConfig {
+        name: "squashfs-server",
+        binary: embedded::SQUASHFS_SERVER,
+        fs_endpoint: sqfs_ep,
+        block_endpoint: block_handle.endpoint,
+        shared: Some(block_handle.region),
+        client_shared: Some(sqfs_client),
+        heap_bytes: 2 * 1024 * 1024,
+        arg0: 0,
+        arg1: 0,
+    });
+
+    // Overlay server: lower = SquashFS (arg0 = sqfs_ep, block-slot region =
+    // sqfs_client so the overlay can forward through it); own client region.
+    let ovl_client = SharedRegion::alloc(128 * 1024).ok_or("overlay client alloc failed")?;
+    let ovl_ep = ipc::create_endpoint("overlay-fs");
+    spawn_server(ServerConfig {
+        name: "overlay-server",
+        binary: embedded::OVERLAY_SERVER,
+        fs_endpoint: ovl_ep,
+        block_endpoint: 0,
+        shared: Some(sqfs_client),
+        client_shared: Some(ovl_client),
+        heap_bytes: 4 * 1024 * 1024,
+        arg0: sqfs_ep,
+        arg1: 0,
+    });
+
+    // Let both servers boot (SquashFS parses its superblock; overlay is ready).
+    for _ in 0..2000 {
+        sched::yield_now();
+    }
+
+    let put = |bytes: &[u8]| -> u64 {
+        let s = unsafe { ovl_client.as_slice_mut() };
+        s[..bytes.len()].copy_from_slice(bytes);
+        bytes.len() as u64
+    };
+    let call = |words: [u64; 4]| ipc::ipc_call(ovl_ep, IpcMessage::new(words), 0);
+
+    // --- 1. Read-through: /version comes from the lower layer ---
+    let plen = put(b"/version");
+    let r = call([OP_OPEN, plen, 0, 0]).map_err(|_| "open /version failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("overlay open /version (read-through) failed");
+    }
+    let fd = r.words[1];
+    let r = call([OP_READ, fd, 0, 15]).map_err(|_| "read /version failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 15 {
+        return Err("overlay read-through wrong length");
+    }
+    {
+        let s = unsafe { ovl_client.as_slice_mut() };
+        if &s[..15] != b"THEMELIOS_ROOT\n" {
+            return Err("overlay read-through content mismatch");
+        }
+    }
+
+    // --- 2. Create a new file in the upper layer, write, read back ---
+    let plen = put(b"/newfile");
+    let r = call([OP_CREATE, plen, 0, 0]).map_err(|_| "create failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("overlay create /newfile failed");
+    }
+    let fd = r.words[1];
+    let payload = b"hello overlay";
+    let dlen = put(payload);
+    let r = call([OP_WRITE, fd, 0, dlen]).map_err(|_| "write failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != payload.len() as u64 {
+        return Err("overlay write /newfile failed");
+    }
+    let r = call([OP_READ, fd, 0, payload.len() as u64]).map_err(|_| "read newfile failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != payload.len() as u64 {
+        return Err("overlay read /newfile wrong length");
+    }
+    {
+        let s = unsafe { ovl_client.as_slice_mut() };
+        if &s[..payload.len()] != payload {
+            return Err("overlay new file content mismatch");
+        }
+    }
+
+    // --- 3. Copy-up: modify a lower file; the upper copy reflects the change ---
+    let plen = put(b"/hello.txt");
+    let r = call([OP_OPEN, plen, 0, 0]).map_err(|_| "open hello failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("overlay open /hello.txt failed");
+    }
+    let fd = r.words[1];
+    let dlen = put(b"J"); // overwrite first byte: "Hello..." -> "Jello..."
+    let r = call([OP_WRITE, fd, 0, dlen]).map_err(|_| "copy-up write failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("overlay copy-up write failed");
+    }
+    let r = call([OP_READ, fd, 0, 21]).map_err(|_| "post-copyup read failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 21 {
+        return Err("overlay post-copy-up read wrong length");
+    }
+    {
+        let s = unsafe { ovl_client.as_slice_mut() };
+        if &s[..21] != b"Jello from SquashFS!\n" {
+            return Err("overlay copy-up content wrong");
+        }
+    }
+
+    // --- 4. Whiteout: deleting a lower file hides it ---
+    let plen = put(b"/big.bin");
+    let r = call([OP_UNLINK, plen, 0, 0]).map_err(|_| "unlink failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("overlay unlink /big.bin failed");
+    }
+    let plen = put(b"/big.bin");
+    let r = call([OP_STAT, plen, 0, 0]).map_err(|_| "stat-after-unlink failed")?;
+    if r.words[0] == STATUS_OK {
+        return Err("overlay whiteout did not hide /big.bin");
+    }
+
+    // --- 5. Readdir merge: lower + upper, whiteouts removed ---
+    let plen = put(b"/");
+    let r = call([OP_OPEN, plen, 0, 0]).map_err(|_| "open / failed")?;
+    let root_fd = r.words[1];
+    let r = call([OP_READDIR, root_fd, 64, 0]).map_err(|_| "readdir / failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("overlay readdir / failed");
+    }
+    let count = r.words[1] as usize;
+    let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    {
+        let s = unsafe { ovl_client.as_slice_mut() };
+        let mut pos = 0usize;
+        for _ in 0..count {
+            if pos + 4 > s.len() {
+                break;
+            }
+            let nlen = u16::from_le_bytes([s[pos], s[pos + 1]]) as usize;
+            pos += 4;
+            if pos + nlen > s.len() {
+                break;
+            }
+            names.push(alloc::string::String::from_utf8_lossy(&s[pos..pos + nlen]).into_owned());
+            pos += nlen;
+        }
+    }
+    // Upper-created /newfile and lower /version must appear; whiteouted /big.bin
+    // must not.
+    if !names.iter().any(|n| n == "newfile") {
+        return Err("overlay readdir missing upper-created newfile");
+    }
+    if !names.iter().any(|n| n == "version") {
+        return Err("overlay readdir missing lower version");
+    }
+    if names.iter().any(|n| n == "big.bin") {
+        return Err("overlay readdir still shows whiteouted big.bin");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_overlay_server() -> Result<(), &'static str> {
     Ok(())
 }

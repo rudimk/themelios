@@ -19,3 +19,6 @@ pub static ECHO_SERVER: &[u8] = include_bytes!("../../../target/servers/echo-ser
 
 /// The SquashFS server: reads the read-only SquashFS root image (sub-phase 3.5).
 pub static SQUASHFS_SERVER: &[u8] = include_bytes!("../../../target/servers/squashfs-server.bin");
+
+/// The overlay server: RAM upper layer merged over a read-only lower (3.6).
+pub static OVERLAY_SERVER: &[u8] = include_bytes!("../../../target/servers/overlay-server.bin");

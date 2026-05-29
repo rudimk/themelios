@@ -1,0 +1,15 @@
+[package]
+name = "overlay-server"
+version = "0.1.0"
+edition = "2021"
+
+# Userspace overlay filesystem server: a RAM-backed writable upper layer merged
+# over a read-only lower layer (the SquashFS server, reached via IPC). This is
+# the overlayfs model container runtimes use to stack image layers, and how
+# ThemeliOS gives its immutable root a writable runtime view. Runs in ring 3.
+[[bin]]
+name = "overlay-server"
+path = "src/main.rs"
+
+[dependencies]
+libthemelios = { path = "../libthemelios" }

@@ -29,6 +29,13 @@ pub const OP_STAT: u64 = 5;
 /// List a directory. Request: `[OP_READDIR, fd, entries_offset, max_entries]`.
 /// Reply: `[status, entry_count]`.
 pub const OP_READDIR: u64 = 6;
+/// Create a new regular file. Request: `[OP_CREATE, path_len]`.
+/// Reply: `[status, fd]`. (Writable filesystems only.)
+pub const OP_CREATE: u64 = 7;
+/// Create a new directory. Request: `[OP_MKDIR, path_len]`. Reply: `[status]`.
+pub const OP_MKDIR: u64 = 8;
+/// Remove a file or directory. Request: `[OP_UNLINK, path_len]`. Reply: `[status]`.
+pub const OP_UNLINK: u64 = 9;
 
 /// Reply status: success.
 pub const STATUS_OK: u64 = 0;
