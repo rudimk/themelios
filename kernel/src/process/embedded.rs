@@ -16,3 +16,6 @@
 /// The echo server: a minimal IPC echo used to validate the server framework
 /// (sub-phase 3.4). Replaced/joined by the real filesystem servers in 3.5+.
 pub static ECHO_SERVER: &[u8] = include_bytes!("../../../target/servers/echo-server.bin");
+
+/// The SquashFS server: reads the read-only SquashFS root image (sub-phase 3.5).
+pub static SQUASHFS_SERVER: &[u8] = include_bytes!("../../../target/servers/squashfs-server.bin");

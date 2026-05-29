@@ -72,10 +72,16 @@ pub struct BootInfo {
     pub fs_endpoint: u64,
     /// IPC endpoint of the kernel block server (0 if this server needs none).
     pub block_endpoint: u64,
-    /// Virtual address of the shared data region in this server's address space.
+    /// Virtual address of the **block** shared region (shared with the kernel
+    /// block server, for disk-block transfers). 0 if the server needs none.
     pub shared_vaddr: u64,
-    /// Size of the shared data region in bytes.
+    /// Size of the block shared region in bytes.
     pub shared_size: u64,
+    /// Virtual address of the **client** shared region (shared with this
+    /// server's clients, for paths and file data). 0 if unused.
+    pub client_shared_vaddr: u64,
+    /// Size of the client shared region in bytes.
+    pub client_shared_size: u64,
     /// Virtual address of the server's heap window.
     pub heap_vaddr: u64,
     /// Size of the heap window in bytes.

@@ -17,6 +17,7 @@ resolver = "2"
 members = [
     "libthemelios",
     "echo-server",
+    "squashfs-server",
 ]
 
 # Servers are freestanding ring-3 binaries: abort on panic (no unwinder), and

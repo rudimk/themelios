@@ -46,8 +46,12 @@ const SERVER_CODE_VIRT: u64 = 0x0020_0000;
 const SERVER_BOOTINFO_VIRT: u64 = 0x0030_0000;
 /// Virtual base of the server's heap window.
 const SERVER_HEAP_VIRT: u64 = 0x4000_0000;
-/// Virtual base where the shared data region is mapped (if any).
+/// Virtual base where the block shared region is mapped (shared with the block
+/// server, for disk-block transfers).
 const SERVER_SHARED_VIRT: u64 = 0x5000_0000;
+/// Virtual base where the client shared region is mapped (shared with the
+/// server's clients, for paths and file data).
+const SERVER_CLIENT_SHARED_VIRT: u64 = 0x5100_0000;
 /// Top of the server's stack (grows downward).
 const SERVER_STACK_TOP: u64 = 0x0000_7FFF_FFF0_0000;
 /// Number of stack pages (16 × 4 KiB = 64 KiB).
@@ -72,6 +76,8 @@ struct ServerBootInfo {
     block_endpoint: u64,
     shared_vaddr: u64,
     shared_size: u64,
+    client_shared_vaddr: u64,
+    client_shared_size: u64,
     heap_vaddr: u64,
     heap_size: u64,
     arg0: u64,
@@ -88,8 +94,12 @@ pub struct ServerConfig {
     pub fs_endpoint: u64,
     /// IPC endpoint of the kernel block server (0 if unused).
     pub block_endpoint: u64,
-    /// Shared data region to map at `SERVER_SHARED_VIRT` (None if unused).
+    /// Block shared region to map at `SERVER_SHARED_VIRT` (None if unused).
+    /// Shared with the kernel block server for disk-block transfers.
     pub shared: Option<SharedRegion>,
+    /// Client shared region to map at `SERVER_CLIENT_SHARED_VIRT` (None if
+    /// unused). Shared with the server's clients for paths and file data.
+    pub client_shared: Option<SharedRegion>,
     /// Heap window size in bytes (rounded up to pages).
     pub heap_bytes: u64,
     /// Server-specific argument 0.
@@ -176,10 +186,16 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
         .expect("spawn_server: no address space");
     }
 
-    // --- Map the optional shared region ---
+    // --- Map the optional shared regions ---
     if let Some(region) = config.shared {
         process::with_address_space(pid, |a| {
             region.map_into(a, VirtAddr::new(SERVER_SHARED_VIRT));
+        })
+        .expect("spawn_server: no address space");
+    }
+    if let Some(region) = config.client_shared {
+        process::with_address_space(pid, |a| {
+            region.map_into(a, VirtAddr::new(SERVER_CLIENT_SHARED_VIRT));
         })
         .expect("spawn_server: no address space");
     }
@@ -192,6 +208,8 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
         block_endpoint: config.block_endpoint,
         shared_vaddr: if config.shared.is_some() { SERVER_SHARED_VIRT } else { 0 },
         shared_size: config.shared.map_or(0, |r| r.size),
+        client_shared_vaddr: if config.client_shared.is_some() { SERVER_CLIENT_SHARED_VIRT } else { 0 },
+        client_shared_size: config.client_shared.map_or(0, |r| r.size),
         heap_vaddr: SERVER_HEAP_VIRT,
         heap_size: (heap_pages as u64) * mm::PAGE_SIZE,
         arg0: config.arg0,

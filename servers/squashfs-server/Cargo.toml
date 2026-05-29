@@ -1,0 +1,19 @@
+[package]
+name = "squashfs-server"
+version = "0.1.0"
+edition = "2021"
+
+# Userspace SquashFS filesystem server. Reads the compressed, read-only root
+# image from the kernel block server (over IPC + shared memory), parses the
+# SquashFS 4.0 on-disk format, decompresses with miniz_oxide, and answers
+# filesystem requests from clients. Runs in ring 3 — a corrupt image can crash
+# this server but never the kernel.
+[[bin]]
+name = "squashfs-server"
+path = "src/main.rs"
+
+[dependencies]
+libthemelios = { path = "../libthemelios" }
+# Pure-Rust gzip/zlib inflate, no_std + alloc. SquashFS "gzip" compression is
+# zlib-wrapped deflate, which decompress_to_vec_zlib handles.
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

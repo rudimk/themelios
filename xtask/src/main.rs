@@ -194,7 +194,7 @@ fn ensure_limine(root: &Path) -> PathBuf {
 /// `x86_64-unknown-none`, linked with the server linker script as a flat binary,
 /// and copied to `target/servers/<name>.bin` where the kernel embeds it via
 /// `include_bytes!`.
-const SERVER_BINARIES: &[&str] = &["echo-server"];
+const SERVER_BINARIES: &[&str] = &["echo-server", "squashfs-server"];
 
 /// Build the userspace server workspace and stage the flat binaries.
 ///

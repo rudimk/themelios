@@ -50,6 +50,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_shared_memory",    func: test_shared_memory },
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
     TestCase { name: "test_server_spawn",     func: test_server_spawn },
+    TestCase { name: "test_squashfs_server",  func: test_squashfs_server },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1551,6 +1552,7 @@ fn test_server_spawn() -> Result<(), &'static str> {
         fs_endpoint: endpoint,
         block_endpoint: 0,
         shared: None,
+        client_shared: None,
         heap_bytes: 256 * 1024,
         arg0: 0,
         arg1: 0,
@@ -1589,5 +1591,228 @@ fn test_server_spawn() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_server_spawn() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_squashfs_server — SquashFS filesystem server (Phase 3.5)
+// ============================================================
+
+/// Test the userspace SquashFS server end to end against the real image.
+///
+/// Probes the VirtIO disks for the SquashFS magic, starts a block server on it,
+/// spawns the SquashFS server (ring 3) with block + client shared regions, then
+/// acts as a client: STATs, OPENs/READs files (small fragment-packed and large
+/// multi-block), and READDIRs directories — verifying bytes match what
+/// `cargo xtask image` packed.
+#[cfg(target_arch = "x86_64")]
+fn test_squashfs_server() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::ipc::{self, IpcMessage};
+    use crate::mm::shared::SharedRegion;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    // FS protocol opcodes (mirror libthemelios::fs_proto).
+    const OP_OPEN: u64 = 1;
+    const OP_READ: u64 = 2;
+    const OP_STAT: u64 = 5;
+    const OP_READDIR: u64 = 6;
+    const STATUS_OK: u64 = 0;
+
+    // --- Locate the SquashFS disk by probing each VirtIO-blk device's block 0
+    //     for the "hsqs" magic (0x73717368). ---
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let mut sqfs_index = None;
+    for dev in devs.iter().filter(|d| d.class == 0x01) {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 512];
+        if blk.read_blocks(0, &mut buf).is_ok() && buf[0..4] == [0x68, 0x73, 0x71, 0x73] {
+            sqfs_index = Some(block::register("squashfs-disk", Box::new(blk)));
+            break;
+        }
+        // Not the SquashFS disk; leak this driver instance and keep probing.
+    }
+    let idx = sqfs_index.ok_or("no SquashFS disk found among VirtIO devices")?;
+
+    // --- Start a block server on the SquashFS device, allocate a client region,
+    //     and spawn the SquashFS server. ---
+    let block_handle = block_server::start(idx);
+    let client = SharedRegion::alloc(128 * 1024).ok_or("client region alloc failed")?;
+    let fs_ep = ipc::create_endpoint("squashfs-fs");
+
+    spawn_server(ServerConfig {
+        name: "squashfs-server",
+        binary: embedded::SQUASHFS_SERVER,
+        fs_endpoint: fs_ep,
+        block_endpoint: block_handle.endpoint,
+        shared: Some(block_handle.region),
+        client_shared: Some(client),
+        heap_bytes: 2 * 1024 * 1024,
+        arg0: 0,
+        arg1: 0,
+    });
+
+    // Let the server boot and parse the superblock.
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+
+    // Helper: place a path in the client region and return its byte length.
+    let put_path = |path: &str| -> u64 {
+        // SAFETY: exclusive access — no outstanding request to the server.
+        let s = unsafe { client.as_slice_mut() };
+        s[..path.len()].copy_from_slice(path.as_bytes());
+        path.len() as u64
+    };
+
+    // --- STAT /version ---
+    let plen = put_path("/version");
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_STAT, plen, 0, 0]), 0)
+        .map_err(|_| "STAT call failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("STAT /version returned error");
+    }
+    if r.words[1] != 15 {
+        return Err("STAT /version wrong size (expected 15)");
+    }
+    if r.words[2] != 0 {
+        return Err("STAT /version should not be a directory");
+    }
+
+    // --- OPEN + READ /version, verify contents ---
+    let plen = put_path("/version");
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_OPEN, plen, 0, 0]), 0)
+        .map_err(|_| "OPEN call failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("OPEN /version failed");
+    }
+    let fd = r.words[1];
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_READ, fd, 0, 15]), 0)
+        .map_err(|_| "READ call failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 15 {
+        return Err("READ /version returned wrong length");
+    }
+    {
+        // SAFETY: request complete; read the server's output.
+        let s = unsafe { client.as_slice_mut() };
+        if &s[..15] != b"THEMELIOS_ROOT\n" {
+            return Err("/version content mismatch (fragment read)");
+        }
+    }
+
+    // --- OPEN + READ /big.bin, verify the deterministic pattern across blocks ---
+    let plen = put_path("/big.bin");
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_OPEN, plen, 0, 0]), 0)
+        .map_err(|_| "OPEN big.bin failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("OPEN /big.bin failed");
+    }
+    let fd = r.words[1];
+
+    // Pattern byte at file offset i = (i*31 + 7) & 0xFF (matches xtask).
+    let check_pattern = |base: u64, len: usize| -> Result<(), &'static str> {
+        let s = unsafe { client.as_slice_mut() };
+        for j in 0..len {
+            let i = base + j as u64;
+            let expect = ((i as u32).wrapping_mul(31).wrapping_add(7) & 0xFF) as u8;
+            if s[j] != expect {
+                return Err("big.bin pattern mismatch");
+            }
+        }
+        Ok(())
+    };
+
+    // First 4 KiB (start of block 0).
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_READ, fd, 0, 4096]), 0)
+        .map_err(|_| "READ big.bin@0 failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 4096 {
+        return Err("READ big.bin@0 wrong length");
+    }
+    check_pattern(0, 4096)?;
+
+    // 256 bytes at offset 131072 — the start of the second data block.
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_READ, fd, 131072, 256]), 0)
+        .map_err(|_| "READ big.bin@128K failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 256 {
+        return Err("READ big.bin@128K wrong length");
+    }
+    check_pattern(131072, 256)?;
+
+    // --- READDIR / — verify expected names are present ---
+    let plen = put_path("/");
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_OPEN, plen, 0, 0]), 0)
+        .map_err(|_| "OPEN / failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("OPEN / failed");
+    }
+    let root_fd = r.words[1];
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_READDIR, root_fd, 64, 0]), 0)
+        .map_err(|_| "READDIR / failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("READDIR / returned error");
+    }
+    let count = r.words[1] as usize;
+    if count < 5 {
+        return Err("READDIR / returned too few entries");
+    }
+    // Parse packed entries: [u16 name_len, u16 type, name bytes]*.
+    let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    {
+        let s = unsafe { client.as_slice_mut() };
+        let mut pos = 0usize;
+        for _ in 0..count {
+            if pos + 4 > s.len() {
+                break;
+            }
+            let nlen = u16::from_le_bytes([s[pos], s[pos + 1]]) as usize;
+            pos += 4;
+            if pos + nlen > s.len() {
+                break;
+            }
+            names.push(alloc::string::String::from_utf8_lossy(&s[pos..pos + nlen]).into_owned());
+            pos += nlen;
+        }
+    }
+    for expect in ["version", "hello.txt", "big.bin", "etc", "docs"] {
+        if !names.iter().any(|n| n == expect) {
+            return Err("READDIR / missing an expected entry");
+        }
+    }
+
+    // --- Read a nested file /docs/readme.txt ---
+    let plen = put_path("/docs/readme.txt");
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_OPEN, plen, 0, 0]), 0)
+        .map_err(|_| "OPEN nested failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("OPEN /docs/readme.txt failed");
+    }
+    let fd = r.words[1];
+    let r = ipc::ipc_call(fs_ep, IpcMessage::new([OP_READ, fd, 0, 21]), 0)
+        .map_err(|_| "READ nested failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("READ /docs/readme.txt failed");
+    }
+    {
+        let s = unsafe { client.as_slice_mut() };
+        let n = r.words[1] as usize;
+        if &s[..n] != b"nested file in /docs\n" {
+            return Err("/docs/readme.txt content mismatch");
+        }
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_squashfs_server() -> Result<(), &'static str> {
     Ok(())
 }
