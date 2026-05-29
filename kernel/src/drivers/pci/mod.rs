@@ -90,8 +90,30 @@ const OFF_REVISION_CLASS: u8 = 0x08;
 /// Offset 0x0C: cache line size, latency timer, header type (byte 2),
 /// BIST (byte 3). Bit 7 of the header type byte flags a multi-function device.
 const OFF_HEADER_TYPE: u8 = 0x0C;
+/// Offset 0x06: status register (16 bits). Bit 4 = capabilities list present.
+const OFF_STATUS: u8 = 0x06;
 /// Offset 0x10: the first of six Base Address Registers (BAR0).
 const OFF_BAR0: u8 = 0x10;
+/// Offset 0x34: capabilities pointer (byte) — offset of the first capability
+/// in config space when the status register's capabilities-list bit is set.
+const OFF_CAP_PTR: u8 = 0x34;
+
+/// Status register bit 4: the device implements a PCI capabilities list.
+const STATUS_CAP_LIST: u16 = 1 << 4;
+
+/// Generic PCI capability ID for a vendor-specific capability (0x09). VirtIO
+/// modern devices describe their register layout through vendor capabilities.
+pub const CAP_ID_VENDOR: u8 = 0x09;
+
+/// A PCI capability discovered by walking the capabilities list.
+#[derive(Clone, Copy, Debug)]
+pub struct PciCapability {
+    /// Capability ID (e.g. 0x09 for vendor-specific / VirtIO).
+    pub id: u8,
+    /// Byte offset of this capability within the function's config space.
+    /// VirtIO-specific fields are read relative to this offset.
+    pub offset: u8,
+}
 
 /// Build the 32-bit CONFIG_ADDRESS value for a given location and register.
 ///
@@ -188,6 +210,70 @@ pub struct PciDevice {
 }
 
 impl PciDevice {
+    /// Read a 32-bit register from this function's config space at `offset`.
+    ///
+    /// `offset` is rounded down to a 4-byte boundary by the address encoding,
+    /// so callers wanting a sub-word field must shift/mask the result.
+    pub fn read_config_u32(&self, offset: u8) -> u32 {
+        config_read32(self.bus, self.slot, self.func, offset)
+    }
+
+    /// Read a 16-bit field from this function's config space at `offset`.
+    pub fn read_config_u16(&self, offset: u8) -> u16 {
+        let aligned = offset & 0xFC;
+        let shift = (offset & 0x3) * 8;
+        (config_read32(self.bus, self.slot, self.func, aligned) >> shift) as u16
+    }
+
+    /// Read an 8-bit field from this function's config space at `offset`.
+    pub fn read_config_u8(&self, offset: u8) -> u8 {
+        let aligned = offset & 0xFC;
+        let shift = (offset & 0x3) * 8;
+        (config_read32(self.bus, self.slot, self.func, aligned) >> shift) as u8
+    }
+
+    /// Walk the PCI capabilities list and return every capability found.
+    ///
+    /// Returns an empty list if the device declares no capabilities (status
+    /// register bit 4 clear). Each capability is a node in a singly linked list
+    /// threaded through config space: a 1-byte ID, a 1-byte "next" pointer, and
+    /// capability-specific data. The walk is bounded to 48 hops as a safety net
+    /// against a malformed (cyclic) list.
+    pub fn capabilities(&self) -> Vec<PciCapability> {
+        let mut caps = Vec::new();
+
+        // Only valid if the device advertises a capabilities list.
+        if self.read_config_u16(OFF_STATUS) & STATUS_CAP_LIST == 0 {
+            return caps;
+        }
+
+        // The capability pointer's low two bits are reserved — mask them off.
+        let mut ptr = self.read_config_u8(OFF_CAP_PTR) & 0xFC;
+        let mut guard = 0;
+        while ptr != 0 && guard < 48 {
+            let id = self.read_config_u8(ptr);
+            let next = self.read_config_u8(ptr + 1);
+            caps.push(PciCapability { id, offset: ptr });
+            ptr = next & 0xFC;
+            guard += 1;
+        }
+        caps
+    }
+
+    /// Read and decode BAR `index` (0–5) by its raw slot, regardless of how the
+    /// folded `bars` list is laid out.
+    ///
+    /// VirtIO capabilities reference a BAR by its raw index, so the transport
+    /// layer needs to resolve a raw slot to its base address even when an
+    /// earlier 64-bit BAR consumed two slots. Returns `None` for an
+    /// unimplemented BAR.
+    pub fn bar(&self, index: u8) -> Option<Bar> {
+        if index >= 6 {
+            return None;
+        }
+        self.read_bar(index)
+    }
+
     /// Read this function's BAR `index` (0–5) and decode it.
     ///
     /// Returns `None` for an unimplemented BAR (reads back as zero after

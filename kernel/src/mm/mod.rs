@@ -44,6 +44,7 @@ use crate::sync::InterruptMutex;
 pub mod addr;
 pub mod frame;
 pub mod heap;
+pub mod mmio;
 pub mod page_table;
 
 extern crate alloc;

@@ -33,3 +33,12 @@
 /// ports. The foundation the VirtIO transport and block driver build on.
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
+
+/// VirtIO PCI transport and split virtqueue.
+///
+/// The device-type-agnostic layer every VirtIO driver builds on: capability
+/// discovery, the device init handshake, feature negotiation, and the split
+/// virtqueue used to exchange buffers with the host. Sits in ring 0 as the thin
+/// trusted transport of the Phase 3 hybrid-microkernel storage design.
+#[cfg(target_arch = "x86_64")]
+pub mod virtio;

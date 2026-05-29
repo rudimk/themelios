@@ -45,6 +45,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_audit",           func: test_audit },
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
     TestCase { name: "test_pci_scan",        func: test_pci_scan },
+    TestCase { name: "test_virtio_transport", func: test_virtio_transport },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1193,5 +1194,65 @@ fn test_pci_scan() -> Result<(), &'static str> {
 /// (aarch64 uses memory-mapped ECAM, deferred to Phase 7).
 #[cfg(not(target_arch = "x86_64"))]
 fn test_pci_scan() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_virtio_transport — VirtIO PCI transport (Phase 3.1)
+// ============================================================
+
+/// Test the VirtIO PCI transport end to end (short of a real I/O request).
+///
+/// Finds the attached VirtIO block device on the PCI bus, then exercises the
+/// full bring-up path the block driver will rely on:
+/// 1. Capability discovery + MMIO mapping (`VirtioTransport::init`)
+/// 2. The reset → ACKNOWLEDGE → DRIVER handshake
+/// 3. Feature negotiation (VIRTIO_F_VERSION_1)
+/// 4. Virtqueue allocation and programming (`setup_queue`)
+/// 5. DRIVER_OK
+///
+/// If any step fails, the device wouldn't be drivable, so this is a strong
+/// signal that 3.1 works before the block read/write path (3.2) is built.
+#[cfg(target_arch = "x86_64")]
+fn test_virtio_transport() -> Result<(), &'static str> {
+    use crate::drivers::pci;
+    use crate::drivers::virtio::VirtioTransport;
+
+    // VirtIO mass-storage device = PCI class 0x01 (the attached virtio-blk).
+    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let blk = virtio_devs
+        .iter()
+        .find(|d| d.class == 0x01)
+        .ok_or("no VirtIO block device on the PCI bus")?;
+
+    // Discover register regions, map them, reset, ACK + DRIVER.
+    let transport =
+        VirtioTransport::init(blk).map_err(|_| "VirtioTransport::init failed")?;
+
+    // Negotiate features — we want nothing device-specific here, just the
+    // mandatory VERSION_1 bit.
+    transport
+        .negotiate_features(0)
+        .map_err(|_| "feature negotiation failed")?;
+
+    // The device must expose at least one virtqueue.
+    if transport.num_queues() == 0 {
+        return Err("device reports zero virtqueues");
+    }
+
+    // Allocate and program virtqueue 0.
+    let _queue = transport
+        .setup_queue(0)
+        .map_err(|_| "virtqueue setup failed")?;
+
+    // Announce the driver is ready.
+    transport.set_driver_ok();
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_virtio_transport() -> Result<(), &'static str> {
     Ok(())
 }

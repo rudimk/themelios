@@ -228,7 +228,12 @@ fn virtio_disk_args(disk_path: &Path) -> Vec<String> {
         "-drive".to_string(),
         format!("file={},format=raw,if=none,id=blk0", disk_path.display()),
         "-device".to_string(),
-        "virtio-blk-pci,drive=blk0".to_string(),
+        // disable-legacy=on forces the modern (VirtIO 1.0+) PCI interface:
+        // the device advertises its registers through PCI capability
+        // structures in MMIO BARs (device ID 1af4:1042) rather than the legacy
+        // I/O-port layout (1af4:1001). The kernel's VirtIO transport speaks the
+        // modern interface only.
+        "virtio-blk-pci,drive=blk0,disable-legacy=on".to_string(),
     ]
 }
 

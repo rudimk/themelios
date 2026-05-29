@@ -417,6 +417,40 @@ impl AddressSpace {
             new_pml4.entries[i].set(limine_pml4.entries[i].as_u64());
         }
 
+        // Pre-populate every kernel-half PML4 slot that Limine left absent with
+        // a fresh, empty PDP table.
+        //
+        // Why: user address spaces (`new_user`) copy these PML4 entries *by
+        // value*. If a kernel-half mapping is added at runtime (e.g. a device
+        // MMIO window, see `mm::mmio`) into a PML4 slot that was empty when a
+        // process was created, that process's PML4 would never see it — and
+        // because kernel tasks run on whatever address space is currently
+        // active, the kernel itself could fault on its own mapping.
+        //
+        // By making every kernel-half slot *present* up front, all address
+        // spaces share the same PDP frames by pointer. Any deeper table added
+        // later (PD/PT under these PDPs) is therefore visible everywhere
+        // automatically. The PML4 entries are PRESENT | WRITABLE but NOT USER,
+        // so these kernel addresses remain inaccessible from ring 3.
+        //
+        // Cost: at most 256 frames (1 MiB) of PDP tables, allocated once.
+        for i in KERNEL_PML4_START..ENTRIES_PER_TABLE {
+            if !new_pml4.entries[i].is_present() {
+                let pdp_phys = frame::allocate_frame()
+                    .expect("new_kernel: failed to allocate shared kernel PDP");
+                // SAFETY: freshly allocated frame, exclusive access via HHDM.
+                let pdp: &mut PageTable =
+                    unsafe { &mut *pdp_phys.as_mut_ptr::<PageTable>() };
+                for e in pdp.entries.iter_mut() {
+                    e.clear();
+                }
+                new_pml4.entries[i] = PageTableEntry::new(
+                    pdp_phys,
+                    PageFlags::PRESENT | PageFlags::WRITABLE,
+                );
+            }
+        }
+
         println!(
             "[pgtable] Kernel address space created: PML4 at {:#x}",
             new_pml4_phys.as_u64()
