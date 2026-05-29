@@ -108,19 +108,21 @@ const PERCPU_USER_RSP: usize = 8;
 pub const SYS_NULL: u64 = 0;
 
 /// SYS_SEND: send a message to an IPC endpoint (blocks until receiver ready).
-/// RDI = endpoint_id, RSI = pointer to IpcMessage in user memory.
+/// RDI = endpoint_id, RSI/RDX/R10/R9 = message words[0..3], R8 = badge.
 pub const SYS_SEND: u64 = 1;
 
 /// SYS_RECEIVE: receive a message from an IPC endpoint (blocks until sender ready).
-/// RDI = endpoint_id, RSI = pointer to buffer for received IpcMessage.
+/// RDI = endpoint_id. Returns: RAX/RDI/RSI/RDX = words[0..3], R8 = badge,
+/// R9 = reply_token.
 pub const SYS_RECEIVE: u64 = 2;
 
 /// SYS_CALL: send a message and block waiting for reply (RPC pattern).
-/// RDI = endpoint_id, RSI = pointer to IpcMessage, RDX = pointer to reply buffer.
+/// RDI = endpoint_id, RSI/RDX/R10/R9 = words[0..3], R8 = badge.
+/// Returns: RAX/RDI/RSI/RDX = reply words[0..3].
 pub const SYS_CALL: u64 = 3;
 
 /// SYS_REPLY: reply to a call, unblocking the caller.
-/// RDI = endpoint_id, RSI = reply_token, RDX = pointer to reply IpcMessage.
+/// RDI = endpoint_id, RSI = reply_token, RDX/R10/R9/R8 = reply words[0..3].
 pub const SYS_REPLY: u64 = 4;
 
 /// SYS_YIELD: yield the calling task's time slice.
@@ -414,9 +416,41 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
                 Err(_) => frame.rax = !0u64,
             }
         }
-        SYS_CALL | SYS_REPLY => {
-            // Full IPC call/reply from userspace deferred to a later phase.
-            frame.rax = !0u64;
+        SYS_CALL => {
+            // Userspace IPC call (RPC): send a request and block for the reply.
+            // Convention: RDI = endpoint_id, RSI/RDX/R10/R9 = words[0..3],
+            // R8 = badge. On return: RAX/RDI/RSI/RDX = reply words[0..3].
+            let endpoint_id = frame.rdi;
+            let badge = frame.r8;
+            let msg = crate::ipc::IpcMessage::new([frame.rsi, frame.rdx, frame.r10, frame.r9]);
+
+            // Re-enable interrupts before blocking (call waits for the reply).
+            cpu::sti();
+
+            match crate::ipc::ipc_call(endpoint_id, msg, badge) {
+                Ok(reply) => {
+                    frame.rax = reply.words[0];
+                    frame.rdi = reply.words[1];
+                    frame.rsi = reply.words[2];
+                    frame.rdx = reply.words[3];
+                }
+                Err(_) => frame.rax = !0u64,
+            }
+        }
+        SYS_REPLY => {
+            // Userspace IPC reply: unblock a caller waiting on our endpoint.
+            // Convention: RDI = endpoint_id, RSI = reply_token,
+            // RDX/R10/R9/R8 = reply words[0..3].
+            let endpoint_id = frame.rdi;
+            let reply_token = frame.rsi;
+            let msg = crate::ipc::IpcMessage::new([frame.rdx, frame.r10, frame.r9, frame.r8]);
+
+            cpu::sti();
+
+            match crate::ipc::ipc_reply(endpoint_id, reply_token, msg) {
+                Ok(()) => frame.rax = 0,
+                Err(_) => frame.rax = !0u64,
+            }
         }
         SYS_YIELD => {
             // Yield the current task's time slice. Re-enable interrupts first
@@ -524,12 +558,26 @@ pub fn init() {
         syscall_entry as *const () as u64);
 }
 
-/// Update the PerCpu kernel stack top.
+/// Update the PerCpu kernel stack top and re-establish the kernel GS base.
 ///
-/// Called from the scheduler's context switch path to ensure the syscall
-/// entry stub loads the correct kernel stack for the newly running task.
-/// Without this, a syscall from userspace would use the previous task's
-/// kernel stack — silently corrupting both tasks.
+/// Called from the scheduler's context switch path. Two jobs:
+///
+/// 1. Set `PerCpu.kernel_stack_top` so the syscall entry stub loads the correct
+///    kernel stack for the newly running task. Without this, a syscall from
+///    userspace would use the previous task's kernel stack — corrupting both.
+///
+/// 2. Re-point `IA32_KERNEL_GS_BASE` at `PER_CPU`. The syscall entry stub does
+///    `swapgs` to bring the kernel GS base into GS; that only works if
+///    `KERNEL_GS_BASE` holds `&PER_CPU` at entry. But a syscall that *blocks*
+///    (e.g. `ipc_receive` with no sender ready) context-switches away **after**
+///    its entry `swapgs` and **before** the matching exit `swapgs` — leaving
+///    `KERNEL_GS_BASE` holding the blocked task's (zero) user GS base. The next
+///    task to enter the kernel via `swapgs` would then get GS = 0 and fault
+///    touching `gs:[...]`. Re-writing the MSR on every switch restores the
+///    single-core invariant "whenever a task runs, `KERNEL_GS_BASE == &PER_CPU`",
+///    so a fresh ring-3 task's first syscall always swaps in the right GS base.
+///    (Safe for a task resuming mid-syscall too: its exit `swapgs` then just
+///    leaves GS = &PER_CPU, which ring 3 never reads.)
 ///
 /// # Safety
 ///
@@ -540,6 +588,9 @@ pub fn set_kernel_stack(stack_top: u64) {
     unsafe {
         let per_cpu = &raw mut PER_CPU;
         (*per_cpu).kernel_stack_top = stack_top;
+
+        // Re-establish KERNEL_GS_BASE = &PER_CPU (see point 2 above).
+        cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu as u64);
     }
 }
 

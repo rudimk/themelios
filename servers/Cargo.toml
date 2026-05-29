@@ -1,0 +1,30 @@
+# Userspace server workspace for ThemeliOS.
+#
+# This is a SEPARATE Cargo workspace from the kernel (the root workspace only
+# builds the kernel and xtask). Keeping it separate means a plain `cargo build`
+# at the repo root never tries to build these bare-metal `no_std` crates for the
+# host. xtask drives their build explicitly for `x86_64-unknown-none`, links
+# each server with the server linker script, and emits a flat binary the kernel
+# embeds via `include_bytes!`.
+#
+# Members:
+#   - libthemelios:   shared userspace runtime (syscalls, allocator, IPC/FS types)
+#   - echo-server:    minimal IPC echo server used to validate the framework
+#   - (later) squashfs-server, ext2-server, overlay-server
+
+[workspace]
+resolver = "2"
+members = [
+    "libthemelios",
+    "echo-server",
+]
+
+# Servers are freestanding ring-3 binaries: abort on panic (no unwinder), and
+# optimise for size since they are embedded in the kernel image.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

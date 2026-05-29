@@ -1,0 +1,15 @@
+[package]
+name = "libthemelios"
+version = "0.1.0"
+edition = "2021"
+
+# Shared runtime for ThemeliOS userspace servers: syscall wrappers, the program
+# entry point (_start), a global heap allocator, a panic handler, and the IPC /
+# filesystem / block protocol types servers and the kernel agree on.
+[lib]
+
+[dependencies]
+# Proven no_std heap allocator (the kernel uses the same crate). Servers free
+# memory (Vec reallocations, decompression buffers), so a real allocator — not
+# a bump allocator — is needed to avoid exhausting the heap.
+linked_list_allocator = "0.10"

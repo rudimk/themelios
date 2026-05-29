@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+# Servers workspace build artifacts (separate workspace, separate target dir)
+/servers/target/
 
 # Editor files
 *.swp

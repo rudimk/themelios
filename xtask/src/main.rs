@@ -185,6 +185,68 @@ fn ensure_limine(root: &Path) -> PathBuf {
 }
 
 // ============================================================================
+// Userspace servers
+// ============================================================================
+
+/// The userspace server binaries to build and embed in the kernel.
+///
+/// Each entry is a binary crate in the `servers/` workspace. Built for
+/// `x86_64-unknown-none`, linked with the server linker script as a flat binary,
+/// and copied to `target/servers/<name>.bin` where the kernel embeds it via
+/// `include_bytes!`.
+const SERVER_BINARIES: &[&str] = &["echo-server"];
+
+/// Build the userspace server workspace and stage the flat binaries.
+///
+/// Must run before the kernel build: the kernel `include_bytes!`s these files.
+/// Servers are linked with `--oformat binary` (LLD emits the raw memory image,
+/// so the kernel needs no ELF parser) against the server linker script, with a
+/// static relocation model (they load at a fixed virtual base).
+fn build_servers(root: &Path) {
+    let servers_dir = root.join("servers");
+    let linker_script = servers_dir.join("linker.ld");
+    let out_dir = root.join("target/servers");
+    fs::create_dir_all(&out_dir).expect("failed to create target/servers");
+
+    // Link flags: place sections per the server linker script, emit a flat
+    // binary, and link non-relocatable (fixed load address).
+    let rustflags = format!(
+        "-C link-arg=-T{} -C link-arg=--oformat=binary -C relocation-model=static",
+        linker_script.display()
+    );
+
+    println!("Building userspace servers...");
+    let status = Command::new("cargo")
+        .current_dir(&servers_dir)
+        .env("RUSTFLAGS", &rustflags)
+        .args([
+            "build",
+            "--release",
+            "--target", "x86_64-unknown-none",
+            BUILD_STD,
+            BUILD_STD_FEATURES,
+        ])
+        .status()
+        .expect("Failed to execute cargo build for servers");
+    if !status.success() {
+        eprintln!("Server build failed!");
+        process::exit(1);
+    }
+
+    // Stage each server's flat binary where the kernel embeds it.
+    let release_dir = servers_dir.join("target/x86_64-unknown-none/release");
+    for name in SERVER_BINARIES {
+        let built = release_dir.join(name);
+        let staged = out_dir.join(format!("{name}.bin"));
+        fs::copy(&built, &staged).unwrap_or_else(|e| {
+            panic!("failed to stage server binary {}: {e}", built.display())
+        });
+        let size = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+        println!("  {name}: {size} bytes -> {}", staged.display());
+    }
+}
+
+// ============================================================================
 // Virtual disks
 // ============================================================================
 
@@ -369,6 +431,10 @@ fn cmd_build(args: &[String]) {
 
     println!("Building ThemeliOS kernel for {target}...");
 
+    // Build the userspace servers first — the kernel embeds their flat binaries
+    // via include_bytes!, so they must exist before the kernel compiles.
+    build_servers(&root);
+
     // Clean the kernel crate's cached artifacts before building. This forces
     // a full recompile every time, which ensures build.rs re-runs and generates
     // a fresh ULID. Without this, cargo's caching would skip recompilation
@@ -518,6 +584,9 @@ fn cmd_test(args: &[String]) {
     let root = workspace_root();
 
     println!("Building ThemeliOS kernel (test mode) for {target}...");
+
+    // Build the userspace servers first (the kernel embeds their binaries).
+    build_servers(&root);
 
     // Clean cached artifacts to ensure build.rs re-runs (fresh ULID).
     let _ = Command::new("cargo")

@@ -49,6 +49,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_virtio_blk",       func: test_virtio_blk },
     TestCase { name: "test_shared_memory",    func: test_shared_memory },
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
+    TestCase { name: "test_server_spawn",     func: test_server_spawn },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1519,5 +1520,74 @@ fn test_block_server_ipc() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_block_server_ipc() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_server_spawn — Userspace server framework (Phase 3.4)
+// ============================================================
+
+/// Test the userspace server framework end to end with the echo server.
+///
+/// Spawns the embedded echo-server flat binary into a ring-3 process, then acts
+/// as an IPC client and calls it. Verifies:
+/// 1. The server boots in ring 3 from the embedded binary (no ELF parsing)
+/// 2. Its heap came up (the echo reply's word3 reflects a successful ring-3
+///    allocation)
+/// 3. The full kernel↔ring-3 IPC round trip works (SYS_RECEIVE + SYS_REPLY)
+/// 4. The reply matches the request transformation (word0 + 1)
+#[cfg(target_arch = "x86_64")]
+fn test_server_spawn() -> Result<(), &'static str> {
+    use crate::ipc::{self, IpcMessage};
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    // Create the endpoint the echo server will receive on, then spawn it.
+    let endpoint = ipc::create_endpoint("echo-test");
+    let _pid = spawn_server(ServerConfig {
+        name: "echo-server",
+        binary: embedded::ECHO_SERVER,
+        fs_endpoint: endpoint,
+        block_endpoint: 0,
+        shared: None,
+        heap_bytes: 256 * 1024,
+        arg0: 0,
+        arg1: 0,
+    });
+
+    // Let the ring-3 server reach its receive loop. It must be scheduled, run
+    // _start (heap init), and block in SYS_RECEIVE.
+    for _ in 0..500 {
+        sched::yield_now();
+    }
+
+    // Call the echo server: it returns [word0+1, word1, word2, heap_probe].
+    let reply = ipc::ipc_call(endpoint, IpcMessage::new([10, 20, 30, 0]), 0)
+        .map_err(|_| "ipc_call to echo server failed")?;
+
+    if reply.words[0] != 11 {
+        return Err("echo server did not transform word0 (no reply?)");
+    }
+    if reply.words[1] != 20 || reply.words[2] != 30 {
+        return Err("echo server corrupted message words");
+    }
+    if reply.words[3] != 1 {
+        return Err("echo server heap allocation failed in ring 3");
+    }
+
+    // A second call confirms the server loops and keeps serving.
+    let reply2 = ipc::ipc_call(endpoint, IpcMessage::new([100, 0, 0, 0]), 0)
+        .map_err(|_| "second ipc_call failed")?;
+    if reply2.words[0] != 101 {
+        return Err("echo server did not handle a second request");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_server_spawn() -> Result<(), &'static str> {
     Ok(())
 }

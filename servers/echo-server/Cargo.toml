@@ -1,0 +1,15 @@
+[package]
+name = "echo-server"
+version = "0.1.0"
+edition = "2021"
+
+# Minimal ring-3 server that echoes IPC requests back to the caller. Exists
+# solely to validate the userspace server framework (sub-phase 3.4): binary
+# embedding, spawn, capability/endpoint wiring, and the full IPC round trip —
+# before the real filesystem servers are built on the same machinery.
+[[bin]]
+name = "echo-server"
+path = "src/main.rs"
+
+[dependencies]
+libthemelios = { path = "../libthemelios" }

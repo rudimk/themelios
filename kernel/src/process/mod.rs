@@ -30,6 +30,8 @@ extern crate alloc;
 
 pub mod pid;
 pub mod init;
+pub mod server;
+pub mod embedded;
 
 use alloc::string::String;
 use alloc::vec::Vec;
