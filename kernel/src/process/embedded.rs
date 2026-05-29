@@ -22,3 +22,6 @@ pub static SQUASHFS_SERVER: &[u8] = include_bytes!("../../../target/servers/squa
 
 /// The overlay server: RAM upper layer merged over a read-only lower (3.6).
 pub static OVERLAY_SERVER: &[u8] = include_bytes!("../../../target/servers/overlay-server.bin");
+
+/// The ext2 server: read-write ext2 for persistent data volumes (3.7).
+pub static EXT2_SERVER: &[u8] = include_bytes!("../../../target/servers/ext2-server.bin");

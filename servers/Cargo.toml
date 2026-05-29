@@ -19,6 +19,7 @@ members = [
     "echo-server",
     "squashfs-server",
     "overlay-server",
+    "ext2-server",
 ]
 
 # Servers are freestanding ring-3 binaries: abort on panic (no unwinder), and

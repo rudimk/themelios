@@ -194,7 +194,8 @@ fn ensure_limine(root: &Path) -> PathBuf {
 /// `x86_64-unknown-none`, linked with the server linker script as a flat binary,
 /// and copied to `target/servers/<name>.bin` where the kernel embeds it via
 /// `include_bytes!`.
-const SERVER_BINARIES: &[&str] = &["echo-server", "squashfs-server", "overlay-server"];
+const SERVER_BINARIES: &[&str] =
+    &["echo-server", "squashfs-server", "overlay-server", "ext2-server"];
 
 /// Build the userspace server workspace and stage the flat binaries.
 ///
@@ -360,6 +361,23 @@ fn find_mkfs_ext2() -> PathBuf {
     })
 }
 
+/// Locate `debugfs` (from `e2fsprogs`), used to pre-populate the ext2 image
+/// with test files so the ext2 server's read path can be validated.
+fn find_debugfs() -> PathBuf {
+    find_tool(&[
+        "debugfs",
+        "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
+        "/usr/local/opt/e2fsprogs/sbin/debugfs",
+        "/sbin/debugfs",
+        "/usr/sbin/debugfs",
+    ])
+    .unwrap_or_else(|| {
+        eprintln!("Error: debugfs not found (part of e2fsprogs).");
+        eprintln!("Install it:  macOS: brew install e2fsprogs   Linux: apt install e2fsprogs");
+        process::exit(1);
+    })
+}
+
 // ============================================================================
 // Filesystem image creation (cargo xtask image)
 // ============================================================================
@@ -441,8 +459,56 @@ fn create_data_image(root: &Path) -> PathBuf {
         eprintln!("mkfs.ext2 failed!");
         process::exit(1);
     }
+
+    // Pre-populate the (otherwise empty) image with deterministic test files so
+    // the ext2 server's read path has real data to verify. The server's write
+    // path (sub-phase 3.7 step 2) then creates files from inside the OS.
+    populate_data_image(root, &out);
+
     println!("  {}", out.display());
     out
+}
+
+/// Write test files into an ext2 image using `debugfs`.
+///
+/// Creates `/hello.txt`, a `/sub/nested.txt`, and a 20 000-byte `/data.bin`
+/// whose size forces use of single-indirect block pointers (>12 KiB with 1 KiB
+/// blocks), all with deterministic contents the ext2 server test asserts on.
+fn populate_data_image(root: &Path, image: &Path) {
+    let src = root.join("target/ext2src");
+    let _ = fs::remove_dir_all(&src);
+    fs::create_dir_all(&src).expect("create ext2src");
+
+    fs::write(src.join("hello.txt"), b"Hello from ext2!\n").unwrap();
+    fs::write(src.join("nested.txt"), b"nested ext2 file\n").unwrap();
+    // 20 000 bytes: 12 direct blocks (12 KiB) + the rest via single indirect.
+    let data: Vec<u8> = (0..20_000u32)
+        .map(|i| (i.wrapping_mul(37).wrapping_add(11) & 0xFF) as u8)
+        .collect();
+    fs::write(src.join("data.bin"), &data).unwrap();
+
+    // A debugfs script: write files and make a subdirectory. Paths to host
+    // source files are absolute; destinations are inside the image.
+    let script = format!(
+        "write {hello} hello.txt\nmkdir /sub\nwrite {nested} /sub/nested.txt\nwrite {data} data.bin\nquit\n",
+        hello = src.join("hello.txt").display(),
+        nested = src.join("nested.txt").display(),
+        data = src.join("data.bin").display(),
+    );
+    let script_path = root.join("target/ext2-populate.debugfs");
+    fs::write(&script_path, script).expect("write debugfs script");
+
+    let debugfs = find_debugfs();
+    let status = Command::new(&debugfs)
+        .args(["-w", "-f"])
+        .arg(&script_path)
+        .arg(image)
+        .status()
+        .expect("failed to run debugfs");
+    if !status.success() {
+        eprintln!("debugfs population failed!");
+        process::exit(1);
+    }
 }
 
 /// Ensure both filesystem images exist, creating any that are missing.
@@ -797,7 +863,10 @@ fn cmd_test(args: &[String]) {
     let qemu = qemu_binary(&opts.arch);
     println!("Running tests in QEMU...\n");
 
-    let timeout_secs = 30;
+    // 90s: the suite now boots several userspace filesystem servers, each doing
+    // IPC + block I/O, so give QEMU comfortable headroom over the ~few seconds a
+    // healthy run takes (a real hang still trips well before this).
+    let timeout_secs = 90;
 
     let mut cmd = Command::new(qemu);
     cmd.current_dir(&root)

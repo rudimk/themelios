@@ -1,0 +1,15 @@
+[package]
+name = "ext2-server"
+version = "0.1.0"
+edition = "2021"
+
+# Userspace ext2 filesystem server (read-write). Backs persistent data volumes
+# for containers. Reads/writes the device through the kernel block server over
+# IPC + shared memory and handles all ext2 parsing and metadata management in
+# ring 3 — a corrupt image or allocation bug crashes this server, not the kernel.
+[[bin]]
+name = "ext2-server"
+path = "src/main.rs"
+
+[dependencies]
+libthemelios = { path = "../libthemelios" }

@@ -52,6 +52,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_server_spawn",     func: test_server_spawn },
     TestCase { name: "test_squashfs_server",  func: test_squashfs_server },
     TestCase { name: "test_overlay_server",   func: test_overlay_server },
+    TestCase { name: "test_ext2_read",        func: test_ext2_read },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -2034,5 +2035,193 @@ fn test_overlay_server() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_overlay_server() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_ext2_read — ext2 server read path (Phase 3.7, step 1)
+// ============================================================
+
+/// Test the ext2 server's read path against a pre-populated ext2 image.
+///
+/// Probes the VirtIO disks for the ext2 magic, brings up the ext2 server, and
+/// verifies: STAT, file read (small + a large file spanning direct AND
+/// single-indirect blocks), directory listing, and nested-path resolution.
+#[cfg(target_arch = "x86_64")]
+fn test_ext2_read() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::ipc::{self, IpcMessage};
+    use crate::mm::shared::SharedRegion;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    const OP_OPEN: u64 = 1;
+    const OP_READ: u64 = 2;
+    const OP_STAT: u64 = 5;
+    const OP_READDIR: u64 = 6;
+    const STATUS_OK: u64 = 0;
+
+    // --- Locate the ext2 disk: superblock magic 0xEF53 at byte 1080 (sector 2,
+    //     offset 56). ---
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let mut ext2_index = None;
+    for dev in devs.iter().filter(|d| d.class == 0x01) {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 512];
+        // Sector 2 = bytes 1024..1536; ext2 magic (0xEF53) at offset 56.
+        if blk.read_blocks(2, &mut buf).is_ok() && buf[56] == 0x53 && buf[57] == 0xEF {
+            ext2_index = Some(block::register("ext2-disk", Box::new(blk)));
+            break;
+        }
+    }
+    let idx = ext2_index.ok_or("no ext2 disk found among VirtIO devices")?;
+
+    let block_handle = block_server::start(idx);
+    let client = SharedRegion::alloc(128 * 1024).ok_or("client region alloc failed")?;
+    let fs_ep = ipc::create_endpoint("ext2-fs");
+    spawn_server(ServerConfig {
+        name: "ext2-server",
+        binary: embedded::EXT2_SERVER,
+        fs_endpoint: fs_ep,
+        block_endpoint: block_handle.endpoint,
+        shared: Some(block_handle.region),
+        client_shared: Some(client),
+        heap_bytes: 2 * 1024 * 1024,
+        arg0: 0,
+        arg1: 0,
+    });
+
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+
+    let put = |bytes: &[u8]| -> u64 {
+        let s = unsafe { client.as_slice_mut() };
+        s[..bytes.len()].copy_from_slice(bytes);
+        bytes.len() as u64
+    };
+    let call = |w: [u64; 4]| ipc::ipc_call(fs_ep, IpcMessage::new(w), 0);
+
+    // --- STAT /hello.txt (17 bytes) ---
+    let p = put(b"/hello.txt");
+    let r = call([OP_STAT, p, 0, 0]).map_err(|_| "STAT call failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 17 {
+        return Err("ext2 STAT /hello.txt wrong size");
+    }
+
+    // --- OPEN + READ /hello.txt ---
+    let p = put(b"/hello.txt");
+    let r = call([OP_OPEN, p, 0, 0]).map_err(|_| "OPEN failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 OPEN /hello.txt failed");
+    }
+    let fd = r.words[1];
+    let r = call([OP_READ, fd, 0, 17]).map_err(|_| "READ failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 17 {
+        return Err("ext2 READ /hello.txt wrong length");
+    }
+    {
+        let s = unsafe { client.as_slice_mut() };
+        if &s[..17] != b"Hello from ext2!\n" {
+            return Err("ext2 /hello.txt content mismatch");
+        }
+    }
+
+    // --- /data.bin: verify pattern across direct AND single-indirect blocks ---
+    let p = put(b"/data.bin");
+    let r = call([OP_OPEN, p, 0, 0]).map_err(|_| "OPEN data.bin failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 OPEN /data.bin failed");
+    }
+    let fd = r.words[1];
+    // Pattern byte at offset i = (i*37 + 11) & 0xFF (matches xtask).
+    let check = |base: u64, len: usize| -> Result<(), &'static str> {
+        let s = unsafe { client.as_slice_mut() };
+        for j in 0..len {
+            let i = base + j as u64;
+            let expect = ((i as u32).wrapping_mul(37).wrapping_add(11) & 0xFF) as u8;
+            if s[j] != expect {
+                return Err("ext2 data.bin pattern mismatch");
+            }
+        }
+        Ok(())
+    };
+    // First 4 KiB: direct blocks.
+    let r = call([OP_READ, fd, 0, 4096]).map_err(|_| "READ data.bin@0 failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 4096 {
+        return Err("ext2 READ data.bin@0 wrong length");
+    }
+    check(0, 4096)?;
+    // Offset 13000: past the 12 direct blocks (12 KiB) — single-indirect region.
+    let r = call([OP_READ, fd, 13000, 256]).map_err(|_| "READ data.bin@13000 failed")?;
+    if r.words[0] != STATUS_OK || r.words[1] != 256 {
+        return Err("ext2 READ data.bin@13000 wrong length (single-indirect)");
+    }
+    check(13000, 256)?;
+
+    // --- READDIR / ---
+    let p = put(b"/");
+    let r = call([OP_OPEN, p, 0, 0]).map_err(|_| "OPEN / failed")?;
+    let root_fd = r.words[1];
+    let r = call([OP_READDIR, root_fd, 64, 0]).map_err(|_| "READDIR / failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 READDIR / failed");
+    }
+    let count = r.words[1] as usize;
+    let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    {
+        let s = unsafe { client.as_slice_mut() };
+        let mut pos = 0usize;
+        for _ in 0..count {
+            if pos + 4 > s.len() {
+                break;
+            }
+            let nlen = u16::from_le_bytes([s[pos], s[pos + 1]]) as usize;
+            pos += 4;
+            if pos + nlen > s.len() {
+                break;
+            }
+            names.push(alloc::string::String::from_utf8_lossy(&s[pos..pos + nlen]).into_owned());
+            pos += nlen;
+        }
+    }
+    for expect in ["hello.txt", "sub", "data.bin", "lost+found"] {
+        if !names.iter().any(|n| n == expect) {
+            return Err("ext2 READDIR / missing an expected entry");
+        }
+    }
+
+    // --- Nested: /sub/nested.txt ---
+    let p = put(b"/sub/nested.txt");
+    let r = call([OP_OPEN, p, 0, 0]).map_err(|_| "OPEN nested failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 OPEN /sub/nested.txt failed");
+    }
+    let fd = r.words[1];
+    let r = call([OP_READ, fd, 0, 17]).map_err(|_| "READ nested failed")?;
+    if r.words[0] != STATUS_OK {
+        return Err("ext2 READ /sub/nested.txt failed");
+    }
+    {
+        let s = unsafe { client.as_slice_mut() };
+        let n = r.words[1] as usize;
+        if &s[..n] != b"nested ext2 file\n" {
+            return Err("ext2 /sub/nested.txt content mismatch");
+        }
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_ext2_read() -> Result<(), &'static str> {
     Ok(())
 }
