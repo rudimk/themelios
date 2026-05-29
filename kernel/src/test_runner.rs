@@ -54,6 +54,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_overlay_server",   func: test_overlay_server },
     TestCase { name: "test_ext2_read",        func: test_ext2_read },
     TestCase { name: "test_ext2_write",       func: test_ext2_write },
+    TestCase { name: "test_vfs_capability",   func: test_vfs_capability },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -2414,5 +2415,123 @@ fn test_ext2_write() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_ext2_write() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_vfs_capability — VFS dispatch + capability gating (Phase 3.8)
+// ============================================================
+
+/// Test the kernel VFS layer: capability-checked open/read/stat that route to a
+/// filesystem server through the mount table, and denial without the capability.
+#[cfg(target_arch = "x86_64")]
+fn test_vfs_capability() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::cap::{Capability, CapHandle, CapRights, CapType};
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::fs::{self, FsError};
+    use crate::ipc;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self, embedded};
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    // Bring up a SquashFS server and register it as a mount.
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let mut sqfs_index = None;
+    for dev in devs.iter().filter(|d| d.class == 0x01) {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 512];
+        if blk.read_blocks(0, &mut buf).is_ok() && buf[0..4] == [0x68, 0x73, 0x71, 0x73] {
+            sqfs_index = Some(block::register("squashfs-vfs", Box::new(blk)));
+            break;
+        }
+    }
+    let idx = sqfs_index.ok_or("no SquashFS disk for VFS test")?;
+    let block_handle = block_server::start(idx);
+    let sqfs_client = SharedRegion::alloc(128 * 1024).ok_or("client alloc failed")?;
+    let sqfs_ep = ipc::create_endpoint("vfs-sqfs");
+    spawn_server(ServerConfig {
+        name: "squashfs-server",
+        binary: embedded::SQUASHFS_SERVER,
+        fs_endpoint: sqfs_ep,
+        block_endpoint: block_handle.endpoint,
+        shared: Some(block_handle.region),
+        client_shared: Some(sqfs_client),
+        heap_bytes: 2 * 1024 * 1024,
+        arg0: 0,
+        arg1: 0,
+    });
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+
+    // Register the mount. The kernel↔server channel is the server's client region.
+    let mount_id = fs::register_mount(sqfs_ep, sqfs_client);
+
+    // --- A process WITH a Filesystem capability can open/read/stat ---
+    let (pid, _) = process::create_process("vfs-test", None);
+    let fs_handle = process::with_cspace_mut(pid, |cspace| {
+        cspace.insert(Capability {
+            cap_type: CapType::Filesystem { mount_id },
+            rights: CapRights::READ | CapRights::WRITE,
+            parent: None,
+        })
+    })
+    .ok_or("no cspace")?
+    .map_err(|_| "insert fs cap failed")?;
+
+    // stat /version
+    let (size, is_dir) = fs::vfs_stat(pid, fs_handle, b"/version").map_err(|_| "vfs_stat failed")?;
+    if size != 15 || is_dir {
+        return Err("vfs_stat /version wrong result");
+    }
+
+    // open + read /version
+    let fd_raw = fs::vfs_open(pid, fs_handle, b"/version").map_err(|_| "vfs_open failed")?;
+    let fd_handle = CapHandle::from_raw(fd_raw);
+    let mut buf = [0u8; 15];
+    let n = fs::vfs_read(pid, fd_handle, 0, &mut buf).map_err(|_| "vfs_read failed")?;
+    if n != 15 || &buf != b"THEMELIOS_ROOT\n" {
+        return Err("vfs_read /version content mismatch");
+    }
+    fs::vfs_close(pid, fd_handle).map_err(|_| "vfs_close failed")?;
+
+    // --- A process WITHOUT the capability is denied ---
+    let (pid2, _) = process::create_process("vfs-noperm", None);
+    // No Filesystem capability inserted; the NULL handle resolves to nothing.
+    match fs::vfs_open(pid2, CapHandle::NULL, b"/version") {
+        Err(FsError::PermissionDenied) => {}
+        _ => return Err("open without capability should be PermissionDenied"),
+    }
+
+    // A non-Filesystem capability also must not grant access.
+    let bogus = process::with_cspace_mut(pid2, |cspace| {
+        cspace.insert(Capability {
+            cap_type: CapType::Endpoint { endpoint_id: 1, badge: 0 },
+            rights: CapRights::READ | CapRights::WRITE,
+            parent: None,
+        })
+    })
+    .ok_or("no cspace")?
+    .map_err(|_| "insert bogus failed")?;
+    match fs::vfs_open(pid2, bogus, b"/version") {
+        Err(FsError::PermissionDenied) => {}
+        _ => return Err("open with wrong cap type should be PermissionDenied"),
+    }
+
+    process::destroy_process(pid);
+    process::destroy_process(pid2);
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_vfs_capability() -> Result<(), &'static str> {
     Ok(())
 }

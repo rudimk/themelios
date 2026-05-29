@@ -199,6 +199,25 @@ pub enum CapType {
         /// PID that allocated/owns the region, for accounting and revocation.
         owner_pid: usize,
     },
+
+    /// Access to a mounted filesystem. A process holding this capability can
+    /// open paths under the named mount (subject to READ/WRITE rights); without
+    /// it, `SYS_OPEN` is denied. This is how the capability system gates
+    /// filesystem access — there is no ambient "open any file" authority.
+    Filesystem {
+        /// Mount identifier (index into the kernel mount table).
+        mount_id: u64,
+    },
+
+    /// An open file handle. Returned by `SYS_OPEN` and consumed by the file
+    /// read/write/close/readdir syscalls. Bound to the opening process and the
+    /// mount it came from, so one process cannot use another's descriptors.
+    FileDescriptor {
+        /// The filesystem-server-side file descriptor.
+        fd: u64,
+        /// The mount this descriptor belongs to.
+        mount_id: u64,
+    },
 }
 
 // --- Capability ---
