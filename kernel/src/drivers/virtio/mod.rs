@@ -47,6 +47,8 @@ use core::ptr::{read_volatile, write_volatile};
 use crate::mm::addr::{PhysAddr, VirtAddr};
 use crate::mm::{frame, mmio, PAGE_SIZE};
 
+pub mod blk;
+
 // --- VirtIO PCI capability layout (fields relative to the capability offset) ---
 
 /// Offset of `cfg_type` within a VirtIO PCI capability (identifies the region).

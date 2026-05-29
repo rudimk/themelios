@@ -46,6 +46,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
     TestCase { name: "test_pci_scan",        func: test_pci_scan },
     TestCase { name: "test_virtio_transport", func: test_virtio_transport },
+    TestCase { name: "test_virtio_blk",       func: test_virtio_blk },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -1254,5 +1255,106 @@ fn test_virtio_transport() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_virtio_transport() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_virtio_blk — VirtIO block driver round-trip (Phase 3.2)
+// ============================================================
+
+/// Test the VirtIO-blk driver and the block device registry.
+///
+/// Brings up the attached virtio-blk disk, registers it, then exercises the
+/// `BlockDevice` interface end to end:
+/// 1. Registry lookup returns the device with a sane capacity
+/// 2. Single-sector write-then-read-back returns identical data
+/// 3. Multi-sector (3-sector) round-trip works
+/// 4. A request past the end of the device is rejected with OutOfRange
+/// 5. Bad (non-sector-multiple) buffer length is rejected
+#[cfg(target_arch = "x86_64")]
+fn test_virtio_blk() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use crate::drivers::{block, pci};
+    use crate::drivers::block::BlockError;
+    use crate::drivers::virtio::blk::VirtioBlk;
+
+    // Find and initialise the virtio-blk device.
+    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let dev = virtio_devs
+        .iter()
+        .find(|d| d.class == 0x01)
+        .ok_or("no VirtIO block device on the PCI bus")?;
+    let blk = VirtioBlk::init_from_pci(dev).map_err(|_| "VirtioBlk init failed")?;
+
+    // Register it and fetch it back through the registry.
+    let index = block::register("virtio-blk0", Box::new(blk));
+    let device = block::get(index).ok_or("registry lookup failed")?;
+
+    let block_size = device.block_size() as usize;
+    if block_size != 512 {
+        return Err("unexpected block size (expected 512)");
+    }
+    let capacity = device.block_count();
+    if capacity == 0 {
+        return Err("device reports zero capacity");
+    }
+
+    // --- 1. Single-sector write/read round-trip ---
+    let mut write_buf = vec![0u8; block_size];
+    for (i, b) in write_buf.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xA5;
+    }
+    device
+        .write_blocks(10, &write_buf)
+        .map_err(|_| "single-sector write failed")?;
+
+    let mut read_buf = vec![0u8; block_size];
+    device
+        .read_blocks(10, &mut read_buf)
+        .map_err(|_| "single-sector read failed")?;
+    if read_buf != write_buf {
+        return Err("single-sector round-trip data mismatch");
+    }
+
+    // --- 2. Multi-sector round-trip (3 sectors) ---
+    let mut multi_write = vec![0u8; block_size * 3];
+    for (i, b) in multi_write.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7).wrapping_add(1);
+    }
+    device
+        .write_blocks(20, &multi_write)
+        .map_err(|_| "multi-sector write failed")?;
+    let mut multi_read = vec![0u8; block_size * 3];
+    device
+        .read_blocks(20, &mut multi_read)
+        .map_err(|_| "multi-sector read failed")?;
+    if multi_read != multi_write {
+        return Err("multi-sector round-trip data mismatch");
+    }
+
+    // --- 3. Out-of-range request is rejected ---
+    let mut oob = vec![0u8; block_size];
+    match device.read_blocks(capacity, &mut oob) {
+        Err(BlockError::OutOfRange) => {}
+        _ => return Err("out-of-range read should return OutOfRange"),
+    }
+
+    // --- 4. Bad buffer length is rejected ---
+    let mut bad = vec![0u8; block_size - 1];
+    match device.read_blocks(0, &mut bad) {
+        Err(BlockError::BadBufferLength) => {}
+        _ => return Err("non-sector-multiple buffer should be rejected"),
+    }
+
+    // --- 5. Flush succeeds ---
+    device.flush().map_err(|_| "flush failed")?;
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_virtio_blk() -> Result<(), &'static str> {
     Ok(())
 }

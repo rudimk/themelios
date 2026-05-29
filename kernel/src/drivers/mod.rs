@@ -26,6 +26,13 @@
 //! with the kernel via IPC. The kernel grants them capabilities for the specific
 //! hardware resources (MMIO regions, interrupt lines) they need — nothing more.
 
+/// Block device abstraction and registry.
+///
+/// The `BlockDevice` trait every storage driver implements, plus the global
+/// registry that maps device names/indices to drivers. Decouples filesystem and
+/// block-server code from the specific hardware (VirtIO-blk now; NVMe later).
+pub mod block;
+
 /// PCI bus enumeration (x86_64).
 ///
 /// Discovers the virtual hardware QEMU exposes on the PCI bus — most importantly
