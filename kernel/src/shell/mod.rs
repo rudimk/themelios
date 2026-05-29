@@ -77,6 +77,12 @@ fn shell_entry() {
             "procs" => commands::cmd_procs(args),
             "caps" => commands::cmd_caps(args),
             "audit" => commands::cmd_audit(args),
+            "mount" => commands::cmd_mount(args),
+            "ls" => commands::cmd_ls(args),
+            "cat" => commands::cmd_cat(args),
+            "stat" => commands::cmd_stat(args),
+            "write" => commands::cmd_write(args),
+            "mkdir" => commands::cmd_mkdir(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
             }

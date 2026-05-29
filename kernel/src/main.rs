@@ -461,6 +461,13 @@ extern "C" fn kmain() -> ! {
         // capabilities, and spawns the init task plus a kernel-side server.
         process::init::start();
 
+        // Bring up the storage stack: discover the VirtIO disks, spawn the
+        // block + filesystem servers (SquashFS root under an overlay, ext2
+        // data volume), and register the "/" and "/data" mounts. The debug
+        // shell's filesystem commands operate on these mounts.
+        fs::boot_storage();
+        fs::print_mount_status();
+
         println!();
         println!("Interrupts enabled — scheduler is running.");
         println!("Type 'help' for available commands.");

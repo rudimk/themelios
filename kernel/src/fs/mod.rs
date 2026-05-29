@@ -139,11 +139,6 @@ pub fn register_mount(fs_endpoint: u64, client_region: SharedRegion) -> u64 {
     mount_id
 }
 
-/// Number of registered mounts.
-pub fn mount_count() -> usize {
-    MOUNTS.lock().len()
-}
-
 /// Look up a mount by id (returns a copy of its routing info).
 fn lookup_mount(mount_id: u64) -> Option<Mount> {
     MOUNTS.lock().iter().find(|m| m.mount_id == mount_id).copied()
@@ -280,4 +275,266 @@ pub fn vfs_readdir(pid: ProcessId, fd_handle: CapHandle, max: u64, out: &mut [u8
     let n = out.len().min(src.len());
     out[..n].copy_from_slice(&src[..n]);
     Ok(count)
+}
+
+// --- Kernel-internal operations ---
+//
+// These mirror the VFS operations but address a mount directly and skip the
+// capability check: the kernel is trusted, and the debug shell / boot sequence
+// use them to inspect and mount filesystems. Userspace must always go through
+// the capability-checked `vfs_*` syscalls.
+
+/// Open `path` on `mount_id` directly, returning the server-side fd.
+pub fn kopen(mount_id: u64, path: &[u8]) -> Result<u64, FsError> {
+    let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
+    let buf = unsafe { m.client_region.as_slice_mut() };
+    let n = path.len().min(buf.len());
+    buf[..n].copy_from_slice(&path[..n]);
+    let (status, fd) = fs_call(m.fs_endpoint, [OP_OPEN, n as u64, 0, 0]);
+    status?;
+    Ok(fd)
+}
+
+/// Read [offset, offset+buf.len()) of file `fd` on `mount_id`.
+pub fn kread(mount_id: u64, fd: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
+    let want = buf.len().min(m.client_region.size as usize);
+    let (status, n) = fs_call(m.fs_endpoint, [OP_READ, fd, offset, want as u64]);
+    status?;
+    let n = (n as usize).min(want);
+    let src = unsafe { m.client_region.as_slice_mut() };
+    buf[..n].copy_from_slice(&src[..n]);
+    Ok(n)
+}
+
+/// Close file `fd` on `mount_id`.
+pub fn kclose(mount_id: u64, fd: u64) -> Result<(), FsError> {
+    let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
+    fs_call(m.fs_endpoint, [OP_CLOSE, fd, 0, 0]).0
+}
+
+/// Stat `path` on `mount_id` → (size, is_dir).
+pub fn kstat(mount_id: u64, path: &[u8]) -> Result<(u64, bool), FsError> {
+    let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
+    let buf = unsafe { m.client_region.as_slice_mut() };
+    let n = path.len().min(buf.len());
+    buf[..n].copy_from_slice(&path[..n]);
+    let reply = ipc::ipc_call(m.fs_endpoint, IpcMessage::new([OP_STAT, n as u64, 0, 0]), 0)
+        .map_err(|_| FsError::ServerUnavailable)?;
+    decode_status(reply.words[0])?;
+    Ok((reply.words[1], reply.words[2] != 0))
+}
+
+/// List directory `fd` on `mount_id`, packed entries into `out`, returning count.
+pub fn kreaddir(mount_id: u64, fd: u64, max: u64, out: &mut [u8]) -> Result<u64, FsError> {
+    let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
+    let (status, count) = fs_call(m.fs_endpoint, [OP_READDIR, fd, max, 0]);
+    status?;
+    let src = unsafe { m.client_region.as_slice_mut() };
+    let n = out.len().min(src.len());
+    out[..n].copy_from_slice(&src[..n]);
+    Ok(count)
+}
+
+/// Create a regular file at `path` on `mount_id`, returning its fd.
+pub fn kcreate(mount_id: u64, path: &[u8]) -> Result<u64, FsError> {
+    let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
+    let buf = unsafe { m.client_region.as_slice_mut() };
+    let n = path.len().min(buf.len());
+    buf[..n].copy_from_slice(&path[..n]);
+    let (status, fd) = fs_call(m.fs_endpoint, [/* OP_CREATE */ 7, n as u64, 0, 0]);
+    status?;
+    Ok(fd)
+}
+
+/// Write `data` at `offset` to file `fd` on `mount_id`. Returns bytes written.
+pub fn kwrite(mount_id: u64, fd: u64, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+    let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
+    let dst = unsafe { m.client_region.as_slice_mut() };
+    let n = data.len().min(dst.len());
+    dst[..n].copy_from_slice(&data[..n]);
+    let (status, written) = fs_call(m.fs_endpoint, [OP_WRITE, fd, offset, n as u64]);
+    status?;
+    Ok((written as usize).min(n))
+}
+
+/// Create a directory at `path` on `mount_id`.
+pub fn kmkdir(mount_id: u64, path: &[u8]) -> Result<(), FsError> {
+    let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
+    let buf = unsafe { m.client_region.as_slice_mut() };
+    let n = path.len().min(buf.len());
+    buf[..n].copy_from_slice(&path[..n]);
+    fs_call(m.fs_endpoint, [/* OP_MKDIR */ 8, n as u64, 0, 0]).0
+}
+
+// --- Boot-time storage bring-up ---
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Mount id of the root filesystem ("/", overlay over SquashFS), or MAX if not
+/// mounted.
+static ROOT_MOUNT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Mount id of the data filesystem ("/data", ext2), or MAX if not mounted.
+static DATA_MOUNT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The root mount id, if storage has been brought up.
+pub fn root_mount() -> Option<u64> {
+    match ROOT_MOUNT.load(Ordering::SeqCst) {
+        u64::MAX => None,
+        v => Some(v),
+    }
+}
+
+/// The data mount id, if a data volume is mounted.
+pub fn data_mount() -> Option<u64> {
+    match DATA_MOUNT.load(Ordering::SeqCst) {
+        u64::MAX => None,
+        v => Some(v),
+    }
+}
+
+/// Bring up the full storage stack and register the root and data mounts.
+///
+/// Discovers the attached VirtIO disks (classifying each by its on-disk magic),
+/// then for the SquashFS disk: block server → SquashFS server → overlay server,
+/// registered as the root mount "/"; and for the ext2 disk: block server → ext2
+/// server, registered as "/data". The mounts are recorded for the shell.
+///
+/// Idempotent guard: does nothing if the root mount is already set.
+pub fn boot_storage() {
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::mm::shared::SharedRegion;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+    use alloc::boxed::Box;
+
+    if root_mount().is_some() {
+        return;
+    }
+
+    // Classify each VirtIO block device by probing its on-disk magic.
+    let mut squashfs_idx: Option<usize> = None;
+    let mut ext2_idx: Option<usize> = None;
+    for dev in pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID)
+        .iter()
+        .filter(|d| d.class == 0x01)
+    {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut sec0 = [0u8; 512];
+        let mut sec2 = [0u8; 512];
+        let r0 = blk.read_blocks(0, &mut sec0);
+        let r2 = blk.read_blocks(2, &mut sec2);
+        if r0.is_ok() && sec0[0..4] == [0x68, 0x73, 0x71, 0x73] {
+            squashfs_idx = Some(block::register("virtio-blk-root", Box::new(blk)));
+        } else if r2.is_ok() && sec2[56] == 0x53 && sec2[57] == 0xEF {
+            ext2_idx = Some(block::register("virtio-blk-data", Box::new(blk)));
+        }
+        // else: a scratch/unknown disk — leave it unregistered.
+    }
+
+    // --- Root: SquashFS (lower) + overlay (upper) ---
+    if let Some(idx) = squashfs_idx {
+        let block_handle = block_server::start(idx);
+        if let Some(sqfs_client) = SharedRegion::alloc(128 * 1024) {
+            let sqfs_ep = crate::ipc::create_endpoint("root-squashfs");
+            spawn_server(ServerConfig {
+                name: "squashfs-server",
+                binary: embedded::SQUASHFS_SERVER,
+                fs_endpoint: sqfs_ep,
+                block_endpoint: block_handle.endpoint,
+                shared: Some(block_handle.region),
+                client_shared: Some(sqfs_client),
+                heap_bytes: 2 * 1024 * 1024,
+                arg0: 0,
+                arg1: 0,
+                filesystem_mount: None,
+            });
+            // Overlay over the SquashFS lower layer.
+            if let Some(ovl_client) = SharedRegion::alloc(128 * 1024) {
+                let ovl_ep = crate::ipc::create_endpoint("root-overlay");
+                spawn_server(ServerConfig {
+                    name: "overlay-server",
+                    binary: embedded::OVERLAY_SERVER,
+                    fs_endpoint: ovl_ep,
+                    block_endpoint: 0,
+                    shared: Some(sqfs_client),
+                    client_shared: Some(ovl_client),
+                    heap_bytes: 4 * 1024 * 1024,
+                    arg0: sqfs_ep,
+                    arg1: 0,
+                    filesystem_mount: None,
+                });
+                let root_id = register_mount(ovl_ep, ovl_client);
+                ROOT_MOUNT.store(root_id, Ordering::SeqCst);
+            }
+        }
+    }
+
+    // --- Data: ext2 ---
+    if let Some(idx) = ext2_idx {
+        let block_handle = block_server::start(idx);
+        if let Some(ext2_client) = SharedRegion::alloc(128 * 1024) {
+            let ext2_ep = crate::ipc::create_endpoint("data-ext2");
+            spawn_server(ServerConfig {
+                name: "ext2-server",
+                binary: embedded::EXT2_SERVER,
+                fs_endpoint: ext2_ep,
+                block_endpoint: block_handle.endpoint,
+                shared: Some(block_handle.region),
+                client_shared: Some(ext2_client),
+                heap_bytes: 2 * 1024 * 1024,
+                arg0: 0,
+                arg1: 0,
+                filesystem_mount: None,
+            });
+            let data_id = register_mount(ext2_ep, ext2_client);
+            DATA_MOUNT.store(data_id, Ordering::SeqCst);
+        }
+    }
+
+    // Let the freshly-spawned servers reach their request loops (parse
+    // superblocks, etc.) before anyone issues filesystem requests.
+    for _ in 0..2000 {
+        sched::yield_now();
+    }
+}
+
+/// Print the mount table and a sample of the root filesystem to serial.
+pub fn print_mount_status() {
+    use crate::println;
+    println!();
+    println!("Storage mounts:");
+    match root_mount() {
+        Some(id) => {
+            println!("  / (mount {})  overlay over SquashFS (read-only root + RAM upper)", id);
+            // Confirm the root is readable by stat-ing a known file. The
+            // overlay→SquashFS→block chain may still be initialising, so retry
+            // a few times, yielding to let those servers reach their loops.
+            let mut readable = None;
+            for _ in 0..32 {
+                if let Ok((size, _)) = kstat(id, b"/version") {
+                    readable = Some(size);
+                    break;
+                }
+                for _ in 0..256 {
+                    crate::sched::yield_now();
+                }
+            }
+            match readable {
+                Some(size) => println!("    /version: {} bytes (readable)", size),
+                None => println!("    (root not yet responding)"),
+            }
+        }
+        None => println!("  / : not mounted"),
+    }
+    match data_mount() {
+        Some(id) => println!("  /data (mount {})  ext2 (read-write)", id),
+        None => println!("  /data : not mounted"),
+    }
 }

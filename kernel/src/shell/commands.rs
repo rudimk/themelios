@@ -25,6 +25,12 @@ pub fn cmd_help(_args: &str) {
     println!("  procs            — list all processes");
     println!("  caps [pid]       — list capabilities in a process's CSpace");
     println!("  audit [n]        — show last n audit log entries (default 20)");
+    println!("  mount            — list mounted filesystems");
+    println!("  ls <path>        — list a directory");
+    println!("  cat <path>       — print file contents");
+    println!("  stat <path>      — show file size and type");
+    println!("  write <path> <s> — create/write a file (overlay or /data)");
+    println!("  mkdir <path>     — create a directory");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -418,3 +424,192 @@ pub fn cmd_audit(args: &str) {
 
 /// We need alloc for Vec in argument parsing.
 extern crate alloc;
+
+// ============================================================
+//  Filesystem commands (Phase 3.10)
+// ============================================================
+//
+// These operate on the mounts brought up by `fs::boot_storage()` and use the
+// kernel-internal FS path (the kernel is trusted; userspace must go through the
+// capability-checked syscalls). A path under "/data" routes to the ext2 data
+// volume; everything else routes to the overlay/SquashFS root.
+
+/// Resolve a shell path to (mount_id, path-within-mount).
+fn resolve_mount(path: &str) -> Option<(u64, alloc::string::String)> {
+    use crate::fs;
+    if path == "/data" {
+        return fs::data_mount().map(|m| (m, alloc::string::String::from("/")));
+    }
+    if let Some(rest) = path.strip_prefix("/data/") {
+        return fs::data_mount().map(|m| (m, alloc::format!("/{}", rest)));
+    }
+    fs::root_mount().map(|m| (m, alloc::string::String::from(path)))
+}
+
+/// `mount` — list mounted filesystems.
+pub fn cmd_mount(_args: &str) {
+    crate::fs::print_mount_status();
+}
+
+/// `ls <path>` — list a directory's entries.
+pub fn cmd_ls(args: &str) {
+    use crate::fs;
+    let path = args.trim();
+    let path = if path.is_empty() { "/" } else { path };
+    let (mount, sub) = match resolve_mount(path) {
+        Some(v) => v,
+        None => {
+            println!("ls: no filesystem mounted");
+            return;
+        }
+    };
+    let fd = match fs::kopen(mount, sub.as_bytes()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            println!("ls: {}: {:?}", path, e);
+            return;
+        }
+    };
+    let mut buf = alloc::vec![0u8; 8192];
+    match fs::kreaddir(mount, fd, 256, &mut buf) {
+        Ok(count) => {
+            let mut pos = 0usize;
+            for _ in 0..count {
+                if pos + 4 > buf.len() {
+                    break;
+                }
+                let nlen = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+                let type_id = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]);
+                pos += 4;
+                if pos + nlen > buf.len() {
+                    break;
+                }
+                let name = core::str::from_utf8(&buf[pos..pos + nlen]).unwrap_or("?");
+                let kind = if type_id == 2 || type_id == 1 { "/" } else { "" };
+                println!("  {}{}", name, kind);
+                pos += nlen;
+            }
+        }
+        Err(e) => println!("ls: {}: {:?}", path, e),
+    }
+    let _ = fs::kclose(mount, fd);
+}
+
+/// `cat <path>` — print a file's contents to serial.
+pub fn cmd_cat(args: &str) {
+    use crate::fs;
+    let path = args.trim();
+    if path.is_empty() {
+        println!("usage: cat <path>");
+        return;
+    }
+    let (mount, sub) = match resolve_mount(path) {
+        Some(v) => v,
+        None => {
+            println!("cat: no filesystem mounted");
+            return;
+        }
+    };
+    let fd = match fs::kopen(mount, sub.as_bytes()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            println!("cat: {}: {:?}", path, e);
+            return;
+        }
+    };
+    let mut off = 0u64;
+    let mut chunk = alloc::vec![0u8; 1024];
+    loop {
+        match fs::kread(mount, fd, off, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                for &b in &chunk[..n] {
+                    crate::print!("{}", b as char);
+                }
+                off += n as u64;
+                if n < chunk.len() {
+                    break;
+                }
+            }
+            Err(e) => {
+                println!("cat: {}: {:?}", path, e);
+                break;
+            }
+        }
+    }
+    let _ = fs::kclose(mount, fd);
+}
+
+/// `stat <path>` — show a file's size and type.
+pub fn cmd_stat(args: &str) {
+    let path = args.trim();
+    if path.is_empty() {
+        println!("usage: stat <path>");
+        return;
+    }
+    let (mount, sub) = match resolve_mount(path) {
+        Some(v) => v,
+        None => {
+            println!("stat: no filesystem mounted");
+            return;
+        }
+    };
+    match crate::fs::kstat(mount, sub.as_bytes()) {
+        Ok((size, is_dir)) => {
+            println!("  {}: {} bytes, {}", path, size, if is_dir { "directory" } else { "file" });
+        }
+        Err(e) => println!("stat: {}: {:?}", path, e),
+    }
+}
+
+/// `write <path> <content>` — create and write a file.
+pub fn cmd_write(args: &str) {
+    use crate::fs;
+    let args = args.trim();
+    let (path, content) = match args.split_once(' ') {
+        Some((p, c)) => (p, c),
+        None => {
+            println!("usage: write <path> <content>");
+            return;
+        }
+    };
+    let (mount, sub) = match resolve_mount(path) {
+        Some(v) => v,
+        None => {
+            println!("write: no filesystem mounted");
+            return;
+        }
+    };
+    let fd = match fs::kcreate(mount, sub.as_bytes()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            println!("write: {}: {:?}", path, e);
+            return;
+        }
+    };
+    match fs::kwrite(mount, fd, 0, content.as_bytes()) {
+        Ok(n) => println!("  wrote {} bytes to {}", n, path),
+        Err(e) => println!("write: {}: {:?}", path, e),
+    }
+    let _ = fs::kclose(mount, fd);
+}
+
+/// `mkdir <path>` — create a directory.
+pub fn cmd_mkdir(args: &str) {
+    let path = args.trim();
+    if path.is_empty() {
+        println!("usage: mkdir <path>");
+        return;
+    }
+    let (mount, sub) = match resolve_mount(path) {
+        Some(v) => v,
+        None => {
+            println!("mkdir: no filesystem mounted");
+            return;
+        }
+    };
+    match crate::fs::kmkdir(mount, sub.as_bytes()) {
+        Ok(()) => println!("  created {}", path),
+        Err(e) => println!("mkdir: {}: {:?}", path, e),
+    }
+}
