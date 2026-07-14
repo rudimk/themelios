@@ -36,10 +36,11 @@
 //! - `word0` = status: 0 = OK, 1 = ERROR
 //! - `word1` = error code (a `BlockError` discriminant when status = ERROR)
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ipc::{self, IpcMessage};
 use crate::mm::shared::SharedRegion;
+use crate::sync::InterruptMutex;
 use crate::sched;
 
 use super::block;
@@ -60,17 +61,41 @@ const SHARED_REGION_BYTES: u64 = 128 * 1024;
 // --- Server state ---
 //
 // The scheduler spawns tasks as bare `fn()` entry points with no arguments, so
-// the server's configuration is published through these globals before the task
-// starts. A single block server instance is supported in Phase 3.
+// a server task can't be handed its configuration directly. Instead each
+// `start()` fills a self-contained [`Instance`] slot *before* spawning its task,
+// and every server task claims a distinct slot at entry via [`CLAIM`]. Because
+// each slot fully describes its endpoint, device, and shared region, multiple
+// block servers can run concurrently without sharing mutable global state —
+// which is exactly what boot needs (one block server for the SquashFS root disk,
+// another for the ext2 data disk). An earlier single-global design silently made
+// every server drive whichever device `start()` was called for *last*.
 
-/// IPC endpoint the server listens on (0 until started).
-static SERVER_ENDPOINT: AtomicU64 = AtomicU64::new(0);
-/// Physical base of the shared transfer region.
-static SHARED_PHYS: AtomicU64 = AtomicU64::new(0);
-/// Size of the shared transfer region in bytes.
-static SHARED_SIZE: AtomicU64 = AtomicU64::new(0);
-/// Registry index of the block device the server drives.
-static DEVICE_INDEX: AtomicUsize = AtomicUsize::new(0);
+/// Maximum number of concurrent block server instances. Phase 3 needs two (root
+/// SquashFS + data ext2); the headroom covers future data volumes cheaply.
+const MAX_INSTANCES: usize = 8;
+
+/// Per-instance configuration for one block server task. Fully self-contained so
+/// a task only ever touches its own slot after claiming it.
+#[derive(Clone, Copy)]
+struct Instance {
+    /// IPC endpoint this instance listens on.
+    endpoint: u64,
+    /// Shared transfer region (data buffer) for this instance.
+    region: SharedRegion,
+    /// Registry index of the block device this instance drives.
+    device_index: usize,
+}
+
+/// Configuration slots, one per started instance. Written by `start()` before
+/// the corresponding task is spawned; read once by that task when it claims its
+/// slot. `None` until populated.
+static INSTANCES: InterruptMutex<[Option<Instance>; MAX_INSTANCES]> =
+    InterruptMutex::new([None; MAX_INSTANCES]);
+/// Number of slots handed out by `start()` (the write cursor into `INSTANCES`).
+static INSTANCE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Next slot for a starting server task to claim (the read cursor). Each task
+/// does a single `fetch_add`, guaranteeing every task gets a distinct slot.
+static CLAIM: AtomicUsize = AtomicUsize::new(0);
 
 /// A handle to a started block server, returned to whoever spawned it.
 ///
@@ -99,19 +124,20 @@ pub fn start(device_index: usize) -> BlockServerHandle {
         .expect("block_server: failed to allocate shared region");
     let endpoint = ipc::create_endpoint("block-server");
 
-    SHARED_PHYS.store(region.phys_base.as_u64(), Ordering::SeqCst);
-    SHARED_SIZE.store(region.size, Ordering::SeqCst);
-    DEVICE_INDEX.store(device_index, Ordering::SeqCst);
-    SERVER_ENDPOINT.store(endpoint, Ordering::SeqCst);
+    // Reserve a configuration slot and publish this instance into it *before*
+    // spawning the task, so the task sees fully-initialised config when it
+    // claims the slot.
+    let slot = INSTANCE_COUNT.fetch_add(1, Ordering::SeqCst);
+    assert!(slot < MAX_INSTANCES, "block_server: too many instances");
+    INSTANCES.lock()[slot] = Some(Instance {
+        endpoint,
+        region,
+        device_index,
+    });
 
     sched::spawn("block-server", server_loop);
 
     BlockServerHandle { endpoint, region }
-}
-
-/// The endpoint the running block server listens on (0 if not started).
-pub fn endpoint() -> u64 {
-    SERVER_ENDPOINT.load(Ordering::SeqCst)
 }
 
 /// The server task entry point: receive requests, perform I/O, reply.
@@ -119,31 +145,39 @@ pub fn endpoint() -> u64 {
 /// Runs forever. Each iteration blocks in `ipc_receive` until a client sends a
 /// request, dispatches it to the block device, and replies with the status.
 fn server_loop() {
-    let endpoint = SERVER_ENDPOINT.load(Ordering::SeqCst);
+    // Claim a distinct configuration slot. Every server task does exactly one
+    // `fetch_add`, so no two tasks ever share a slot, and each slot was fully
+    // populated by its `start()` before the task was spawned.
+    let slot = CLAIM.fetch_add(1, Ordering::SeqCst);
+    let instance = match INSTANCES.lock().get(slot).copied().flatten() {
+        Some(inst) => inst,
+        // No config for this slot — misconfigured spawn; nothing to serve.
+        None => return,
+    };
 
     loop {
-        let request = match ipc::ipc_receive(endpoint) {
+        let request = match ipc::ipc_receive(instance.endpoint) {
             Ok(msg) => msg,
             // If the endpoint is torn down, the server exits.
             Err(_) => return,
         };
 
-        let (status, error_code) = handle_request(&request);
+        let (status, error_code) = handle_request(&instance, &request);
 
         let reply = IpcMessage::new([status, error_code, 0, 0]);
         // A failed reply (caller gone) is non-fatal — keep serving.
-        let _ = ipc::ipc_reply(endpoint, request.reply_token, reply);
+        let _ = ipc::ipc_reply(instance.endpoint, request.reply_token, reply);
     }
 }
 
-/// Dispatch a single block request, returning `(status, error_code)`.
-fn handle_request(request: &IpcMessage) -> (u64, u64) {
+/// Dispatch a single block request for `instance`, returning `(status, error_code)`.
+fn handle_request(instance: &Instance, request: &IpcMessage) -> (u64, u64) {
     let op = request.words[0];
     let start_lba = request.words[1];
     let block_count = request.words[2];
     let offset = request.words[3];
 
-    let device = match block::get(DEVICE_INDEX.load(Ordering::SeqCst)) {
+    let device = match block::get(instance.device_index) {
         Some(d) => d,
         None => return (STATUS_ERROR, 0),
     };
@@ -159,7 +193,7 @@ fn handle_request(request: &IpcMessage) -> (u64, u64) {
     // READ/WRITE: compute and bounds-check the shared-buffer window.
     let block_size = device.block_size() as u64;
     let len = block_count * block_size;
-    let shared_size = SHARED_SIZE.load(Ordering::SeqCst);
+    let shared_size = instance.region.size;
     if offset.checked_add(len).map_or(true, |end| end > shared_size) {
         // Request would read/write outside the shared region.
         return (STATUS_ERROR, BlockErrorCode::BadOffset as u64);
@@ -168,11 +202,7 @@ fn handle_request(request: &IpcMessage) -> (u64, u64) {
     // SAFETY: the shared region is valid for `shared_size` bytes via the HHDM,
     // and the request/reply protocol serialises access to it (a client waits
     // for the reply before reusing the window).
-    let region = SharedRegion {
-        phys_base: crate::mm::addr::PhysAddr::new(SHARED_PHYS.load(Ordering::SeqCst)),
-        size: shared_size,
-    };
-    let buf = unsafe { region.as_slice_mut() };
+    let buf = unsafe { instance.region.as_slice_mut() };
     let window = &mut buf[offset as usize..(offset + len) as usize];
 
     let result = match op {
