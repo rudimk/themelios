@@ -675,6 +675,11 @@ impl Ext2 {
     }
 
     /// Create a regular file at `path`, returning (ino, inode).
+    ///
+    /// If a regular file already exists at `path`, it is reused and truncated to
+    /// zero (open-or-create with O_TRUNC semantics) rather than allocating a
+    /// second inode with a duplicate directory entry — the latter corrupts the
+    /// directory. A directory already at `path` is rejected.
     fn create_file(&self, path: &str) -> Result<(u32, Inode), FsError> {
         let (parent_path, name) = Self::split_path(path);
         let (_, parent) = self.resolve_num(parent_path).ok_or(FsError::NotFound)?;
@@ -684,11 +689,40 @@ impl Ext2 {
         if name.is_empty() || name.len() > 255 {
             return Err(FsError::InvalidArgument);
         }
+        // Reuse an existing entry rather than adding a duplicate dirent.
+        if let Some((existing_ino, existing)) = self.resolve_num(path) {
+            if existing.is_dir() {
+                return Err(FsError::IsADirectory);
+            }
+            // Truncate: free the file's data blocks, then reset the inode in
+            // place (same inode number, so its single directory entry stays).
+            self.free_inode_blocks(&existing);
+            self.init_inode(existing_ino, S_IFREG | 0o644, 1);
+            let inode = self.read_inode(existing_ino).ok_or(FsError::IoError)?;
+            return Ok((existing_ino, inode));
+        }
         let ino = self.alloc_inode(false).ok_or(FsError::NoInodes)?;
         self.init_inode(ino, S_IFREG | 0o644, 1);
         self.add_dir_entry(&parent, name, ino, 1)?;
         let inode = self.read_inode(ino).ok_or(FsError::IoError)?;
         Ok((ino, inode))
+    }
+
+    /// Free all data blocks (direct + single-indirect) referenced by `inode`,
+    /// including the single-indirect table block itself. Does not touch the
+    /// inode record — callers either re-init it or free the inode separately.
+    fn free_inode_blocks(&self, inode: &Inode) {
+        let bs = self.sb.block_size as u64;
+        let n_blocks = inode.size.div_ceil(bs) as u32;
+        for lb in 0..n_blocks {
+            let phys = self.resolve_block(inode, lb);
+            if phys != 0 {
+                self.free_block(phys);
+            }
+        }
+        if inode.block[IND_BLOCK] != 0 {
+            self.free_block(inode.block[IND_BLOCK]);
+        }
     }
 
     /// Create a directory at `path`.
@@ -697,6 +731,10 @@ impl Ext2 {
         let (parent_ino, parent) = self.resolve_num(parent_path).ok_or(FsError::NotFound)?;
         if !parent.is_dir() {
             return Err(FsError::NotADirectory);
+        }
+        // Reject an existing name rather than adding a duplicate dirent.
+        if self.resolve_num(path).is_some() {
+            return Err(FsError::AlreadyExists);
         }
         let ino = self.alloc_inode(true).ok_or(FsError::NoInodes)?;
         self.init_inode(ino, S_IFDIR | 0o755, 2);
@@ -759,18 +797,8 @@ impl Ext2 {
         let links = self.inode_links(ino);
         let new_links = links.saturating_sub(1);
         if new_links == 0 || inode.is_dir() {
-            // Free all data blocks the file/dir used.
-            let bs = self.sb.block_size as u64;
-            let n_blocks = inode.size.div_ceil(bs) as u32;
-            for lb in 0..n_blocks {
-                let phys = self.resolve_block(&inode, lb);
-                if phys != 0 {
-                    self.free_block(phys);
-                }
-            }
-            if inode.block[IND_BLOCK] != 0 {
-                self.free_block(inode.block[IND_BLOCK]);
-            }
+            // Free all data blocks the file/dir used, then the inode itself.
+            self.free_inode_blocks(&inode);
             self.free_inode(ino, inode.is_dir());
         } else {
             self.write_inode(ino, &inode, new_links, 0);
