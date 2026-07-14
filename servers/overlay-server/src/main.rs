@@ -479,10 +479,10 @@ impl Overlay {
                     names.remove(&name);
                 }
                 Node::File(_) => {
-                    names.insert(name, fs_proto::OP_READ as u16 /*file marker=2*/);
+                    names.insert(name, fs_proto::DT_FILE);
                 }
                 Node::Dir => {
-                    names.insert(name, 1 /*dir marker*/);
+                    names.insert(name, fs_proto::DT_DIR);
                 }
             }
         }

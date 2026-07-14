@@ -40,6 +40,26 @@ pub const OP_UNLINK: u64 = 9;
 /// Reply status: success.
 pub const STATUS_OK: u64 = 0;
 
+// --- Canonical directory-entry type codes ---
+//
+// The `readdir` wire format packs, per entry, `[u16 name_len, u16 type, name]`.
+// Filesystem servers store entry types in their own native on-disk encodings
+// (ext2 dirent filetypes, SquashFS inode types, …) which disagree — e.g. ext2
+// uses 1=file/2=dir while SquashFS uses 1=dir/2=file. So each server MUST
+// translate to these canonical codes before packing, letting any client (the
+// shell's `ls`) render entry kinds uniformly regardless of the backing FS.
+// The values are chosen to coincide with ext2's dirent filetypes so the ext2
+// server needs no translation.
+
+/// Directory-entry type: unknown / not classified.
+pub const DT_UNKNOWN: u16 = 0;
+/// Directory-entry type: regular file.
+pub const DT_FILE: u16 = 1;
+/// Directory-entry type: directory.
+pub const DT_DIR: u16 = 2;
+/// Directory-entry type: symbolic link.
+pub const DT_SYMLINK: u16 = 3;
+
 /// Filesystem error codes — mirror the kernel's `fs::FsError` discriminants.
 ///
 /// Returned in a reply's status word (with the high bit set to distinguish an

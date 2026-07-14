@@ -85,8 +85,21 @@ const NO_FRAGMENT: u32 = 0xFFFF_FFFF;
 // Inode types.
 const TYPE_DIR: u16 = 1;
 const TYPE_FILE: u16 = 2;
+const TYPE_SYMLINK: u16 = 3;
 const TYPE_LDIR: u16 = 8; // extended directory
 const TYPE_LREG: u16 = 9; // extended file
+const TYPE_LSYMLINK: u16 = 10; // extended symlink
+
+/// Map a native SquashFS inode type to the canonical `fs_proto` readdir type
+/// code, so clients see a filesystem-independent notion of file vs. directory.
+fn canonical_dt(sqfs_type: u16) -> u16 {
+    match sqfs_type {
+        TYPE_DIR | TYPE_LDIR => fs_proto::DT_DIR,
+        TYPE_FILE | TYPE_LREG => fs_proto::DT_FILE,
+        TYPE_SYMLINK | TYPE_LSYMLINK => fs_proto::DT_SYMLINK,
+        _ => fs_proto::DT_UNKNOWN,
+    }
+}
 
 /// Parsed superblock fields we use.
 struct Superblock {
@@ -612,7 +625,9 @@ impl Server {
                         for e in entries.iter().take(max) {
                             let nb = e.name.as_bytes();
                             packed.extend_from_slice(&(nb.len() as u16).to_le_bytes());
-                            packed.extend_from_slice(&e.type_id.to_le_bytes());
+                            // Translate the native SquashFS inode type to the
+                            // canonical readdir type code the client expects.
+                            packed.extend_from_slice(&canonical_dt(e.type_id).to_le_bytes());
                             packed.extend_from_slice(nb);
                             count += 1;
                         }

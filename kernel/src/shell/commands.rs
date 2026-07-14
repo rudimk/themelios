@@ -485,7 +485,10 @@ pub fn cmd_ls(args: &str) {
                     break;
                 }
                 let name = core::str::from_utf8(&buf[pos..pos + nlen]).unwrap_or("?");
-                let kind = if type_id == 2 || type_id == 1 { "/" } else { "" };
+                // Canonical readdir type codes (fs_proto::DT_*): 2 = directory.
+                // Only directories get a trailing slash; files and everything
+                // else print bare.
+                let kind = if type_id == 2 { "/" } else { "" };
                 println!("  {}{}", name, kind);
                 pos += nlen;
             }
