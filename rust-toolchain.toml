@@ -1,4 +1,7 @@
 [toolchain]
-channel = "nightly"
+# Pinned to a specific nightly for reproducible builds. A floating "nightly"
+# silently drifts, so CI and local machines can end up on different compilers —
+# a latent source of "works here, fails in CI". Bump this deliberately.
+channel = "nightly-2026-07-15"
 components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]
 targets = ["x86_64-unknown-none", "aarch64-unknown-none"]
