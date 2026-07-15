@@ -285,6 +285,7 @@ pub fn vfs_readdir(pid: ProcessId, fd_handle: CapHandle, max: u64, out: &mut [u8
 // the capability-checked `vfs_*` syscalls.
 
 /// Open `path` on `mount_id` directly, returning the server-side fd.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn kopen(mount_id: u64, path: &[u8]) -> Result<u64, FsError> {
     let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
     let buf = unsafe { m.client_region.as_slice_mut() };
@@ -296,6 +297,7 @@ pub fn kopen(mount_id: u64, path: &[u8]) -> Result<u64, FsError> {
 }
 
 /// Read [offset, offset+buf.len()) of file `fd` on `mount_id`.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn kread(mount_id: u64, fd: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
     let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
     let want = buf.len().min(m.client_region.size as usize);
@@ -308,12 +310,14 @@ pub fn kread(mount_id: u64, fd: u64, offset: u64, buf: &mut [u8]) -> Result<usiz
 }
 
 /// Close file `fd` on `mount_id`.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn kclose(mount_id: u64, fd: u64) -> Result<(), FsError> {
     let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
     fs_call(m.fs_endpoint, [OP_CLOSE, fd, 0, 0]).0
 }
 
 /// Stat `path` on `mount_id` → (size, is_dir).
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn kstat(mount_id: u64, path: &[u8]) -> Result<(u64, bool), FsError> {
     let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
     let buf = unsafe { m.client_region.as_slice_mut() };
@@ -326,6 +330,7 @@ pub fn kstat(mount_id: u64, path: &[u8]) -> Result<(u64, bool), FsError> {
 }
 
 /// List directory `fd` on `mount_id`, packed entries into `out`, returning count.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn kreaddir(mount_id: u64, fd: u64, max: u64, out: &mut [u8]) -> Result<u64, FsError> {
     let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
     let (status, count) = fs_call(m.fs_endpoint, [OP_READDIR, fd, max, 0]);
@@ -337,6 +342,7 @@ pub fn kreaddir(mount_id: u64, fd: u64, max: u64, out: &mut [u8]) -> Result<u64,
 }
 
 /// Create a regular file at `path` on `mount_id`, returning its fd.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn kcreate(mount_id: u64, path: &[u8]) -> Result<u64, FsError> {
     let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
     let buf = unsafe { m.client_region.as_slice_mut() };
@@ -348,6 +354,7 @@ pub fn kcreate(mount_id: u64, path: &[u8]) -> Result<u64, FsError> {
 }
 
 /// Write `data` at `offset` to file `fd` on `mount_id`. Returns bytes written.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn kwrite(mount_id: u64, fd: u64, offset: u64, data: &[u8]) -> Result<usize, FsError> {
     let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
     let dst = unsafe { m.client_region.as_slice_mut() };
@@ -359,6 +366,7 @@ pub fn kwrite(mount_id: u64, fd: u64, offset: u64, data: &[u8]) -> Result<usize,
 }
 
 /// Create a directory at `path` on `mount_id`.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn kmkdir(mount_id: u64, path: &[u8]) -> Result<(), FsError> {
     let m = lookup_mount(mount_id).ok_or(FsError::ServerUnavailable)?;
     let buf = unsafe { m.client_region.as_slice_mut() };
@@ -401,6 +409,7 @@ pub fn data_mount() -> Option<u64> {
 /// server, registered as "/data". The mounts are recorded for the shell.
 ///
 /// Idempotent guard: does nothing if the root mount is already set.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn boot_storage() {
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
@@ -506,6 +515,7 @@ pub fn boot_storage() {
 }
 
 /// Print the mount table and a sample of the root filesystem to serial.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn print_mount_status() {
     use crate::println;
     println!();

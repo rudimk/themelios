@@ -3,6 +3,13 @@
 //! Each command is a function that takes an argument string (everything after
 //! the command name) and prints its output to serial via `println!`.
 
+// Every function here is reached only through the interactive shell's dispatch
+// table (see `shell::shell_entry`), which runs solely in the normal kernel. The
+// test kernel replaces the shell with the test runner, so these are dead code in
+// that build only — suppress the lint there, but keep it active for normal builds
+// so genuinely-unused commands are still flagged.
+#![cfg_attr(feature = "test", allow(dead_code))]
+
 use crate::mm;
 use crate::println;
 use crate::sched;
