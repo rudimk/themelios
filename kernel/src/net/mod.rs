@@ -25,3 +25,14 @@
 //! In the full microkernel design, the network stack runs in userspace. The kernel
 //! only provides the raw VirtIO device access (via capabilities) and IPC channels
 //! for the network service to communicate with other processes.
+//!
+//! ## Phase 4 status
+//!
+//! Sub-phase 4.0 adds the [`device`] module: the [`NetDevice`](device::NetDevice)
+//! trait (the bus-independent NIC abstraction and the arm64 seam) and the global
+//! network device registry. The VirtIO-net driver that implements it lives in
+//! [`crate::drivers::virtio::net`]. Higher layers — the kernel net service and the
+//! ring-3 TCP/IP stack — build on this in later sub-phases.
+
+/// Network device abstraction (`NetDevice` trait) and the global NIC registry.
+pub mod device;
