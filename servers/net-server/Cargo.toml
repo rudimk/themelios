@@ -1,0 +1,29 @@
+[package]
+name = "net-server"
+version = "0.1.0"
+edition = "2021"
+
+# Userspace TCP/IP stack (Phase 4). The kernel keeps only a thin VirtIO-net
+# driver; all protocol parsing — Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP — runs
+# here in ring 3, reaching the NIC through the kernel net service over IPC +
+# shared memory. Built on smoltcp, which is fully contained by the ring-3
+# boundary (the same containment rationale as miniz_oxide in the SquashFS server).
+[[bin]]
+name = "net-server"
+path = "src/main.rs"
+
+[dependencies]
+libthemelios = { path = "../libthemelios" }
+# no_std TCP/IP stack. default-features = false drops std; we enable exactly the
+# protocols and socket types Phase 4 needs. Verified to build bare-metal for both
+# x86_64-unknown-none and aarch64-unknown-none (the arm64 compile gate).
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-udp",
+    "socket-tcp",
+    "socket-dhcpv4",
+    "socket-icmp",
+] }

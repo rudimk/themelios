@@ -21,6 +21,7 @@ members = [
     "overlay-server",
     "ext2-server",
     "fstest-client",
+    "net-server",
 ]
 
 # Servers are freestanding ring-3 binaries: abort on panic (no unwinder), and
