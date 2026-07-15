@@ -7,7 +7,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **0** | Boot on QEMU, serial output | Complete |
 | **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
 | **2** | Capability system, process isolation, IPC | Complete |
-| **3** | VirtIO block driver, read-only filesystem | In progress |
+| **3** | VirtIO block driver, read-only filesystem | Complete |
 | **4** | VirtIO net driver, TCP/IP stack | Not started |
 | **5** | OCI container support | Not started |
 | **6** | Management API (Docker-compatible) | Not started |
@@ -57,15 +57,29 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 - Reclaim bootloader-reclaimable memory (safe once we own GDT, page tables, and stack)
 - First userspace process (init)
 
-## Phase 3 — Storage (In progress)
+## Phase 3 — Storage (Complete)
 
-**Goal**: Read from a virtual disk and present a filesystem.
+**Goal**: Read from a virtual disk and present a filesystem, using a hybrid
+microkernel design — a thin in-kernel block driver with all filesystem parsing in
+userspace servers. See [Storage Architecture](./storage.md) for the full design.
 
 **Deliverables**:
-- VirtIO block driver (for QEMU's virtual disk)
-- Read-only filesystem (simple format, possibly custom or FAT)
-- RAM-backed ephemeral writable layer
-- Immutable root image creation tooling
+- PCI enumeration and a VirtIO (modern PCI transport + split virtqueue) layer
+- `BlockDevice` trait and a VirtIO-blk driver
+- Kernel-side block server exposing the disk to userspace over IPC + shared memory
+- `CapType::SharedMemory` for bulk data transfer across the privilege boundary
+- Userspace server framework (flat-binary embedding, `spawn_server`) and the
+  `libthemelios` support library
+- SquashFS server (compressed read-only root) running in ring 3
+- Overlay server (RAM upper + SquashFS lower, copy-up, whiteouts) — the ephemeral
+  writable layer
+- ext2 server (read-write persistent data volume) running in ring 3
+- VFS dispatch with `Filesystem` / `FileDescriptor` capabilities and the
+  filesystem syscalls (open, read, write, close, stat, readdir)
+- Audit logging for filesystem operations
+- `cargo xtask image` tooling to build the SquashFS root and ext2 data images
+- Boot integration (mounts `/` and `/data`) and debug-shell commands
+  (`mount`, `ls`, `cat`, `stat`, `write`, `mkdir`)
 
 ## Phase 4 — Networking (Not started)
 
