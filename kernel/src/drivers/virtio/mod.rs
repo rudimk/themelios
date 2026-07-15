@@ -48,6 +48,7 @@ use crate::mm::addr::{PhysAddr, VirtAddr};
 use crate::mm::{frame, mmio, PAGE_SIZE};
 
 pub mod blk;
+pub mod net;
 
 // --- VirtIO PCI capability layout (fields relative to the capability offset) ---
 
@@ -193,6 +194,10 @@ struct VirtqDesc {
 pub struct Virtqueue {
     /// Number of descriptors (queue size).
     size: u16,
+    /// This queue's index (0-based). Written to the notify doorbell to tell the
+    /// device which queue has new buffers — queue 0 for a block device, or the
+    /// receive/transmit queues (0/1) of a network device.
+    index: u16,
     /// HHDM virtual base of the descriptor table.
     desc: VirtAddr,
     /// HHDM virtual base of the available ring.
@@ -226,7 +231,7 @@ impl Virtqueue {
     /// Each of the three regions gets its own contiguous physical allocation
     /// (page-aligned, which satisfies all VirtIO alignment requirements) and is
     /// zeroed. Returns `OutOfMemory` if any allocation fails.
-    fn new(size: u16, notify_addr: VirtAddr) -> Result<Self, VirtioError> {
+    fn new(size: u16, index: u16, notify_addr: VirtAddr) -> Result<Self, VirtioError> {
         let n = size as usize;
         // Region sizes per the spec.
         let desc_bytes = 16 * n;
@@ -239,6 +244,7 @@ impl Virtqueue {
 
         Ok(Self {
             size,
+            index,
             desc: desc_phys.to_virt(),
             avail: avail_phys.to_virt(),
             used: used_phys.to_virt(),
@@ -291,7 +297,7 @@ impl Virtqueue {
         // notify doorbell.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe {
-            write_volatile(self.notify_addr.as_u64() as *mut u16, 0);
+            write_volatile(self.notify_addr.as_u64() as *mut u16, self.index);
         }
 
         // 5. Poll the used ring until its index advances past what we last saw,
@@ -305,6 +311,64 @@ impl Virtqueue {
             }
             core::hint::spin_loop();
         }
+    }
+
+    // ----- Asynchronous (non-blocking) primitives for networking -----
+    //
+    // Block I/O is request/response and uses `submit_and_wait`. Networking is
+    // different: RX buffers are pre-posted and filled by the device whenever
+    // frames arrive, and the driver polls for completions without blocking. These
+    // three primitives — publish, kick, poll_used — provide that pattern.
+
+    /// Publish descriptor chain head `head` into the available ring, WITHOUT
+    /// kicking the device or waiting. Used to (re)post RX buffers and to queue a
+    /// TX frame before a single `kick`.
+    fn publish(&self, head: u16) {
+        // SAFETY: avail ring is HHDM-mapped RAM of the correct size.
+        let avail_idx = unsafe { mmio_read_u16(self.avail, RING_IDX) };
+        let slot = avail_idx % self.size;
+        unsafe {
+            let entry = (self.avail.as_u64() + RING_ENTRIES + (slot as u64) * 2) as *mut u16;
+            write_volatile(entry, head);
+        }
+        // Ensure the ring entry is visible before we advance the index.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            mmio_write_u16(self.avail, RING_IDX, avail_idx.wrapping_add(1));
+        }
+    }
+
+    /// Kick the device: tell it this queue has newly-available buffers to process.
+    fn kick(&self) {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: notify_addr is this queue's mapped MMIO doorbell; the value is
+        // the queue index (the vqn the device expects).
+        unsafe {
+            write_volatile(self.notify_addr.as_u64() as *mut u16, self.index);
+        }
+    }
+
+    /// Non-blocking used-ring poll. If the device has returned a buffer since our
+    /// last observation, returns `(descriptor head id, bytes written by device)`
+    /// and advances our used cursor by one; otherwise returns `None`.
+    fn poll_used(&mut self) -> Option<(u16, u32)> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: used ring is HHDM-mapped RAM of the correct size.
+        let used_idx = unsafe { mmio_read_u16(self.used, RING_IDX) };
+        if used_idx == self.last_used_idx {
+            return None;
+        }
+        // Read the used element at our cursor. Used-ring entries start at
+        // RING_ENTRIES and are 8 bytes each: { id: u32, len: u32 }.
+        let slot = (self.last_used_idx % self.size) as u64;
+        let (id, len) = unsafe {
+            let base = self.used.as_u64() + RING_ENTRIES + slot * 8;
+            let id = read_volatile(base as *const u32);
+            let len = read_volatile((base + 4) as *const u32);
+            (id, len)
+        };
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        Some((id as u16, len))
     }
 }
 
@@ -522,7 +586,7 @@ impl VirtioTransport {
                 + (notify_off as u64) * (self.notify_off_multiplier as u64),
         );
 
-        let queue = Virtqueue::new(size, notify_addr)?;
+        let queue = Virtqueue::new(size, index, notify_addr)?;
 
         // Program the queue: size, ring physical addresses, disable MSI-X
         // (0xFFFF = NO_VECTOR — we poll), then enable.
