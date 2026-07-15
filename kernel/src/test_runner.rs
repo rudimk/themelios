@@ -56,6 +56,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_ext2_write",       func: test_ext2_write },
     TestCase { name: "test_vfs_capability",   func: test_vfs_capability },
     TestCase { name: "test_fs_syscalls",      func: test_fs_syscalls },
+    TestCase { name: "test_virtio_net",       func: test_virtio_net },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -2636,6 +2637,95 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_fs_syscalls() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_virtio_net — VirtIO-net driver TX/RX round-trip (Phase 4.0)
+// ============================================================
+
+/// Test the VirtIO-net driver end-to-end by ARP-resolving the slirp gateway.
+///
+/// Brings up the NIC, registers it, transmits a broadcast ARP request for the
+/// user-mode-networking gateway (10.0.2.2), and polls the receive path for the
+/// gateway's ARP reply. A correct reply proves the whole driver works: feature
+/// negotiation, both virtqueues, TX (frame consumed by the device) and polled RX
+/// (a frame delivered into a pre-posted buffer), and the 12-byte VirtIO-net
+/// header handling (a wrong header length would misalign the parsed EtherType).
+#[cfg(target_arch = "x86_64")]
+fn test_virtio_net() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use crate::drivers::pci;
+    use crate::drivers::virtio::net::VirtioNet;
+    use crate::net::device;
+    use crate::sched;
+
+    // Find the VirtIO network device (vendor 0x1AF4, PCI class 0x02 = network).
+    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let dev = virtio_devs
+        .iter()
+        .find(|d| d.class == 0x02)
+        .ok_or("no VirtIO network device on the PCI bus")?;
+    let nic = VirtioNet::init_from_pci(dev).map_err(|_| "VirtioNet init failed")?;
+
+    // Register it and fetch it back through the registry.
+    let index = device::register("virtio-net0", Box::new(nic));
+    let netdev = device::get(index).ok_or("net registry lookup failed")?;
+
+    let mac = netdev.mac();
+    if mac == [0u8; 6] {
+        return Err("device reports an all-zero MAC");
+    }
+    if netdev.mtu() < 576 {
+        return Err("device reports an implausible MTU");
+    }
+
+    // --- Build an ARP request: "who has 10.0.2.2?" (the slirp gateway) ---
+    // Ethernet header (14 bytes) + ARP (28 bytes) = 42 bytes.
+    let mut frame = vec![0u8; 42];
+    frame[0..6].copy_from_slice(&[0xff; 6]); // dst = broadcast
+    frame[6..12].copy_from_slice(&mac); // src = our MAC
+    frame[12..14].copy_from_slice(&[0x08, 0x06]); // EtherType = ARP
+    frame[14..16].copy_from_slice(&[0x00, 0x01]); // htype = Ethernet
+    frame[16..18].copy_from_slice(&[0x08, 0x00]); // ptype = IPv4
+    frame[18] = 6; // hlen
+    frame[19] = 4; // plen
+    frame[20..22].copy_from_slice(&[0x00, 0x01]); // op = request
+    frame[22..28].copy_from_slice(&mac); // sender hardware addr
+    frame[28..32].copy_from_slice(&[10, 0, 2, 15]); // sender protocol addr
+    // target hardware addr stays zeroed (unknown)
+    frame[38..42].copy_from_slice(&[10, 0, 2, 2]); // target protocol addr = gateway
+
+    netdev.transmit(&frame).map_err(|_| "ARP transmit failed")?;
+
+    // --- Poll the receive path for the gateway's ARP reply ---
+    let mut rxbuf = [0u8; 2048];
+    let mut got_reply = false;
+    for _ in 0..8000 {
+        let n = netdev.receive(&mut rxbuf).map_err(|_| "receive failed")?;
+        if n >= 42 {
+            let is_arp = rxbuf[12] == 0x08 && rxbuf[13] == 0x06;
+            let is_reply = rxbuf[20] == 0x00 && rxbuf[21] == 0x02;
+            let sender_is_gateway = rxbuf[28..32] == [10, 0, 2, 2];
+            if is_arp && is_reply && sender_is_gateway {
+                got_reply = true;
+                break;
+            }
+        }
+        // Yield so the round-trip has time to complete (RX is polled).
+        sched::yield_now();
+    }
+
+    if !got_reply {
+        return Err("no ARP reply from gateway — TX/RX round-trip failed");
+    }
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_virtio_net() -> Result<(), &'static str> {
     Ok(())
 }
 

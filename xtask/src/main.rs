@@ -308,6 +308,23 @@ fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
     ]
 }
 
+/// QEMU arguments attaching a VirtIO network device backed by user-mode (slirp)
+/// networking (Phase 4).
+///
+/// - `-netdev user,id=<id>`: QEMU's built-in user-mode network — no host config,
+///   provides a gateway (10.0.2.2), DHCP, and DNS (10.0.2.3). Enough to exercise
+///   ARP, DHCP, and outbound UDP/TCP without touching the host network stack.
+/// - `-device virtio-net-pci,netdev=<id>,disable-legacy=on`: create the modern
+///   VirtIO-net PCI device the kernel driver binds to.
+fn virtio_net_args(id: &str) -> Vec<String> {
+    vec![
+        "-netdev".to_string(),
+        format!("user,id={id}"),
+        "-device".to_string(),
+        format!("virtio-net-pci,netdev={id},disable-legacy=on"),
+    ]
+}
+
 /// Locate a host tool: try each candidate (a bare name resolved via `PATH`, or
 /// an absolute path) and return the first that exists/resolves.
 ///
@@ -783,6 +800,9 @@ fn cmd_run(args: &[String]) {
             cmd.args(virtio_disk_args(&squashfs, "blkroot", true));
             cmd.args(virtio_disk_args(&ext2, "blkdata", false));
 
+            // Attach a VirtIO NIC on user-mode networking (Phase 4).
+            cmd.args(virtio_net_args("net0"));
+
             // In headless mode, suppress the QEMU graphical window.
             // With --display, let QEMU use its default backend (Cocoa/GTK/SDL).
             if !opts.display {
@@ -900,6 +920,10 @@ fn cmd_test(args: &[String]) {
     let (squashfs, ext2) = ensure_images(&root);
     cmd.args(virtio_disk_args(&squashfs, "blkroot", true));
     cmd.args(virtio_disk_args(&ext2, "blkdata", false));
+
+    // Attach a VirtIO NIC on user-mode networking (Phase 4) so net tests have a
+    // device to bind. slirp answers ARP for the gateway (10.0.2.2).
+    cmd.args(virtio_net_args("net0"));
 
     let child = cmd
         .stdout(process::Stdio::inherit())
