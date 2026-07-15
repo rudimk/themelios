@@ -57,6 +57,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_vfs_capability",   func: test_vfs_capability },
     TestCase { name: "test_fs_syscalls",      func: test_fs_syscalls },
     TestCase { name: "test_virtio_net",       func: test_virtio_net },
+    TestCase { name: "test_net_service",      func: test_net_service },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -2726,6 +2727,114 @@ fn test_virtio_net() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_virtio_net() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_net_service — kernel net service frame bridge (Phase 4.1)
+// ============================================================
+
+/// Test the kernel net service by playing the role of the ring-3 net server.
+///
+/// Brings up a NIC, starts the net service on it, then drives the service purely
+/// through IPC `ipc_call`s (as the ring-3 server will): transmits an ARP request
+/// via `MSG_TX_FRAME` (frame staged in the TX shared region) and polls with
+/// `MSG_POLL` until the gateway's ARP reply comes back in the RX shared region.
+/// Also checks the `MSG_POLL` reply carries a monotonic, non-decreasing timestamp
+/// (the same tick source `SYS_UPTIME_MS` exposes). Exercises the whole pull-based
+/// bridge — endpoint, both shared regions, RX buffering, and TX — end to end.
+#[cfg(target_arch = "x86_64")]
+fn test_net_service() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::arch::x86_64::idt;
+    use crate::drivers::pci;
+    use crate::drivers::virtio::net::VirtioNet;
+    use crate::ipc::{self, IpcMessage};
+    use crate::net::device::{self, NetDevice};
+    use crate::net::net_service::{self, MSG_POLL, MSG_TX_FRAME, STATUS_OK};
+    use crate::sched;
+
+    // Bring up a fresh NIC and start the net service on it. (Re-initialising the
+    // VirtIO device resets it cleanly; any driver from an earlier test is
+    // orphaned but unused.)
+    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let dev = virtio_devs
+        .iter()
+        .find(|d| d.class == 0x02)
+        .ok_or("no VirtIO network device on the PCI bus")?;
+    let nic = VirtioNet::init_from_pci(dev).map_err(|_| "VirtioNet init failed")?;
+    let mac = nic.mac();
+    let index = device::register("virtio-net-svc", Box::new(nic));
+    let handle = net_service::start(index).ok_or("net_service start failed")?;
+
+    // Let the service task reach its receive loop.
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+
+    // --- Stage an ARP request for the gateway in the TX shared region ---
+    {
+        // SAFETY: kernel-side access to the shared region via the HHDM.
+        let tx = unsafe { handle.tx_region.as_slice_mut() };
+        tx[..42].fill(0);
+        tx[0..6].copy_from_slice(&[0xff; 6]); // dst = broadcast
+        tx[6..12].copy_from_slice(&mac); // src = our MAC
+        tx[12..14].copy_from_slice(&[0x08, 0x06]); // EtherType = ARP
+        tx[14..16].copy_from_slice(&[0x00, 0x01]); // htype = Ethernet
+        tx[16..18].copy_from_slice(&[0x08, 0x00]); // ptype = IPv4
+        tx[18] = 6;
+        tx[19] = 4;
+        tx[20..22].copy_from_slice(&[0x00, 0x01]); // op = request
+        tx[22..28].copy_from_slice(&mac);
+        tx[28..32].copy_from_slice(&[10, 0, 2, 15]);
+        tx[38..42].copy_from_slice(&[10, 0, 2, 2]);
+    }
+    let reply = ipc::ipc_call(handle.endpoint, IpcMessage::new([MSG_TX_FRAME, 42, 0, 0]), 0)
+        .map_err(|_| "MSG_TX_FRAME call failed")?;
+    if reply.words[0] != STATUS_OK {
+        return Err("net service refused to transmit the frame");
+    }
+
+    // --- Poll the service for the gateway's ARP reply ---
+    let mut got_reply = false;
+    let mut last_ts = 0u64;
+    for _ in 0..8000 {
+        let r = ipc::ipc_call(handle.endpoint, IpcMessage::new([MSG_POLL, 0, 0, 0]), 0)
+            .map_err(|_| "MSG_POLL call failed")?;
+        // Timestamp (word2) must never go backwards.
+        if r.words[2] < last_ts {
+            return Err("net service timestamp went backwards");
+        }
+        last_ts = r.words[2];
+
+        let n = r.words[1] as usize;
+        if n >= 42 {
+            // SAFETY: kernel-side access to the RX shared region via the HHDM.
+            let rx = unsafe { handle.rx_region.as_slice_mut() };
+            let is_arp = rx[12] == 0x08 && rx[13] == 0x06;
+            let is_reply = rx[20] == 0x00 && rx[21] == 0x02;
+            let sender_is_gateway = rx[28..32] == [10, 0, 2, 2];
+            if is_arp && is_reply && sender_is_gateway {
+                got_reply = true;
+                break;
+            }
+        }
+        sched::yield_now();
+    }
+
+    if !got_reply {
+        return Err("no ARP reply via the net service — bridge round-trip failed");
+    }
+    // By now the timer has ticked; the timestamp source must be live.
+    if last_ts == 0 && idt::tick_count() > 0 {
+        return Err("net service reported a zero timestamp after ticks elapsed");
+    }
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_net_service() -> Result<(), &'static str> {
     Ok(())
 }
 

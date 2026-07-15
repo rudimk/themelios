@@ -36,3 +36,7 @@
 
 /// Network device abstraction (`NetDevice` trait) and the global NIC registry.
 pub mod device;
+
+/// Kernel net service: the pull-based IPC + shared-memory bridge between the
+/// in-kernel NIC driver and the ring-3 TCP/IP stack.
+pub mod net_service;
