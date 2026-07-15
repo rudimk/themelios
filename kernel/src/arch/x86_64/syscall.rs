@@ -165,6 +165,11 @@ pub const SYS_STAT: u64 = 12;
 /// R10 = out buffer length. Returns RAX = entry count.
 pub const SYS_READDIR: u64 = 13;
 
+/// SYS_UPTIME_MS: monotonic milliseconds since boot. No arguments; returns
+/// RAX = uptime in ms. Used by the ring-3 net server to drive smoltcp's clock
+/// (`Instant`) each poll. Derived from the 100 Hz timer tick (`ticks × 10`).
+pub const SYS_UPTIME_MS: u64 = 14;
+
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
 /// RDI = the SYS_NULL return value. The handler stores the result and
@@ -505,6 +510,11 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
             // Filesystem syscalls block on the FS server, so enable interrupts.
             cpu::sti();
             dispatch_fs_syscall(frame);
+        }
+        SYS_UPTIME_MS => {
+            // Monotonic milliseconds since boot: 100 Hz tick × 10. A plain
+            // atomic read, so no need to re-enable interrupts or block.
+            frame.rax = crate::arch::x86_64::idt::tick_count().wrapping_mul(10);
         }
         SYS_TEST_COMPLETE => {
             // Internal test syscall: store the test result and kill the task.
