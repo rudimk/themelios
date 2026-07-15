@@ -472,8 +472,20 @@ fn create_data_image(root: &Path) -> PathBuf {
     // layout for the ext2 server). No journal (-O ^has_journal): ext2, not ext4.
     let zeros = vec![0u8; 16 * 1024 * 1024];
     fs::write(&out, &zeros).expect("failed to create ext2 backing file");
+    // Feature notes: the ext2 server is a *linear* directory parser and reads a
+    // classic on-disk layout. We disable features it does not implement so the
+    // image is deterministic across e2fsprogs versions/hosts:
+    //   ^has_journal   — ext2, not ext4 (no journal).
+    //   ^resize_inode  — no reserved GDT blocks.
+    //   ^dir_index     — no hashed (htree) directories; keep dirs linear. Some
+    //                    e2fsprogs/debugfs versions lay out even small indexed
+    //                    directories as htrees, which the linear parser misreads.
+    //   ^metadata_csum,^64bit — no checksums / 64-bit fields the server ignores.
     let status = Command::new(&mkfs)
-        .args(["-F", "-q", "-b", "1024", "-O", "^has_journal,^resize_inode"])
+        .args([
+            "-F", "-q", "-b", "1024", "-I", "256",
+            "-O", "^has_journal,^resize_inode,^dir_index,^metadata_csum,^64bit",
+        ])
         .arg(&out)
         .status()
         .expect("failed to run mkfs.ext2");

@@ -651,7 +651,14 @@ impl Ext2 {
                 if rec_len == 0 {
                     break;
                 }
-                if ino != 0 && nl == name.len() && &buf[pos + 8..pos + 8 + nl] == name.as_bytes() {
+                // Bound-check the name slice before comparing: a corrupt or
+                // misparsed record could make `pos + 8 + nl` exceed the block and
+                // panic (crashing the server). `list_dir` guards the same way.
+                if ino != 0
+                    && nl == name.len()
+                    && pos + 8 + nl <= bs
+                    && &buf[pos + 8..pos + 8 + nl] == name.as_bytes()
+                {
                     match prev {
                         Some(pp) => {
                             // Merge this record into the previous one.
