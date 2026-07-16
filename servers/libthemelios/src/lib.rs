@@ -46,6 +46,7 @@ use linked_list_allocator::LockedHeap;
 
 pub mod block_proto;
 pub mod fs_proto;
+pub mod net_proto;
 
 // ----- Boot info -----
 
@@ -328,6 +329,23 @@ pub mod syscall {
                 options(nostack),
             );
         }
+    }
+
+    /// Milliseconds since boot (monotonic). Drives smoltcp's `Instant` clock in
+    /// the net server's poll loop.
+    const SYS_UPTIME_MS: u64 = 14;
+    pub fn uptime_ms() -> u64 {
+        let ms: u64;
+        // SAFETY: UPTIME_MS takes no arguments and returns the value in RAX.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_UPTIME_MS => ms,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ms
     }
 
     /// Terminate this server process. Never returns.
