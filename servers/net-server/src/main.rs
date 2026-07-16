@@ -29,7 +29,7 @@ use alloc::vec::Vec;
 use libthemelios::{boot_info, syscall};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
 use device::IpcDevice;
 
@@ -71,6 +71,14 @@ pub extern "C" fn server_main() -> ! {
 
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     let mut iface = Interface::new(config, &mut dev, now());
+
+    // Static address for now (matches QEMU's user-mode network). DHCP replaces
+    // this in sub-phase 4.4. With an address configured, smoltcp answers ARP for
+    // it — which is what the 4.2 round-trip test exercises.
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24));
+    });
+
     let mut sockets: SocketSet = SocketSet::new(Vec::new());
 
     loop {

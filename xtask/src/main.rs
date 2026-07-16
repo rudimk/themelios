@@ -200,6 +200,7 @@ const SERVER_BINARIES: &[&str] = &[
     "overlay-server",
     "ext2-server",
     "fstest-client",
+    "net-server",
 ];
 
 /// Build the userspace server workspace and stage the flat binaries.

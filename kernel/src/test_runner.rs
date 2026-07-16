@@ -58,6 +58,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_fs_syscalls",      func: test_fs_syscalls },
     TestCase { name: "test_virtio_net",       func: test_virtio_net },
     TestCase { name: "test_net_service",      func: test_net_service },
+    TestCase { name: "test_net_server_stack", func: test_net_server_stack },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -2835,6 +2836,136 @@ fn test_net_service() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_net_service() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_net_server_stack — ring-3 smoltcp stack round-trip (Phase 4.2)
+// ============================================================
+
+/// Test the real ring-3 net server (smoltcp) end to end by playing the role of
+/// the kernel net service.
+///
+/// Spawns the net server wired to test-controlled endpoint + shared regions,
+/// then acts as the service: on the server's first `MSG_POLL`, inject an ARP
+/// request "who has 10.0.2.15?" (the server's configured IP); the server's
+/// smoltcp stack must process it and `MSG_TX_FRAME` an ARP *reply* carrying the
+/// server's MAC and IP. Proves the whole 4.2 path — the net server boots in ring
+/// 3, initialises the Interface, and the IPC Device moves a frame in (MSG_POLL)
+/// and out (MSG_TX_FRAME) with smoltcp processing in between.
+#[cfg(target_arch = "x86_64")]
+fn test_net_server_stack() -> Result<(), &'static str> {
+    use crate::arch::x86_64::idt;
+    use crate::ipc::{self, IpcMessage};
+    use crate::mm::shared::SharedRegion;
+    use crate::net::net_service::{MSG_POLL, MSG_TX_FRAME, STATUS_OK};
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    // Play the net service: allocate the RX/TX frame regions and an endpoint.
+    let rx_region = SharedRegion::alloc(2048).ok_or("rx region alloc failed")?;
+    let tx_region = SharedRegion::alloc(2048).ok_or("tx region alloc failed")?;
+    let svc_ep = ipc::create_endpoint("test-net-svc");
+    let fs_ep = ipc::create_endpoint("test-net-server-fs");
+
+    // The MAC the net server will use (packed into arg1); smoltcp answers ARP for
+    // 10.0.2.15 with this MAC.
+    let mac = [0x52u8, 0x54, 0x00, 0x12, 0x34, 0x56];
+    let packed_mac = {
+        let mut v = 0u64;
+        for (i, b) in mac.iter().enumerate() {
+            v |= (*b as u64) << (8 * i);
+        }
+        v
+    };
+
+    spawn_server(ServerConfig {
+        name: "net-server",
+        binary: embedded::NET_SERVER,
+        fs_endpoint: fs_ep,
+        block_endpoint: 0,
+        shared: Some(rx_region),
+        client_shared: Some(tx_region),
+        heap_bytes: 8 * 1024 * 1024,
+        arg0: svc_ep,
+        arg1: packed_mac,
+        filesystem_mount: None,
+    });
+
+    // An ARP request from the gateway asking for the net server's IP.
+    let sender_mac = [0x52u8, 0x55, 0x0a, 0x00, 0x02, 0x02];
+
+    let mut injected = false;
+    let mut got_reply = false;
+    for _ in 0..20000 {
+        // Serve one request from the net server (blocks until it polls us).
+        let req = match ipc::ipc_receive(svc_ep) {
+            Ok(m) => m,
+            Err(_) => {
+                sched::yield_now();
+                continue;
+            }
+        };
+        let now = idt::tick_count().wrapping_mul(10);
+        match req.words[0] {
+            MSG_POLL => {
+                if !injected {
+                    // SAFETY: kernel-side access to the RX region via the HHDM.
+                    let b = unsafe { rx_region.as_slice_mut() };
+                    b[..42].fill(0);
+                    b[0..6].copy_from_slice(&[0xff; 6]); // dst broadcast
+                    b[6..12].copy_from_slice(&sender_mac); // src
+                    b[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
+                    b[14..16].copy_from_slice(&[0x00, 0x01]); // htype
+                    b[16..18].copy_from_slice(&[0x08, 0x00]); // ptype
+                    b[18] = 6;
+                    b[19] = 4;
+                    b[20..22].copy_from_slice(&[0x00, 0x01]); // op = request
+                    b[22..28].copy_from_slice(&sender_mac); // sha
+                    b[28..32].copy_from_slice(&[10, 0, 2, 2]); // spa (gateway)
+                    b[38..42].copy_from_slice(&[10, 0, 2, 15]); // tpa (net server)
+                    injected = true;
+                    let _ = ipc::ipc_reply(svc_ep, req.reply_token, IpcMessage::new([STATUS_OK, 42, now, 0]));
+                } else {
+                    let _ = ipc::ipc_reply(svc_ep, req.reply_token, IpcMessage::new([STATUS_OK, 0, now, 0]));
+                }
+            }
+            MSG_TX_FRAME => {
+                let len = req.words[1] as usize;
+                // SAFETY: kernel-side access to the TX region via the HHDM.
+                let b = unsafe { tx_region.as_slice_mut() };
+                if len >= 42
+                    && b[12] == 0x08
+                    && b[13] == 0x06 // ARP
+                    && b[20] == 0x00
+                    && b[21] == 0x02 // reply
+                    && b[28..32] == [10, 0, 2, 15] // sender IP = net server
+                    && b[22..28] == mac
+                // sender MAC = net server MAC
+                {
+                    got_reply = true;
+                }
+                let _ = ipc::ipc_reply(svc_ep, req.reply_token, IpcMessage::new([STATUS_OK, 0, 0, 0]));
+            }
+            _ => {
+                let _ = ipc::ipc_reply(svc_ep, req.reply_token, IpcMessage::new([STATUS_OK, 0, 0, 0]));
+            }
+        }
+        if got_reply {
+            break;
+        }
+    }
+
+    if !got_reply {
+        return Err("net server did not answer ARP for its IP — stack round-trip failed");
+    }
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_net_server_stack() -> Result<(), &'static str> {
     Ok(())
 }
 

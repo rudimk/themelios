@@ -28,3 +28,7 @@ pub static EXT2_SERVER: &[u8] = include_bytes!("../../../target/servers/ext2-ser
 
 /// The filesystem syscall test client: exercises the VFS syscalls from ring 3 (3.8).
 pub static FSTEST_CLIENT: &[u8] = include_bytes!("../../../target/servers/fstest-client.bin");
+
+/// The net server: the ring-3 TCP/IP stack (smoltcp) driven over the kernel net
+/// service's frame bridge (Phase 4.2).
+pub static NET_SERVER: &[u8] = include_bytes!("../../../target/servers/net-server.bin");

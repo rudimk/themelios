@@ -468,6 +468,10 @@ extern "C" fn kmain() -> ! {
         fs::boot_storage();
         fs::print_mount_status();
 
+        // Bring up the network stack: discover the VirtIO NIC, start the kernel
+        // net service, and spawn the ring-3 net server (smoltcp).
+        net::boot_net();
+
         println!();
         println!("Interrupts enabled — scheduler is running.");
         println!("Type 'help' for available commands.");
