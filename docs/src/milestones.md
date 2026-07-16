@@ -8,7 +8,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
 | **2** | Capability system, process isolation, IPC | Complete |
 | **3** | VirtIO block driver, read-only filesystem | Complete |
-| **4** | VirtIO net driver, TCP/IP stack | Not started |
+| **4** | VirtIO net driver, TCP/IP stack | In progress |
 | **5** | OCI container support | Not started |
 | **6** | Management API (Docker-compatible) | Not started |
 | **7** | aarch64 port | Not started |
@@ -81,7 +81,7 @@ userspace servers. See [Storage Architecture](./storage.md) for the full design.
 - Boot integration (mounts `/` and `/data`) and debug-shell commands
   (`mount`, `ls`, `cat`, `stat`, `write`, `mkdir`)
 
-## Phase 4 — Networking (Not started)
+## Phase 4 — Networking (In progress)
 
 **Goal**: TCP/IP connectivity.
 

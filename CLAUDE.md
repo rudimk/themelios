@@ -141,7 +141,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
 | **2** | Capability system, process isolation, IPC, audit logging | Complete |
 | **3** | VirtIO block driver, read-only FS, ephemeral layers | Complete |
-| **4** | VirtIO net driver, TCP/IP stack | Not started |
+| **4** | VirtIO net driver, TCP/IP stack | In progress |
 | **5** | OCI containers, Linux syscall compat, exec, registries | Not started |
 | **6** | Docker-compatible management API | Not started |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Not started |
@@ -150,6 +150,33 @@ When starting or completing a phase, update all three locations (this table, the
 | **10** | Kubernetes worker node (full parity) | Not started |
 | **11** | GPU support across clouds | Not started |
 | **12** | Production operations (observability, updates) | Not started |
+
+## Current Status — resume here
+
+_Single source of truth for "where are we / what's next". Update the relevant
+line when finishing a sub-phase. Detailed per-sub-phase checklists live in
+`.sisyphus/plans/` (local, gitignored); the git commit history has the full
+narrative per commit._
+
+**Active: Phase 4 — Networking (in progress).** Design: the TCP/IP stack runs in
+a ring-3 **net server** on **smoltcp**; a thin VirtIO-net driver stays in the
+kernel; frames cross via a **pull-based** IPC bridge (net server always initiates,
+kernel replies). amd64 is the run/test target; arm64-ready by design (smoltcp
+compiles for both). `main` is green — keep it that way (the suite can hit flaky
+kernel races; loop `cargo xtask test` locally before pushing).
+
+- ✅ **4.0** VirtIO-net driver + `NetDevice` trait
+- ✅ **4.1** Kernel net service (pull-based frame bridge, `SYS_UPTIME_MS`)
+- ✅ **4.2** Ring-3 net server + smoltcp (Device-over-IPC, boot spawn, round-trip test)
+- ⬜ **4.3 — Ethernet/ARP/IPv4/ICMP bring-up (guest↔gateway ping) ← NEXT**
+- ⬜ **4.4** DHCPv4 client (replaces the net server's placeholder static IP 10.0.2.15)
+- ⬜ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19)
+- ⬜ **4.6** TCP sockets (syscalls 20–24) · ⬜ **4.7** shell/boot/tests
+
+**Off-ramp milestone after 4.4**: link up + DHCP address + ping ("it's on the
+network"). Notable: a pre-existing intermittent kernel double-fault (a
+`KERNEL_GS_BASE` scheduler race) was found and fixed during Phase 4 (commit
+`b1b7cea`).
 
 ## License
 
