@@ -245,11 +245,21 @@ pub fn schedule() {
         sched.tasks[next_id].as_mut().unwrap().state = TaskState::Running;
         sched.current_id = next_id;
 
+        // Re-establish KERNEL_GS_BASE = &PER_CPU on EVERY switch — including
+        // switches to kernel-only tasks (idle, bootstrap) with no ring-3 kernel
+        // stack. Skipping it for those leaves KERNEL_GS_BASE stale after a
+        // ring-3 task blocks mid-syscall, and the next ring-3 syscall then loads
+        // RSP=0 and double-faults. See `syscall::refresh_kernel_gs_base`.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::syscall::refresh_kernel_gs_base();
+
         // Update TSS.RSP0 and PerCpu.kernel_stack_top for the new task.
         // This must happen BEFORE the context switch so that if the new task
         // is in ring 3 and gets interrupted (or does a syscall), the CPU uses
         // the correct kernel stack. On a single-core system with interrupts
         // disabled, there's no race — the values are set before the switch.
+        // (For kernel tasks with kernel_stack_top == 0 we leave the stack alone;
+        // they never enter `syscall_entry`, and the next ring-3 switch sets it.)
         let next_stack_top = sched.tasks[next_id].as_ref().unwrap().kernel_stack_top;
         if next_stack_top != 0 {
             #[cfg(target_arch = "x86_64")]

@@ -791,6 +791,30 @@ pub fn set_kernel_stack(stack_top: u64) {
     }
 }
 
+/// Re-establish `KERNEL_GS_BASE = &PER_CPU` without touching the kernel stack.
+///
+/// The invariant "whenever a task runs, `KERNEL_GS_BASE == &PER_CPU`" (see
+/// [`set_kernel_stack`]) must hold on **every** context switch — including
+/// switches to kernel-only tasks (idle, the bootstrap task) that have no ring-3
+/// kernel stack and therefore skip [`set_kernel_stack`]. If we skipped the MSR
+/// write for those, a ring-3 task that blocked in a syscall (leaving
+/// `KERNEL_GS_BASE` holding its zero user GS base after the entry `swapgs`) could
+/// be followed through a kernel task and then resumed with `KERNEL_GS_BASE` still
+/// zero — so its next syscall's `swapgs` yields `GS_BASE = 0`, `gs:[…]` reads
+/// address 0, and the kernel loads `RSP = 0` and double-faults. Calling this on
+/// every switch closes that window.
+///
+/// # Safety
+///
+/// Must be called with interrupts disabled (during context switch).
+pub fn refresh_kernel_gs_base() {
+    // SAFETY: single-core, interrupts disabled during the context switch.
+    unsafe {
+        let per_cpu = &raw mut PER_CPU;
+        cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu as u64);
+    }
+}
+
 // --- Test infrastructure ---
 //
 // These globals are used by the ring 3 round-trip test (test_syscall_round_trip).
