@@ -29,7 +29,7 @@ use alloc::vec::Vec;
 use libthemelios::{boot_info, syscall};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 use device::IpcDevice;
 
@@ -78,6 +78,13 @@ pub extern "C" fn server_main() -> ! {
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24));
     });
+
+    // Default route via QEMU's slirp gateway (10.0.2.2), so off-subnet traffic
+    // (and DHCP in 4.4) has somewhere to go. On-subnet ICMP echo is answered by
+    // smoltcp automatically at the interface level.
+    let _ = iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
 
     let mut sockets: SocketSet = SocketSet::new(Vec::new());
 
