@@ -168,9 +168,13 @@ kernel races; loop `cargo xtask test` locally before pushing).
 - ✅ **4.0** VirtIO-net driver + `NetDevice` trait
 - ✅ **4.1** Kernel net service (pull-based frame bridge, `SYS_UPTIME_MS`)
 - ✅ **4.2** Ring-3 net server + smoltcp (Device-over-IPC, boot spawn, round-trip test)
-- ⬜ **4.3 — Ethernet/ARP/IPv4/ICMP bring-up (guest↔gateway ping) ← NEXT**
-- ⬜ **4.4** DHCPv4 client (replaces the net server's placeholder static IP 10.0.2.15)
-- ⬜ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19)
+- ✅ **4.3** Ethernet/ARP/IPv4/ICMP bring-up — stack answers ping; default route added.
+  (Interactive `ping` shell cmd + outbound round-trip → moved to 4.5, they need the
+  client request path.)
+- ⬜ **4.4 — DHCPv4 client (replaces the placeholder static IP 10.0.2.15) ← NEXT**
+- ⬜ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19). **Prereq to build here:**
+  a non-blocking `ipc_try_receive` + client request/reply path so the net server can
+  serve requests while polling smoltcp (also unblocks the deferred `ping` shell cmd).
 - ⬜ **4.6** TCP sockets (syscalls 20–24) · ⬜ **4.7** shell/boot/tests
 
 **Off-ramp milestone after 4.4**: link up + DHCP address + ping ("it's on the
