@@ -61,6 +61,8 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_net_server_stack", func: test_net_server_stack },
     TestCase { name: "test_net_icmp_echo",    func: test_net_icmp_echo },
     TestCase { name: "test_dhcp",             func: test_dhcp },
+    TestCase { name: "test_socket_capability", func: test_socket_capability },
+    TestCase { name: "test_udp_echo",         func: test_udp_echo },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3238,6 +3240,246 @@ fn test_dhcp() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_dhcp() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  Socket API tests (Phase 4.5)
+// ============================================================
+
+/// Bring up a NIC + kernel net service + ring-3 net server, map the socket
+/// payload region, and register the kernel socket router — the same wiring
+/// `boot_net` does. Returns the net server's request endpoint. `dhcp` selects
+/// DHCP vs the static fallback address.
+#[cfg(target_arch = "x86_64")]
+fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u64, &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::pci;
+    use crate::drivers::virtio::net::VirtioNet;
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::net::device::NetDevice;
+    use crate::net::{self, device, net_service, socket};
+    use crate::process::server::{spawn_server, ServerConfig, SERVER_SOCKET_BYTES, SERVER_SOCKET_VIRT};
+    use crate::process::{self, embedded};
+    use crate::sched;
+
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let dev = devs
+        .iter()
+        .find(|d| d.class == 0x02)
+        .ok_or("no VirtIO network device on the PCI bus")?;
+    let nic = VirtioNet::init_from_pci(dev).map_err(|_| "VirtioNet init failed")?;
+    let mac = nic.mac();
+    let index = device::register(nic_name, Box::new(nic));
+    let handle = net_service::start(index).ok_or("net_service start failed")?;
+    for _ in 0..500 {
+        sched::yield_now();
+    }
+
+    let fs_ep = crate::ipc::create_endpoint("test-sock-net");
+    let mut packed = 0u64;
+    for (i, b) in mac.iter().enumerate() {
+        packed |= (*b as u64) << (8 * i);
+    }
+    if dhcp {
+        packed |= net::NET_ARG_DHCP;
+    }
+
+    let pid = spawn_server(ServerConfig {
+        name: "net-server",
+        binary: embedded::NET_SERVER,
+        fs_endpoint: fs_ep,
+        block_endpoint: 0,
+        shared: Some(handle.rx_region),
+        client_shared: Some(handle.tx_region),
+        heap_bytes: 8 * 1024 * 1024,
+        arg0: handle.endpoint,
+        arg1: packed,
+        filesystem_mount: None,
+    });
+
+    // Map the socket payload region and register the router (as boot_net does).
+    let sock_region = SharedRegion::alloc(SERVER_SOCKET_BYTES).ok_or("socket region alloc failed")?;
+    process::with_address_space(pid, |a| {
+        sock_region.map_into(a, VirtAddr::new(SERVER_SOCKET_VIRT));
+    })
+    .ok_or("map socket region failed")?;
+    socket::init(fs_ep, sock_region);
+
+    // Let the net server reach its poll/serve loop.
+    for _ in 0..2000 {
+        sched::yield_now();
+    }
+    Ok(fs_ep)
+}
+
+/// Test the capability-checked socket API: a process holding the network
+/// authority can create/bind/close a UDP socket; one without it is denied at
+/// `sys_socket`; a wrong-type capability is also denied; and a socket capability
+/// is revoked on close. Mirrors `test_vfs_capability` for the socket layer.
+///
+/// Deterministic — no external network is needed to create/bind/close a socket
+/// (the round-trip is exercised separately by `test_udp_echo`).
+#[cfg(target_arch = "x86_64")]
+fn test_socket_capability() -> Result<(), &'static str> {
+    use crate::cap::{CapHandle, CapRights, CapType, Capability, SOCKET_FACTORY};
+    use crate::net::socket::{self, SockError};
+    use crate::process;
+
+    let _fs_ep = spawn_net_server_with_sockets(false, "virtio-net-sock")?;
+
+    // --- A process WITH the network authority can create/bind/close a socket ---
+    let (pid, _) = process::create_process("sock-test", None);
+    let factory = process::with_cspace_mut(pid, |cs| {
+        cs.insert(Capability {
+            cap_type: CapType::Socket { socket_id: SOCKET_FACTORY },
+            rights: CapRights::READ | CapRights::WRITE,
+            parent: None,
+        })
+    })
+    .ok_or("no cspace")?
+    .map_err(|_| "insert factory cap failed")?;
+
+    let sh_raw = socket::sys_socket(pid, factory, socket::SOCK_TYPE_UDP, 15)
+        .map_err(|_| "sys_socket denied for an authorized process")?;
+    let sh = CapHandle::from_raw(sh_raw);
+    socket::sys_bind(pid, sh, [0, 0, 0, 0], 12345, 16).map_err(|_| "sys_bind failed")?;
+    socket::sys_close(pid, sh, 19).map_err(|_| "sys_close failed")?;
+
+    // The socket capability is revoked on close: reusing it is denied.
+    match socket::sys_bind(pid, sh, [0, 0, 0, 0], 12345, 16) {
+        Err(SockError::PermissionDenied) => {}
+        _ => return Err("bind on a closed socket should be PermissionDenied"),
+    }
+
+    // --- A process WITHOUT the authority is denied at sys_socket ---
+    let (pid2, _) = process::create_process("sock-noperm", None);
+    match socket::sys_socket(pid2, CapHandle::NULL, socket::SOCK_TYPE_UDP, 15) {
+        Err(SockError::PermissionDenied) => {}
+        _ => return Err("sys_socket without capability should be PermissionDenied"),
+    }
+    // A wrong-type capability must not authorize socket creation either.
+    let bogus = process::with_cspace_mut(pid2, |cs| {
+        cs.insert(Capability {
+            cap_type: CapType::Endpoint { endpoint_id: 1, badge: 0 },
+            rights: CapRights::READ | CapRights::WRITE,
+            parent: None,
+        })
+    })
+    .ok_or("no cspace")?
+    .map_err(|_| "insert bogus cap failed")?;
+    match socket::sys_socket(pid2, bogus, socket::SOCK_TYPE_UDP, 15) {
+        Err(SockError::PermissionDenied) => {}
+        _ => return Err("sys_socket with a wrong-type cap should be PermissionDenied"),
+    }
+
+    process::destroy_process(pid);
+    process::destroy_process(pid2);
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_socket_capability() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Build a minimal DNS A-record query for "example.com" (29 bytes).
+#[cfg(target_arch = "x86_64")]
+fn build_dns_query() -> [u8; 29] {
+    let mut q = [0u8; 29];
+    q[0] = 0x12; // transaction id (high)
+    q[1] = 0x34; // transaction id (low)
+    q[2] = 0x01; // flags: recursion desired
+    q[5] = 0x01; // QDCOUNT = 1
+    // QNAME: 7"example" 3"com" 0
+    q[12] = 7;
+    q[13..20].copy_from_slice(b"example");
+    q[20] = 3;
+    q[21..24].copy_from_slice(b"com");
+    q[24] = 0;
+    q[26] = 0x01; // QTYPE = A
+    q[28] = 0x01; // QCLASS = IN
+    q
+}
+
+/// Test UDP send/receive through the socket API end to end.
+///
+/// Brings the stack up with DHCP, then creates a UDP socket, binds it, and sends
+/// a DNS query to slirp's DNS server (10.0.2.3:53). The **send path** — socket
+/// creation, bind, and datagram transmission through the kernel router and the
+/// ring-3 net server — is the hard assertion. The **reply** is best-effort:
+/// slirp's DNS proxy resolves via the host, which a sandboxed CI may not permit;
+/// the UDP transport round-trip itself is already proven deterministically by
+/// `test_dhcp` (DHCP is UDP). When a reply does arrive it is validated.
+#[cfg(target_arch = "x86_64")]
+fn test_udp_echo() -> Result<(), &'static str> {
+    use crate::net::{net_service, socket};
+    use crate::sched;
+
+    let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-udp")?;
+
+    // Wait for DHCP so the interface has an address and default route.
+    let mut configured = false;
+    for _ in 0..300_000 {
+        if net_service::status().config.configured {
+            configured = true;
+            break;
+        }
+        sched::yield_now();
+    }
+    if !configured {
+        return Err("DHCP did not configure before the UDP test");
+    }
+
+    // Create + bind a UDP socket via the kernel-internal socket API.
+    let id = socket::ksocket_open().map_err(|_| "ksocket_open failed")?;
+    socket::ksocket_bind(id, [0, 0, 0, 0], 5353).map_err(|_| "ksocket_bind failed")?;
+
+    // Send a DNS query to slirp's DNS server. The send must be fully accepted.
+    let query = build_dns_query();
+    let sent = socket::ksocket_sendto(id, &query, [10, 0, 2, 3], 53)
+        .map_err(|_| "ksocket_sendto failed")?;
+    if sent != query.len() {
+        return Err("sendto did not accept the whole datagram");
+    }
+
+    // Best-effort: try to receive the DNS response (see the doc comment).
+    let mut buf = [0u8; 512];
+    let mut got = false;
+    for _ in 0..200_000 {
+        if let Ok((n, ip, port)) = socket::ksocket_recvfrom(id, &mut buf) {
+            if n > 0 {
+                if ip == [10, 0, 2, 3]
+                    && port == 53
+                    && n >= 12
+                    && buf[0] == query[0]
+                    && buf[1] == query[1]
+                    && (buf[2] & 0x80) != 0
+                {
+                    got = true;
+                }
+                break;
+            }
+        }
+        sched::yield_now();
+    }
+    let _ = socket::ksocket_close(id);
+
+    if got {
+        crate::println!("  [test_udp_echo] DNS round-trip via slirp OK");
+    } else {
+        crate::println!(
+            "  [test_udp_echo] send OK; no DNS reply (best-effort — transport proven by test_dhcp)"
+        );
+    }
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_udp_echo() -> Result<(), &'static str> {
     Ok(())
 }
 

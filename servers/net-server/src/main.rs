@@ -24,14 +24,21 @@ extern crate alloc;
 
 mod device;
 
+use alloc::vec;
 use alloc::vec::Vec;
 
-use libthemelios::net_proto::{pack_ipv4, MSG_CONFIG};
-use libthemelios::{boot_info, ipc, syscall};
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::socket::dhcpv4;
+use libthemelios::net_proto::{
+    pack_ip_port, pack_ipv4, unpack_ip_port, MSG_CONFIG, OP_SOCK_BIND, OP_SOCK_CLOSE, OP_SOCK_OPEN,
+    OP_SOCK_RECV, OP_SOCK_SEND, SOCKET_REGION_BYTES, SOCKET_REGION_VADDR, SOCK_ERR, SOCK_OK,
+    SOCK_TYPE_UDP, SOCK_WOULDBLOCK,
+};
+use libthemelios::{boot_info, ipc, syscall, IpcMessage};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::socket::{dhcpv4, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+};
 
 use device::IpcDevice;
 
@@ -97,7 +104,16 @@ pub extern "C" fn server_main() -> ! {
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     let mut iface = Interface::new(config, &mut dev, now());
 
-    let mut sockets: SocketSet = SocketSet::new(Vec::new());
+    // Owned socket storage, so the set (and its UDP sockets, whose buffers are
+    // heap-allocated Vecs) is `'static`.
+    let mut sockets: SocketSet<'static> = SocketSet::new(Vec::new());
+
+    // The kernel socket router (Phase 4.5) sends OP_SOCK_* requests to our
+    // request endpoint; `socket_table` maps a kernel-facing socket id to the
+    // smoltcp socket handle, and `next_socket_id` hands out fresh ids.
+    let socket_ep = info.fs_endpoint;
+    let mut socket_table: Vec<(u64, SocketHandle)> = Vec::new();
+    let mut next_socket_id: u64 = 0;
 
     // A DHCP socket is added only in DHCP mode. In static mode the interface is
     // configured up-front and the socket set stays empty (the two static-IP
@@ -120,6 +136,13 @@ pub extern "C" fn server_main() -> ! {
     };
 
     loop {
+        // Serve one pending socket request from the kernel router (non-blocking,
+        // so the poll loop keeps running). One per iteration is enough — requests
+        // drain over successive iterations, interleaved with smoltcp polling.
+        if let Some(req) = syscall::try_receive(socket_ep) {
+            serve_socket(&mut sockets, &mut socket_table, &mut next_socket_id, socket_ep, req);
+        }
+
         // Drive smoltcp: process any received frames, run timers, emit output.
         iface.poll(now(), &mut dev, &mut sockets);
 
@@ -197,4 +220,144 @@ fn report_config(service_ep: u64, cfg: &dhcpv4::Config<'_>) {
 /// Report loss of configuration (a zero address word) to the kernel net service.
 fn report_deconfig(service_ep: u64) {
     ipc::call(service_ep, [MSG_CONFIG, 0, 0, 0], 0);
+}
+
+// --- UDP socket API (Phase 4.5) ---
+//
+// The kernel socket router forwards capability-checked socket syscalls here as
+// OP_SOCK_* requests. We keep a table of smoltcp UDP sockets keyed by the id we
+// hand back on OP_SOCK_OPEN; datagram bytes travel through the shared socket
+// region the kernel maps at SOCKET_REGION_VADDR.
+
+/// Per-socket buffer sizes: a handful of datagrams each way.
+const UDP_META_SLOTS: usize = 8;
+const UDP_PAYLOAD_BYTES: usize = 8 * 1024;
+
+/// Build a fresh UDP socket with heap-owned RX/TX ring buffers (so it is `'static`).
+fn make_udp_socket() -> udp::Socket<'static> {
+    let rx = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+        vec![0u8; UDP_PAYLOAD_BYTES],
+    );
+    let tx = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+        vec![0u8; UDP_PAYLOAD_BYTES],
+    );
+    udp::Socket::new(rx, tx)
+}
+
+/// The shared socket payload region the kernel mapped at `SOCKET_REGION_VADDR`.
+///
+/// # Safety
+/// Only called while serving a socket request, which the kernel only sends once
+/// it has mapped the region — so the address is backed by writable shared RAM.
+/// The returned reference is used and dropped entirely within one handler.
+unsafe fn socket_region() -> &'static mut [u8] {
+    core::slice::from_raw_parts_mut(SOCKET_REGION_VADDR as *mut u8, SOCKET_REGION_BYTES)
+}
+
+/// Look up the smoltcp handle for a kernel-facing socket id.
+fn find_socket(table: &[(u64, SocketHandle)], id: u64) -> Option<SocketHandle> {
+    table.iter().find(|(sid, _)| *sid == id).map(|(_, h)| *h)
+}
+
+/// Split a smoltcp `IpEndpoint` into `([a,b,c,d], port)` (0.0.0.0 for non-IPv4).
+fn endpoint_octets(ep: IpEndpoint) -> ([u8; 4], u16) {
+    match ep.addr {
+        IpAddress::Ipv4(a) => (a.octets(), ep.port),
+    }
+}
+
+/// Handle one OP_SOCK_* request and reply to the kernel router.
+fn serve_socket(
+    sockets: &mut SocketSet<'static>,
+    table: &mut Vec<(u64, SocketHandle)>,
+    next_id: &mut u64,
+    ep: u64,
+    req: IpcMessage,
+) {
+    let token = req.reply_token;
+    let reply = |words: [u64; 4]| {
+        syscall::reply(ep, token, words);
+    };
+
+    match req.words[0] {
+        OP_SOCK_OPEN => {
+            if req.words[1] != SOCK_TYPE_UDP {
+                reply([SOCK_ERR, 0, 0, 0]);
+                return;
+            }
+            let handle = sockets.add(make_udp_socket());
+            let id = *next_id;
+            *next_id += 1;
+            table.push((id, handle));
+            reply([SOCK_OK, id, 0, 0]);
+        }
+        OP_SOCK_BIND => {
+            let id = req.words[1];
+            let port = req.words[3] as u16;
+            match find_socket(table, id) {
+                Some(h) => {
+                    let s = sockets.get_mut::<udp::Socket>(h);
+                    match s.bind(port) {
+                        Ok(()) => reply([SOCK_OK, 0, 0, 0]),
+                        Err(_) => reply([SOCK_ERR, 0, 0, 0]),
+                    }
+                }
+                None => reply([SOCK_ERR, 0, 0, 0]),
+            }
+        }
+        OP_SOCK_SEND => {
+            let id = req.words[1];
+            let len = (req.words[2] as usize).min(SOCKET_REGION_BYTES);
+            let (ip, port) = unpack_ip_port(req.words[3]);
+            match find_socket(table, id) {
+                Some(h) => {
+                    let dest = IpEndpoint::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port);
+                    // SAFETY: see socket_region; the slice is used only here.
+                    let region = unsafe { socket_region() };
+                    let data: &[u8] = &region[..len];
+                    let s = sockets.get_mut::<udp::Socket>(h);
+                    match s.send_slice(data, dest) {
+                        Ok(()) => reply([SOCK_OK, len as u64, 0, 0]),
+                        Err(udp::SendError::BufferFull) => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                        Err(_) => reply([SOCK_ERR, 0, 0, 0]),
+                    }
+                }
+                None => reply([SOCK_ERR, 0, 0, 0]),
+            }
+        }
+        OP_SOCK_RECV => {
+            let id = req.words[1];
+            let max = (req.words[2] as usize).min(SOCKET_REGION_BYTES);
+            match find_socket(table, id) {
+                Some(h) => {
+                    // SAFETY: see socket_region; the slice is used only here.
+                    let region = unsafe { socket_region() };
+                    let s = sockets.get_mut::<udp::Socket>(h);
+                    match s.recv_slice(&mut region[..max]) {
+                        Ok((n, meta)) => {
+                            let (ip, port) = endpoint_octets(meta.endpoint);
+                            reply([SOCK_OK, n as u64, pack_ip_port(ip, port), 0]);
+                        }
+                        // Exhausted (nothing pending) or truncated → WouldBlock.
+                        Err(_) => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                    }
+                }
+                None => reply([SOCK_ERR, 0, 0, 0]),
+            }
+        }
+        OP_SOCK_CLOSE => {
+            let id = req.words[1];
+            match table.iter().position(|(sid, _)| *sid == id) {
+                Some(pos) => {
+                    let (_, h) = table.remove(pos);
+                    sockets.remove(h);
+                    reply([SOCK_OK, 0, 0, 0]);
+                }
+                None => reply([SOCK_ERR, 0, 0, 0]),
+            }
+        }
+        _ => reply([SOCK_ERR, 0, 0, 0]),
+    }
 }

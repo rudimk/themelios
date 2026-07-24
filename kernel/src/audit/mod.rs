@@ -93,6 +93,10 @@ pub enum AuditOp {
     /// A filesystem operation was dispatched through the VFS layer.
     /// Detail: the filesystem syscall number (SYS_OPEN .. SYS_READDIR).
     FsAccess,
+
+    /// A socket operation was dispatched through the kernel socket router
+    /// (Phase 4.5). Detail: the socket syscall number (SYS_SOCKET .. SYS_SOCKET_CLOSE).
+    NetAccess,
 }
 
 impl core::fmt::Display for AuditOp {
@@ -108,6 +112,7 @@ impl core::fmt::Display for AuditOp {
             AuditOp::IpcReply    => write!(f, "ipc_reply"),
             AuditOp::Syscall     => write!(f, "syscall"),
             AuditOp::FsAccess    => write!(f, "fs_access"),
+            AuditOp::NetAccess   => write!(f, "net_access"),
         }
     }
 }

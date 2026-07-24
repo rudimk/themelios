@@ -1,0 +1,347 @@
+//! # Socket routing — the kernel's capability-checked socket API (Phase 4.5)
+//!
+//! Sockets follow the exact same hybrid-microkernel pattern as the Phase 3
+//! filesystem: the kernel is a **router**, not an implementor. The UDP/TCP
+//! protocol state lives in the ring-3 net server (smoltcp); the kernel checks a
+//! capability, forwards the request to the net server over IPC, moves datagram
+//! bytes through a shared region, and audit-logs. **The kernel never parses
+//! packet data.**
+//!
+//! ## Capability model
+//!
+//! Access is gated by [`CapType::Socket`], with two roles:
+//!
+//! - The **network authority** (`socket_id == `[`SOCKET_FACTORY`]) is the right
+//!   to *create* sockets. [`sys_socket`] requires the caller to present it, just
+//!   as `SYS_OPEN` requires a [`CapType::Filesystem`] capability. A process
+//!   without it cannot make sockets.
+//! - A **per-socket capability** (`socket_id` = a net-server socket id) is minted
+//!   by [`sys_socket`] and consumed by bind/sendto/recvfrom/close, mirroring how
+//!   `FileDescriptor` capabilities work. WRITE grants send, READ grants receive.
+//!
+//! ## Data path
+//!
+//! Like the VFS, the payload region is shared between the **kernel and the net
+//! server** (not the client process): the kernel copies validated user bytes
+//! into it and reads results out via the HHDM, so a client never shares memory
+//! with the server directly and the kernel mediates every transfer. Phase 4.5
+//! uses a single such region and, like the FS servers, serves one request at a
+//! time in practice; per-client regions are a later refinement.
+
+use crate::cap::{CapHandle, CapRights, CapType, Capability, SOCKET_FACTORY};
+use crate::ipc::{self, IpcMessage};
+use crate::mm::shared::SharedRegion;
+use crate::process::{self, ProcessId};
+use crate::sync::InterruptMutex;
+
+// --- Socket protocol opcodes (mirror libthemelios::net_proto) ---
+
+const OP_SOCK_OPEN: u64 = 10;
+const OP_SOCK_BIND: u64 = 11;
+const OP_SOCK_SEND: u64 = 12;
+const OP_SOCK_RECV: u64 = 13;
+const OP_SOCK_CLOSE: u64 = 14;
+
+/// Socket type: UDP (the only type in Phase 4.5).
+pub const SOCK_TYPE_UDP: u64 = 0;
+
+/// Net-server reply status words (mirror `net_proto`).
+const SOCK_OK: u64 = 0;
+const SOCK_WOULDBLOCK: u64 = 1;
+
+/// High bit marking a socket syscall return as an encoded [`SockError`].
+const STATUS_ERROR_FLAG: u64 = 1 << 63;
+
+/// Socket errors — returned by the socket syscalls. The discriminants are the
+/// low bits of a high-bit-set syscall return, so userspace can distinguish them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SockError {
+    /// Non-blocking op with nothing ready (no datagram to receive, TX full).
+    WouldBlock = 1,
+    /// The capability check failed (missing/wrong-type/insufficient-rights cap).
+    PermissionDenied = 2,
+    /// A malformed argument (bad length, unroutable address).
+    InvalidArgument = 3,
+    /// The requested local port is already in use.
+    AddrInUse = 4,
+    /// Out of socket handles or buffers in the net server.
+    NoResources = 5,
+    /// The net server is unreachable (not started, IPC failed).
+    ServerUnavailable = 6,
+}
+
+impl SockError {
+    /// Encode as a high-bit-set syscall return (matching the FS convention).
+    pub fn as_syscall_ret(self) -> u64 {
+        STATUS_ERROR_FLAG | self as u64
+    }
+}
+
+/// Map a net-server reply status word into a `Result`.
+fn map_status(status: u64) -> Result<(), SockError> {
+    match status {
+        SOCK_OK => Ok(()),
+        SOCK_WOULDBLOCK => Err(SockError::WouldBlock),
+        _ => Err(SockError::InvalidArgument),
+    }
+}
+
+// --- IPv4 packing (mirror net_proto; the kernel does not depend on libthemelios) ---
+
+fn pack_ipv4(o: [u8; 4]) -> u64 {
+    ((o[0] as u64) << 24) | ((o[1] as u64) << 16) | ((o[2] as u64) << 8) | (o[3] as u64)
+}
+
+fn unpack_ipv4(w: u64) -> [u8; 4] {
+    [(w >> 24) as u8, (w >> 16) as u8, (w >> 8) as u8, w as u8]
+}
+
+/// Pack a peer address into one word: `(ip << 16) | port`.
+fn pack_ip_port(ip: [u8; 4], port: u16) -> u64 {
+    (pack_ipv4(ip) << 16) | (port as u64)
+}
+
+/// Unpack `(ip << 16) | port`.
+fn unpack_ip_port(w: u64) -> ([u8; 4], u16) {
+    (unpack_ipv4(w >> 16), w as u16)
+}
+
+// --- Router state ---
+
+/// The socket router: where the net server listens and the shared payload region.
+#[derive(Clone, Copy)]
+struct Router {
+    /// The net server's request endpoint (it serves `OP_SOCK_*` here).
+    endpoint: u64,
+    /// Kernel↔net-server shared region for datagram payloads.
+    region: SharedRegion,
+}
+
+/// Single router (Phase 4 has one net server / one NIC). Set by [`init`] at boot.
+static ROUTER: InterruptMutex<Option<Router>> = InterruptMutex::new(None);
+
+/// Register the net server's socket endpoint and payload region. Called by
+/// `boot_net` once the net server is spawned and its socket region mapped.
+pub fn init(endpoint: u64, region: SharedRegion) {
+    *ROUTER.lock() = Some(Router { endpoint, region });
+}
+
+/// Copy of the current router, or `ServerUnavailable` if sockets aren't up.
+fn router() -> Result<Router, SockError> {
+    ROUTER.lock().ok_or(SockError::ServerUnavailable)
+}
+
+// --- Capability resolution ---
+
+/// Verify `pid` holds the network-authority capability at `handle`.
+fn resolve_factory(pid: ProcessId, handle: CapHandle) -> Result<(), SockError> {
+    process::with_cspace_mut(pid, |cspace| match cspace.lookup(handle) {
+        Ok(cap) => match cap.cap_type {
+            CapType::Socket { socket_id } if socket_id == SOCKET_FACTORY => Ok(()),
+            _ => Err(SockError::PermissionDenied),
+        },
+        Err(_) => Err(SockError::PermissionDenied),
+    })
+    .unwrap_or(Err(SockError::PermissionDenied))
+}
+
+/// Resolve `handle` to a per-socket id, requiring `need` rights. Rejects the
+/// factory capability (it is not a usable socket).
+fn resolve_socket(pid: ProcessId, handle: CapHandle, need: CapRights) -> Result<u64, SockError> {
+    process::with_cspace_mut(pid, |cspace| match cspace.lookup(handle) {
+        Ok(cap) => match cap.cap_type {
+            CapType::Socket { socket_id }
+                if socket_id != SOCKET_FACTORY && cap.rights.contains(need) =>
+            {
+                Ok(socket_id)
+            }
+            _ => Err(SockError::PermissionDenied),
+        },
+        Err(_) => Err(SockError::PermissionDenied),
+    })
+    .unwrap_or(Err(SockError::PermissionDenied))
+}
+
+// --- IPC helper ---
+
+/// Call the net server and return its reply, or `ServerUnavailable` on IPC error.
+fn sock_call(endpoint: u64, words: [u64; 4]) -> Result<IpcMessage, SockError> {
+    ipc::ipc_call(endpoint, IpcMessage::new(words), 0).map_err(|_| SockError::ServerUnavailable)
+}
+
+/// Audit-log a socket operation (detail = the socket syscall number).
+fn audit(pid: ProcessId, syscall_num: u64, socket_id: u64) {
+    crate::audit::log_event(
+        pid,
+        crate::audit::AuditOp::NetAccess,
+        CapType::Socket { socket_id },
+        syscall_num,
+    );
+}
+
+// --- Capability-checked operations (called by the syscall layer) ---
+
+/// Create a socket. `factory_handle` must resolve to the network authority.
+/// Returns a fresh `Socket` capability handle for the new socket.
+pub fn sys_socket(
+    pid: ProcessId,
+    factory_handle: CapHandle,
+    sock_type: u64,
+    syscall_num: u64,
+) -> Result<u32, SockError> {
+    resolve_factory(pid, factory_handle)?;
+    if sock_type != SOCK_TYPE_UDP {
+        return Err(SockError::InvalidArgument);
+    }
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_OPEN, sock_type, 0, 0])?;
+    map_status(reply.words[0])?;
+    let socket_id = reply.words[1];
+    audit(pid, syscall_num, socket_id);
+
+    // Mint the per-socket capability under the factory authority.
+    process::with_cspace_mut(pid, |cspace| {
+        cspace.insert(Capability {
+            cap_type: CapType::Socket { socket_id },
+            rights: CapRights::READ | CapRights::WRITE,
+            parent: Some(factory_handle),
+        })
+    })
+    .ok_or(SockError::ServerUnavailable)?
+    .map(|h| h.as_raw())
+    .map_err(|_| SockError::NoResources)
+}
+
+/// Bind a socket to a local port (and optional local address; `ip == [0;4]`
+/// means any). Requires WRITE rights.
+pub fn sys_bind(
+    pid: ProcessId,
+    handle: CapHandle,
+    ip: [u8; 4],
+    port: u16,
+    syscall_num: u64,
+) -> Result<(), SockError> {
+    let socket_id = resolve_socket(pid, handle, CapRights::WRITE)?;
+    let r = router()?;
+    audit(pid, syscall_num, socket_id);
+    let reply = sock_call(r.endpoint, [OP_SOCK_BIND, socket_id, pack_ipv4(ip), port as u64])?;
+    map_status(reply.words[0])
+}
+
+/// Send a datagram to `(ip, port)`. Requires WRITE (send) rights. Returns the
+/// number of bytes accepted.
+pub fn sys_sendto(
+    pid: ProcessId,
+    handle: CapHandle,
+    buf: &[u8],
+    ip: [u8; 4],
+    port: u16,
+    syscall_num: u64,
+) -> Result<usize, SockError> {
+    let socket_id = resolve_socket(pid, handle, CapRights::WRITE)?;
+    let r = router()?;
+    audit(pid, syscall_num, socket_id);
+    // Stage the payload in the shared region.
+    // SAFETY: the kernel owns this region's frames; the call is synchronous.
+    let dst = unsafe { r.region.as_slice_mut() };
+    let n = buf.len().min(dst.len());
+    dst[..n].copy_from_slice(&buf[..n]);
+    let reply = sock_call(
+        r.endpoint,
+        [OP_SOCK_SEND, socket_id, n as u64, pack_ip_port(ip, port)],
+    )?;
+    map_status(reply.words[0])?;
+    Ok((reply.words[1] as usize).min(n))
+}
+
+/// Receive a datagram into `buf`. Requires READ (receive) rights. Returns
+/// `(bytes, src_ip, src_port)`, or `WouldBlock` if nothing is pending.
+pub fn sys_recvfrom(
+    pid: ProcessId,
+    handle: CapHandle,
+    buf: &mut [u8],
+    syscall_num: u64,
+) -> Result<(usize, [u8; 4], u16), SockError> {
+    let socket_id = resolve_socket(pid, handle, CapRights::READ)?;
+    let r = router()?;
+    audit(pid, syscall_num, socket_id);
+    let max = buf.len().min(r.region.size as usize);
+    let reply = sock_call(r.endpoint, [OP_SOCK_RECV, socket_id, max as u64, 0])?;
+    map_status(reply.words[0])?;
+    let n = (reply.words[1] as usize).min(max);
+    let (ip, port) = unpack_ip_port(reply.words[2]);
+    // SAFETY: kernel-owned region; the synchronous call has completed.
+    let src = unsafe { r.region.as_slice_mut() };
+    buf[..n].copy_from_slice(&src[..n]);
+    Ok((n, ip, port))
+}
+
+/// Close a socket and revoke its capability. Requires READ rights (any holder).
+pub fn sys_close(
+    pid: ProcessId,
+    handle: CapHandle,
+    syscall_num: u64,
+) -> Result<(), SockError> {
+    let socket_id = resolve_socket(pid, handle, CapRights::READ)?;
+    let r = router()?;
+    audit(pid, syscall_num, socket_id);
+    let reply = sock_call(r.endpoint, [OP_SOCK_CLOSE, socket_id, 0, 0]);
+    // Drop the capability regardless of the server's reply.
+    let _ = process::with_cspace_mut(pid, |cspace| cspace.remove(handle));
+    reply.map(|_| ())
+}
+
+// --- Kernel-internal operations (no capability check) ---
+//
+// These address the net server directly, for the debug shell's `udpsend`. The
+// kernel is trusted; userspace must go through the capability-checked `sys_*`.
+
+/// Create a UDP socket directly, returning its net-server socket id.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_open() -> Result<u64, SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_OPEN, SOCK_TYPE_UDP, 0, 0])?;
+    map_status(reply.words[0])?;
+    Ok(reply.words[1])
+}
+
+/// Bind socket `socket_id` to a local port directly.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_bind(socket_id: u64, ip: [u8; 4], port: u16) -> Result<(), SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_BIND, socket_id, pack_ipv4(ip), port as u64])?;
+    map_status(reply.words[0])
+}
+
+/// Send `data` from socket `socket_id` to `(ip, port)` directly.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_sendto(socket_id: u64, data: &[u8], ip: [u8; 4], port: u16) -> Result<usize, SockError> {
+    let r = router()?;
+    let dst = unsafe { r.region.as_slice_mut() };
+    let n = data.len().min(dst.len());
+    dst[..n].copy_from_slice(&data[..n]);
+    let reply = sock_call(r.endpoint, [OP_SOCK_SEND, socket_id, n as u64, pack_ip_port(ip, port)])?;
+    map_status(reply.words[0])?;
+    Ok((reply.words[1] as usize).min(n))
+}
+
+/// Receive a datagram on socket `socket_id` directly into `buf`.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_recvfrom(socket_id: u64, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16), SockError> {
+    let r = router()?;
+    let max = buf.len().min(r.region.size as usize);
+    let reply = sock_call(r.endpoint, [OP_SOCK_RECV, socket_id, max as u64, 0])?;
+    map_status(reply.words[0])?;
+    let n = (reply.words[1] as usize).min(max);
+    let (ip, port) = unpack_ip_port(reply.words[2]);
+    let src = unsafe { r.region.as_slice_mut() };
+    buf[..n].copy_from_slice(&src[..n]);
+    Ok((n, ip, port))
+}
+
+/// Close socket `socket_id` directly.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_close(socket_id: u64) -> Result<(), SockError> {
+    let r = router()?;
+    sock_call(r.endpoint, [OP_SOCK_CLOSE, socket_id, 0, 0]).map(|_| ())
+}

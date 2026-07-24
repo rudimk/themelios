@@ -39,6 +39,7 @@ pub fn cmd_help(_args: &str) {
     println!("  write <path> <s> — create/write a file (overlay or /data)");
     println!("  mkdir <path>     — create a directory");
     println!("  ifconfig         — show network interface configuration");
+    println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -351,6 +352,7 @@ pub fn cmd_caps(args: &str) {
             CapType::SharedMemory { .. } => "ShMem",
             CapType::Filesystem { .. } => "FS",
             CapType::FileDescriptor { .. } => "FD",
+            CapType::Socket { .. } => "Socket",
         };
         let details = match cap_type {
             CapType::Null => alloc::string::String::from("-"),
@@ -368,6 +370,10 @@ pub fn cmd_caps(args: &str) {
                 alloc::format!("mount={}", mount_id),
             CapType::FileDescriptor { fd, mount_id } =>
                 alloc::format!("fd={} mount={}", fd, mount_id),
+            CapType::Socket { socket_id } if *socket_id == crate::cap::SOCKET_FACTORY =>
+                alloc::string::String::from("factory"),
+            CapType::Socket { socket_id } =>
+                alloc::format!("sock={}", socket_id),
         };
         println!("  {:>12}  {:>16}  {:>8}  {}",
             handle, type_str, rights, details);
@@ -418,6 +424,7 @@ pub fn cmd_audit(args: &str) {
             CapType::SharedMemory { .. } => "ShMem",
             CapType::Filesystem { .. } => "FS",
             CapType::FileDescriptor { .. } => "FD",
+            CapType::Socket { .. } => "Socket",
         };
 
         println!("  {:>6}  {:>8}  {:>6}  {:>14}  {:>10}  {:#012x}",
@@ -661,4 +668,72 @@ pub fn cmd_ifconfig(_args: &str) {
         println!("  inet: (unconfigured — awaiting DHCP)");
     }
     println!("  RX drops: {}", st.rx_dropped);
+}
+
+/// Parse a dotted-quad IPv4 address ("10.0.2.3") into octets.
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut it = s.split('.');
+    for o in octets.iter_mut() {
+        *o = it.next()?.parse().ok()?;
+    }
+    if it.next().is_some() {
+        return None;
+    }
+    Some(octets)
+}
+
+/// `udpsend <ip> <port> <msg>` — send a UDP datagram via the net server.
+///
+/// A manual test for the Phase 4.5 socket path: it creates a UDP socket through
+/// the kernel socket router (which routes to the ring-3 net server), binds an
+/// ephemeral local port, sends `msg`, and closes. Uses the kernel-internal
+/// socket ops (the shell runs in the kernel); userspace goes through the
+/// capability-checked syscalls instead.
+pub fn cmd_udpsend(args: &str) {
+    use crate::net::socket;
+
+    let mut parts = args.splitn(3, ' ');
+    let ip_s = parts.next().unwrap_or("").trim();
+    let port_s = parts.next().unwrap_or("").trim();
+    let msg = parts.next().unwrap_or("");
+    if ip_s.is_empty() || port_s.is_empty() || msg.is_empty() {
+        println!("usage: udpsend <ip> <port> <msg>");
+        return;
+    }
+    let ip = match parse_ipv4(ip_s) {
+        Some(v) => v,
+        None => {
+            println!("udpsend: invalid IP '{}'", ip_s);
+            return;
+        }
+    };
+    let port: u16 = match port_s.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            println!("udpsend: invalid port '{}'", port_s);
+            return;
+        }
+    };
+
+    let id = match socket::ksocket_open() {
+        Ok(id) => id,
+        Err(e) => {
+            println!("udpsend: socket: {:?}", e);
+            return;
+        }
+    };
+    if let Err(e) = socket::ksocket_bind(id, [0, 0, 0, 0], 49152) {
+        println!("udpsend: bind: {:?}", e);
+        let _ = socket::ksocket_close(id);
+        return;
+    }
+    match socket::ksocket_sendto(id, msg.as_bytes(), ip, port) {
+        Ok(n) => println!(
+            "udpsend: sent {} bytes to {}.{}.{}.{}:{}",
+            n, ip[0], ip[1], ip[2], ip[3], port
+        ),
+        Err(e) => println!("udpsend: send: {:?}", e),
+    }
+    let _ = socket::ksocket_close(id);
 }

@@ -41,6 +41,10 @@ pub mod device;
 /// in-kernel NIC driver and the ring-3 TCP/IP stack.
 pub mod net_service;
 
+/// Socket routing: the kernel's capability-checked UDP socket API (Phase 4.5).
+/// Routes socket syscalls to the ring-3 net server; never parses packets.
+pub mod socket;
+
 /// Pack a 6-byte MAC into a little-endian u64, for passing to the net server via
 /// `BootInfo.arg1`.
 ///
@@ -101,9 +105,11 @@ pub fn boot_net() {
             None => return,
         };
 
-        // Spawn the ring-3 net server, wired to the service.
+        // Spawn the ring-3 net server, wired to the service. `fs_ep` is the
+        // server's request endpoint: it serves socket requests (Phase 4.5) here,
+        // and the kernel socket router routes SYS_SOCKET/… to it.
         let fs_ep = crate::ipc::create_endpoint("net-server");
-        spawn_server(ServerConfig {
+        let pid = spawn_server(ServerConfig {
             name: "net-server",
             binary: embedded::NET_SERVER,
             fs_endpoint: fs_ep,
@@ -117,6 +123,23 @@ pub fn boot_net() {
             arg1: pack_mac(mac) | NET_ARG_DHCP,
             filesystem_mount: None,
         });
+
+        // Set up the capability-checked socket API (Phase 4.5): allocate the
+        // kernel↔net-server socket payload region, map it into the server at the
+        // fixed SERVER_SOCKET_VIRT (which the server hardcodes), and register the
+        // router so socket syscalls can reach the net server.
+        use crate::mm::addr::VirtAddr;
+        use crate::mm::shared::SharedRegion;
+        use crate::process::server::{SERVER_SOCKET_BYTES, SERVER_SOCKET_VIRT};
+        if let Some(sock_region) = SharedRegion::alloc(SERVER_SOCKET_BYTES) {
+            let mapped = crate::process::with_address_space(pid, |a| {
+                sock_region.map_into(a, VirtAddr::new(SERVER_SOCKET_VIRT));
+            })
+            .is_some();
+            if mapped {
+                socket::init(fs_ep, sock_region);
+            }
+        }
 
         crate::println!(
             "Network: virtio-net0 up ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}), net server spawned (DHCP)",

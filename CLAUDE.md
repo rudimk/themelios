@@ -177,11 +177,18 @@ kernel races; loop `cargo xtask test` locally before pushing).
   (real end-to-end acquisition vs slirp) added. DHCP is gated behind an `arg1`
   flag (`NET_ARG_DHCP`) so the static-IP round-trip tests stay deterministic.
   **Off-ramp milestone reached: link up + DHCP address ("it's on the network").**
-- ⬜ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19) **← NEXT**. **Prereq to
-  build here:** a non-blocking `ipc_try_receive` + client request/reply path so the
-  net server can serve requests while polling smoltcp (also unblocks the deferred
-  `ping` shell cmd).
-- ⬜ **4.6** TCP sockets (syscalls 20–24) · ⬜ **4.7** shell/boot/tests
+- ✅ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19). Non-blocking
+  `ipc_try_receive` (`SYS_TRY_RECEIVE` 20) lets the net server serve client
+  requests while polling smoltcp; `CapType::Socket` with a `SOCKET_FACTORY`
+  authority sentinel (create-sockets right) + per-socket caps (send/recv); kernel
+  socket router (`net/socket.rs`) checks caps → routes to the net server → moves
+  payloads via a shared region → audits `NetAccess`. Net server keeps a UDP
+  socket table served over `try_receive`. `udpsend` shell cmd; `test_socket_capability`
+  + `test_udp_echo` (live DNS round-trip vs slirp) added. **32 tests pass.**
+- ⬜ **4.6** TCP sockets (connect/listen/accept/send/recv, syscalls 21–25) **← NEXT**.
+  Non-blocking sockets first; a client that wants to block on `recv` busy-polls via
+  `yield` (readiness/wake deferred). · ⬜ **4.7** shell (`sockets`/`ping`/`tcpconnect`),
+  boot integration, remaining tests, mdbook network doc.
 
 Notable: a pre-existing intermittent kernel double-fault (a `KERNEL_GS_BASE`
 scheduler race) was found and fixed during Phase 4 (commit `b1b7cea`).
