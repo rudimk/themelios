@@ -116,11 +116,18 @@ fi
 
 if ! rustup toolchain list | grep -q "${PINNED_NIGHTLY}"; then
   log "Installing Rust ${PINNED_NIGHTLY} with components + bare-metal targets"
-  # shellcheck disable=SC2086 # component/target lists are space-separated args
-  rustup toolchain install "${PINNED_NIGHTLY}" \
-    --profile minimal \
-    --component ${RUST_COMPONENTS} \
-    --target ${RUST_TARGETS}
+  # `rustup toolchain install` takes exactly ONE value per --component/--target
+  # flag; a space-separated list would be misparsed as extra positional
+  # toolchain names (`invalid toolchain name: 'rustfmt'`). So build repeated
+  # flags — one per component/target — into an argument array.
+  install_args=(--profile minimal)
+  for comp in ${RUST_COMPONENTS}; do
+    install_args+=(--component "${comp}")
+  done
+  for tgt in ${RUST_TARGETS}; do
+    install_args+=(--target "${tgt}")
+  done
+  rustup toolchain install "${PINNED_NIGHTLY}" "${install_args[@]}"
 else
   echo "Toolchain ${PINNED_NIGHTLY} already installed; ensuring components/targets."
   # Adding an already-present component/target is a no-op, so this is safe to
