@@ -476,7 +476,32 @@ socket-API bugs.
 
 ---
 
-### Sub-phase 4.4 — DHCPv4 client
+### Sub-phase 4.4 — DHCPv4 client ✅ COMPLETE
+
+**Implementation notes**: the ring-3 net server now runs smoltcp's `dhcpv4::Socket`
+and applies each lease to the interface (address + default route; `apply_dhcp_config`
+in `net-server/src/main.rs`). Because `dhcpv4::Socket::new()` starts with
+`config_changed = true` in `Discovering`, its **first `poll()` emits
+`Deconfigured`** — which would wipe a pre-seeded static IP — so DHCP is gated
+behind an explicit boot-arg flag (`NET_ARG_DHCP`, bit 48 of the packed-MAC
+`arg1`): live boot sets it; the two static-IP round-trip tests
+(`test_net_server_stack`, `test_net_icmp_echo`) don't, so they keep their
+deterministic `10.0.2.15` and the static path is byte-for-byte unchanged. The
+server reports each acquired/renewed/lost lease to the kernel over a new
+**`MSG_CONFIG`** opcode (addr+prefix, gateway, primary DNS — packed IPv4 in the
+IPC words; the kernel only *records* it, never parses packets). The net service
+stores it in a `NetStatus` (plus MAC/MTU read at startup and the RX-overflow
+counter) exposed via `net_service::status()`, which the new `ifconfig` shell
+command prints. `test_dhcp` wires the **real** net server to the **real** net
+service on a real NIC (exactly like `boot_net`) and lets its DHCP client exchange
+DISCOVER/OFFER/REQUEST/ACK with QEMU slirp's built-in DHCP server, then asserts
+`status()` shows the slirp-assigned `10.0.2.15` + gateway `10.0.2.2`. 30 tests
+pass. **Deviations from plan (justified):** (1) **Lease renewal** is handled by
+smoltcp's socket transparently and `add_default_ipv4_route` replaces (not stacks)
+the default route on each `Configured`, so renewals can't wedge or leak routes;
+there's no separate renewal test because slirp leases don't expire within a test
+run. (2) **DNS** is captured (first server) and surfaced by `ifconfig` for display
+only — no resolver in Phase 4, per plan.
 
 **Goal**: Acquire the interface address/gateway/DNS dynamically via DHCP.
 
@@ -495,10 +520,12 @@ slirp includes a DHCP server, so this is testable out of the box.
 **Module**: `servers/net-server/src/main.rs`, `kernel/src/shell/commands.rs`
 
 **Acceptance criteria**:
-- [ ] Guest acquires `10.0.2.15` (or slirp-assigned) via DHCP at boot
-- [ ] Gateway and DNS are configured from the DHCP offer
-- [ ] `ifconfig` shows the acquired configuration
-- [ ] Lease renewal does not wedge the stack
+- [x] Guest acquires `10.0.2.15` (or slirp-assigned) via DHCP at boot
+- [x] Gateway and DNS are configured from the DHCP offer (`test_dhcp` asserts the
+      gateway; DNS is captured and shown by `ifconfig`)
+- [x] `ifconfig` shows the acquired configuration (MAC, MTU, inet/gw/dns, RX drops)
+- [x] Lease renewal does not wedge the stack (smoltcp renews transparently;
+      `add_default_ipv4_route` replaces the default route rather than stacking)
 
 ---
 

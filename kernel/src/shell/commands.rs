@@ -38,6 +38,7 @@ pub fn cmd_help(_args: &str) {
     println!("  stat <path>      — show file size and type");
     println!("  write <path> <s> — create/write a file (overlay or /data)");
     println!("  mkdir <path>     — create a directory");
+    println!("  ifconfig         — show network interface configuration");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -622,4 +623,42 @@ pub fn cmd_mkdir(args: &str) {
         Ok(()) => println!("  created {}", path),
         Err(e) => println!("mkdir: {}: {:?}", path, e),
     }
+}
+
+/// `ifconfig` — show the network interface configuration.
+///
+/// Reads the live status the kernel net service maintains (sub-phase 4.4): the
+/// NIC's MAC and MTU, the IPv4 address/gateway/DNS the ring-3 stack acquired via
+/// DHCP, and the RX-overflow drop counter. The kernel does not parse packets — it
+/// only reports what the net server told it over `MSG_CONFIG`.
+pub fn cmd_ifconfig(_args: &str) {
+    let st = crate::net::net_service::status();
+    if !st.present {
+        println!("No network interface (no NIC discovered at boot).");
+        return;
+    }
+    println!("virtio-net0:");
+    println!(
+        "  MAC:  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        st.mac[0], st.mac[1], st.mac[2], st.mac[3], st.mac[4], st.mac[5],
+    );
+    println!("  MTU:  {}", st.mtu);
+    let c = st.config;
+    if c.configured {
+        println!(
+            "  inet: {}.{}.{}.{}/{}",
+            c.addr[0], c.addr[1], c.addr[2], c.addr[3], c.prefix,
+        );
+        match c.gateway {
+            Some(g) => println!("  gw:   {}.{}.{}.{}", g[0], g[1], g[2], g[3]),
+            None => println!("  gw:   (none)"),
+        }
+        match c.dns {
+            Some(d) => println!("  dns:  {}.{}.{}.{}", d[0], d[1], d[2], d[3]),
+            None => println!("  dns:  (none)"),
+        }
+    } else {
+        println!("  inet: (unconfigured — awaiting DHCP)");
+    }
+    println!("  RX drops: {}", st.rx_dropped);
 }

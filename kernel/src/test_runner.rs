@@ -60,6 +60,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_net_service",      func: test_net_service },
     TestCase { name: "test_net_server_stack", func: test_net_server_stack },
     TestCase { name: "test_net_icmp_echo",    func: test_net_icmp_echo },
+    TestCase { name: "test_dhcp",             func: test_dhcp },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3136,6 +3137,107 @@ fn test_net_icmp_echo() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_net_icmp_echo() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_dhcp — DHCPv4 address acquisition end to end (Phase 4.4)
+// ============================================================
+
+/// Test the DHCPv4 client by bringing the full stack up against QEMU's slirp
+/// DHCP server, exactly as the live boot does.
+///
+/// Unlike the earlier net-server tests (which *play* the kernel service and feed
+/// scripted frames), this test wires the real ring-3 net server to the **real**
+/// kernel net service on a real NIC and lets it run — so its smoltcp DHCP client
+/// exchanges DISCOVER/OFFER/REQUEST/ACK with slirp's built-in DHCP server. When
+/// the lease is acquired the server reports it via `MSG_CONFIG`, which the net
+/// service records in [`net_service::status`]. The test polls that status until
+/// the interface is configured, then checks slirp's well-known assignment
+/// (`10.0.2.15`, gateway `10.0.2.2`). Proves address/gateway acquisition and the
+/// whole config-reporting path end to end.
+#[cfg(target_arch = "x86_64")]
+fn test_dhcp() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::pci;
+    use crate::drivers::virtio::net::VirtioNet;
+    use crate::net::{self, device, net_service};
+    use crate::net::device::NetDevice;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    // Bring up a fresh NIC and start the real net service on it.
+    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let dev = virtio_devs
+        .iter()
+        .find(|d| d.class == 0x02)
+        .ok_or("no VirtIO network device on the PCI bus")?;
+    let nic = VirtioNet::init_from_pci(dev).map_err(|_| "VirtioNet init failed")?;
+    let mac = nic.mac();
+    let index = device::register("virtio-net-dhcp", Box::new(nic));
+    let handle = net_service::start(index).ok_or("net_service start failed")?;
+
+    // Let the service task reach its receive loop and publish MAC/MTU.
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+
+    // Spawn the real ring-3 net server in DHCP mode. arg1 packs the MAC in the
+    // low 48 bits with NET_ARG_DHCP (bit 48) set — the same wiring `boot_net`
+    // uses live, so this exercises the production DHCP path.
+    let fs_ep = crate::ipc::create_endpoint("test-dhcp-fs");
+    let packed_mac = {
+        let mut v = 0u64;
+        for (i, b) in mac.iter().enumerate() {
+            v |= (*b as u64) << (8 * i);
+        }
+        v
+    };
+    spawn_server(ServerConfig {
+        name: "net-server",
+        binary: embedded::NET_SERVER,
+        fs_endpoint: fs_ep,
+        block_endpoint: 0,
+        shared: Some(handle.rx_region),
+        client_shared: Some(handle.tx_region),
+        heap_bytes: 8 * 1024 * 1024,
+        arg0: handle.endpoint,
+        arg1: packed_mac | net::NET_ARG_DHCP,
+        filesystem_mount: None,
+    });
+
+    // Drive the scheduler until the DHCP client acquires a lease. slirp answers
+    // DISCOVER immediately, so acquisition takes a handful of poll round-trips;
+    // the budget is generous to absorb scheduling jitter.
+    let mut acquired = false;
+    for _ in 0..300_000 {
+        let cfg = net_service::status().config;
+        if cfg.configured && cfg.addr != [0, 0, 0, 0] {
+            // slirp's built-in DHCP server hands out 10.0.2.15 with gateway
+            // 10.0.2.2. Anything else means the acquisition path is wrong.
+            if cfg.addr != [10, 0, 2, 15] {
+                return Err("DHCP acquired an unexpected address");
+            }
+            match cfg.gateway {
+                Some([10, 0, 2, 2]) => {}
+                _ => return Err("DHCP did not configure the expected gateway"),
+            }
+            acquired = true;
+            break;
+        }
+        sched::yield_now();
+    }
+
+    if !acquired {
+        return Err("net server did not acquire a DHCP lease from slirp");
+    }
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_dhcp() -> Result<(), &'static str> {
     Ok(())
 }
 

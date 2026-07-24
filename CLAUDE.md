@@ -171,16 +171,20 @@ kernel races; loop `cargo xtask test` locally before pushing).
 - ✅ **4.3** Ethernet/ARP/IPv4/ICMP bring-up — stack answers ping; default route added.
   (Interactive `ping` shell cmd + outbound round-trip → moved to 4.5, they need the
   client request path.)
-- ⬜ **4.4 — DHCPv4 client (replaces the placeholder static IP 10.0.2.15) ← NEXT**
-- ⬜ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19). **Prereq to build here:**
-  a non-blocking `ipc_try_receive` + client request/reply path so the net server can
-  serve requests while polling smoltcp (also unblocks the deferred `ping` shell cmd).
+- ✅ **4.4** DHCPv4 client — replaces the placeholder static IP. Ring-3 smoltcp
+  `dhcpv4::Socket` acquires addr/gateway/DNS from slirp; the server reports it to
+  the kernel over a new `MSG_CONFIG` opcode; `ifconfig` shell cmd + `test_dhcp`
+  (real end-to-end acquisition vs slirp) added. DHCP is gated behind an `arg1`
+  flag (`NET_ARG_DHCP`) so the static-IP round-trip tests stay deterministic.
+  **Off-ramp milestone reached: link up + DHCP address ("it's on the network").**
+- ⬜ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19) **← NEXT**. **Prereq to
+  build here:** a non-blocking `ipc_try_receive` + client request/reply path so the
+  net server can serve requests while polling smoltcp (also unblocks the deferred
+  `ping` shell cmd).
 - ⬜ **4.6** TCP sockets (syscalls 20–24) · ⬜ **4.7** shell/boot/tests
 
-**Off-ramp milestone after 4.4**: link up + DHCP address + ping ("it's on the
-network"). Notable: a pre-existing intermittent kernel double-fault (a
-`KERNEL_GS_BASE` scheduler race) was found and fixed during Phase 4 (commit
-`b1b7cea`).
+Notable: a pre-existing intermittent kernel double-fault (a `KERNEL_GS_BASE`
+scheduler race) was found and fixed during Phase 4 (commit `b1b7cea`).
 
 ## License
 

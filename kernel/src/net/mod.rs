@@ -43,6 +43,10 @@ pub mod net_service;
 
 /// Pack a 6-byte MAC into a little-endian u64, for passing to the net server via
 /// `BootInfo.arg1`.
+///
+/// A MAC occupies the low 48 bits, so the high 16 bits are free to carry flags —
+/// see [`NET_ARG_DHCP`]. The net server unpacks the MAC by masking off those flag
+/// bits (`arg1 & 0x0000_FFFF_FFFF_FFFF`).
 fn pack_mac(mac: [u8; 6]) -> u64 {
     let mut v = 0u64;
     for (i, b) in mac.iter().enumerate() {
@@ -50,6 +54,15 @@ fn pack_mac(mac: [u8; 6]) -> u64 {
     }
     v
 }
+
+/// `BootInfo.arg1` flag bit: run the DHCPv4 client instead of using a static IP.
+///
+/// The net server's `arg1` packs the NIC's MAC in its low 48 bits; bit 48 selects
+/// the addressing mode. Set at boot (`boot_net`) so the live node configures
+/// itself via DHCP; the two static-IP round-trip tests spawn the server without
+/// this bit, so they keep their deterministic `10.0.2.15`. The net server mirrors
+/// this constant by hand (it cannot depend on kernel crates).
+pub const NET_ARG_DHCP: u64 = 1 << 48;
 
 /// Bring up the network stack at boot: discover the VirtIO NIC, start the kernel
 /// net service over it, and spawn the ring-3 net server (smoltcp) wired to the
@@ -99,12 +112,14 @@ pub fn boot_net() {
             client_shared: Some(handle.tx_region),
             heap_bytes: 8 * 1024 * 1024,
             arg0: handle.endpoint,
-            arg1: pack_mac(mac),
+            // Live boot: run the DHCPv4 client (sub-phase 4.4). The MAC rides in
+            // the low 48 bits; NET_ARG_DHCP (bit 48) requests DHCP.
+            arg1: pack_mac(mac) | NET_ARG_DHCP,
             filesystem_mount: None,
         });
 
         crate::println!(
-            "Network: virtio-net0 up ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}), net server spawned",
+            "Network: virtio-net0 up ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}), net server spawned (DHCP)",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
         );
     }
