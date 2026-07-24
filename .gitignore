@@ -20,6 +20,3 @@ Thumbs.db
 # QEMU state
 *.qcow2
 *.img
-
-# Sisyphus planning artifacts
-.sisyphus/
