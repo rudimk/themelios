@@ -79,6 +79,10 @@ const IA32_LSTAR: u32 = 0xC000_0082;
 /// We clear IF (bit 9) to disable interrupts in the kernel.
 const IA32_FMASK: u32 = 0xC000_0084;
 
+/// IA32_GS_BASE — the **current** GS segment base. `gs:[...]` accesses use this
+/// directly (no swap). We keep it pointing at `PerCpu` while kernel code runs.
+const IA32_GS_BASE: u32 = 0xC000_0101;
+
 /// IA32_KERNEL_GS_BASE — Kernel GS base address.
 /// Swapped with IA32_GS_BASE by `swapgs`. We store the PerCpu struct
 /// address here so `gs:[0]` points to PerCpu after swapgs at syscall entry.
@@ -337,6 +341,21 @@ unsafe extern "C" fn syscall_entry() {
         "call {dispatch}",
 
         // ===== EXIT: ring 0 → ring 3 =====
+
+        // Disable interrupts for the whole exit tail. The dispatcher may have
+        // enabled them (blocking syscalls call `sti`), but the tail below is a
+        // critical section that MUST run uninterrupted:
+        //  - `PerCpu.user_rsp_scratch` (gs:0x8) is a single shared slot; we
+        //    re-stash the user RSP into it and read it back two instructions
+        //    later. A preempting syscall's entry would overwrite it, so the task
+        //    would `sysretq` onto another task's stack.
+        //  - After `mov gs:0x8, rsp` loads the user RSP we are briefly in ring 0
+        //    with a ring-3 RSP; an interrupt there would push onto the user
+        //    stack. And an interrupt between `swapgs` and `sysretq` would run
+        //    with the user GS base.
+        // `sysretq` restores the user RFLAGS (with IF) from R11, so interrupts
+        // come back on atomically as we return to ring 3.
+        "cli",
 
         // Step 5: Restore registers from the SyscallFrame.
         // The dispatch function may have modified frame.rax (return value).
@@ -895,10 +914,13 @@ pub fn init() {
         // user stack, corrupting it).
         cpu::wrmsr(IA32_FMASK, RFLAGS_IF);
 
-        // Point IA32_KERNEL_GS_BASE to our PerCpu struct.
+        // Point both GS-base MSRs at our PerCpu struct so the invariant
+        // "kernel code runs with GS_BASE == &PER_CPU" holds from the very first
+        // task, before any context switch calls `refresh_kernel_gs_base`.
         // After `swapgs` in the syscall entry stub, `gs:[0]` addresses
         // PerCpu.kernel_stack_top and `gs:[8]` addresses PerCpu.user_rsp_scratch.
         let per_cpu_addr = &raw const PER_CPU as u64;
+        cpu::wrmsr(IA32_GS_BASE, per_cpu_addr);
         cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
     }
 
@@ -943,18 +965,31 @@ pub fn set_kernel_stack(stack_top: u64) {
     }
 }
 
-/// Re-establish `KERNEL_GS_BASE = &PER_CPU` without touching the kernel stack.
+/// Re-establish the GS-base invariant on a context switch: both the **current**
+/// GS base (`IA32_GS_BASE`) and the swap target (`IA32_KERNEL_GS_BASE`) point at
+/// `&PER_CPU`. Must run on **every** switch — including switches to kernel-only
+/// tasks (idle, bootstrap) that skip [`set_kernel_stack`].
 ///
-/// The invariant "whenever a task runs, `KERNEL_GS_BASE == &PER_CPU`" (see
-/// [`set_kernel_stack`]) must hold on **every** context switch — including
-/// switches to kernel-only tasks (idle, the bootstrap task) that have no ring-3
-/// kernel stack and therefore skip [`set_kernel_stack`]. If we skipped the MSR
-/// write for those, a ring-3 task that blocked in a syscall (leaving
-/// `KERNEL_GS_BASE` holding its zero user GS base after the entry `swapgs`) could
-/// be followed through a kernel task and then resumed with `KERNEL_GS_BASE` still
-/// zero — so its next syscall's `swapgs` yields `GS_BASE = 0`, `gs:[…]` reads
-/// address 0, and the kernel loads `RSP = 0` and double-faults. Calling this on
-/// every switch closes that window.
+/// ## Why set the *current* GS base too (the real fix)
+///
+/// The invariant we need is "**whenever kernel code runs, `GS_BASE == &PER_CPU`**"
+/// — every `gs:[…]` access (syscall entry loading the kernel stack, syscall exit
+/// restoring the user stack) depends on it. The interrupt/exception stubs in
+/// `idt.rs` do **not** `swapgs`, so an interrupt taken in ring 3 runs with the
+/// task's *user* GS base (0). When that handler calls `schedule()` and switches
+/// into another task, `switch_context` does not touch `GS_BASE` (it is a global
+/// CPU register, not saved per task), so the resumed task inherits `GS_BASE = 0`
+/// and its next `gs:[…]` (e.g. the syscall-exit `mov gs:0x8, rsp`) faults — with
+/// `RSP` transiently 0 from the canonical-RIP check, the fault's frame push then
+/// double-faults. Writing `IA32_KERNEL_GS_BASE` alone (the previous fix) only
+/// repaired the *next* `swapgs`, not the GS base the resumed task actually runs
+/// with. Writing `IA32_GS_BASE = &PER_CPU` here guarantees every switched-to task
+/// resumes kernel execution with the correct GS base.
+///
+/// This leaves ring 3 running with `GS_BASE = &PER_CPU` after an `iretq`/`sysretq`
+/// that doesn't swap it back, which is harmless: ring-3 code here never reads GS,
+/// and the next syscall's `swapgs` (with `KERNEL_GS_BASE = &PER_CPU`) keeps the
+/// kernel base correct.
 ///
 /// # Safety
 ///
@@ -962,8 +997,11 @@ pub fn set_kernel_stack(stack_top: u64) {
 pub fn refresh_kernel_gs_base() {
     // SAFETY: single-core, interrupts disabled during the context switch.
     unsafe {
-        let per_cpu = &raw mut PER_CPU;
-        cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu as u64);
+        let per_cpu = &raw mut PER_CPU as u64;
+        // Current GS base — what `gs:[…]` uses right now and after the switch.
+        cpu::wrmsr(IA32_GS_BASE, per_cpu);
+        // Swap target — what the next `swapgs` (syscall entry) brings in.
+        cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu);
     }
 }
 
