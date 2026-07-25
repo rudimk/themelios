@@ -325,8 +325,19 @@ pub fn ipc_receive(endpoint_id: u64) -> Result<IpcMessage, IpcError> {
             })?;
 
         if let Some(sender) = ep.senders.pop_front() {
-            // Immediate rendezvous: take the message and wake the sender
-            sched::wake_task(sender.task_id);
+            // Immediate rendezvous: take the message. Only wake a *plain* sender
+            // here. A sender with a non-zero reply_token is a caller from
+            // `ipc_call` that is ALSO parked in the `callers` queue waiting for
+            // its reply — waking it now would make its `ipc_call` return before
+            // any reply was delivered (`take_delivery` sees an empty slot). It
+            // must stay blocked until `ipc_reply` wakes it. This mirrors the
+            // guard in `ipc_try_receive`, and matters whenever the kernel's
+            // `ipc_call` reaches this endpoint before the server has parked in
+            // `ipc_receive` (a scheduling race that shows up under load as
+            // spurious "call failed" IPC errors).
+            if sender.message.reply_token == 0 {
+                sched::wake_task(sender.task_id);
+            }
             Some(sender.message)
         } else {
             // No sender waiting: queue the receiver
