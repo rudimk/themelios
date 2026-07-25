@@ -28,10 +28,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use libthemelios::net_proto::{
-    pack_ip_port, pack_ipv4, unpack_ip_port, MSG_CONFIG, OP_SOCK_BIND, OP_SOCK_CLOSE,
-    OP_SOCK_CONNECT, OP_SOCK_OPEN, OP_SOCK_RECV, OP_SOCK_SEND, SOCKET_REGION_BYTES,
-    SOCKET_REGION_VADDR, SOCK_ERR, SOCK_OK, SOCK_REFUSED, SOCK_TYPE_TCP, SOCK_TYPE_UDP,
-    SOCK_WOULDBLOCK,
+    pack_ip_port, pack_ipv4, unpack_ip_port, MSG_CONFIG, OP_SOCK_ACCEPT, OP_SOCK_BIND,
+    OP_SOCK_CLOSE, OP_SOCK_CONNECT, OP_SOCK_LISTEN, OP_SOCK_OPEN, OP_SOCK_RECV, OP_SOCK_SEND,
+    SOCKET_REGION_BYTES, SOCKET_REGION_VADDR, SOCK_ERR, SOCK_OK, SOCK_REFUSED, SOCK_TYPE_TCP,
+    SOCK_TYPE_UDP, SOCK_WOULDBLOCK,
 };
 use libthemelios::{boot_info, ipc, syscall, IpcMessage};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -251,11 +251,14 @@ enum SockKind {
 }
 
 /// A socket in the net server's table: its kernel-facing id, the smoltcp handle,
-/// and its kind.
+/// its kind, and (for a TCP listener) the local port it was bound to.
 struct SockEntry {
     id: u64,
     handle: SocketHandle,
     kind: SockKind,
+    /// Local port set by `bind` — used by `listen` and to re-arm the replacement
+    /// listening socket on `accept`. 0 = unbound.
+    local_port: u16,
 }
 
 /// Build a fresh UDP socket with heap-owned RX/TX ring buffers (so it is `'static`).
@@ -334,21 +337,88 @@ fn serve_socket(
             };
             let id = *next_id;
             *next_id += 1;
-            table.push(SockEntry { id, handle, kind });
+            table.push(SockEntry { id, handle, kind, local_port: 0 });
             reply([SOCK_OK, id, 0, 0]);
         }
         OP_SOCK_BIND => {
             let id = req.words[1];
             let port = req.words[3] as u16;
-            match find_entry(table, id) {
-                // UDP: bind to the local port. TCP: bind is only meaningful for a
-                // future listen (Phase 4.7); accept it as a no-op for now.
-                Some((h, SockKind::Udp)) => match sockets.get_mut::<udp::Socket>(h).bind(port) {
-                    Ok(()) => reply([SOCK_OK, 0, 0, 0]),
-                    Err(_) => reply([SOCK_ERR, 0, 0, 0]),
+            match table.iter().position(|e| e.id == id) {
+                Some(i) => match table[i].kind {
+                    // UDP: bind to the local port now.
+                    SockKind::Udp => match sockets.get_mut::<udp::Socket>(table[i].handle).bind(port)
+                    {
+                        Ok(()) => reply([SOCK_OK, 0, 0, 0]),
+                        Err(_) => reply([SOCK_ERR, 0, 0, 0]),
+                    },
+                    // TCP: record the port; `listen` consumes it.
+                    SockKind::Tcp => {
+                        table[i].local_port = port;
+                        reply([SOCK_OK, 0, 0, 0]);
+                    }
                 },
-                Some((_, SockKind::Tcp)) => reply([SOCK_OK, 0, 0, 0]),
                 None => reply([SOCK_ERR, 0, 0, 0]),
+            }
+        }
+        OP_SOCK_LISTEN => {
+            // Put the (bound) TCP socket into LISTEN on its local port.
+            let id = req.words[1];
+            match table.iter().position(|e| e.id == id) {
+                Some(i) if table[i].kind == SockKind::Tcp && table[i].local_port != 0 => {
+                    let port = table[i].local_port;
+                    match sockets.get_mut::<tcp::Socket>(table[i].handle).listen(port) {
+                        Ok(()) => reply([SOCK_OK, 0, 0, 0]),
+                        Err(_) => reply([SOCK_ERR, 0, 0, 0]),
+                    }
+                }
+                _ => reply([SOCK_ERR, 0, 0, 0]),
+            }
+        }
+        OP_SOCK_ACCEPT => {
+            // If the listener socket has an established connection, hand it back as
+            // a new socket id and re-arm the listener with a fresh LISTEN socket.
+            let id = req.words[1];
+            let idx = match table.iter().position(|e| e.id == id) {
+                Some(i) if table[i].kind == SockKind::Tcp => i,
+                _ => {
+                    reply([SOCK_ERR, 0, 0, 0]);
+                    return;
+                }
+            };
+            let old_handle = table[idx].handle;
+            let port = table[idx].local_port;
+            let state = sockets.get_mut::<tcp::Socket>(old_handle).state();
+            match state {
+                // Still waiting for a SYN.
+                tcp::State::Listen => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                // Fell back to Closed (e.g. peer reset before we accepted): re-arm.
+                tcp::State::Closed => {
+                    let _ = sockets.get_mut::<tcp::Socket>(old_handle).listen(port);
+                    reply([SOCK_WOULDBLOCK, 0, 0, 0]);
+                }
+                // A connection is on `old_handle`. Promote it and replace the
+                // listener with a fresh LISTEN socket on the same port.
+                _ => {
+                    let peer = sockets
+                        .get_mut::<tcp::Socket>(old_handle)
+                        .remote_endpoint()
+                        .map(endpoint_octets)
+                        .unwrap_or(([0; 4], 0));
+                    let new_listen = sockets.add(make_tcp_socket());
+                    let _ = sockets.get_mut::<tcp::Socket>(new_listen).listen(port);
+                    // The listener keeps its id but now points at the new socket.
+                    table[idx].handle = new_listen;
+                    // The accepted connection gets a fresh id on the old handle.
+                    let conn_id = *next_id;
+                    *next_id += 1;
+                    table.push(SockEntry {
+                        id: conn_id,
+                        handle: old_handle,
+                        kind: SockKind::Tcp,
+                        local_port: 0,
+                    });
+                    reply([SOCK_OK, conn_id, pack_ip_port(peer.0, peer.1), 0]);
+                }
             }
         }
         OP_SOCK_CONNECT => {

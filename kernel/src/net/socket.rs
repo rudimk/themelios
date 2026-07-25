@@ -42,6 +42,8 @@ const OP_SOCK_SEND: u64 = 12;
 const OP_SOCK_RECV: u64 = 13;
 const OP_SOCK_CLOSE: u64 = 14;
 const OP_SOCK_CONNECT: u64 = 15;
+const OP_SOCK_LISTEN: u64 = 16;
+const OP_SOCK_ACCEPT: u64 = 17;
 
 /// Socket type: UDP (Phase 4.5).
 pub const SOCK_TYPE_UDP: u64 = 0;
@@ -362,6 +364,52 @@ pub fn sys_recv(
     Ok(n)
 }
 
+/// Listen for inbound TCP connections on a bound socket. Requires WRITE rights.
+/// The socket must already be bound (via [`sys_bind`]).
+pub fn sys_listen(
+    pid: ProcessId,
+    handle: CapHandle,
+    backlog: u64,
+    syscall_num: u64,
+) -> Result<(), SockError> {
+    let socket_id = resolve_socket(pid, handle, CapRights::WRITE)?;
+    let r = router()?;
+    audit(pid, syscall_num, socket_id);
+    let reply = sock_call(r.endpoint, [OP_SOCK_LISTEN, socket_id, backlog, 0])?;
+    map_status(reply.words[0])
+}
+
+/// Accept one established inbound connection on a listening socket. Requires READ
+/// rights. On success mints a fresh `Socket` capability for the accepted
+/// connection (mirroring how `SYS_SOCKET`/`vfs_open` mint caps — the net server
+/// never fabricates them) and returns `(cap_handle, peer_ip, peer_port)`.
+/// Returns `WouldBlock` if no connection is pending.
+pub fn sys_accept(
+    pid: ProcessId,
+    handle: CapHandle,
+    syscall_num: u64,
+) -> Result<(u32, [u8; 4], u16), SockError> {
+    let listen_id = resolve_socket(pid, handle, CapRights::READ)?;
+    let r = router()?;
+    audit(pid, syscall_num, listen_id);
+    let reply = sock_call(r.endpoint, [OP_SOCK_ACCEPT, listen_id, 0, 0])?;
+    map_status(reply.words[0])?;
+    let conn_socket_id = reply.words[1];
+    let (ip, port) = unpack_ip_port(reply.words[2]);
+    // Mint a per-connection Socket capability under the listener.
+    let cap = process::with_cspace_mut(pid, |cspace| {
+        cspace.insert(Capability {
+            cap_type: CapType::Socket { socket_id: conn_socket_id },
+            rights: CapRights::READ | CapRights::WRITE,
+            parent: Some(handle),
+        })
+    })
+    .ok_or(SockError::ServerUnavailable)?
+    .map(|h| h.as_raw())
+    .map_err(|_| SockError::NoResources)?;
+    Ok((cap, ip, port))
+}
+
 // --- Kernel-internal operations (no capability check) ---
 //
 // These address the net server directly, for the debug shell's `udpsend`. The
@@ -457,4 +505,31 @@ pub fn ksocket_recv(socket_id: u64, buf: &mut [u8]) -> Result<usize, SockError> 
     let src = unsafe { r.region.as_slice_mut() };
     buf[..n].copy_from_slice(&src[..n]);
     Ok(n)
+}
+
+/// Bind TCP `socket_id` to a local port directly (records the port for listen).
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_bind_port(socket_id: u64, port: u16) -> Result<(), SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_BIND, socket_id, 0, port as u64])?;
+    map_status(reply.words[0])
+}
+
+/// Put TCP `socket_id` into LISTEN directly.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_listen(socket_id: u64) -> Result<(), SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_LISTEN, socket_id, 1, 0])?;
+    map_status(reply.words[0])
+}
+
+/// Accept one connection on listening TCP `socket_id` directly. Returns the new
+/// connection's net-server socket id and peer `(ip, port)`; `WouldBlock` if none.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_accept(socket_id: u64) -> Result<(u64, [u8; 4], u16), SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_ACCEPT, socket_id, 0, 0])?;
+    map_status(reply.words[0])?;
+    let (ip, port) = unpack_ip_port(reply.words[2]);
+    Ok((reply.words[1], ip, port))
 }

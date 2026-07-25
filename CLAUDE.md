@@ -187,16 +187,19 @@ section). Still, `cargo xtask test` before pushing.
   payloads via a shared region → audits `NetAccess`. Net server keeps a UDP
   socket table served over `try_receive`. `udpsend` shell cmd; `test_socket_capability`
   + `test_udp_echo` (live DNS round-trip vs slirp) added. **32 tests pass.**
-- 🟡 **4.6** TCP sockets — **client path done** (`SOCK_TYPE_TCP`; `connect`/stream
-  `send`/`recv`/`close`; syscalls `SYS_CONNECT` 21, `SYS_TCP_SEND` 24, `SYS_TCP_RECV`
-  25; non-blocking with a `TcpPhase` state machine → WouldBlock while connecting,
-  ConnectionRefused on reset). `tcpconnect` shell cmd + `test_tcp_client` (33 tests,
-  reliably green). smoltcp `tcp::Socket`s in the net server keyed by kind.
-  **← server path NEXT:** `listen`/`accept` (syscalls 22/23) with a listening-socket
-  pool + cap-mint-on-accept, and a deterministic round-trip test via a host-side
-  listener over QEMU `hostfwd` (slirp has no reachable TCP endpoint, so the client
-  test only validates plumbing; the real data round-trip needs the server path).
-- ⬜ **4.7** shell (`sockets`/`ping`), boot integration, remaining tests, mdbook network doc.
+- ✅ **4.6** TCP sockets — **client + server done**. Client: `SOCK_TYPE_TCP`,
+  `connect`/stream `send`/`recv`/`close` (`SYS_CONNECT` 21, `SYS_TCP_SEND` 24,
+  `SYS_TCP_RECV` 25); non-blocking `TcpPhase` state machine (WouldBlock connecting,
+  ConnectionRefused on reset). Server: `bind`/`listen`/`accept` (`SYS_LISTEN` 22,
+  `SYS_ACCEPT` 23) — smoltcp's listening socket *becomes* the connection, so accept
+  promotes it + re-arms a fresh listener; the kernel mints the per-connection cap.
+  `tcpconnect` shell cmd. `test_tcp_client` (plumbing; slirp has no TCP listener)
+  + `test_tcp_server` — **deterministic round-trip**: guest listens on :7, the
+  xtask host thread connects via QEMU `hostfwd` (127.0.0.1:15007 → guest :7), guest
+  accepts + echoes. **34 tests, reliably green.** (`test_tcp_server` runs before the
+  other persistent net-server tests so it is the sole NIC drainer.)
+- ⬜ **4.7** **← NEXT:** shell (`sockets` list, `ping`), boot integration (bring the
+  net stack up at boot outside test mode), remaining tests, mdbook network doc.
 
 Per-milestone branches now: 4.6 lives on `claude/phase-4.6-tcp-sockets` (fresh PR),
 cut from `main` after the 4.4/4.5 PR merged.

@@ -318,9 +318,64 @@ fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
 /// - `-device virtio-net-pci,netdev=<id>,disable-legacy=on`: create the modern
 ///   VirtIO-net PCI device the kernel driver binds to.
 fn virtio_net_args(id: &str) -> Vec<String> {
+    virtio_net_args_fwd(id, None)
+}
+
+/// Host TCP port forwarded to the guest's TCP listener (guest port 7) during
+/// `cargo xtask test`, for the Phase 4.6 `test_tcp_server` round-trip.
+const TCP_TEST_HOST_PORT: u16 = 15007;
+/// Guest TCP port the server test listens on.
+const TCP_TEST_GUEST_PORT: u16 = 7;
+
+/// The payload the host peer sends and `test_tcp_server` echoes back.
+const TCP_TEST_PAYLOAD: &[u8] = b"THEMELIOS_TCP_PING";
+
+/// Spawn a detached host thread that connects to the guest TCP listener (via the
+/// `hostfwd` rule), sends [`TCP_TEST_PAYLOAD`], and reads the echo. It retries
+/// until the guest is listening (early connects are refused), then stops after a
+/// successful exchange. Failures are silent: the guest side asserts the
+/// round-trip; this thread only drives the connection.
+fn spawn_tcp_test_peer() {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
+
+    std::thread::spawn(|| {
+        let sa: SocketAddr = match format!("127.0.0.1:{TCP_TEST_HOST_PORT}").parse() {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let deadline = Instant::now() + Duration::from_secs(85);
+        while Instant::now() < deadline {
+            match TcpStream::connect_timeout(&sa, Duration::from_millis(500)) {
+                Ok(mut stream) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+                    if stream.write_all(TCP_TEST_PAYLOAD).is_ok() {
+                        // Read the echo back (keeps the connection open long enough
+                        // for the guest to recv + echo), then we're done.
+                        let mut buf = [0u8; 64];
+                        let _ = stream.read(&mut buf);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(150)),
+            }
+        }
+    });
+}
+
+/// Like [`virtio_net_args`] but optionally adds a slirp `hostfwd` rule so the
+/// host can reach a guest TCP listener (used by the server-socket test).
+fn virtio_net_args_fwd(id: &str, hostfwd: Option<&str>) -> Vec<String> {
+    let netdev = match hostfwd {
+        Some(fw) => format!("user,id={id},{fw}"),
+        None => format!("user,id={id}"),
+    };
     vec![
         "-netdev".to_string(),
-        format!("user,id={id}"),
+        netdev,
         "-device".to_string(),
         format!("virtio-net-pci,netdev={id},disable-legacy=on"),
     ]
@@ -935,8 +990,19 @@ fn cmd_test(args: &[String]) {
     cmd.args(virtio_disk_args(&ext2, "blkdata", false));
 
     // Attach a VirtIO NIC on user-mode networking (Phase 4) so net tests have a
-    // device to bind. slirp answers ARP for the gateway (10.0.2.2).
-    cmd.args(virtio_net_args("net0"));
+    // device to bind. slirp answers ARP for the gateway (10.0.2.2). A `hostfwd`
+    // rule maps host 127.0.0.1:TCP_TEST_HOST_PORT → guest :TCP_TEST_GUEST_PORT so
+    // the host-side peer below can reach `test_tcp_server`'s listener.
+    let hostfwd = format!(
+        "hostfwd=tcp:127.0.0.1:{TCP_TEST_HOST_PORT}-:{TCP_TEST_GUEST_PORT}"
+    );
+    cmd.args(virtio_net_args_fwd("net0", Some(&hostfwd)));
+
+    // Host-side TCP peer for `test_tcp_server`: repeatedly connect to the guest's
+    // listener (via the hostfwd above), send a known payload, and read the echo.
+    // The guest asserts it received the payload; this thread just drives the
+    // connection. It retries until the guest is listening, then stops.
+    spawn_tcp_test_peer();
 
     let child = cmd
         .stdout(process::Stdio::inherit())

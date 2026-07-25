@@ -204,11 +204,19 @@ pub const SYS_SOCKET_CLOSE: u64 = 19;
 /// requests while continuously polling smoltcp.
 pub const SYS_TRY_RECEIVE: u64 = 20;
 
-// --- TCP socket syscalls (Phase 4.6). 22/23 reserved for LISTEN/ACCEPT. ---
+// --- TCP socket syscalls (Phase 4.6). ---
 
 /// SYS_CONNECT: begin an outbound TCP connection. RDI = socket cap, RSI = dest
 /// IPv4 (packed), RDX = dest port. Non-blocking; returns 0, or a high-bit error.
 pub const SYS_CONNECT: u64 = 21;
+/// SYS_LISTEN: listen for inbound TCP connections on a bound socket. RDI = socket
+/// cap, RSI = backlog. Returns 0, or a high-bit error.
+pub const SYS_LISTEN: u64 = 22;
+/// SYS_ACCEPT: accept one established inbound connection. RDI = listening socket
+/// cap, RSI = peer-out ptr (`[ip:u32_le, port:u16_le]`, 8 bytes; 0 to skip).
+/// Returns a new `Socket` capability handle for the connection, or a high-bit
+/// error (`WouldBlock` if none pending).
+pub const SYS_ACCEPT: u64 = 23;
 /// SYS_TCP_SEND: send bytes on a connected (TCP) socket. RDI = socket cap,
 /// RSI = buf ptr, RDX = len. Returns bytes sent, or a high-bit error
 /// (`WouldBlock` while connecting / send window full). Named distinctly from the
@@ -600,7 +608,7 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
             }
         }
         SYS_SOCKET | SYS_BIND | SYS_SENDTO | SYS_RECVFROM | SYS_SOCKET_CLOSE | SYS_CONNECT
-        | SYS_TCP_SEND | SYS_TCP_RECV => {
+        | SYS_TCP_SEND | SYS_TCP_RECV | SYS_LISTEN | SYS_ACCEPT => {
             // Socket syscalls block on the net server, so enable interrupts.
             cpu::sti();
             dispatch_socket_syscall(frame);
@@ -916,6 +924,34 @@ fn dispatch_socket_syscall(frame: &mut SyscallFrame) {
             match socket::sys_recv(pid, handle, &mut kbuf, num) {
                 Ok(n) if copy_to_user(frame.rsi, &kbuf[..n]) => frame.rax = n as u64,
                 Ok(_) => frame.rax = bad_arg,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_LISTEN => {
+            // RDI = socket cap, RSI = backlog.
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            match socket::sys_listen(pid, handle, frame.rsi, num) {
+                Ok(()) => frame.rax = 0,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_ACCEPT => {
+            // RDI = listening socket cap, RSI = peer-out ptr (8 bytes, 0 to skip).
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            let peer_ptr = frame.rsi;
+            match socket::sys_accept(pid, handle, num) {
+                Ok((conn_handle, ip, port)) => {
+                    if peer_ptr != 0 {
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&ip);
+                        out[4..6].copy_from_slice(&port.to_le_bytes());
+                        if !copy_to_user(peer_ptr, &out) {
+                            frame.rax = bad_arg;
+                            return;
+                        }
+                    }
+                    frame.rax = conn_handle as u64;
+                }
                 Err(e) => frame.rax = e.as_syscall_ret(),
             }
         }
