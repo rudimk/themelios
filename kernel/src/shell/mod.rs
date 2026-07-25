@@ -83,6 +83,8 @@ fn shell_entry() {
             "stat" => commands::cmd_stat(args),
             "write" => commands::cmd_write(args),
             "mkdir" => commands::cmd_mkdir(args),
+            "ifconfig" => commands::cmd_ifconfig(args),
+            "udpsend" => commands::cmd_udpsend(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
             }

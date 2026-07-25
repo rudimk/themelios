@@ -218,7 +218,30 @@ pub enum CapType {
         /// The mount this descriptor belongs to.
         mount_id: u64,
     },
+
+    /// A network socket (Phase 4.5). This is the networking analogue of the
+    /// filesystem capabilities above, with two roles distinguished by
+    /// `socket_id`:
+    ///
+    /// - `socket_id == `[`SOCKET_FACTORY`] — the **network authority**: the
+    ///   right to *create* sockets. `SYS_SOCKET` requires the caller to hold
+    ///   this; without it, socket creation is denied. It is the "mount"-like
+    ///   root capability (compare [`CapType::Filesystem`]).
+    /// - any other `socket_id` — a specific open socket in the ring-3 net
+    ///   server. Minted by `SYS_SOCKET` and consumed by
+    ///   `bind`/`sendto`/`recvfrom`/`close` (compare [`CapType::FileDescriptor`]).
+    ///   READ grants receive, WRITE grants send.
+    Socket {
+        /// The net-server-side socket id, or [`SOCKET_FACTORY`] for the
+        /// create-sockets authority.
+        socket_id: u64,
+    },
 }
+
+/// Sentinel `socket_id` marking a [`CapType::Socket`] as the **network
+/// authority** (the right to create sockets via `SYS_SOCKET`) rather than a
+/// specific open socket. A real net-server socket id never reaches `u64::MAX`.
+pub const SOCKET_FACTORY: u64 = u64::MAX;
 
 // --- Capability ---
 

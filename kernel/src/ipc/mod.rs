@@ -325,8 +325,19 @@ pub fn ipc_receive(endpoint_id: u64) -> Result<IpcMessage, IpcError> {
             })?;
 
         if let Some(sender) = ep.senders.pop_front() {
-            // Immediate rendezvous: take the message and wake the sender
-            sched::wake_task(sender.task_id);
+            // Immediate rendezvous: take the message. Only wake a *plain* sender
+            // here. A sender with a non-zero reply_token is a caller from
+            // `ipc_call` that is ALSO parked in the `callers` queue waiting for
+            // its reply — waking it now would make its `ipc_call` return before
+            // any reply was delivered (`take_delivery` sees an empty slot). It
+            // must stay blocked until `ipc_reply` wakes it. This mirrors the
+            // guard in `ipc_try_receive`, and matters whenever the kernel's
+            // `ipc_call` reaches this endpoint before the server has parked in
+            // `ipc_receive` (a scheduling race that shows up under load as
+            // spurious "call failed" IPC errors).
+            if sender.message.reply_token == 0 {
+                sched::wake_task(sender.task_id);
+            }
             Some(sender.message)
         } else {
             // No sender waiting: queue the receiver
@@ -349,6 +360,42 @@ pub fn ipc_receive(endpoint_id: u64) -> Result<IpcMessage, IpcError> {
 
     // After waking, the message should be in our delivery slot
     take_delivery(current_task).ok_or(IpcError::InvalidEndpoint)
+}
+
+/// Non-blocking receive: take a waiting sender's message if one is queued,
+/// otherwise return `Ok(None)` immediately without blocking.
+///
+/// This is the primitive a *polling* server needs — one that must interleave
+/// serving requests with other work (the net server polls smoltcp continuously
+/// and cannot park in a blocking [`ipc_receive`]). The kernel routes client
+/// socket calls to it via [`ipc_call`], and the server drains them with this.
+///
+/// ## Correctness with `call`/`reply`
+///
+/// A caller blocked in [`ipc_call`] appears in the endpoint's `senders` queue
+/// (carrying its request) *and* its `callers` queue (awaiting the reply). A
+/// plain [`ipc_receive`] wakes whatever sender it pops — correct for a bare
+/// `ipc_send`, but a **caller must stay blocked** until we `ipc_reply`. So we
+/// only wake a popped sender whose `reply_token == 0` (a plain send); a caller
+/// (`reply_token != 0`) is left blocked in `callers`, exactly as the
+/// receiver-already-parked path in `ipc_call` leaves it. Waking it here would
+/// make `ipc_call` return with no reply.
+pub fn ipc_try_receive(endpoint_id: u64) -> Result<Option<IpcMessage>, IpcError> {
+    // No blocking here, so no lost-wakeup window: the InterruptMutex already
+    // disables interrupts while the registry is locked, which is all we need.
+    let mut registry = ENDPOINT_REGISTRY.lock();
+    let ep = find_endpoint_mut(&mut registry, endpoint_id).ok_or(IpcError::InvalidEndpoint)?;
+
+    match ep.senders.pop_front() {
+        Some(sender) => {
+            // Only wake a plain sender; a caller stays blocked awaiting reply.
+            if sender.message.reply_token == 0 {
+                sched::wake_task(sender.task_id);
+            }
+            Ok(Some(sender.message))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Send a message and wait for a reply (RPC pattern).

@@ -79,6 +79,10 @@ const IA32_LSTAR: u32 = 0xC000_0082;
 /// We clear IF (bit 9) to disable interrupts in the kernel.
 const IA32_FMASK: u32 = 0xC000_0084;
 
+/// IA32_GS_BASE — the **current** GS segment base. `gs:[...]` accesses use this
+/// directly (no swap). We keep it pointing at `PerCpu` while kernel code runs.
+const IA32_GS_BASE: u32 = 0xC000_0101;
+
 /// IA32_KERNEL_GS_BASE — Kernel GS base address.
 /// Swapped with IA32_GS_BASE by `swapgs`. We store the PerCpu struct
 /// address here so `gs:[0]` points to PerCpu after swapgs at syscall entry.
@@ -169,6 +173,36 @@ pub const SYS_READDIR: u64 = 13;
 /// RAX = uptime in ms. Used by the ring-3 net server to drive smoltcp's clock
 /// (`Instant`) each poll. Derived from the 100 Hz timer tick (`ticks × 10`).
 pub const SYS_UPTIME_MS: u64 = 14;
+
+// --- Socket syscalls (Phase 4.5) ---
+//
+// UDP sockets through a capability-checked API. The kernel is a router: it
+// checks a `Socket` capability, forwards to the ring-3 net server via IPC +
+// the shared socket-payload region, and never parses packet data.
+
+/// SYS_SOCKET: create a socket. RDI = socket type (0 = UDP). Returns a new
+/// `Socket` capability handle in RAX, or a high-bit-set `SockError`. Requires
+/// the caller to hold the network-authority capability.
+pub const SYS_SOCKET: u64 = 15;
+/// SYS_BIND: bind a socket to a local port. RDI = socket cap, RSI = local IPv4
+/// (packed, 0 = any), RDX = port. Returns 0 / error.
+pub const SYS_BIND: u64 = 16;
+/// SYS_SENDTO: send a datagram. RDI = socket cap, RSI = buf ptr, RDX = buf len,
+/// R10 = dest IPv4 (packed), R9 = dest port. Returns bytes sent / error.
+pub const SYS_SENDTO: u64 = 17;
+/// SYS_RECVFROM: receive a datagram. RDI = socket cap, RSI = buf ptr,
+/// RDX = buf len, R10 = source-out ptr (`[ip:u32_le, port:u16_le]`, 8 bytes).
+/// Returns bytes received / error (WouldBlock if none pending).
+pub const SYS_RECVFROM: u64 = 18;
+/// SYS_SOCKET_CLOSE: close a socket. RDI = socket cap. Returns 0 / error.
+pub const SYS_SOCKET_CLOSE: u64 = 19;
+
+/// SYS_TRY_RECEIVE: non-blocking IPC receive, for servers that poll. RDI =
+/// endpoint. Returns RAX = 1 if a message was received (words in
+/// RDI/RSI/RDX/R8, reply token in R9), or RAX = 0 if none was waiting. Unlike
+/// SYS_RECEIVE it never blocks — the net server uses it to serve socket
+/// requests while continuously polling smoltcp.
+pub const SYS_TRY_RECEIVE: u64 = 20;
 
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
@@ -307,6 +341,21 @@ unsafe extern "C" fn syscall_entry() {
         "call {dispatch}",
 
         // ===== EXIT: ring 0 → ring 3 =====
+
+        // Disable interrupts for the whole exit tail. The dispatcher may have
+        // enabled them (blocking syscalls call `sti`), but the tail below is a
+        // critical section that MUST run uninterrupted:
+        //  - `PerCpu.user_rsp_scratch` (gs:0x8) is a single shared slot; we
+        //    re-stash the user RSP into it and read it back two instructions
+        //    later. A preempting syscall's entry would overwrite it, so the task
+        //    would `sysretq` onto another task's stack.
+        //  - After `mov gs:0x8, rsp` loads the user RSP we are briefly in ring 0
+        //    with a ring-3 RSP; an interrupt there would push onto the user
+        //    stack. And an interrupt between `swapgs` and `sysretq` would run
+        //    with the user GS base.
+        // `sysretq` restores the user RFLAGS (with IF) from R11, so interrupts
+        // come back on atomically as we return to ring 3.
+        "cli",
 
         // Step 5: Restore registers from the SyscallFrame.
         // The dispatch function may have modified frame.rax (return value).
@@ -516,6 +565,30 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
             // atomic read, so no need to re-enable interrupts or block.
             frame.rax = crate::arch::x86_64::idt::tick_count().wrapping_mul(10);
         }
+        SYS_TRY_RECEIVE => {
+            // Non-blocking receive for polling servers (the net server). RDI =
+            // endpoint. RAX = 1 with words in RDI/RSI/RDX/R8 + token in R9 if a
+            // message was waiting, else RAX = 0. Never blocks, so we don't touch
+            // the interrupt flag.
+            let endpoint_id = frame.rdi;
+            match crate::ipc::ipc_try_receive(endpoint_id) {
+                Ok(Some(msg)) => {
+                    frame.rax = 1;
+                    frame.rdi = msg.words[0];
+                    frame.rsi = msg.words[1];
+                    frame.rdx = msg.words[2];
+                    frame.r8 = msg.words[3];
+                    frame.r9 = msg.reply_token;
+                }
+                Ok(None) => frame.rax = 0,
+                Err(_) => frame.rax = !0u64,
+            }
+        }
+        SYS_SOCKET | SYS_BIND | SYS_SENDTO | SYS_RECVFROM | SYS_SOCKET_CLOSE => {
+            // Socket syscalls block on the net server, so enable interrupts.
+            cpu::sti();
+            dispatch_socket_syscall(frame);
+        }
         SYS_TEST_COMPLETE => {
             // Internal test syscall: store the test result and kill the task.
             // RDI contains the SYS_NULL return value from the test shellcode.
@@ -700,6 +773,104 @@ fn dispatch_fs_syscall(frame: &mut SyscallFrame) {
     }
 }
 
+// --- Socket syscall dispatch (Phase 4.5) ---
+//
+// Thin handlers that validate/copy user pointers, then delegate to the
+// capability-checked socket router in `crate::net::socket`. They run with
+// interrupts enabled (the router blocks on the ring-3 net server). A packed
+// IPv4 address arrives as a big-endian `a<<24|b<<16|c<<8|d` word.
+
+/// Unpack a syscall IPv4 argument (`a<<24|b<<16|c<<8|d`) into octets.
+fn unpack_ipv4_arg(w: u64) -> [u8; 4] {
+    [(w >> 24) as u8, (w >> 16) as u8, (w >> 8) as u8, w as u8]
+}
+
+/// Dispatch a socket syscall (SYS_SOCKET .. SYS_SOCKET_CLOSE) from `frame`.
+fn dispatch_socket_syscall(frame: &mut SyscallFrame) {
+    use crate::cap::CapHandle;
+    use crate::net::socket::{self, SockError};
+
+    let pid = crate::sched::current_process_id();
+    crate::audit::log_event(pid, crate::audit::AuditOp::NetAccess, crate::cap::CapType::Null, frame.rax);
+    let bad_arg = SockError::InvalidArgument.as_syscall_ret();
+    let num = frame.rax;
+
+    match num {
+        SYS_SOCKET => {
+            // RDI = socket type, RSI = network-authority (factory) cap handle.
+            let sock_type = frame.rdi;
+            let factory = CapHandle::from_raw(frame.rsi as u32);
+            match socket::sys_socket(pid, factory, sock_type, num) {
+                Ok(handle) => frame.rax = handle as u64,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_BIND => {
+            // RDI = socket cap, RSI = local IPv4 (packed), RDX = port.
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            let ip = unpack_ipv4_arg(frame.rsi);
+            let port = frame.rdx as u16;
+            match socket::sys_bind(pid, handle, ip, port, num) {
+                Ok(()) => frame.rax = 0,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_SENDTO => {
+            // RDI = socket cap, RSI = buf ptr, RDX = len, R10 = dest IPv4, R9 = port.
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            let ip = unpack_ipv4_arg(frame.r10);
+            let port = frame.r9 as u16;
+            match copy_from_user(frame.rsi, frame.rdx as usize) {
+                Some(data) => match socket::sys_sendto(pid, handle, &data, ip, port, num) {
+                    Ok(n) => frame.rax = n as u64,
+                    Err(e) => frame.rax = e.as_syscall_ret(),
+                },
+                None => frame.rax = bad_arg,
+            }
+        }
+        SYS_RECVFROM => {
+            // RDI = socket cap, RSI = buf ptr, RDX = len, R10 = source-out ptr.
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            let len = (frame.rdx as usize).min(FS_MAX_XFER);
+            let src_ptr = frame.r10;
+            if !user_range_ok(frame.rsi, len) {
+                frame.rax = bad_arg;
+                return;
+            }
+            let mut kbuf = alloc::vec![0u8; len];
+            match socket::sys_recvfrom(pid, handle, &mut kbuf, num) {
+                Ok((n, ip, port)) => {
+                    if !copy_to_user(frame.rsi, &kbuf[..n]) {
+                        frame.rax = bad_arg;
+                        return;
+                    }
+                    // Write [ip:u32_le, port:u16_le] to the source-out buffer if
+                    // the caller supplied one (src_ptr != 0).
+                    if src_ptr != 0 {
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&ip);
+                        out[4..6].copy_from_slice(&port.to_le_bytes());
+                        if !copy_to_user(src_ptr, &out) {
+                            frame.rax = bad_arg;
+                            return;
+                        }
+                    }
+                    frame.rax = n as u64;
+                }
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_SOCKET_CLOSE => {
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            match socket::sys_close(pid, handle, num) {
+                Ok(()) => frame.rax = 0,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        _ => frame.rax = bad_arg,
+    }
+}
+
 // --- Initialization ---
 
 /// Initialize the syscall/sysret mechanism.
@@ -743,10 +914,13 @@ pub fn init() {
         // user stack, corrupting it).
         cpu::wrmsr(IA32_FMASK, RFLAGS_IF);
 
-        // Point IA32_KERNEL_GS_BASE to our PerCpu struct.
+        // Point both GS-base MSRs at our PerCpu struct so the invariant
+        // "kernel code runs with GS_BASE == &PER_CPU" holds from the very first
+        // task, before any context switch calls `refresh_kernel_gs_base`.
         // After `swapgs` in the syscall entry stub, `gs:[0]` addresses
         // PerCpu.kernel_stack_top and `gs:[8]` addresses PerCpu.user_rsp_scratch.
         let per_cpu_addr = &raw const PER_CPU as u64;
+        cpu::wrmsr(IA32_GS_BASE, per_cpu_addr);
         cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
     }
 
@@ -791,18 +965,31 @@ pub fn set_kernel_stack(stack_top: u64) {
     }
 }
 
-/// Re-establish `KERNEL_GS_BASE = &PER_CPU` without touching the kernel stack.
+/// Re-establish the GS-base invariant on a context switch: both the **current**
+/// GS base (`IA32_GS_BASE`) and the swap target (`IA32_KERNEL_GS_BASE`) point at
+/// `&PER_CPU`. Must run on **every** switch — including switches to kernel-only
+/// tasks (idle, bootstrap) that skip [`set_kernel_stack`].
 ///
-/// The invariant "whenever a task runs, `KERNEL_GS_BASE == &PER_CPU`" (see
-/// [`set_kernel_stack`]) must hold on **every** context switch — including
-/// switches to kernel-only tasks (idle, the bootstrap task) that have no ring-3
-/// kernel stack and therefore skip [`set_kernel_stack`]. If we skipped the MSR
-/// write for those, a ring-3 task that blocked in a syscall (leaving
-/// `KERNEL_GS_BASE` holding its zero user GS base after the entry `swapgs`) could
-/// be followed through a kernel task and then resumed with `KERNEL_GS_BASE` still
-/// zero — so its next syscall's `swapgs` yields `GS_BASE = 0`, `gs:[…]` reads
-/// address 0, and the kernel loads `RSP = 0` and double-faults. Calling this on
-/// every switch closes that window.
+/// ## Why set the *current* GS base too (the real fix)
+///
+/// The invariant we need is "**whenever kernel code runs, `GS_BASE == &PER_CPU`**"
+/// — every `gs:[…]` access (syscall entry loading the kernel stack, syscall exit
+/// restoring the user stack) depends on it. The interrupt/exception stubs in
+/// `idt.rs` do **not** `swapgs`, so an interrupt taken in ring 3 runs with the
+/// task's *user* GS base (0). When that handler calls `schedule()` and switches
+/// into another task, `switch_context` does not touch `GS_BASE` (it is a global
+/// CPU register, not saved per task), so the resumed task inherits `GS_BASE = 0`
+/// and its next `gs:[…]` (e.g. the syscall-exit `mov gs:0x8, rsp`) faults — with
+/// `RSP` transiently 0 from the canonical-RIP check, the fault's frame push then
+/// double-faults. Writing `IA32_KERNEL_GS_BASE` alone (the previous fix) only
+/// repaired the *next* `swapgs`, not the GS base the resumed task actually runs
+/// with. Writing `IA32_GS_BASE = &PER_CPU` here guarantees every switched-to task
+/// resumes kernel execution with the correct GS base.
+///
+/// This leaves ring 3 running with `GS_BASE = &PER_CPU` after an `iretq`/`sysretq`
+/// that doesn't swap it back, which is harmless: ring-3 code here never reads GS,
+/// and the next syscall's `swapgs` (with `KERNEL_GS_BASE = &PER_CPU`) keeps the
+/// kernel base correct.
 ///
 /// # Safety
 ///
@@ -810,8 +997,11 @@ pub fn set_kernel_stack(stack_top: u64) {
 pub fn refresh_kernel_gs_base() {
     // SAFETY: single-core, interrupts disabled during the context switch.
     unsafe {
-        let per_cpu = &raw mut PER_CPU;
-        cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu as u64);
+        let per_cpu = &raw mut PER_CPU as u64;
+        // Current GS base — what `gs:[…]` uses right now and after the switch.
+        cpu::wrmsr(IA32_GS_BASE, per_cpu);
+        // Swap target — what the next `swapgs` (syscall entry) brings in.
+        cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu);
     }
 }
 

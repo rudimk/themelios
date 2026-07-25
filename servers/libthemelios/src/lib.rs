@@ -348,6 +348,43 @@ pub mod syscall {
         ms
     }
 
+    /// Non-blocking IPC receive (SYS_TRY_RECEIVE = 20). Returns `Some(msg)` if a
+    /// message was waiting, `None` otherwise — never blocks. A polling server
+    /// (the net server) uses this to serve requests on its endpoint while
+    /// continuously driving smoltcp; a blocking `receive` would stall the poll
+    /// loop. On return RAX = 1/0 (had message?), with the words in
+    /// RDI/RSI/RDX/R8 and the reply token in R9.
+    const SYS_TRY_RECEIVE: u64 = 20;
+    pub fn try_receive(endpoint: u64) -> Option<IpcMessage> {
+        let has: u64;
+        let w0: u64;
+        let w1: u64;
+        let w2: u64;
+        let w3: u64;
+        let token: u64;
+        // SAFETY: TRY_RECEIVE takes the endpoint in RDI and returns the
+        // has-message flag in RAX plus the message words/token in the registers
+        // above. It never blocks.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_TRY_RECEIVE => has,
+                inout("rdi") endpoint => w0,
+                out("rsi") w1,
+                out("rdx") w2,
+                out("r8") w3,
+                out("r9") token,
+                out("rcx") _, out("r11") _, out("r10") _,
+                options(nostack),
+            );
+        }
+        if has == 0 {
+            None
+        } else {
+            Some(IpcMessage { words: [w0, w1, w2, w3], badge: 0, reply_token: token })
+        }
+    }
+
     /// Terminate this server process. Never returns.
     pub fn exit(code: u64) -> ! {
         // SAFETY: EXIT terminates the task; the kernel never returns here.
@@ -423,6 +460,114 @@ pub mod syscall {
     /// `entries_out`. Returns the entry count.
     pub fn readdir(fd: u64, entries_out: *mut u8, max: u64, out_len: usize) -> u64 {
         fs_syscall(SYS_READDIR, fd, entries_out as u64, max, out_len as u64)
+    }
+
+    // --- Socket syscalls (Phase 4.5) ---
+    //
+    // UDP sockets through the capability-checked API. A return with the high bit
+    // set is an encoded `net_proto` socket error. IPv4 addresses are packed
+    // `a<<24|b<<16|c<<8|d`.
+
+    const SYS_SOCKET: u64 = 15;
+    const SYS_BIND: u64 = 16;
+    const SYS_SENDTO: u64 = 17;
+    const SYS_RECVFROM: u64 = 18;
+    const SYS_SOCKET_CLOSE: u64 = 19;
+
+    /// Create a socket of `sock_type` (0 = UDP) using the network-authority
+    /// capability `factory`. Returns a socket capability handle, or a high-bit
+    /// error.
+    pub fn socket(sock_type: u64, factory: u64) -> u64 {
+        // RDI = type, RSI = factory handle.
+        let ret: u64;
+        // SAFETY: SYS_SOCKET register ABI.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_SOCKET => ret,
+                in("rdi") sock_type,
+                in("rsi") factory,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Bind socket `sock` to `(local_ip, port)` (local_ip packed; 0 = any).
+    pub fn bind(sock: u64, local_ip: u64, port: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_BIND register ABI.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_BIND => ret,
+                in("rdi") sock,
+                in("rsi") local_ip,
+                in("rdx") port,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Send `len` bytes at `buf` from socket `sock` to `(ip, port)` (ip packed).
+    /// Returns bytes sent, or a high-bit error.
+    pub fn sendto(sock: u64, buf: *const u8, len: usize, ip: u64, port: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_SENDTO register ABI (buf/len validated by the kernel).
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_SENDTO => ret,
+                in("rdi") sock,
+                in("rsi") buf as u64,
+                in("rdx") len as u64,
+                in("r10") ip,
+                in("r9") port,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Receive a datagram on `sock` into `buf` (up to `len`), writing the source
+    /// `[ip:u32_le, port:u16_le]` to `src_out` (8 bytes; pass null to skip).
+    /// Returns bytes received, or a high-bit error (WouldBlock if none pending).
+    pub fn recvfrom(sock: u64, buf: *mut u8, len: usize, src_out: *mut u8) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_RECVFROM register ABI (pointers validated by the kernel).
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_RECVFROM => ret,
+                in("rdi") sock,
+                in("rsi") buf as u64,
+                in("rdx") len as u64,
+                in("r10") src_out as u64,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Close socket `sock`.
+    pub fn socket_close(sock: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_SOCKET_CLOSE register ABI.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_SOCKET_CLOSE => ret,
+                in("rdi") sock,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
     }
 
     /// Print a single byte to the kernel serial console (debugging only).

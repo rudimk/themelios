@@ -57,10 +57,105 @@ pub const MSG_POLL: u64 = 0;
 /// `word1 = frame length`. Reply: `[status, 0, 0, 0]`.
 pub const MSG_TX_FRAME: u64 = 1;
 
+/// Request: the ring-3 server reports its acquired IP configuration (sub-phase
+/// 4.4). The kernel records it (it does not parse packets — it only stores what
+/// the server tells it) so `ifconfig` can display the live configuration.
+///
+/// Word layout (must match `libthemelios::net_proto`, kept in sync by hand):
+/// - `word1` = IPv4 address in bits 0..32 (`a<<24|b<<16|c<<8|d`) | `prefix<<32`
+/// - `word2` = default gateway (packed IPv4, 0 = none)
+/// - `word3` = primary DNS server (packed IPv4, 0 = none; display only)
+///
+/// A fully-zero `word1` means "deconfigured". Reply: `[status, 0, 0, 0]`.
+pub const MSG_CONFIG: u64 = 2;
+
 /// Reply status: success.
 pub const STATUS_OK: u64 = 0;
 /// Reply status: failure.
 pub const STATUS_ERROR: u64 = 1;
+
+/// The IPv4 configuration the ring-3 net server last reported (via `MSG_CONFIG`).
+///
+/// The kernel keeps this purely for display (`ifconfig`); it is the server's
+/// smoltcp interface that actually holds and uses the configuration.
+#[derive(Clone, Copy, Default)]
+pub struct AcquiredConfig {
+    /// True once an address has been acquired (via DHCP or set statically).
+    pub configured: bool,
+    /// The interface's IPv4 address.
+    pub addr: [u8; 4],
+    /// The address prefix length (e.g. 24 for a /24).
+    pub prefix: u8,
+    /// The default gateway, if any.
+    pub gateway: Option<[u8; 4]>,
+    /// The primary DNS server, if any (stored for display; no resolver yet).
+    pub dns: Option<[u8; 4]>,
+}
+
+/// A snapshot of the network interface's status, for the `ifconfig` command and
+/// the DHCP integration test. Populated by the net service task.
+#[derive(Clone, Copy)]
+pub struct NetStatus {
+    /// Whether a net service is running (a NIC was found and bound).
+    pub present: bool,
+    /// The NIC's hardware (MAC) address.
+    pub mac: [u8; 6],
+    /// The NIC's MTU in bytes.
+    pub mtu: usize,
+    /// Count of RX frames dropped because the service's RX queue overflowed.
+    pub rx_dropped: u64,
+    /// The IPv4 configuration the ring-3 stack last reported.
+    pub config: AcquiredConfig,
+}
+
+impl Default for NetStatus {
+    fn default() -> Self {
+        Self {
+            present: false,
+            mac: [0; 6],
+            mtu: 0,
+            rx_dropped: 0,
+            config: AcquiredConfig::default(),
+        }
+    }
+}
+
+/// Live interface status, updated by the net service task and read by
+/// [`status`]. Guarded by an `InterruptMutex` because the shell (or a test) may
+/// read it concurrently with the service task's writes.
+static STATUS: InterruptMutex<NetStatus> = InterruptMutex::new(NetStatus {
+    present: false,
+    mac: [0; 6],
+    mtu: 0,
+    rx_dropped: 0,
+    config: AcquiredConfig {
+        configured: false,
+        addr: [0; 4],
+        prefix: 0,
+        gateway: None,
+        dns: None,
+    },
+});
+
+/// Read a snapshot of the current network interface status.
+///
+/// Returns a `NetStatus` with `present == false` if no net service is running
+/// (no NIC was discovered at boot).
+pub fn status() -> NetStatus {
+    *STATUS.lock()
+}
+
+/// Decode a packed IPv4 address from the low 32 bits of a `MSG_CONFIG` word.
+/// Mirrors `libthemelios::net_proto::unpack_ipv4` (duplicated by hand — the
+/// kernel does not depend on the userspace support crate).
+fn unpack_ipv4(word: u64) -> [u8; 4] {
+    [
+        (word >> 24) as u8,
+        (word >> 16) as u8,
+        (word >> 8) as u8,
+        word as u8,
+    ]
+}
 
 /// Size of each frame shared region: one maximum Ethernet frame, rounded up.
 const REGION_BYTES: u64 = 2048;
@@ -138,6 +233,15 @@ fn service_loop() {
         None => return,
     };
 
+    // Publish the interface's static properties (MAC, MTU) so `ifconfig` can
+    // show them even before the ring-3 stack has acquired an address.
+    {
+        let mut st = STATUS.lock();
+        st.present = true;
+        st.mac = nic.mac();
+        st.mtu = nic.mtu();
+    }
+
     // Local mutable state: the RX frame queue and the overflow counter.
     let mut rx_queue: VecDeque<Vec<u8>> = VecDeque::new();
     let mut dropped: u64 = 0;
@@ -162,6 +266,8 @@ fn service_loop() {
                                 // Bounded queue: drop the oldest and count it.
                                 rx_queue.pop_front();
                                 dropped = dropped.wrapping_add(1);
+                                // Surface the running drop count for `ifconfig`.
+                                STATUS.lock().rx_dropped = dropped;
                             }
                             rx_queue.push_back(scratch[..n].to_vec());
                         }
@@ -193,6 +299,31 @@ fn service_loop() {
                     Err(_) => STATUS_ERROR,
                 };
                 IpcMessage::new([status, 0, 0, 0])
+            }
+            MSG_CONFIG => {
+                // The ring-3 stack reports its acquired IP configuration. Record
+                // it for `ifconfig`; the kernel never inspects packet contents.
+                let addr_word = request.words[1];
+                let addr = unpack_ipv4(addr_word);
+                let prefix = (addr_word >> 32) as u8;
+                let gateway = match request.words[2] {
+                    0 => None,
+                    w => Some(unpack_ipv4(w)),
+                };
+                let dns = match request.words[3] {
+                    0 => None,
+                    w => Some(unpack_ipv4(w)),
+                };
+                // A fully-zero address word means "deconfigured" (lease lost).
+                let configured = addr_word != 0;
+                STATUS.lock().config = AcquiredConfig {
+                    configured,
+                    addr,
+                    prefix,
+                    gateway,
+                    dns,
+                };
+                IpcMessage::new([STATUS_OK, 0, 0, 0])
             }
             _ => IpcMessage::new([STATUS_ERROR, 0, 0, 0]),
         };

@@ -162,8 +162,10 @@ narrative per commit._
 a ring-3 **net server** on **smoltcp**; a thin VirtIO-net driver stays in the
 kernel; frames cross via a **pull-based** IPC bridge (net server always initiates,
 kernel replies). amd64 is the run/test target; arm64-ready by design (smoltcp
-compiles for both). `main` is green — keep it that way (the suite can hit flaky
-kernel races; loop `cargo xtask test` locally before pushing).
+compiles for both). `main` is green — keep it that way. The suite is now
+reliably green (10/10 soak runs); the long-standing intermittent double-fault /
+IPC-race flakiness was root-caused and fixed (see the notes at the end of this
+section). Still, `cargo xtask test` before pushing.
 
 - ✅ **4.0** VirtIO-net driver + `NetDevice` trait
 - ✅ **4.1** Kernel net service (pull-based frame bridge, `SYS_UPTIME_MS`)
@@ -171,16 +173,42 @@ kernel races; loop `cargo xtask test` locally before pushing).
 - ✅ **4.3** Ethernet/ARP/IPv4/ICMP bring-up — stack answers ping; default route added.
   (Interactive `ping` shell cmd + outbound round-trip → moved to 4.5, they need the
   client request path.)
-- ⬜ **4.4 — DHCPv4 client (replaces the placeholder static IP 10.0.2.15) ← NEXT**
-- ⬜ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19). **Prereq to build here:**
-  a non-blocking `ipc_try_receive` + client request/reply path so the net server can
-  serve requests while polling smoltcp (also unblocks the deferred `ping` shell cmd).
-- ⬜ **4.6** TCP sockets (syscalls 20–24) · ⬜ **4.7** shell/boot/tests
+- ✅ **4.4** DHCPv4 client — replaces the placeholder static IP. Ring-3 smoltcp
+  `dhcpv4::Socket` acquires addr/gateway/DNS from slirp; the server reports it to
+  the kernel over a new `MSG_CONFIG` opcode; `ifconfig` shell cmd + `test_dhcp`
+  (real end-to-end acquisition vs slirp) added. DHCP is gated behind an `arg1`
+  flag (`NET_ARG_DHCP`) so the static-IP round-trip tests stay deterministic.
+  **Off-ramp milestone reached: link up + DHCP address ("it's on the network").**
+- ✅ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19). Non-blocking
+  `ipc_try_receive` (`SYS_TRY_RECEIVE` 20) lets the net server serve client
+  requests while polling smoltcp; `CapType::Socket` with a `SOCKET_FACTORY`
+  authority sentinel (create-sockets right) + per-socket caps (send/recv); kernel
+  socket router (`net/socket.rs`) checks caps → routes to the net server → moves
+  payloads via a shared region → audits `NetAccess`. Net server keeps a UDP
+  socket table served over `try_receive`. `udpsend` shell cmd; `test_socket_capability`
+  + `test_udp_echo` (live DNS round-trip vs slirp) added. **32 tests pass.**
+- ⬜ **4.6** TCP sockets (connect/listen/accept/send/recv, syscalls 21–25) **← NEXT**.
+  Non-blocking sockets first; a client that wants to block on `recv` busy-polls via
+  `yield` (readiness/wake deferred). · ⬜ **4.7** shell (`sockets`/`ping`/`tcpconnect`),
+  boot integration, remaining tests, mdbook network doc.
 
-**Off-ramp milestone after 4.4**: link up + DHCP address + ping ("it's on the
-network"). Notable: a pre-existing intermittent kernel double-fault (a
-`KERNEL_GS_BASE` scheduler race) was found and fixed during Phase 4 (commit
-`b1b7cea`).
+Notable — three long-standing concurrency bugs in the syscall/IPC core were
+root-caused and fixed during Phase 4.5 (they grew from rare to majority-of-runs
+as the suite added tasks/syscalls; `b1b7cea` had only partially masked the
+first):
+- **Syscall-exit double-fault.** `PerCpu.user_rsp_scratch` (`gs:0x8`) is a single
+  shared slot; the syscall exit re-stashed the user RSP there and read it back
+  with interrupts *enabled*, so a preempting syscall clobbered it and the task
+  `sysretq`'d onto another task's stack. Fixed by making the exit tail atomic
+  (`cli`; `sysretq` restores IF).
+- **Stale GS base.** GS base is a global register not saved per task, and the
+  interrupt stubs never `swapgs`, so an interrupt in ring 3 could context-switch
+  with the user GS base. Fixed by writing `IA32_GS_BASE = &PER_CPU` on every
+  context switch (not just `KERNEL_GS_BASE`).
+- **Spurious IPC "call failed".** `ipc_receive` woke a popped caller-sender
+  before its reply was delivered (when `ipc_call` raced ahead of the server
+  parking). Fixed by only waking plain sends (`reply_token == 0`); callers wait
+  for `ipc_reply`. Same guard as `ipc_try_receive`.
 
 ## License
 

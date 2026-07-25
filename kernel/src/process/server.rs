@@ -52,6 +52,16 @@ const SERVER_SHARED_VIRT: u64 = 0x5000_0000;
 /// Virtual base where the client shared region is mapped (shared with the
 /// server's clients, for paths and file data).
 const SERVER_CLIENT_SHARED_VIRT: u64 = 0x5100_0000;
+/// Virtual base where a server's **socket payload** region is mapped, if it has
+/// one (Phase 4.5 — the net server). Shared with the kernel socket router for
+/// datagram bytes. Mapped after spawn by `boot_net` at this fixed address, which
+/// the net server hardcodes (mirrors `libthemelios::net_proto::SOCKET_REGION_VADDR`),
+/// so no boot-info field is needed. Distinct from the two frame regions the net
+/// server already uses for the RX/TX bridge.
+pub const SERVER_SOCKET_VIRT: u64 = 0x5200_0000;
+/// Size of the socket payload region (mirrors
+/// `libthemelios::net_proto::SOCKET_REGION_BYTES`). One datagram in flight.
+pub const SERVER_SOCKET_BYTES: u64 = 64 * 1024;
 /// Top of the server's stack (grows downward).
 const SERVER_STACK_TOP: u64 = 0x0000_7FFF_FFF0_0000;
 /// Number of stack pages (16 × 4 KiB = 64 KiB).
