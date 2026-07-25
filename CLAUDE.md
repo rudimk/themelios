@@ -187,10 +187,19 @@ section). Still, `cargo xtask test` before pushing.
   payloads via a shared region → audits `NetAccess`. Net server keeps a UDP
   socket table served over `try_receive`. `udpsend` shell cmd; `test_socket_capability`
   + `test_udp_echo` (live DNS round-trip vs slirp) added. **32 tests pass.**
-- ⬜ **4.6** TCP sockets (connect/listen/accept/send/recv, syscalls 21–25) **← NEXT**.
-  Non-blocking sockets first; a client that wants to block on `recv` busy-polls via
-  `yield` (readiness/wake deferred). · ⬜ **4.7** shell (`sockets`/`ping`/`tcpconnect`),
-  boot integration, remaining tests, mdbook network doc.
+- 🟡 **4.6** TCP sockets — **client path done** (`SOCK_TYPE_TCP`; `connect`/stream
+  `send`/`recv`/`close`; syscalls `SYS_CONNECT` 21, `SYS_TCP_SEND` 24, `SYS_TCP_RECV`
+  25; non-blocking with a `TcpPhase` state machine → WouldBlock while connecting,
+  ConnectionRefused on reset). `tcpconnect` shell cmd + `test_tcp_client` (33 tests,
+  reliably green). smoltcp `tcp::Socket`s in the net server keyed by kind.
+  **← server path NEXT:** `listen`/`accept` (syscalls 22/23) with a listening-socket
+  pool + cap-mint-on-accept, and a deterministic round-trip test via a host-side
+  listener over QEMU `hostfwd` (slirp has no reachable TCP endpoint, so the client
+  test only validates plumbing; the real data round-trip needs the server path).
+- ⬜ **4.7** shell (`sockets`/`ping`), boot integration, remaining tests, mdbook network doc.
+
+Per-milestone branches now: 4.6 lives on `claude/phase-4.6-tcp-sockets` (fresh PR),
+cut from `main` after the 4.4/4.5 PR merged.
 
 Notable — three long-standing concurrency bugs in the syscall/IPC core were
 root-caused and fixed during Phase 4.5 (they grew from rare to majority-of-runs

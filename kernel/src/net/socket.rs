@@ -41,13 +41,17 @@ const OP_SOCK_BIND: u64 = 11;
 const OP_SOCK_SEND: u64 = 12;
 const OP_SOCK_RECV: u64 = 13;
 const OP_SOCK_CLOSE: u64 = 14;
+const OP_SOCK_CONNECT: u64 = 15;
 
-/// Socket type: UDP (the only type in Phase 4.5).
+/// Socket type: UDP (Phase 4.5).
 pub const SOCK_TYPE_UDP: u64 = 0;
+/// Socket type: TCP stream (Phase 4.6).
+pub const SOCK_TYPE_TCP: u64 = 1;
 
 /// Net-server reply status words (mirror `net_proto`).
 const SOCK_OK: u64 = 0;
 const SOCK_WOULDBLOCK: u64 = 1;
+const SOCK_REFUSED: u64 = 3;
 
 /// High bit marking a socket syscall return as an encoded [`SockError`].
 const STATUS_ERROR_FLAG: u64 = 1 << 63;
@@ -68,6 +72,8 @@ pub enum SockError {
     NoResources = 5,
     /// The net server is unreachable (not started, IPC failed).
     ServerUnavailable = 6,
+    /// A TCP connection was refused or reset by the peer (Phase 4.6).
+    ConnectionRefused = 7,
 }
 
 impl SockError {
@@ -82,6 +88,7 @@ fn map_status(status: u64) -> Result<(), SockError> {
     match status {
         SOCK_OK => Ok(()),
         SOCK_WOULDBLOCK => Err(SockError::WouldBlock),
+        SOCK_REFUSED => Err(SockError::ConnectionRefused),
         _ => Err(SockError::InvalidArgument),
     }
 }
@@ -291,6 +298,70 @@ pub fn sys_close(
     reply.map(|_| ())
 }
 
+// --- TCP stream operations (Phase 4.6) ---
+
+/// Begin an outbound TCP connection to `(ip, port)`. Requires WRITE rights.
+/// Non-blocking: it returns once the handshake is initiated; the connection
+/// completes asynchronously, so [`sys_send`]/[`sys_recv`] return `WouldBlock`
+/// until it is established (or `ConnectionRefused` if the peer rejects it).
+pub fn sys_connect(
+    pid: ProcessId,
+    handle: CapHandle,
+    ip: [u8; 4],
+    port: u16,
+    syscall_num: u64,
+) -> Result<(), SockError> {
+    let socket_id = resolve_socket(pid, handle, CapRights::WRITE)?;
+    let r = router()?;
+    audit(pid, syscall_num, socket_id);
+    let reply = sock_call(r.endpoint, [OP_SOCK_CONNECT, socket_id, pack_ipv4(ip), port as u64])?;
+    map_status(reply.words[0])
+}
+
+/// Send bytes on a connected (TCP) socket. Requires WRITE rights. Returns the
+/// number of bytes accepted (may be fewer than requested); `WouldBlock` if the
+/// connection is still establishing or the send window is full.
+pub fn sys_send(
+    pid: ProcessId,
+    handle: CapHandle,
+    buf: &[u8],
+    syscall_num: u64,
+) -> Result<usize, SockError> {
+    let socket_id = resolve_socket(pid, handle, CapRights::WRITE)?;
+    let r = router()?;
+    audit(pid, syscall_num, socket_id);
+    // SAFETY: the kernel owns this region's frames; the call is synchronous.
+    let dst = unsafe { r.region.as_slice_mut() };
+    let n = buf.len().min(dst.len());
+    dst[..n].copy_from_slice(&buf[..n]);
+    // word3 = 0: TCP is connection-oriented, no per-datagram destination.
+    let reply = sock_call(r.endpoint, [OP_SOCK_SEND, socket_id, n as u64, 0])?;
+    map_status(reply.words[0])?;
+    Ok((reply.words[1] as usize).min(n))
+}
+
+/// Receive bytes from a connected (TCP) socket. Requires READ rights. Returns
+/// the number of bytes read (`0` = the peer closed the connection);
+/// `WouldBlock` if connected but no data is pending yet.
+pub fn sys_recv(
+    pid: ProcessId,
+    handle: CapHandle,
+    buf: &mut [u8],
+    syscall_num: u64,
+) -> Result<usize, SockError> {
+    let socket_id = resolve_socket(pid, handle, CapRights::READ)?;
+    let r = router()?;
+    audit(pid, syscall_num, socket_id);
+    let max = buf.len().min(r.region.size as usize);
+    let reply = sock_call(r.endpoint, [OP_SOCK_RECV, socket_id, max as u64, 0])?;
+    map_status(reply.words[0])?;
+    let n = (reply.words[1] as usize).min(max);
+    // SAFETY: kernel-owned region; the synchronous call has completed.
+    let src = unsafe { r.region.as_slice_mut() };
+    buf[..n].copy_from_slice(&src[..n]);
+    Ok(n)
+}
+
 // --- Kernel-internal operations (no capability check) ---
 //
 // These address the net server directly, for the debug shell's `udpsend`. The
@@ -344,4 +415,46 @@ pub fn ksocket_recvfrom(socket_id: u64, buf: &mut [u8]) -> Result<(usize, [u8; 4
 pub fn ksocket_close(socket_id: u64) -> Result<(), SockError> {
     let r = router()?;
     sock_call(r.endpoint, [OP_SOCK_CLOSE, socket_id, 0, 0]).map(|_| ())
+}
+
+/// Create a TCP socket directly, returning its net-server socket id.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_open_tcp() -> Result<u64, SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_OPEN, SOCK_TYPE_TCP, 0, 0])?;
+    map_status(reply.words[0])?;
+    Ok(reply.words[1])
+}
+
+/// Begin a TCP connect on `socket_id` to `(ip, port)` directly (non-blocking).
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_connect(socket_id: u64, ip: [u8; 4], port: u16) -> Result<(), SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_CONNECT, socket_id, pack_ipv4(ip), port as u64])?;
+    map_status(reply.words[0])
+}
+
+/// Stream-send `data` on TCP `socket_id` directly. Returns bytes accepted.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_send(socket_id: u64, data: &[u8]) -> Result<usize, SockError> {
+    let r = router()?;
+    let dst = unsafe { r.region.as_slice_mut() };
+    let n = data.len().min(dst.len());
+    dst[..n].copy_from_slice(&data[..n]);
+    let reply = sock_call(r.endpoint, [OP_SOCK_SEND, socket_id, n as u64, 0])?;
+    map_status(reply.words[0])?;
+    Ok((reply.words[1] as usize).min(n))
+}
+
+/// Stream-receive into `buf` on TCP `socket_id` directly. Returns bytes read.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_recv(socket_id: u64, buf: &mut [u8]) -> Result<usize, SockError> {
+    let r = router()?;
+    let max = buf.len().min(r.region.size as usize);
+    let reply = sock_call(r.endpoint, [OP_SOCK_RECV, socket_id, max as u64, 0])?;
+    map_status(reply.words[0])?;
+    let n = (reply.words[1] as usize).min(max);
+    let src = unsafe { r.region.as_slice_mut() };
+    buf[..n].copy_from_slice(&src[..n]);
+    Ok(n)
 }

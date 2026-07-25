@@ -85,6 +85,7 @@ fn shell_entry() {
             "mkdir" => commands::cmd_mkdir(args),
             "ifconfig" => commands::cmd_ifconfig(args),
             "udpsend" => commands::cmd_udpsend(args),
+            "tcpconnect" => commands::cmd_tcpconnect(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
             }

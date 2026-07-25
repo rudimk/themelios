@@ -63,6 +63,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_dhcp",             func: test_dhcp },
     TestCase { name: "test_socket_capability", func: test_socket_capability },
     TestCase { name: "test_udp_echo",         func: test_udp_echo },
+    TestCase { name: "test_tcp_client",       func: test_tcp_client },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3480,6 +3481,135 @@ fn test_udp_echo() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_udp_echo() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_tcp_client — outbound TCP connect through the socket API (Phase 4.6)
+// ============================================================
+
+/// Test the TCP client path end to end: create a TCP socket, connect out, and
+/// drive the handshake through the net server + smoltcp.
+///
+/// Brings the stack up with DHCP, then drives an outbound TCP connect to
+/// slirp's DNS address (10.0.2.3:53) and probes it, exercising the full client
+/// plumbing: socket create, `connect`, and the non-blocking send/recv state
+/// machine routed through the kernel router and the ring-3 net server.
+///
+/// The **hard assertions** are that every socket call returns a *sensible* result
+/// (never a plumbing error) and drives the smoltcp state machine — connect is
+/// accepted, and the send probe returns `WouldBlock` while the handshake is in
+/// flight. The connection *outcome* is best-effort: slirp has no general TCP
+/// listener and its DNS proxy does not answer TCP SYNs, so establishment /
+/// refusal / a silently-dropped SYN are all acceptable (a deterministic TCP
+/// round-trip against a real listener lands with the server path in 4.7). The
+/// probe budget is bounded so a dropped SYN cannot hang the test.
+#[cfg(target_arch = "x86_64")]
+fn test_tcp_client() -> Result<(), &'static str> {
+    use crate::net::socket::SockError;
+    use crate::net::{net_service, socket};
+    use crate::sched;
+
+    let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-tcp")?;
+
+    // Wait for DHCP so the interface has an address and default route.
+    let mut configured = false;
+    for _ in 0..300_000 {
+        if net_service::status().config.configured {
+            configured = true;
+            break;
+        }
+        sched::yield_now();
+    }
+    if !configured {
+        return Err("DHCP did not configure before the TCP test");
+    }
+
+    // Create a TCP socket and begin connecting to slirp's DNS address over TCP.
+    let id = socket::ksocket_open_tcp().map_err(|_| "ksocket_open_tcp failed")?;
+    socket::ksocket_connect(id, [10, 0, 2, 3], 53).map_err(|_| "ksocket_connect failed")?;
+
+    // Probe the connection with a small bounded budget. Each probe is a full IPC
+    // round-trip to the net server, so the budget is kept modest — it is ample
+    // for a real handshake to complete (a few round-trips) while a silently
+    // dropped SYN just exhausts it quickly. Every reply must be one of the
+    // expected outcomes: a plumbing error fails the test; `WouldBlock` (handshake
+    // in flight) is expected and required at least once.
+    let mut established = false;
+    let mut refused = false;
+    let mut saw_wouldblock = false;
+    for _ in 0..2_000 {
+        match socket::ksocket_send(id, &[]) {
+            Ok(_) => {
+                established = true;
+                break;
+            }
+            Err(SockError::WouldBlock) => {
+                saw_wouldblock = true;
+                sched::yield_now();
+            }
+            Err(SockError::ConnectionRefused) => {
+                refused = true;
+                break;
+            }
+            Err(_) => {
+                let _ = socket::ksocket_close(id);
+                return Err("TCP send probe returned an unexpected error (bad plumbing)");
+            }
+        }
+    }
+
+    if established {
+        // Established — attempt a best-effort DNS-over-TCP round-trip.
+        let query = build_dns_query();
+        let mut framed = [0u8; 31];
+        framed[0..2].copy_from_slice(&(query.len() as u16).to_be_bytes());
+        framed[2..].copy_from_slice(&query);
+        let mut sent = 0usize;
+        for _ in 0..2_000 {
+            match socket::ksocket_send(id, &framed[sent..]) {
+                Ok(n) => {
+                    sent += n;
+                    if sent >= framed.len() {
+                        break;
+                    }
+                }
+                Err(SockError::WouldBlock) => sched::yield_now(),
+                Err(_) => break,
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut got = 0usize;
+        for _ in 0..2_000 {
+            match socket::ksocket_recv(id, &mut buf) {
+                Ok(n) if n > 0 => {
+                    got = n;
+                    break;
+                }
+                Ok(_) => break,
+                Err(SockError::WouldBlock) => sched::yield_now(),
+                Err(_) => break,
+            }
+        }
+        crate::println!("  [test_tcp_client] TCP established to 10.0.2.3:53; reply {} bytes", got);
+    } else if refused {
+        crate::println!("  [test_tcp_client] slirp refused TCP :53; client path + refusal detection OK");
+    } else {
+        // The send probe must have exercised the non-blocking path at least once.
+        if !saw_wouldblock {
+            let _ = socket::ksocket_close(id);
+            return Err("TCP send probe never returned WouldBlock (state machine not advancing)");
+        }
+        crate::println!("  [test_tcp_client] no TCP listener at 10.0.2.3:53 (SYN dropped); client plumbing OK");
+    }
+
+    let _ = socket::ksocket_close(id);
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_tcp_client() -> Result<(), &'static str> {
     Ok(())
 }
 

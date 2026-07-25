@@ -28,13 +28,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use libthemelios::net_proto::{
-    pack_ip_port, pack_ipv4, unpack_ip_port, MSG_CONFIG, OP_SOCK_BIND, OP_SOCK_CLOSE, OP_SOCK_OPEN,
-    OP_SOCK_RECV, OP_SOCK_SEND, SOCKET_REGION_BYTES, SOCKET_REGION_VADDR, SOCK_ERR, SOCK_OK,
-    SOCK_TYPE_UDP, SOCK_WOULDBLOCK,
+    pack_ip_port, pack_ipv4, unpack_ip_port, MSG_CONFIG, OP_SOCK_BIND, OP_SOCK_CLOSE,
+    OP_SOCK_CONNECT, OP_SOCK_OPEN, OP_SOCK_RECV, OP_SOCK_SEND, SOCKET_REGION_BYTES,
+    SOCKET_REGION_VADDR, SOCK_ERR, SOCK_OK, SOCK_REFUSED, SOCK_TYPE_TCP, SOCK_TYPE_UDP,
+    SOCK_WOULDBLOCK,
 };
 use libthemelios::{boot_info, ipc, syscall, IpcMessage};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{dhcpv4, udp};
+use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
@@ -112,7 +113,7 @@ pub extern "C" fn server_main() -> ! {
     // request endpoint; `socket_table` maps a kernel-facing socket id to the
     // smoltcp socket handle, and `next_socket_id` hands out fresh ids.
     let socket_ep = info.fs_endpoint;
-    let mut socket_table: Vec<(u64, SocketHandle)> = Vec::new();
+    let mut socket_table: Vec<SockEntry> = Vec::new();
     let mut next_socket_id: u64 = 0;
 
     // A DHCP socket is added only in DHCP mode. In static mode the interface is
@@ -140,7 +141,14 @@ pub extern "C" fn server_main() -> ! {
         // so the poll loop keeps running). One per iteration is enough — requests
         // drain over successive iterations, interleaved with smoltcp polling.
         if let Some(req) = syscall::try_receive(socket_ep) {
-            serve_socket(&mut sockets, &mut socket_table, &mut next_socket_id, socket_ep, req);
+            serve_socket(
+                &mut iface,
+                &mut sockets,
+                &mut socket_table,
+                &mut next_socket_id,
+                socket_ep,
+                req,
+            );
         }
 
         // Drive smoltcp: process any received frames, run timers, emit output.
@@ -229,9 +237,26 @@ fn report_deconfig(service_ep: u64) {
 // hand back on OP_SOCK_OPEN; datagram bytes travel through the shared socket
 // region the kernel maps at SOCKET_REGION_VADDR.
 
-/// Per-socket buffer sizes: a handful of datagrams each way.
+/// Per-socket UDP buffer sizes: a handful of datagrams each way.
 const UDP_META_SLOTS: usize = 8;
 const UDP_PAYLOAD_BYTES: usize = 8 * 1024;
+/// Per-socket TCP stream buffer sizes (RX/TX windows).
+const TCP_BUFFER_BYTES: usize = 16 * 1024;
+
+/// What transport a kernel-facing socket id is backed by.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SockKind {
+    Udp,
+    Tcp,
+}
+
+/// A socket in the net server's table: its kernel-facing id, the smoltcp handle,
+/// and its kind.
+struct SockEntry {
+    id: u64,
+    handle: SocketHandle,
+    kind: SockKind,
+}
 
 /// Build a fresh UDP socket with heap-owned RX/TX ring buffers (so it is `'static`).
 fn make_udp_socket() -> udp::Socket<'static> {
@@ -246,6 +271,13 @@ fn make_udp_socket() -> udp::Socket<'static> {
     udp::Socket::new(rx, tx)
 }
 
+/// Build a fresh TCP socket with heap-owned RX/TX stream buffers.
+fn make_tcp_socket() -> tcp::Socket<'static> {
+    let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
+    tcp::Socket::new(rx, tx)
+}
+
 /// The shared socket payload region the kernel mapped at `SOCKET_REGION_VADDR`.
 ///
 /// # Safety
@@ -256,9 +288,9 @@ unsafe fn socket_region() -> &'static mut [u8] {
     core::slice::from_raw_parts_mut(SOCKET_REGION_VADDR as *mut u8, SOCKET_REGION_BYTES)
 }
 
-/// Look up the smoltcp handle for a kernel-facing socket id.
-fn find_socket(table: &[(u64, SocketHandle)], id: u64) -> Option<SocketHandle> {
-    table.iter().find(|(sid, _)| *sid == id).map(|(_, h)| *h)
+/// Look up a socket entry (handle + kind) by kernel-facing id.
+fn find_entry(table: &[SockEntry], id: u64) -> Option<(SocketHandle, SockKind)> {
+    table.iter().find(|e| e.id == id).map(|e| (e.handle, e.kind))
 }
 
 /// Split a smoltcp `IpEndpoint` into `([a,b,c,d], port)` (0.0.0.0 for non-IPv4).
@@ -268,10 +300,19 @@ fn endpoint_octets(ep: IpEndpoint) -> ([u8; 4], u16) {
     }
 }
 
-/// Handle one OP_SOCK_* request and reply to the kernel router.
+/// A deterministic ephemeral local port for a TCP connect, derived from the
+/// socket id (avoids threading a separate counter; collisions are unlikely
+/// within the small socket space this server serves).
+fn ephemeral_port(socket_id: u64) -> u16 {
+    49152u16.wrapping_add((socket_id % 16000) as u16)
+}
+
+/// Handle one OP_SOCK_* request and reply to the kernel router. `iface` is
+/// needed for the TCP connect handshake (`iface.context()`).
 fn serve_socket(
+    iface: &mut Interface,
     sockets: &mut SocketSet<'static>,
-    table: &mut Vec<(u64, SocketHandle)>,
+    table: &mut Vec<SockEntry>,
     next_id: &mut u64,
     ep: u64,
     req: IpcMessage,
@@ -283,36 +324,56 @@ fn serve_socket(
 
     match req.words[0] {
         OP_SOCK_OPEN => {
-            if req.words[1] != SOCK_TYPE_UDP {
-                reply([SOCK_ERR, 0, 0, 0]);
-                return;
-            }
-            let handle = sockets.add(make_udp_socket());
+            let (handle, kind) = match req.words[1] {
+                SOCK_TYPE_UDP => (sockets.add(make_udp_socket()), SockKind::Udp),
+                SOCK_TYPE_TCP => (sockets.add(make_tcp_socket()), SockKind::Tcp),
+                _ => {
+                    reply([SOCK_ERR, 0, 0, 0]);
+                    return;
+                }
+            };
             let id = *next_id;
             *next_id += 1;
-            table.push((id, handle));
+            table.push(SockEntry { id, handle, kind });
             reply([SOCK_OK, id, 0, 0]);
         }
         OP_SOCK_BIND => {
             let id = req.words[1];
             let port = req.words[3] as u16;
-            match find_socket(table, id) {
-                Some(h) => {
-                    let s = sockets.get_mut::<udp::Socket>(h);
-                    match s.bind(port) {
+            match find_entry(table, id) {
+                // UDP: bind to the local port. TCP: bind is only meaningful for a
+                // future listen (Phase 4.7); accept it as a no-op for now.
+                Some((h, SockKind::Udp)) => match sockets.get_mut::<udp::Socket>(h).bind(port) {
+                    Ok(()) => reply([SOCK_OK, 0, 0, 0]),
+                    Err(_) => reply([SOCK_ERR, 0, 0, 0]),
+                },
+                Some((_, SockKind::Tcp)) => reply([SOCK_OK, 0, 0, 0]),
+                None => reply([SOCK_ERR, 0, 0, 0]),
+            }
+        }
+        OP_SOCK_CONNECT => {
+            let id = req.words[1];
+            let (ip, port) = (unpack_ipv4_word(req.words[2]), req.words[3] as u16);
+            match find_entry(table, id) {
+                Some((h, SockKind::Tcp)) => {
+                    let remote = IpEndpoint::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port);
+                    let local = ephemeral_port(id);
+                    let s = sockets.get_mut::<tcp::Socket>(h);
+                    match s.connect(iface.context(), remote, local) {
                         Ok(()) => reply([SOCK_OK, 0, 0, 0]),
                         Err(_) => reply([SOCK_ERR, 0, 0, 0]),
                     }
                 }
-                None => reply([SOCK_ERR, 0, 0, 0]),
+                // connect() is TCP-only.
+                _ => reply([SOCK_ERR, 0, 0, 0]),
             }
         }
         OP_SOCK_SEND => {
             let id = req.words[1];
             let len = (req.words[2] as usize).min(SOCKET_REGION_BYTES);
-            let (ip, port) = unpack_ip_port(req.words[3]);
-            match find_socket(table, id) {
-                Some(h) => {
+            match find_entry(table, id) {
+                Some((h, SockKind::Udp)) => {
+                    let (ip, port) = unpack_ip_port(req.words[3]);
                     let dest = IpEndpoint::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port);
                     // SAFETY: see socket_region; the slice is used only here.
                     let region = unsafe { socket_region() };
@@ -324,14 +385,39 @@ fn serve_socket(
                         Err(_) => reply([SOCK_ERR, 0, 0, 0]),
                     }
                 }
+                Some((h, SockKind::Tcp)) => {
+                    let s = sockets.get_mut::<tcp::Socket>(h);
+                    // A zero-length send doubles as a connection-state probe:
+                    // WouldBlock while connecting, OK once established, Refused on
+                    // reset. Otherwise it's a stream send bounded by the TX window.
+                    match tcp_phase(s) {
+                        TcpPhase::Connecting => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                        TcpPhase::Refused => reply([SOCK_REFUSED, 0, 0, 0]),
+                        TcpPhase::Ready => {
+                            if len == 0 {
+                                reply([SOCK_OK, 0, 0, 0]);
+                            } else if s.can_send() {
+                                // SAFETY: see socket_region.
+                                let region = unsafe { socket_region() };
+                                match s.send_slice(&region[..len]) {
+                                    Ok(n) => reply([SOCK_OK, n as u64, 0, 0]),
+                                    Err(_) => reply([SOCK_REFUSED, 0, 0, 0]),
+                                }
+                            } else {
+                                // TX window full — retry later.
+                                reply([SOCK_WOULDBLOCK, 0, 0, 0]);
+                            }
+                        }
+                    }
+                }
                 None => reply([SOCK_ERR, 0, 0, 0]),
             }
         }
         OP_SOCK_RECV => {
             let id = req.words[1];
             let max = (req.words[2] as usize).min(SOCKET_REGION_BYTES);
-            match find_socket(table, id) {
-                Some(h) => {
+            match find_entry(table, id) {
+                Some((h, SockKind::Udp)) => {
                     // SAFETY: see socket_region; the slice is used only here.
                     let region = unsafe { socket_region() };
                     let s = sockets.get_mut::<udp::Socket>(h);
@@ -340,8 +426,31 @@ fn serve_socket(
                             let (ip, port) = endpoint_octets(meta.endpoint);
                             reply([SOCK_OK, n as u64, pack_ip_port(ip, port), 0]);
                         }
-                        // Exhausted (nothing pending) or truncated → WouldBlock.
                         Err(_) => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                    }
+                }
+                Some((h, SockKind::Tcp)) => {
+                    let s = sockets.get_mut::<tcp::Socket>(h);
+                    match tcp_phase(s) {
+                        TcpPhase::Connecting => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                        TcpPhase::Refused => reply([SOCK_REFUSED, 0, 0, 0]),
+                        TcpPhase::Ready => {
+                            if s.can_recv() {
+                                // SAFETY: see socket_region.
+                                let region = unsafe { socket_region() };
+                                match s.recv_slice(&mut region[..max]) {
+                                    // No peer address on a stream recv (word2 = 0).
+                                    Ok(n) => reply([SOCK_OK, n as u64, 0, 0]),
+                                    Err(_) => reply([SOCK_REFUSED, 0, 0, 0]),
+                                }
+                            } else if s.may_recv() {
+                                // Connected, no data yet — retry later.
+                                reply([SOCK_WOULDBLOCK, 0, 0, 0]);
+                            } else {
+                                // Peer closed and the buffer is drained → EOF.
+                                reply([SOCK_OK, 0, 0, 0]);
+                            }
+                        }
                     }
                 }
                 None => reply([SOCK_ERR, 0, 0, 0]),
@@ -349,10 +458,15 @@ fn serve_socket(
         }
         OP_SOCK_CLOSE => {
             let id = req.words[1];
-            match table.iter().position(|(sid, _)| *sid == id) {
+            match table.iter().position(|e| e.id == id) {
                 Some(pos) => {
-                    let (_, h) = table.remove(pos);
-                    sockets.remove(h);
+                    let entry = table.remove(pos);
+                    if entry.kind == SockKind::Tcp {
+                        // Send a FIN so the peer sees a clean close before we drop
+                        // the socket on the next poll.
+                        sockets.get_mut::<tcp::Socket>(entry.handle).close();
+                    }
+                    sockets.remove(entry.handle);
                     reply([SOCK_OK, 0, 0, 0]);
                 }
                 None => reply([SOCK_ERR, 0, 0, 0]),
@@ -360,4 +474,33 @@ fn serve_socket(
         }
         _ => reply([SOCK_ERR, 0, 0, 0]),
     }
+}
+
+/// The client-visible phase of a TCP socket, derived from its smoltcp state.
+enum TcpPhase {
+    /// Handshake in progress (SYN sent / received) — the caller should retry.
+    Connecting,
+    /// Established (or half-closed) — send/recv are meaningful.
+    Ready,
+    /// The connection was refused/reset or is fully closed.
+    Refused,
+}
+
+/// Classify a TCP socket into a client-visible [`TcpPhase`].
+fn tcp_phase(s: &tcp::Socket) -> TcpPhase {
+    use tcp::State::*;
+    match s.state() {
+        SynSent | SynReceived => TcpPhase::Connecting,
+        Established | FinWait1 | FinWait2 | CloseWait | Closing | LastAck | TimeWait => {
+            TcpPhase::Ready
+        }
+        // Closed / Listen: no active connection. For a client that has called
+        // connect(), reaching Closed means the peer refused or reset it.
+        Closed | Listen => TcpPhase::Refused,
+    }
+}
+
+/// Unpack a bare packed-IPv4 word (as sent by OP_SOCK_CONNECT `word2`) to octets.
+fn unpack_ipv4_word(w: u64) -> [u8; 4] {
+    [(w >> 24) as u8, (w >> 16) as u8, (w >> 8) as u8, w as u8]
 }

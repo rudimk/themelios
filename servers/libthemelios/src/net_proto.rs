@@ -56,8 +56,27 @@ pub const OP_SOCK_RECV: u64 = 13;
 /// Close a socket. `[OP_SOCK_CLOSE, socket_id, 0, 0]` → `[status]`.
 pub const OP_SOCK_CLOSE: u64 = 14;
 
-/// Socket type: UDP datagram socket (the only type in Phase 4.5).
+// TCP-specific opcodes (Phase 4.6). Stream send/recv reuse OP_SOCK_SEND /
+// OP_SOCK_RECV — the net server dispatches by the socket's kind, and for a TCP
+// socket ignores the peer-address word on send and reports none on recv.
+
+/// Begin an outbound TCP connection. `[OP_SOCK_CONNECT, socket_id, ip, port]` →
+/// `[status]`. Non-blocking: the handshake completes asynchronously; subsequent
+/// send/recv return `SOCK_WOULDBLOCK` until the connection is established, or
+/// `SOCK_REFUSED` if it was refused/reset.
+pub const OP_SOCK_CONNECT: u64 = 15;
+/// Listen for inbound TCP connections on the socket's bound port.
+/// `[OP_SOCK_LISTEN, socket_id, backlog, 0]` → `[status]`.
+pub const OP_SOCK_LISTEN: u64 = 16;
+/// Accept one established inbound connection. `[OP_SOCK_ACCEPT, socket_id, 0, 0]`
+/// → `[status, new_socket_id, (peer_ip << 16) | peer_port]`. Returns
+/// `SOCK_WOULDBLOCK` if no connection is pending.
+pub const OP_SOCK_ACCEPT: u64 = 17;
+
+/// Socket type: UDP datagram socket.
 pub const SOCK_TYPE_UDP: u64 = 0;
+/// Socket type: TCP stream socket (Phase 4.6).
+pub const SOCK_TYPE_TCP: u64 = 1;
 
 /// Socket reply status (`word0` of an `OP_SOCK_*` reply): success.
 pub const SOCK_OK: u64 = 0;
@@ -67,6 +86,10 @@ pub const SOCK_OK: u64 = 0;
 pub const SOCK_WOULDBLOCK: u64 = 1;
 /// Socket reply status: a hard error (bad socket id, bind failure, no room).
 pub const SOCK_ERR: u64 = 2;
+/// Socket reply status: a TCP connection was refused or reset by the peer
+/// (Phase 4.6). Distinct from `SOCK_ERR` so the client sees a connection error
+/// rather than a generic failure or a hang.
+pub const SOCK_REFUSED: u64 = 3;
 
 /// Fixed virtual address where the kernel maps the shared **socket payload
 /// region** into the net server (mirrors `SERVER_SOCKET_VIRT` in the kernel's
