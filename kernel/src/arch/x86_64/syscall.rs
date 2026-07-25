@@ -683,6 +683,11 @@ fn user_range_ok(uptr: u64, len: usize) -> bool {
 
 /// Copy `len` bytes from a validated user pointer into a kernel `Vec`.
 fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    // A zero-length transfer touches no memory — never dereference the pointer
+    // (which may be null): `from_raw_parts(null, 0)` is UB even for len 0.
+    if len == 0 {
+        return Some(alloc::vec::Vec::new());
+    }
     if len > FS_MAX_XFER || !user_range_ok(uptr, len) {
         return None;
     }
@@ -694,6 +699,10 @@ fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
 
 /// Copy `data` to a validated user pointer. Returns false if the range is bad.
 fn copy_to_user(uptr: u64, data: &[u8]) -> bool {
+    // Nothing to copy → success without dereferencing a possibly-null pointer.
+    if data.is_empty() {
+        return true;
+    }
     if !user_range_ok(uptr, data.len()) {
         return false;
     }
@@ -939,16 +948,21 @@ fn dispatch_socket_syscall(frame: &mut SyscallFrame) {
             // RDI = listening socket cap, RSI = peer-out ptr (8 bytes, 0 to skip).
             let handle = CapHandle::from_raw(frame.rdi as u32);
             let peer_ptr = frame.rsi;
+            // Validate the peer buffer BEFORE accepting: sys_accept promotes the
+            // connection and mints its capability, so a copy failure afterwards
+            // would orphan a live connection the caller never learns the handle of.
+            if peer_ptr != 0 && !user_range_ok(peer_ptr, 8) {
+                frame.rax = bad_arg;
+                return;
+            }
             match socket::sys_accept(pid, handle, num) {
                 Ok((conn_handle, ip, port)) => {
                     if peer_ptr != 0 {
                         let mut out = [0u8; 8];
                         out[0..4].copy_from_slice(&ip);
                         out[4..6].copy_from_slice(&port.to_le_bytes());
-                        if !copy_to_user(peer_ptr, &out) {
-                            frame.rax = bad_arg;
-                            return;
-                        }
+                        // Range already validated above, so this write succeeds.
+                        copy_to_user(peer_ptr, &out);
                     }
                     frame.rax = conn_handle as u64;
                 }

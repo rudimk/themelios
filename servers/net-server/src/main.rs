@@ -378,8 +378,11 @@ fn serve_socket(
             // If the listener socket has an established connection, hand it back as
             // a new socket id and re-arm the listener with a fresh LISTEN socket.
             let id = req.words[1];
+            // Only a bound listener (local_port != 0) may be accepted on — this
+            // rejects `accept` on a connected/outbound socket (local_port == 0),
+            // which would otherwise re-arm a bogus listener on port 0.
             let idx = match table.iter().position(|e| e.id == id) {
-                Some(i) if table[i].kind == SockKind::Tcp => i,
+                Some(i) if table[i].kind == SockKind::Tcp && table[i].local_port != 0 => i,
                 _ => {
                     reply([SOCK_ERR, 0, 0, 0]);
                     return;
