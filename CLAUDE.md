@@ -141,7 +141,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
 | **2** | Capability system, process isolation, IPC, audit logging | Complete |
 | **3** | VirtIO block driver, read-only FS, ephemeral layers | Complete |
-| **4** | VirtIO net driver, TCP/IP stack | In progress |
+| **4** | VirtIO net driver, TCP/IP stack | Complete |
 | **5** | OCI containers, Linux syscall compat, exec, registries | Not started |
 | **6** | Docker-compatible management API | Not started |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Not started |
@@ -158,14 +158,15 @@ line when finishing a sub-phase. Detailed per-sub-phase checklists live in
 `.sisyphus/plans/` (local, gitignored); the git commit history has the full
 narrative per commit._
 
-**Active: Phase 4 — Networking (in progress).** Design: the TCP/IP stack runs in
+**Phase 4 — Networking: COMPLETE.** Design: the TCP/IP stack runs in
 a ring-3 **net server** on **smoltcp**; a thin VirtIO-net driver stays in the
 kernel; frames cross via a **pull-based** IPC bridge (net server always initiates,
 kernel replies). amd64 is the run/test target; arm64-ready by design (smoltcp
-compiles for both). `main` is green — keep it that way. The suite is now
-reliably green (10/10 soak runs); the long-standing intermittent double-fault /
-IPC-race flakiness was root-caused and fixed (see the notes at the end of this
-section). Still, `cargo xtask test` before pushing.
+compiles for both — enforced by a CI compile gate). `main` is green — keep it
+that way. The suite is reliably green (35 tests); the long-standing intermittent
+double-fault / IPC-race flakiness was root-caused and fixed (see the notes at the
+end of this section). Still, `cargo xtask test` before pushing. **Next up: Phase 5
+(OCI containers, Linux syscall compat).**
 
 - ✅ **4.0** VirtIO-net driver + `NetDevice` trait
 - ✅ **4.1** Kernel net service (pull-based frame bridge, `SYS_UPTIME_MS`)
@@ -198,11 +199,22 @@ section). Still, `cargo xtask test` before pushing.
   xtask host thread connects via QEMU `hostfwd` (127.0.0.1:15007 → guest :7), guest
   accepts + echoes. **34 tests, reliably green.** (`test_tcp_server` runs before the
   other persistent net-server tests so it is the sole NIC drainer.)
-- ⬜ **4.7** **← NEXT:** shell (`sockets` list, `ping`), boot integration (bring the
-  net stack up at boot outside test mode), remaining tests, mdbook network doc.
+- ✅ **4.7** Shell + boot integration + tests + arm64 gate + docs — **Phase 4 done**.
+  `sockets` (lists the net server's socket table via a new `OP_SOCK_LIST`) and
+  `ping` (a new ICMP echo socket: `SOCK_TYPE_ICMP` + `OP_SOCK_PING`; best-effort
+  round-trip since slirp's ICMP proxy may lack host privileges). Boot integration
+  was already in place (`net::boot_net` brings the NIC + service + net server up
+  with DHCP in non-test mode). `test_socket_list` (deterministic: opens a UDP/TCP/
+  ICMP socket, verifies the listing, emits an echo request) added — **35 tests,
+  reliably green**. arm64 dependency gate wired into CI (`cargo xtask arm64-gate`
+  compiles the `servers/smoltcp-gate` crate — smoltcp with the net server's exact
+  feature set — for `aarch64-unknown-none`). mdbook `networking.md` written.
+  Deferred (documented): interrupt-driven RX, a DNS resolver, socket readiness
+  wait/wake, per-client payload regions, and a dedicated net-server crash-isolation
+  test (ring-3 containment is structural and exercised implicitly).
 
-Per-milestone branches now: 4.6 lives on `claude/phase-4.6-tcp-sockets` (fresh PR),
-cut from `main` after the 4.4/4.5 PR merged.
+Per-milestone branches: 4.7 lives on `claude/phase-4.7-net-integration` (fresh PR),
+cut from `main` after the 4.6 PR (#2) merged.
 
 Notable — three long-standing concurrency bugs in the syscall/IPC core were
 root-caused and fixed during Phase 4.5 (they grew from rare to majority-of-runs

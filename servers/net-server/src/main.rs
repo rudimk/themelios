@@ -29,16 +29,21 @@ use alloc::vec::Vec;
 
 use libthemelios::net_proto::{
     pack_ip_port, pack_ipv4, unpack_ip_port, MSG_CONFIG, OP_SOCK_ACCEPT, OP_SOCK_BIND,
-    OP_SOCK_CLOSE, OP_SOCK_CONNECT, OP_SOCK_LISTEN, OP_SOCK_OPEN, OP_SOCK_RECV, OP_SOCK_SEND,
-    SOCKET_REGION_BYTES, SOCKET_REGION_VADDR, SOCK_ERR, SOCK_OK, SOCK_REFUSED, SOCK_TYPE_TCP,
-    SOCK_TYPE_UDP, SOCK_WOULDBLOCK,
+    OP_SOCK_CLOSE, OP_SOCK_CONNECT, OP_SOCK_LIST, OP_SOCK_LISTEN, OP_SOCK_OPEN, OP_SOCK_PING,
+    OP_SOCK_RECV, OP_SOCK_SEND, SLK_ICMP, SLK_TCP, SLK_UDP, SLS_ICMP, SLS_TCP_CLOSED,
+    SLS_TCP_CLOSE_WAIT, SLS_TCP_CLOSING, SLS_TCP_ESTABLISHED, SLS_TCP_FIN_WAIT1, SLS_TCP_FIN_WAIT2,
+    SLS_TCP_LAST_ACK, SLS_TCP_LISTEN, SLS_TCP_SYN_RECEIVED, SLS_TCP_SYN_SENT, SLS_TCP_TIME_WAIT,
+    SLS_UDP, SOCKET_REGION_BYTES, SOCKET_REGION_VADDR, SOCK_ERR, SOCK_LIST_ENTRY_BYTES, SOCK_OK,
+    SOCK_REFUSED, SOCK_TYPE_ICMP, SOCK_TYPE_TCP, SOCK_TYPE_UDP, SOCK_WOULDBLOCK,
 };
 use libthemelios::{boot_info, ipc, syscall, IpcMessage};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{dhcpv4, tcp, udp};
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::socket::{dhcpv4, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
+    Ipv4Address,
 };
 
 use device::IpcDevice;
@@ -243,11 +248,25 @@ const UDP_PAYLOAD_BYTES: usize = 8 * 1024;
 /// Per-socket TCP stream buffer sizes (RX/TX windows).
 const TCP_BUFFER_BYTES: usize = 16 * 1024;
 
+/// Per-socket ICMP buffer sizes: a few echo packets each way.
+const ICMP_META_SLOTS: usize = 8;
+const ICMP_PAYLOAD_BYTES: usize = 4 * 1024;
+
+/// Fixed ICMP echo-request payload (the classic monotonic byte pattern). The
+/// exact bytes do not matter — a correct echo reply returns them verbatim, which
+/// smoltcp checks implicitly via the ICMP checksum.
+const PING_PAYLOAD: [u8; 32] = [
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+];
+
 /// What transport a kernel-facing socket id is backed by.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SockKind {
     Udp,
     Tcp,
+    /// An ICMP echo socket (backs `ping`), bound to an identifier.
+    Icmp,
 }
 
 /// A socket in the net server's table: its kernel-facing id, the smoltcp handle,
@@ -279,6 +298,27 @@ fn make_tcp_socket() -> tcp::Socket<'static> {
     let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
     let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]);
     tcp::Socket::new(rx, tx)
+}
+
+/// Build a fresh ICMP socket with heap-owned RX/TX packet buffers.
+fn make_icmp_socket() -> icmp::Socket<'static> {
+    let rx = icmp::PacketBuffer::new(
+        vec![icmp::PacketMetadata::EMPTY; ICMP_META_SLOTS],
+        vec![0u8; ICMP_PAYLOAD_BYTES],
+    );
+    let tx = icmp::PacketBuffer::new(
+        vec![icmp::PacketMetadata::EMPTY; ICMP_META_SLOTS],
+        vec![0u8; ICMP_PAYLOAD_BYTES],
+    );
+    icmp::Socket::new(rx, tx)
+}
+
+/// An ICMP identifier derived from a kernel-facing socket id. Echo replies carry
+/// the identifier of the request, and the ICMP socket is bound to it so smoltcp
+/// routes matching replies back to this socket. Kept in the low 16 bits — the
+/// small socket space this server serves makes collisions negligible.
+fn icmp_ident(socket_id: u64) -> u16 {
+    socket_id as u16
 }
 
 /// The shared socket payload region the kernel mapped at `SOCKET_REGION_VADDR`.
@@ -327,17 +367,34 @@ fn serve_socket(
 
     match req.words[0] {
         OP_SOCK_OPEN => {
-            let (handle, kind) = match req.words[1] {
-                SOCK_TYPE_UDP => (sockets.add(make_udp_socket()), SockKind::Udp),
-                SOCK_TYPE_TCP => (sockets.add(make_tcp_socket()), SockKind::Tcp),
+            let id = *next_id;
+            let (handle, kind, local_port) = match req.words[1] {
+                SOCK_TYPE_UDP => (sockets.add(make_udp_socket()), SockKind::Udp, 0),
+                SOCK_TYPE_TCP => (sockets.add(make_tcp_socket()), SockKind::Tcp, 0),
+                SOCK_TYPE_ICMP => {
+                    // An ICMP socket is usable only once bound to an identifier
+                    // (so echo replies route back to it), so bind it here at open
+                    // time. `local_port` records the identifier for the listing.
+                    let ident = icmp_ident(id);
+                    let handle = sockets.add(make_icmp_socket());
+                    if sockets
+                        .get_mut::<icmp::Socket>(handle)
+                        .bind(icmp::Endpoint::Ident(ident))
+                        .is_err()
+                    {
+                        sockets.remove(handle);
+                        reply([SOCK_ERR, 0, 0, 0]);
+                        return;
+                    }
+                    (handle, SockKind::Icmp, ident)
+                }
                 _ => {
                     reply([SOCK_ERR, 0, 0, 0]);
                     return;
                 }
             };
-            let id = *next_id;
             *next_id += 1;
-            table.push(SockEntry { id, handle, kind, local_port: 0 });
+            table.push(SockEntry { id, handle, kind, local_port });
             reply([SOCK_OK, id, 0, 0]);
         }
         OP_SOCK_BIND => {
@@ -345,10 +402,14 @@ fn serve_socket(
             let port = req.words[3] as u16;
             match table.iter().position(|e| e.id == id) {
                 Some(i) => match table[i].kind {
-                    // UDP: bind to the local port now.
+                    // UDP: bind to the local port now (and record it for the
+                    // `sockets` listing).
                     SockKind::Udp => match sockets.get_mut::<udp::Socket>(table[i].handle).bind(port)
                     {
-                        Ok(()) => reply([SOCK_OK, 0, 0, 0]),
+                        Ok(()) => {
+                            table[i].local_port = port;
+                            reply([SOCK_OK, 0, 0, 0]);
+                        }
                         Err(_) => reply([SOCK_ERR, 0, 0, 0]),
                     },
                     // TCP: record the port; `listen` consumes it.
@@ -356,6 +417,8 @@ fn serve_socket(
                         table[i].local_port = port;
                         reply([SOCK_OK, 0, 0, 0]);
                     }
+                    // ICMP has no bind (it is bound to an identifier at open).
+                    SockKind::Icmp => reply([SOCK_ERR, 0, 0, 0]),
                 },
                 None => reply([SOCK_ERR, 0, 0, 0]),
             }
@@ -483,6 +546,8 @@ fn serve_socket(
                         }
                     }
                 }
+                // ICMP sockets send via OP_SOCK_PING, not the byte-stream path.
+                Some((_, SockKind::Icmp)) => reply([SOCK_ERR, 0, 0, 0]),
                 None => reply([SOCK_ERR, 0, 0, 0]),
             }
         }
@@ -526,8 +591,101 @@ fn serve_socket(
                         }
                     }
                 }
+                Some((h, SockKind::Icmp)) => {
+                    // Deliver the next buffered ICMP echo reply, if any. We report
+                    // the sequence number (word1) and source address (word2) — the
+                    // ping data itself stays in the server (a correct reply echoes
+                    // our payload, which smoltcp validates via the ICMP checksum).
+                    let s = sockets.get_mut::<icmp::Socket>(h);
+                    if !s.can_recv() {
+                        reply([SOCK_WOULDBLOCK, 0, 0, 0]);
+                        return;
+                    }
+                    match s.recv() {
+                        Ok((payload, src)) => {
+                            let caps = ChecksumCapabilities::default();
+                            let parsed = Icmpv4Packet::new_checked(payload)
+                                .ok()
+                                .and_then(|p| Icmpv4Repr::parse(&p, &caps).ok());
+                            match parsed {
+                                Some(Icmpv4Repr::EchoReply { seq_no, .. }) => {
+                                    let src_octets = match src {
+                                        IpAddress::Ipv4(a) => a.octets(),
+                                    };
+                                    reply([SOCK_OK, seq_no as u64, pack_ip_port(src_octets, 0), 0]);
+                                }
+                                // Some other ICMP message (unreachable, etc.) —
+                                // not an echo reply, so nothing pending for ping.
+                                _ => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                            }
+                        }
+                        Err(_) => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                    }
+                }
                 None => reply([SOCK_ERR, 0, 0, 0]),
             }
+        }
+        OP_SOCK_PING => {
+            // Emit one ICMPv4 echo request from an ICMP socket. word2 = dest IP
+            // (bare packed IPv4), word3 = sequence number.
+            let id = req.words[1];
+            let dest = unpack_ipv4_word(req.words[2]);
+            let seq_no = req.words[3] as u16;
+            match table.iter().find(|e| e.id == id) {
+                Some(e) if e.kind == SockKind::Icmp => {
+                    let ident = e.local_port; // the identifier we bound at open
+                    let handle = e.handle;
+                    let dest_addr = IpAddress::v4(dest[0], dest[1], dest[2], dest[3]);
+                    let caps = ChecksumCapabilities::default();
+                    let repr = Icmpv4Repr::EchoRequest {
+                        ident,
+                        seq_no,
+                        data: &PING_PAYLOAD,
+                    };
+                    let s = sockets.get_mut::<icmp::Socket>(handle);
+                    if !s.can_send() {
+                        reply([SOCK_WOULDBLOCK, 0, 0, 0]);
+                        return;
+                    }
+                    match s.send(repr.buffer_len(), dest_addr) {
+                        Ok(buf) => {
+                            let mut packet = Icmpv4Packet::new_unchecked(buf);
+                            repr.emit(&mut packet, &caps);
+                            reply([SOCK_OK, 0, 0, 0]);
+                        }
+                        Err(_) => reply([SOCK_WOULDBLOCK, 0, 0, 0]),
+                    }
+                }
+                _ => reply([SOCK_ERR, 0, 0, 0]),
+            }
+        }
+        OP_SOCK_LIST => {
+            // Serialise the socket table into the shared region as fixed-size
+            // entries (see SOCK_LIST_ENTRY_BYTES), returning the count. The kernel
+            // reads the entries back out to print the `sockets` shell command.
+            let max_entries = SOCKET_REGION_BYTES / SOCK_LIST_ENTRY_BYTES;
+            let mut count = 0usize;
+            for i in 0..table.len() {
+                if count >= max_entries {
+                    break;
+                }
+                let (kind_code, state_code, remote_ip, remote_port) = list_describe(&table[i], sockets);
+                let id = table[i].id;
+                let local_port = table[i].local_port;
+                // SAFETY: see socket_region; used and dropped within this handler.
+                let region = unsafe { socket_region() };
+                let off = count * SOCK_LIST_ENTRY_BYTES;
+                let slot = &mut region[off..off + SOCK_LIST_ENTRY_BYTES];
+                slot.fill(0);
+                slot[0..8].copy_from_slice(&id.to_le_bytes());
+                slot[8] = kind_code;
+                slot[9] = state_code;
+                slot[10..12].copy_from_slice(&local_port.to_le_bytes());
+                slot[12..16].copy_from_slice(&remote_ip);
+                slot[16..18].copy_from_slice(&remote_port.to_le_bytes());
+                count += 1;
+            }
+            reply([SOCK_OK, count as u64, 0, 0]);
         }
         OP_SOCK_CLOSE => {
             let id = req.words[1];
@@ -576,4 +734,45 @@ fn tcp_phase(s: &tcp::Socket) -> TcpPhase {
 /// Unpack a bare packed-IPv4 word (as sent by OP_SOCK_CONNECT `word2`) to octets.
 fn unpack_ipv4_word(w: u64) -> [u8; 4] {
     [(w >> 24) as u8, (w >> 16) as u8, (w >> 8) as u8, w as u8]
+}
+
+/// Map a smoltcp `tcp::State` to the wire state code used by `OP_SOCK_LIST`.
+fn tcp_state_code(state: tcp::State) -> u8 {
+    use tcp::State::*;
+    match state {
+        Closed => SLS_TCP_CLOSED,
+        Listen => SLS_TCP_LISTEN,
+        SynSent => SLS_TCP_SYN_SENT,
+        SynReceived => SLS_TCP_SYN_RECEIVED,
+        Established => SLS_TCP_ESTABLISHED,
+        FinWait1 => SLS_TCP_FIN_WAIT1,
+        FinWait2 => SLS_TCP_FIN_WAIT2,
+        CloseWait => SLS_TCP_CLOSE_WAIT,
+        Closing => SLS_TCP_CLOSING,
+        LastAck => SLS_TCP_LAST_ACK,
+        TimeWait => SLS_TCP_TIME_WAIT,
+    }
+}
+
+/// Describe a socket for the `OP_SOCK_LIST` listing: its kind code, state code,
+/// and remote endpoint (0.0.0.0:0 when there is none). TCP reads live state and
+/// the connected peer from smoltcp; UDP and ICMP have fixed state codes and no
+/// single remote endpoint.
+fn list_describe(
+    entry: &SockEntry,
+    sockets: &mut SocketSet<'static>,
+) -> (u8, u8, [u8; 4], u16) {
+    match entry.kind {
+        SockKind::Udp => (SLK_UDP, SLS_UDP, [0; 4], 0),
+        SockKind::Icmp => (SLK_ICMP, SLS_ICMP, [0; 4], 0),
+        SockKind::Tcp => {
+            let s = sockets.get_mut::<tcp::Socket>(entry.handle);
+            let state = tcp_state_code(s.state());
+            let (ip, port) = s
+                .remote_endpoint()
+                .map(endpoint_octets)
+                .unwrap_or(([0; 4], 0));
+            (SLK_TCP, state, ip, port)
+        }
+    }
 }

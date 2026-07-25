@@ -1099,6 +1099,36 @@ fn cmd_docs(_args: &[String]) {
     }
 }
 
+/// `cargo xtask arm64-gate` — compile smoltcp alone for `aarch64-unknown-none`.
+///
+/// Phase 4 runs and tests only on amd64, but the TCP/IP stack (smoltcp) is meant
+/// to be architecture-independent so the Phase 7 arm64 port inherits it unchanged.
+/// This builds the `servers/smoltcp-gate` crate — a minimal `no_std` lib pinned to
+/// the net server's exact smoltcp feature set — for aarch64. A failure here means
+/// the stack has taken an amd64-only (or `std`) dependency. Compile-only; no QEMU.
+fn cmd_arm64_gate(_args: &[String]) {
+    let root = workspace_root();
+    let gate_dir = root.join("servers/smoltcp-gate");
+
+    println!("Compiling smoltcp for aarch64-unknown-none (arm64 dependency gate)...");
+    let status = Command::new("cargo")
+        .current_dir(&gate_dir)
+        .args([
+            "build",
+            "--target", "aarch64-unknown-none",
+            BUILD_STD,
+        ])
+        .status()
+        .expect("Failed to execute cargo build for the arm64 gate");
+
+    if status.success() {
+        println!("arm64 gate passed: smoltcp builds for aarch64-unknown-none.");
+    } else {
+        eprintln!("arm64 gate FAILED: smoltcp did not build for aarch64-unknown-none.");
+        process::exit(1);
+    }
+}
+
 /// Print usage information.
 fn print_usage() {
     eprintln!(
@@ -1113,6 +1143,7 @@ Commands:
     test     Build and run tests in QEMU
     image    Create the SquashFS root and ext2 data disk images
     docs     Build mdbook and rustdoc
+    arm64-gate  Compile smoltcp for aarch64-unknown-none (dependency gate)
 
 Options:
     --arch <ARCH>  Target architecture: x86_64 (default), arm64
@@ -1143,6 +1174,7 @@ fn main() {
         "test" => cmd_test(rest),
         "image" => cmd_image(rest),
         "docs" => cmd_docs(rest),
+        "arm64-gate" => cmd_arm64_gate(rest),
         "help" | "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("Unknown command: {unknown}\n");
