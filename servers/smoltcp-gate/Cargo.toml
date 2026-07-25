@@ -1,0 +1,49 @@
+# aarch64 compile gate for smoltcp (Phase 4).
+#
+# ThemeliOS runs its whole TCP/IP stack (smoltcp) in the ring-3 net server. The
+# net server itself builds only for x86_64 in Phase 4 — its `libthemelios`
+# syscall wrappers are raw x86 `syscall` asm, so an aarch64 build waits for the
+# Phase 7 arm64 port. But the *stack* is meant to be architecture-independent:
+# the arm64 port should inherit smoltcp unchanged.
+#
+# This crate is the honest check of that claim (the same "compile the library
+# alone, bare-metal" precedent Phase 3 used for miniz_oxide): a minimal `no_std`
+# lib that depends on smoltcp with EXACTLY the feature set the net server uses,
+# and nothing arch-specific. CI compiles it for `aarch64-unknown-none`; if a
+# smoltcp feature ever pulled in an amd64-only or `std` dependency, this job goes
+# red long before the Phase 7 port trips over it.
+#
+# It is a SEPARATE, detached workspace (the empty `[workspace]` table below) so
+# neither the root workspace nor the servers workspace tries to build it for the
+# host or for x86 — it is driven explicitly by the CI gate job (and
+# `cargo xtask arm64-gate`).
+[workspace]
+
+[package]
+name = "smoltcp-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "smoltcp_gate"
+path = "src/lib.rs"
+
+[dependencies]
+# Must mirror servers/net-server/Cargo.toml exactly — this gate is only
+# meaningful if it exercises the same feature set the net server compiles.
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-udp",
+    "socket-tcp",
+    "socket-dhcpv4",
+    "socket-icmp",
+] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

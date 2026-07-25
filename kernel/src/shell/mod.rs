@@ -84,6 +84,8 @@ fn shell_entry() {
             "write" => commands::cmd_write(args),
             "mkdir" => commands::cmd_mkdir(args),
             "ifconfig" => commands::cmd_ifconfig(args),
+            "sockets" => commands::cmd_sockets(args),
+            "ping" => commands::cmd_ping(args),
             "udpsend" => commands::cmd_udpsend(args),
             "tcpconnect" => commands::cmd_tcpconnect(args),
             _ => {

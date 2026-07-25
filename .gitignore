@@ -2,6 +2,8 @@
 /target/
 # Servers workspace build artifacts (separate workspace, separate target dir)
 /servers/target/
+# arm64 smoltcp compile gate is its own detached workspace with its own target dir
+/servers/smoltcp-gate/target/
 
 # Editor files
 *.swp

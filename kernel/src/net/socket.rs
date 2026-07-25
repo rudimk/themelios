@@ -44,11 +44,19 @@ const OP_SOCK_CLOSE: u64 = 14;
 const OP_SOCK_CONNECT: u64 = 15;
 const OP_SOCK_LISTEN: u64 = 16;
 const OP_SOCK_ACCEPT: u64 = 17;
+const OP_SOCK_LIST: u64 = 18;
+const OP_SOCK_PING: u64 = 19;
+
+/// Bytes per entry returned by `OP_SOCK_LIST` (mirrors
+/// `net_proto::SOCK_LIST_ENTRY_BYTES`).
+const SOCK_LIST_ENTRY_BYTES: usize = 24;
 
 /// Socket type: UDP (Phase 4.5).
 pub const SOCK_TYPE_UDP: u64 = 0;
 /// Socket type: TCP stream (Phase 4.6).
 pub const SOCK_TYPE_TCP: u64 = 1;
+/// Socket type: ICMP echo (Phase 4.7, backs `ping`).
+pub const SOCK_TYPE_ICMP: u64 = 2;
 
 /// Net-server reply status words (mirror `net_proto`).
 const SOCK_OK: u64 = 0;
@@ -532,4 +540,89 @@ pub fn ksocket_accept(socket_id: u64) -> Result<(u64, [u8; 4], u16), SockError> 
     map_status(reply.words[0])?;
     let (ip, port) = unpack_ip_port(reply.words[2]);
     Ok((reply.words[1], ip, port))
+}
+
+// --- ICMP / inspection (Phase 4.7) ---
+
+/// Create an ICMP echo socket directly, returning its net-server socket id. The
+/// net server binds it to an identifier at open time so echo replies route back.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_open_icmp() -> Result<u64, SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_OPEN, SOCK_TYPE_ICMP, 0, 0])?;
+    map_status(reply.words[0])?;
+    Ok(reply.words[1])
+}
+
+/// Send one ICMPv4 echo request (ping) with sequence `seq` to `ip` on ICMP
+/// `socket_id`. `WouldBlock` if the socket's TX buffer is momentarily full.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_ping(socket_id: u64, ip: [u8; 4], seq: u16) -> Result<(), SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_PING, socket_id, pack_ipv4(ip), seq as u64])?;
+    map_status(reply.words[0])
+}
+
+/// Collect the next buffered ICMP echo reply on ICMP `socket_id`. Returns the
+/// reply's `(sequence_number, source_ip)`; `WouldBlock` if none has arrived.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_ping_recv(socket_id: u64) -> Result<(u16, [u8; 4]), SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_RECV, socket_id, 0, 0])?;
+    map_status(reply.words[0])?;
+    let seq = reply.words[1] as u16;
+    // The ICMP recv reply packs the source address as `ip << 16` (port unused).
+    let (ip, _) = unpack_ip_port(reply.words[2]);
+    Ok((seq, ip))
+}
+
+/// A single row of the `sockets` listing, decoded from an `OP_SOCK_LIST` entry.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub struct SockInfo {
+    /// Net-server socket id.
+    pub id: u64,
+    /// Socket kind code (`net_proto::SLK_*`: 0=UDP, 1=TCP, 2=ICMP).
+    pub kind: u8,
+    /// State code (`net_proto::SLS_*`: TCP state, or a fixed code for UDP/ICMP).
+    pub state: u8,
+    /// Bound local port (0 if unbound); for ICMP, the bound identifier.
+    pub local_port: u16,
+    /// Connected peer address (0.0.0.0 if none).
+    pub remote_ip: [u8; 4],
+    /// Connected peer port (0 if none).
+    pub remote_port: u16,
+}
+
+/// List the net server's open sockets. Asks the server to serialise its socket
+/// table into the shared region (`OP_SOCK_LIST`), then decodes the fixed-size
+/// entries. Backs the `sockets` shell command; the kernel is trusted here (no
+/// capability check), like the other `ksocket_*` helpers.
+#[cfg_attr(feature = "test", allow(dead_code))]
+pub fn ksocket_list() -> Result<alloc::vec::Vec<SockInfo>, SockError> {
+    let r = router()?;
+    let reply = sock_call(r.endpoint, [OP_SOCK_LIST, 0, 0, 0])?;
+    map_status(reply.words[0])?;
+    let count = reply.words[1] as usize;
+    // SAFETY: kernel-owned region; the synchronous call has completed, so the
+    // server has finished writing the entries.
+    let src = unsafe { r.region.as_slice_mut() };
+    let mut out = alloc::vec::Vec::new();
+    for i in 0..count {
+        let off = i * SOCK_LIST_ENTRY_BYTES;
+        if off + SOCK_LIST_ENTRY_BYTES > src.len() {
+            break;
+        }
+        let e = &src[off..off + SOCK_LIST_ENTRY_BYTES];
+        let mut id_bytes = [0u8; 8];
+        id_bytes.copy_from_slice(&e[0..8]);
+        out.push(SockInfo {
+            id: u64::from_le_bytes(id_bytes),
+            kind: e[8],
+            state: e[9],
+            local_port: u16::from_le_bytes([e[10], e[11]]),
+            remote_ip: [e[12], e[13], e[14], e[15]],
+            remote_port: u16::from_le_bytes([e[16], e[17]]),
+        });
+    }
+    Ok(out)
 }

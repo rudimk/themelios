@@ -8,7 +8,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **1** | Memory allocator, scheduler, interrupts (x86_64) | Complete |
 | **2** | Capability system, process isolation, IPC | Complete |
 | **3** | VirtIO block driver, read-only filesystem | Complete |
-| **4** | VirtIO net driver, TCP/IP stack | In progress |
+| **4** | VirtIO net driver, TCP/IP stack | Complete |
 | **5** | OCI container support | Not started |
 | **6** | Management API (Docker-compatible) | Not started |
 | **7** | aarch64 port | Not started |
@@ -81,16 +81,26 @@ userspace servers. See [Storage Architecture](./storage.md) for the full design.
 - Boot integration (mounts `/` and `/data`) and debug-shell commands
   (`mount`, `ls`, `cat`, `stat`, `write`, `mkdir`)
 
-## Phase 4 — Networking (In progress)
+## Phase 4 — Networking (Complete)
 
 **Goal**: TCP/IP connectivity.
 
-**Deliverables**:
-- VirtIO network driver
-- Ethernet, ARP, IPv4
-- TCP and UDP
-- Basic socket-like API via capabilities
-- DHCP client
+The whole TCP/IP stack (smoltcp) runs in a ring-3 net server; a thin VirtIO-net
+driver stays in the kernel and frames cross via a pull-based IPC bridge. Sockets
+are capability-checked and kernel-routed. See the
+[Network Architecture](./networking.md) doc for the full design.
+
+**Deliverables** (all delivered):
+- VirtIO network driver + `NetDevice` trait (the arm64/bus seam)
+- Kernel net service (pull-based frame bridge) and `SYS_UPTIME_MS` clock
+- Ring-3 smoltcp stack: Ethernet, ARP, IPv4, ICMP
+- DHCPv4 client (address, gateway, DNS captured for display)
+- Capability-checked socket API (`CapType::Socket`): UDP, TCP, and ICMP
+- Shell: `ifconfig`, `sockets`, `ping`, `udpsend`, `tcpconnect`
+- Boot integration (NIC + service + net server, DHCP-configured, at boot)
+- Integration tests (driver, service, ARP/ICMP, DHCP, UDP echo, socket caps,
+  socket listing, TCP client + server) — 35 tests, reliably green
+- aarch64 smoltcp compile gate in CI (`cargo xtask arm64-gate`)
 
 ## Phase 5 — Containers (Not started)
 

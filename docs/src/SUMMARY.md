@@ -15,6 +15,7 @@
 - [Capability System](./capabilities.md)
 - [Memory Management](./memory.md)
 - [Storage Architecture](./storage.md)
+- [Network Architecture](./networking.md)
 
 # Roadmap
 

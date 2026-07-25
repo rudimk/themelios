@@ -48,6 +48,39 @@ jobs:
 
       - name: Run kernel tests
         run: cargo xtask test
+        
+  arm64-gate:
+    name: aarch64 smoltcp compile gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Phase 4 runs and tests only on amd64, but the TCP/IP stack (smoltcp) is
+    # meant to be architecture-independent so the Phase 7 arm64 port inherits it
+    # unchanged. This job compiles smoltcp alone — with the net server's exact
+    # feature set — for aarch64-unknown-none (see servers/smoltcp-gate). It goes
+    # red the moment the stack takes an amd64-only or std dependency, long before
+    # the arm64 port would trip over it. Compile-only: no QEMU needed.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-arm64gate-${{ hashFiles('servers/smoltcp-gate/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arm64gate-
+
+      - name: Compile smoltcp for aarch64-unknown-none
+        run: cargo xtask arm64-gate
 
   release:
     name: Release ISO (amd64)

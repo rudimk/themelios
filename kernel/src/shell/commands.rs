@@ -39,6 +39,8 @@ pub fn cmd_help(_args: &str) {
     println!("  write <path> <s> — create/write a file (overlay or /data)");
     println!("  mkdir <path>     — create a directory");
     println!("  ifconfig         — show network interface configuration");
+    println!("  sockets          — list open sockets and their state");
+    println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
     println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
     println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
 }
@@ -832,4 +834,155 @@ pub fn cmd_tcpconnect(args: &str) {
         }
     }
     let _ = socket::ksocket_close(id);
+}
+
+/// Human-readable name for a `SOCK_LIST` kind code (`net_proto::SLK_*`).
+fn sock_kind_name(kind: u8) -> &'static str {
+    match kind {
+        0 => "udp",
+        1 => "tcp",
+        2 => "icmp",
+        _ => "?",
+    }
+}
+
+/// Human-readable name for a `SOCK_LIST` state code (`net_proto::SLS_*`).
+fn sock_state_name(state: u8) -> &'static str {
+    match state {
+        0 => "-",              // UDP: connectionless
+        1 => "CLOSED",
+        2 => "LISTEN",
+        3 => "SYN-SENT",
+        4 => "SYN-RCVD",
+        5 => "ESTABLISHED",
+        6 => "FIN-WAIT-1",
+        7 => "FIN-WAIT-2",
+        8 => "CLOSE-WAIT",
+        9 => "CLOSING",
+        10 => "LAST-ACK",
+        11 => "TIME-WAIT",
+        12 => "icmp",
+        _ => "?",
+    }
+}
+
+/// `sockets` — list the net server's open sockets and their state.
+///
+/// Asks the ring-3 net server (via the kernel socket router) to enumerate its
+/// socket table: each socket's id, transport, TCP state (or `-`/`icmp`), bound
+/// local port, and connected peer. The kernel only relays the listing — the
+/// socket state lives entirely in the net server.
+pub fn cmd_sockets(_args: &str) {
+    use crate::net::socket;
+    let list = match socket::ksocket_list() {
+        Ok(l) => l,
+        Err(e) => {
+            println!("sockets: {:?} (is the net server up?)", e);
+            return;
+        }
+    };
+    if list.is_empty() {
+        println!("  No open sockets.");
+        return;
+    }
+    println!("  {:>4}  {:>5}  {:>12}  {:>6}  {}", "ID", "KIND", "STATE", "LPORT", "PEER");
+    println!("  {:->4}  {:->5}  {:->12}  {:->6}  {:->21}", "", "", "", "", "");
+    for s in &list {
+        // A zero remote address means "no connected peer".
+        let peer = if s.remote_ip == [0, 0, 0, 0] && s.remote_port == 0 {
+            alloc::string::String::from("-")
+        } else {
+            alloc::format!(
+                "{}.{}.{}.{}:{}",
+                s.remote_ip[0], s.remote_ip[1], s.remote_ip[2], s.remote_ip[3], s.remote_port
+            )
+        };
+        println!(
+            "  {:>4}  {:>5}  {:>12}  {:>6}  {}",
+            s.id, sock_kind_name(s.kind), sock_state_name(s.state), s.local_port, peer
+        );
+    }
+    println!("  ({} sockets)", list.len());
+}
+
+/// `ping <ip> [count]` — send ICMP echo requests and report replies.
+///
+/// Drives the Phase 4.7 ICMP socket path: open an ICMP socket via the net server,
+/// send `count` echo requests (default 4) one at a time, and poll for each reply
+/// within a ~1s window, printing the round-trip time. **Best-effort**: QEMU's
+/// slirp proxies guest ICMP to host pings, which needs host raw-socket/ping
+/// privileges that may be unavailable — a timeout there is an environment limit,
+/// not a stack bug (`ifconfig` + `udpsend` still prove the stack is live).
+pub fn cmd_ping(args: &str) {
+    use crate::net::socket::{self, SockError};
+
+    let mut parts = args.split_whitespace();
+    let ip_s = parts.next().unwrap_or("").trim();
+    if ip_s.is_empty() {
+        println!("usage: ping <ip> [count]");
+        return;
+    }
+    let ip = match parse_ipv4(ip_s) {
+        Some(v) => v,
+        None => {
+            println!("ping: invalid IP '{}'", ip_s);
+            return;
+        }
+    };
+    let count: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(4);
+
+    let id = match socket::ksocket_open_icmp() {
+        Ok(id) => id,
+        Err(e) => {
+            println!("ping: socket: {:?}", e);
+            return;
+        }
+    };
+
+    println!("PING {}.{}.{}.{} ({} requests):", ip[0], ip[1], ip[2], ip[3], count);
+    let mut received = 0u32;
+    for seq in 0..count {
+        let start = now_ms();
+        if let Err(e) = socket::ksocket_ping(id, ip, seq) {
+            println!("  seq={} send failed: {:?}", seq, e);
+            continue;
+        }
+        // Poll for the echo reply for up to ~1 second.
+        let mut got = false;
+        loop {
+            match socket::ksocket_ping_recv(id) {
+                Ok((rseq, src)) => {
+                    let rtt = now_ms().saturating_sub(start);
+                    println!(
+                        "  reply from {}.{}.{}.{}: seq={} time={}ms",
+                        src[0], src[1], src[2], src[3], rseq, rtt
+                    );
+                    received += 1;
+                    got = true;
+                    break;
+                }
+                Err(SockError::WouldBlock) => {
+                    if now_ms().saturating_sub(start) > 1000 {
+                        break;
+                    }
+                    crate::sched::yield_now();
+                }
+                Err(e) => {
+                    println!("  seq={} recv error: {:?}", seq, e);
+                    break;
+                }
+            }
+        }
+        if !got {
+            println!("  seq={} timeout", seq);
+        }
+    }
+    let _ = socket::ksocket_close(id);
+    println!("  {} transmitted, {} received", count, received);
+}
+
+/// Monotonic milliseconds since boot (the same source as `SYS_UPTIME_MS`), for
+/// the `ping` round-trip timer. The 100 Hz tick gives ~10 ms resolution.
+fn now_ms() -> u64 {
+    crate::arch::x86_64::idt::tick_count().wrapping_mul(10)
 }

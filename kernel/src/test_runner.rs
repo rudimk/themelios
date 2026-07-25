@@ -65,6 +65,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_tcp_server",       func: test_tcp_server },
     TestCase { name: "test_dhcp",             func: test_dhcp },
     TestCase { name: "test_socket_capability", func: test_socket_capability },
+    TestCase { name: "test_socket_list",      func: test_socket_list },
     TestCase { name: "test_udp_echo",         func: test_udp_echo },
     TestCase { name: "test_tcp_client",       func: test_tcp_client },
 ];
@@ -3386,6 +3387,74 @@ fn test_socket_capability() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_socket_capability() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Test the `sockets` listing path (`OP_SOCK_LIST`) and the ICMP socket /
+/// ping-send plumbing (`OP_SOCK_PING`), both introduced in sub-phase 4.7.
+///
+/// Deterministic: it only opens sockets, binds, lists, and *emits* one ICMP echo
+/// request — none of which needs an external peer or an inbound frame (so it does
+/// not compete with `test_tcp_server` for the NIC). Whether an echo *reply* comes
+/// back is left to the best-effort `ping` shell command (slirp's ICMP proxy may
+/// lack host privileges); here we assert the send is accepted, which exercises the
+/// whole ICMP socket build/bind/emit path in the ring-3 stack.
+#[cfg(target_arch = "x86_64")]
+fn test_socket_list() -> Result<(), &'static str> {
+    use crate::net::socket;
+
+    // Static-config server (10.0.2.15/24, gateway 10.0.2.2) — no DHCP needed.
+    let _fs_ep = spawn_net_server_with_sockets(false, "virtio-net-list")?;
+
+    // Open one socket of each kind through the kernel-internal path.
+    let udp = socket::ksocket_open().map_err(|_| "ksocket_open (udp) failed")?;
+    socket::ksocket_bind(udp, [0, 0, 0, 0], 40001).map_err(|_| "ksocket_bind (udp) failed")?;
+    let tcp = socket::ksocket_open_tcp().map_err(|_| "ksocket_open_tcp failed")?;
+    let icmp = socket::ksocket_open_icmp().map_err(|_| "ksocket_open_icmp failed")?;
+
+    // The listing must show all three, with the right kinds and the bound UDP port.
+    let list = socket::ksocket_list().map_err(|_| "ksocket_list failed")?;
+    if list.len() < 3 {
+        return Err("ksocket_list returned fewer than the three open sockets");
+    }
+    let udp_e = list.iter().find(|s| s.id == udp).ok_or("udp socket missing from listing")?;
+    if udp_e.kind != 0 {
+        return Err("udp socket reported wrong kind code");
+    }
+    if udp_e.local_port != 40001 {
+        return Err("udp socket reported wrong bound local port");
+    }
+    let tcp_e = list.iter().find(|s| s.id == tcp).ok_or("tcp socket missing from listing")?;
+    if tcp_e.kind != 1 {
+        return Err("tcp socket reported wrong kind code");
+    }
+    let icmp_e = list.iter().find(|s| s.id == icmp).ok_or("icmp socket missing from listing")?;
+    if icmp_e.kind != 2 {
+        return Err("icmp socket reported wrong kind code");
+    }
+
+    // Emit one echo request to the gateway. The send is accepted (buffered) even
+    // though no reply may arrive in CI — this exercises OP_SOCK_PING end to end.
+    socket::ksocket_ping(icmp, [10, 0, 2, 2], 1).map_err(|_| "ksocket_ping send rejected")?;
+    // Give the poll loop a chance to emit the frame; a reply is best-effort, so we
+    // only require that recv does not hard-error (WouldBlock is the normal result).
+    for _ in 0..2000 {
+        match socket::ksocket_ping_recv(icmp) {
+            Ok(_) => break,                                   // a reply came back
+            Err(socket::SockError::WouldBlock) => crate::sched::yield_now(),
+            Err(_) => return Err("ksocket_ping_recv hard-errored"),
+        }
+    }
+
+    let _ = socket::ksocket_close(udp);
+    let _ = socket::ksocket_close(tcp);
+    let _ = socket::ksocket_close(icmp);
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_socket_list() -> Result<(), &'static str> {
     Ok(())
 }
 

@@ -73,10 +73,81 @@ pub const OP_SOCK_LISTEN: u64 = 16;
 /// `SOCK_WOULDBLOCK` if no connection is pending.
 pub const OP_SOCK_ACCEPT: u64 = 17;
 
+// --- Inspection / ICMP opcodes (Phase 4.7) ---
+
+/// List the net server's open sockets. `[OP_SOCK_LIST, 0, 0, 0]` →
+/// `[status, count, 0, 0]`. The server writes `count` fixed-size
+/// [`SOCK_LIST_ENTRY_BYTES`]-byte entries into the shared socket region (see the
+/// entry layout on [`SOCK_LIST_ENTRY_BYTES`]); the caller reads them back out.
+/// Backs the `sockets` shell command.
+pub const OP_SOCK_LIST: u64 = 18;
+
+/// Send one ICMPv4 echo request (ping). `[OP_SOCK_PING, socket_id, dest_ip, seq]`
+/// → `[status]`. The socket must be an ICMP socket (`SOCK_TYPE_ICMP`); the server
+/// builds the echo request with the socket's identifier and the given sequence
+/// number and transmits it. `dest_ip` is a bare [`pack_ipv4`] word. Echo replies
+/// are collected with a normal `OP_SOCK_RECV` on the same socket, which returns
+/// `[status, seq_no, (src_ip << 16)]` for an ICMP socket. Backs `ping`.
+pub const OP_SOCK_PING: u64 = 19;
+
 /// Socket type: UDP datagram socket.
 pub const SOCK_TYPE_UDP: u64 = 0;
 /// Socket type: TCP stream socket (Phase 4.6).
 pub const SOCK_TYPE_TCP: u64 = 1;
+/// Socket type: ICMP echo socket (Phase 4.7, backs `ping`).
+pub const SOCK_TYPE_ICMP: u64 = 2;
+
+/// Size of one entry written by [`OP_SOCK_LIST`] into the shared socket region.
+///
+/// Layout (little-endian, one entry per socket, tightly packed):
+/// ```text
+/// [0..8]   socket id (u64)
+/// [8]      kind      (SLK_UDP / SLK_TCP / SLK_ICMP)
+/// [9]      state     (SLS_* — smoltcp TCP state, or a fixed code for UDP/ICMP)
+/// [10..12] local port (u16; the bound port, 0 if unbound)
+/// [12..16] remote IP  (4 octets, most-significant first; 0.0.0.0 if none)
+/// [16..18] remote port (u16; 0 if none)
+/// [18..24] reserved (zero)
+/// ```
+pub const SOCK_LIST_ENTRY_BYTES: usize = 24;
+
+// Socket "kind" codes in a `SOCK_LIST` entry (byte 8). Distinct from
+// `SOCK_TYPE_*` only to keep the on-wire listing format self-contained.
+/// `SOCK_LIST` kind: UDP socket.
+pub const SLK_UDP: u8 = 0;
+/// `SOCK_LIST` kind: TCP socket.
+pub const SLK_TCP: u8 = 1;
+/// `SOCK_LIST` kind: ICMP socket.
+pub const SLK_ICMP: u8 = 2;
+
+// Socket "state" codes in a `SOCK_LIST` entry (byte 9). For TCP these mirror
+// smoltcp's `tcp::State`; UDP and ICMP use single fixed codes.
+/// `SOCK_LIST` state: a UDP socket (connectionless — no TCP state).
+pub const SLS_UDP: u8 = 0;
+/// `SOCK_LIST` state: TCP `Closed`.
+pub const SLS_TCP_CLOSED: u8 = 1;
+/// `SOCK_LIST` state: TCP `Listen`.
+pub const SLS_TCP_LISTEN: u8 = 2;
+/// `SOCK_LIST` state: TCP `SynSent`.
+pub const SLS_TCP_SYN_SENT: u8 = 3;
+/// `SOCK_LIST` state: TCP `SynReceived`.
+pub const SLS_TCP_SYN_RECEIVED: u8 = 4;
+/// `SOCK_LIST` state: TCP `Established`.
+pub const SLS_TCP_ESTABLISHED: u8 = 5;
+/// `SOCK_LIST` state: TCP `FinWait1`.
+pub const SLS_TCP_FIN_WAIT1: u8 = 6;
+/// `SOCK_LIST` state: TCP `FinWait2`.
+pub const SLS_TCP_FIN_WAIT2: u8 = 7;
+/// `SOCK_LIST` state: TCP `CloseWait`.
+pub const SLS_TCP_CLOSE_WAIT: u8 = 8;
+/// `SOCK_LIST` state: TCP `Closing`.
+pub const SLS_TCP_CLOSING: u8 = 9;
+/// `SOCK_LIST` state: TCP `LastAck`.
+pub const SLS_TCP_LAST_ACK: u8 = 10;
+/// `SOCK_LIST` state: TCP `TimeWait`.
+pub const SLS_TCP_TIME_WAIT: u8 = 11;
+/// `SOCK_LIST` state: an ICMP socket (bound to an identifier).
+pub const SLS_ICMP: u8 = 12;
 
 /// Socket reply status (`word0` of an `OP_SOCK_*` reply): success.
 pub const SOCK_OK: u64 = 0;
