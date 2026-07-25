@@ -40,6 +40,7 @@ pub fn cmd_help(_args: &str) {
     println!("  mkdir <path>     — create a directory");
     println!("  ifconfig         — show network interface configuration");
     println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
+    println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -734,6 +735,101 @@ pub fn cmd_udpsend(args: &str) {
             n, ip[0], ip[1], ip[2], ip[3], port
         ),
         Err(e) => println!("udpsend: send: {:?}", e),
+    }
+    let _ = socket::ksocket_close(id);
+}
+
+/// `tcpconnect <ip> <port>` — open a TCP connection, send a line, print the reply.
+///
+/// Exercises the Phase 4.6 TCP client path through the net server: create a TCP
+/// socket, connect (non-blocking; poll until established or refused), send a
+/// short request, and print whatever comes back. Uses the kernel-internal socket
+/// ops (the shell runs in the kernel).
+pub fn cmd_tcpconnect(args: &str) {
+    use crate::net::socket::{self, SockError};
+
+    let mut parts = args.splitn(2, ' ');
+    let ip_s = parts.next().unwrap_or("").trim();
+    let port_s = parts.next().unwrap_or("").trim();
+    if ip_s.is_empty() || port_s.is_empty() {
+        println!("usage: tcpconnect <ip> <port>");
+        return;
+    }
+    let ip = match parse_ipv4(ip_s) {
+        Some(v) => v,
+        None => {
+            println!("tcpconnect: invalid IP '{}'", ip_s);
+            return;
+        }
+    };
+    let port: u16 = match port_s.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            println!("tcpconnect: invalid port '{}'", port_s);
+            return;
+        }
+    };
+
+    let id = match socket::ksocket_open_tcp() {
+        Ok(id) => id,
+        Err(e) => {
+            println!("tcpconnect: socket: {:?}", e);
+            return;
+        }
+    };
+    if let Err(e) = socket::ksocket_connect(id, ip, port) {
+        println!("tcpconnect: connect: {:?}", e);
+        let _ = socket::ksocket_close(id);
+        return;
+    }
+
+    // Poll a zero-length send until the connection is established or refused.
+    let mut established = false;
+    for _ in 0..500_000 {
+        match socket::ksocket_send(id, &[]) {
+            Ok(_) => {
+                established = true;
+                break;
+            }
+            Err(SockError::WouldBlock) => crate::sched::yield_now(),
+            Err(SockError::ConnectionRefused) => {
+                println!("tcpconnect: connection refused");
+                let _ = socket::ksocket_close(id);
+                return;
+            }
+            Err(e) => {
+                println!("tcpconnect: {:?}", e);
+                let _ = socket::ksocket_close(id);
+                return;
+            }
+        }
+    }
+    if !established {
+        println!("tcpconnect: timed out connecting to {}.{}.{}.{}:{}",
+            ip[0], ip[1], ip[2], ip[3], port);
+        let _ = socket::ksocket_close(id);
+        return;
+    }
+    println!("tcpconnect: connected to {}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
+
+    // Send a minimal request line.
+    let _ = socket::ksocket_send(id, b"hello\r\n");
+
+    // Poll for a reply for a bounded time.
+    let mut buf = [0u8; 256];
+    for _ in 0..500_000 {
+        match socket::ksocket_recv(id, &mut buf) {
+            Ok(n) if n > 0 => {
+                println!("tcpconnect: received {} bytes", n);
+                break;
+            }
+            Ok(_) => break, // 0 = peer closed
+            Err(SockError::WouldBlock) => crate::sched::yield_now(),
+            Err(e) => {
+                println!("tcpconnect: recv: {:?}", e);
+                break;
+            }
+        }
     }
     let _ = socket::ksocket_close(id);
 }

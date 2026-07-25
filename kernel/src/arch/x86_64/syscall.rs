@@ -204,6 +204,29 @@ pub const SYS_SOCKET_CLOSE: u64 = 19;
 /// requests while continuously polling smoltcp.
 pub const SYS_TRY_RECEIVE: u64 = 20;
 
+// --- TCP socket syscalls (Phase 4.6). ---
+
+/// SYS_CONNECT: begin an outbound TCP connection. RDI = socket cap, RSI = dest
+/// IPv4 (packed), RDX = dest port. Non-blocking; returns 0, or a high-bit error.
+pub const SYS_CONNECT: u64 = 21;
+/// SYS_LISTEN: listen for inbound TCP connections on a bound socket. RDI = socket
+/// cap, RSI = backlog. Returns 0, or a high-bit error.
+pub const SYS_LISTEN: u64 = 22;
+/// SYS_ACCEPT: accept one established inbound connection. RDI = listening socket
+/// cap, RSI = peer-out ptr (`[ip:u32_le, port:u16_le]`, 8 bytes; 0 to skip).
+/// Returns a new `Socket` capability handle for the connection, or a high-bit
+/// error (`WouldBlock` if none pending).
+pub const SYS_ACCEPT: u64 = 23;
+/// SYS_TCP_SEND: send bytes on a connected (TCP) socket. RDI = socket cap,
+/// RSI = buf ptr, RDX = len. Returns bytes sent, or a high-bit error
+/// (`WouldBlock` while connecting / send window full). Named distinctly from the
+/// IPC `SYS_SEND` (1).
+pub const SYS_TCP_SEND: u64 = 24;
+/// SYS_TCP_RECV: receive bytes from a connected (TCP) socket. RDI = socket cap,
+/// RSI = buf ptr, RDX = len. Returns bytes read (0 = peer closed), or a
+/// high-bit error (`WouldBlock` if connected but no data yet).
+pub const SYS_TCP_RECV: u64 = 25;
+
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
 /// RDI = the SYS_NULL return value. The handler stores the result and
@@ -584,7 +607,8 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
                 Err(_) => frame.rax = !0u64,
             }
         }
-        SYS_SOCKET | SYS_BIND | SYS_SENDTO | SYS_RECVFROM | SYS_SOCKET_CLOSE => {
+        SYS_SOCKET | SYS_BIND | SYS_SENDTO | SYS_RECVFROM | SYS_SOCKET_CLOSE | SYS_CONNECT
+        | SYS_TCP_SEND | SYS_TCP_RECV | SYS_LISTEN | SYS_ACCEPT => {
             // Socket syscalls block on the net server, so enable interrupts.
             cpu::sti();
             dispatch_socket_syscall(frame);
@@ -659,6 +683,11 @@ fn user_range_ok(uptr: u64, len: usize) -> bool {
 
 /// Copy `len` bytes from a validated user pointer into a kernel `Vec`.
 fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    // A zero-length transfer touches no memory — never dereference the pointer
+    // (which may be null): `from_raw_parts(null, 0)` is UB even for len 0.
+    if len == 0 {
+        return Some(alloc::vec::Vec::new());
+    }
     if len > FS_MAX_XFER || !user_range_ok(uptr, len) {
         return None;
     }
@@ -670,6 +699,10 @@ fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
 
 /// Copy `data` to a validated user pointer. Returns false if the range is bad.
 fn copy_to_user(uptr: u64, data: &[u8]) -> bool {
+    // Nothing to copy → success without dereferencing a possibly-null pointer.
+    if data.is_empty() {
+        return true;
+    }
     if !user_range_ok(uptr, data.len()) {
         return false;
     }
@@ -864,6 +897,75 @@ fn dispatch_socket_syscall(frame: &mut SyscallFrame) {
             let handle = CapHandle::from_raw(frame.rdi as u32);
             match socket::sys_close(pid, handle, num) {
                 Ok(()) => frame.rax = 0,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_CONNECT => {
+            // RDI = socket cap, RSI = dest IPv4 (packed), RDX = dest port.
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            let ip = unpack_ipv4_arg(frame.rsi);
+            let port = frame.rdx as u16;
+            match socket::sys_connect(pid, handle, ip, port, num) {
+                Ok(()) => frame.rax = 0,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_TCP_SEND => {
+            // RDI = socket cap, RSI = buf ptr, RDX = len (stream send).
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            match copy_from_user(frame.rsi, frame.rdx as usize) {
+                Some(data) => match socket::sys_send(pid, handle, &data, num) {
+                    Ok(n) => frame.rax = n as u64,
+                    Err(e) => frame.rax = e.as_syscall_ret(),
+                },
+                None => frame.rax = bad_arg,
+            }
+        }
+        SYS_TCP_RECV => {
+            // RDI = socket cap, RSI = buf ptr, RDX = len (stream recv).
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            let len = (frame.rdx as usize).min(FS_MAX_XFER);
+            if !user_range_ok(frame.rsi, len) {
+                frame.rax = bad_arg;
+                return;
+            }
+            let mut kbuf = alloc::vec![0u8; len];
+            match socket::sys_recv(pid, handle, &mut kbuf, num) {
+                Ok(n) if copy_to_user(frame.rsi, &kbuf[..n]) => frame.rax = n as u64,
+                Ok(_) => frame.rax = bad_arg,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_LISTEN => {
+            // RDI = socket cap, RSI = backlog.
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            match socket::sys_listen(pid, handle, frame.rsi, num) {
+                Ok(()) => frame.rax = 0,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        SYS_ACCEPT => {
+            // RDI = listening socket cap, RSI = peer-out ptr (8 bytes, 0 to skip).
+            let handle = CapHandle::from_raw(frame.rdi as u32);
+            let peer_ptr = frame.rsi;
+            // Validate the peer buffer BEFORE accepting: sys_accept promotes the
+            // connection and mints its capability, so a copy failure afterwards
+            // would orphan a live connection the caller never learns the handle of.
+            if peer_ptr != 0 && !user_range_ok(peer_ptr, 8) {
+                frame.rax = bad_arg;
+                return;
+            }
+            match socket::sys_accept(pid, handle, num) {
+                Ok((conn_handle, ip, port)) => {
+                    if peer_ptr != 0 {
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&ip);
+                        out[4..6].copy_from_slice(&port.to_le_bytes());
+                        // Range already validated above, so this write succeeds.
+                        copy_to_user(peer_ptr, &out);
+                    }
+                    frame.rax = conn_handle as u64;
+                }
                 Err(e) => frame.rax = e.as_syscall_ret(),
             }
         }

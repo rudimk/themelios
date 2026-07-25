@@ -204,6 +204,16 @@ pub fn start(nic_index: usize) -> Option<NetServiceHandle> {
     let tx_region = SharedRegion::alloc(REGION_BYTES)?;
     let endpoint = ipc::create_endpoint("net-service");
 
+    // Reset the acquired-config view: this interface has not (re)configured yet.
+    // Without this, a caller polling `status().config.configured` could observe a
+    // stale `true` left by a previous service instance and act (e.g. TCP connect)
+    // before this interface has an address. The new service task republishes
+    // MAC/MTU at startup and the ring-3 stack re-reports its lease.
+    {
+        let mut st = STATUS.lock();
+        st.config = AcquiredConfig::default();
+    }
+
     *CONFIG.lock() = Some(Config {
         nic_index,
         endpoint,

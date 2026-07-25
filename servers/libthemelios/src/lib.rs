@@ -570,6 +570,111 @@ pub mod syscall {
         ret
     }
 
+    // --- TCP stream syscalls (Phase 4.6) ---
+
+    const SYS_CONNECT: u64 = 21;
+    const SYS_LISTEN: u64 = 22;
+    const SYS_ACCEPT: u64 = 23;
+    const SYS_TCP_SEND: u64 = 24;
+    const SYS_TCP_RECV: u64 = 25;
+
+    /// Listen for inbound TCP connections on the bound socket `sock`. Returns 0,
+    /// or a high-bit error.
+    pub fn listen(sock: u64, backlog: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_LISTEN register ABI.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_LISTEN => ret,
+                in("rdi") sock,
+                in("rsi") backlog,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Accept one connection on listening socket `sock`, writing the peer
+    /// `[ip:u32_le, port:u16_le]` to `peer_out` (8 bytes; pass null to skip).
+    /// Returns a new socket capability handle, or a high-bit error (WouldBlock if
+    /// none pending).
+    pub fn accept(sock: u64, peer_out: *mut u8) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_ACCEPT register ABI (peer_out validated by the kernel).
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_ACCEPT => ret,
+                in("rdi") sock,
+                in("rsi") peer_out as u64,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Begin an outbound TCP connection on `sock` to `(ip, port)` (ip packed).
+    /// Non-blocking; returns 0, or a high-bit error.
+    pub fn connect(sock: u64, ip: u64, port: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_CONNECT register ABI.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_CONNECT => ret,
+                in("rdi") sock,
+                in("rsi") ip,
+                in("rdx") port,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Send `len` bytes at `buf` on connected socket `sock`. Returns bytes sent,
+    /// or a high-bit error (WouldBlock while connecting / window full). Named
+    /// distinctly from the IPC [`send`](self::send).
+    pub fn tcp_send(sock: u64, buf: *const u8, len: usize) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_TCP_SEND register ABI (buf/len validated by the kernel).
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_TCP_SEND => ret,
+                in("rdi") sock,
+                in("rsi") buf as u64,
+                in("rdx") len as u64,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Receive up to `len` bytes into `buf` from connected socket `sock`.
+    /// Returns bytes read (0 = peer closed), or a high-bit error (WouldBlock if
+    /// connected but no data yet).
+    pub fn tcp_recv(sock: u64, buf: *mut u8, len: usize) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_TCP_RECV register ABI (pointers validated by the kernel).
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_TCP_RECV => ret,
+                in("rdi") sock,
+                in("rsi") buf as u64,
+                in("rdx") len as u64,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
     /// Print a single byte to the kernel serial console (debugging only).
     pub fn debug_print_char(ch: u8) {
         // SAFETY: DEBUG_PRINT takes the character in RDI.

@@ -60,9 +60,13 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_net_service",      func: test_net_service },
     TestCase { name: "test_net_server_stack", func: test_net_server_stack },
     TestCase { name: "test_net_icmp_echo",    func: test_net_icmp_echo },
+    // Runs before the other persistent net-server tests so it is the sole NIC
+    // drainer (no inbound-frame competition) for the host-driven TCP handshake.
+    TestCase { name: "test_tcp_server",       func: test_tcp_server },
     TestCase { name: "test_dhcp",             func: test_dhcp },
     TestCase { name: "test_socket_capability", func: test_socket_capability },
     TestCase { name: "test_udp_echo",         func: test_udp_echo },
+    TestCase { name: "test_tcp_client",       func: test_tcp_client },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3480,6 +3484,249 @@ fn test_udp_echo() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_udp_echo() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_tcp_client — outbound TCP connect through the socket API (Phase 4.6)
+// ============================================================
+
+/// Test the TCP client path end to end: create a TCP socket, connect out, and
+/// drive the handshake through the net server + smoltcp.
+///
+/// Brings the stack up with DHCP, then drives an outbound TCP connect to
+/// slirp's DNS address (10.0.2.3:53) and probes it, exercising the full client
+/// plumbing: socket create, `connect`, and the non-blocking send/recv state
+/// machine routed through the kernel router and the ring-3 net server.
+///
+/// The **hard assertions** are that every socket call returns a *sensible* result
+/// (never a plumbing error) and drives the smoltcp state machine — connect is
+/// accepted, and the send probe returns `WouldBlock` while the handshake is in
+/// flight. The connection *outcome* is best-effort: slirp has no general TCP
+/// listener and its DNS proxy does not answer TCP SYNs, so establishment /
+/// refusal / a silently-dropped SYN are all acceptable (a deterministic TCP
+/// round-trip against a real listener lands with the server path in 4.7). The
+/// probe budget is bounded so a dropped SYN cannot hang the test.
+#[cfg(target_arch = "x86_64")]
+fn test_tcp_client() -> Result<(), &'static str> {
+    use crate::net::socket::SockError;
+    use crate::net::{net_service, socket};
+    use crate::sched;
+
+    let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-tcp")?;
+
+    // Wait for DHCP so the interface has an address and default route.
+    let mut configured = false;
+    for _ in 0..300_000 {
+        if net_service::status().config.configured {
+            configured = true;
+            break;
+        }
+        sched::yield_now();
+    }
+    if !configured {
+        return Err("DHCP did not configure before the TCP test");
+    }
+
+    // Create a TCP socket and begin connecting to slirp's DNS address over TCP.
+    let id = socket::ksocket_open_tcp().map_err(|_| "ksocket_open_tcp failed")?;
+    socket::ksocket_connect(id, [10, 0, 2, 3], 53).map_err(|_| "ksocket_connect failed")?;
+
+    // Probe the connection with a small bounded budget. Each probe is a full IPC
+    // round-trip to the net server, so the budget is kept modest — it is ample
+    // for a real handshake to complete (a few round-trips) while a silently
+    // dropped SYN just exhausts it quickly. Every reply must be one of the
+    // expected outcomes: a plumbing error fails the test; `WouldBlock` (handshake
+    // in flight) is expected and required at least once.
+    let mut established = false;
+    let mut refused = false;
+    let mut saw_wouldblock = false;
+    for _ in 0..2_000 {
+        match socket::ksocket_send(id, &[]) {
+            Ok(_) => {
+                established = true;
+                break;
+            }
+            Err(SockError::WouldBlock) => {
+                saw_wouldblock = true;
+                sched::yield_now();
+            }
+            Err(SockError::ConnectionRefused) => {
+                refused = true;
+                break;
+            }
+            Err(_) => {
+                let _ = socket::ksocket_close(id);
+                return Err("TCP send probe returned an unexpected error (bad plumbing)");
+            }
+        }
+    }
+
+    if established {
+        // Established — attempt a best-effort DNS-over-TCP round-trip.
+        let query = build_dns_query();
+        let mut framed = [0u8; 31];
+        framed[0..2].copy_from_slice(&(query.len() as u16).to_be_bytes());
+        framed[2..].copy_from_slice(&query);
+        let mut sent = 0usize;
+        for _ in 0..2_000 {
+            match socket::ksocket_send(id, &framed[sent..]) {
+                Ok(n) => {
+                    sent += n;
+                    if sent >= framed.len() {
+                        break;
+                    }
+                }
+                Err(SockError::WouldBlock) => sched::yield_now(),
+                Err(_) => break,
+            }
+        }
+        let mut buf = [0u8; 512];
+        let mut got = 0usize;
+        for _ in 0..2_000 {
+            match socket::ksocket_recv(id, &mut buf) {
+                Ok(n) if n > 0 => {
+                    got = n;
+                    break;
+                }
+                Ok(_) => break,
+                Err(SockError::WouldBlock) => sched::yield_now(),
+                Err(_) => break,
+            }
+        }
+        crate::println!("  [test_tcp_client] TCP established to 10.0.2.3:53; reply {} bytes", got);
+    } else if refused {
+        crate::println!("  [test_tcp_client] slirp refused TCP :53; client path + refusal detection OK");
+    } else {
+        // The send probe must have exercised the non-blocking path at least once.
+        if !saw_wouldblock {
+            let _ = socket::ksocket_close(id);
+            return Err("TCP send probe never returned WouldBlock (state machine not advancing)");
+        }
+        crate::println!("  [test_tcp_client] no TCP listener at 10.0.2.3:53 (SYN dropped); client plumbing OK");
+    }
+
+    let _ = socket::ksocket_close(id);
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_tcp_client() -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ============================================================
+//  test_tcp_server — inbound TCP listen/accept + echo (Phase 4.6)
+// ============================================================
+
+/// Test the TCP server path with a real inbound connection driven by the host.
+///
+/// Brings the stack up with DHCP, listens on port 7, and accepts a connection
+/// that the xtask harness's host-side peer makes through a QEMU `hostfwd` rule
+/// (host 127.0.0.1:15007 → guest :7). The guest receives the peer's payload,
+/// verifies it, and echoes it back — a deterministic, bidirectional TCP round
+/// trip against an external endpoint, exercising `bind`/`listen`/`accept` and the
+/// per-connection socket, `recv`, and `send`.
+///
+/// Registered before the other persistent net-server tests so it is the only
+/// interface draining the NIC when it runs — otherwise accumulated net servers
+/// would compete for the inbound frames.
+#[cfg(target_arch = "x86_64")]
+fn test_tcp_server() -> Result<(), &'static str> {
+    use crate::net::socket::SockError;
+    use crate::net::{net_service, socket};
+    use crate::sched;
+
+    let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-tcpsrv")?;
+
+    // Wait for DHCP: the host's hostfwd targets the guest's DHCP address.
+    let mut configured = false;
+    for _ in 0..300_000 {
+        if net_service::status().config.configured {
+            configured = true;
+            break;
+        }
+        sched::yield_now();
+    }
+    if !configured {
+        return Err("DHCP did not configure before the TCP server test");
+    }
+
+    // Listen on port 7 (the hostfwd target).
+    let listener = socket::ksocket_open_tcp().map_err(|_| "ksocket_open_tcp failed")?;
+    socket::ksocket_bind_port(listener, 7).map_err(|_| "ksocket_bind_port failed")?;
+    socket::ksocket_listen(listener).map_err(|_| "ksocket_listen failed")?;
+
+    // Accept the host peer's inbound connection. Each poll cycles the net server,
+    // so the handshake completes within a bounded number of attempts.
+    let mut conn: Option<u64> = None;
+    for _ in 0..40_000 {
+        match socket::ksocket_accept(listener) {
+            Ok((cid, _ip, _port)) => {
+                conn = Some(cid);
+                break;
+            }
+            Err(SockError::WouldBlock) => sched::yield_now(),
+            Err(_) => {
+                let _ = socket::ksocket_close(listener);
+                return Err("TCP accept returned an unexpected error");
+            }
+        }
+    }
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            let _ = socket::ksocket_close(listener);
+            return Err("no inbound TCP connection accepted (host peer did not connect)");
+        }
+    };
+
+    // Receive the host peer's payload.
+    let expect: &[u8] = b"THEMELIOS_TCP_PING";
+    let mut buf = [0u8; 64];
+    let mut got = 0usize;
+    for _ in 0..40_000 {
+        match socket::ksocket_recv(conn, &mut buf) {
+            Ok(n) if n > 0 => {
+                got = n;
+                break;
+            }
+            Ok(_) => sched::yield_now(),
+            Err(SockError::WouldBlock) => sched::yield_now(),
+            Err(_) => break,
+        }
+    }
+    if got != expect.len() || &buf[..got] != expect {
+        let _ = socket::ksocket_close(conn);
+        let _ = socket::ksocket_close(listener);
+        return Err("TCP server received an unexpected payload");
+    }
+
+    // Echo it back to the host.
+    let mut sent = 0usize;
+    for _ in 0..20_000 {
+        match socket::ksocket_send(conn, &buf[sent..got]) {
+            Ok(n) => {
+                sent += n;
+                if sent >= got {
+                    break;
+                }
+            }
+            Err(SockError::WouldBlock) => sched::yield_now(),
+            Err(_) => break,
+        }
+    }
+
+    let _ = socket::ksocket_close(conn);
+    let _ = socket::ksocket_close(listener);
+    crate::println!("  [test_tcp_server] accepted inbound TCP, echoed {} bytes", got);
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_tcp_server() -> Result<(), &'static str> {
     Ok(())
 }
 
