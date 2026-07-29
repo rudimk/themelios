@@ -88,7 +88,37 @@ pub struct Process {
     /// trampoline, an ELF's entry and initial `%rsp` vary per image. `None` for
     /// the kernel process and flat-binary servers (which use the fixed layout).
     pub user_entry: Option<(u64, u64)>,
+
+    /// Syscall personality (Phase 5.1). A `Linux` process has its `syscall`s
+    /// routed through the Linux dispatch table (Linux numbers/ABI); a `Native`
+    /// process uses ThemeliOS's own syscalls. The two number spaces collide
+    /// (Linux `write`=1 vs native `SYS_SEND`=1), so the personality — not the
+    /// number — decides the table.
+    pub personality: Personality,
+
+    /// Current program break for the Linux `brk` syscall (Phase 5.1). The heap
+    /// grows upward from [`LINUX_BRK_BASE`]; 0 until the first `brk`.
+    pub brk: u64,
+
+    /// Next free virtual address for anonymous Linux `mmap` (Phase 5.1). A simple
+    /// upward bump allocator from [`LINUX_MMAP_BASE`]; 0 until first use.
+    pub mmap_next: u64,
 }
+
+/// A process's syscall personality — which ABI its `syscall`s speak.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Personality {
+    /// Native ThemeliOS syscalls (servers, the ELF smoke test).
+    Native,
+    /// The Linux syscall ABI (OCI container binaries, Phase 5.1+).
+    Linux,
+}
+
+/// Base of the Linux `brk` heap region (well clear of ELF segments at ~2 MiB and
+/// the stack near 0x7fff_…). Grows upward.
+pub const LINUX_BRK_BASE: u64 = 0x0000_0002_0000_0000; // 8 GiB
+/// Base of the anonymous Linux `mmap` region. Grows upward, below the stack.
+pub const LINUX_MMAP_BASE: u64 = 0x0000_0001_0000_0000; // 4 GiB
 
 /// The global process table, protected by an interrupt-disabling mutex.
 ///
@@ -138,6 +168,9 @@ pub fn init() {
         tasks: Vec::new(), // Tasks will be assigned via assign_task_to_kernel()
         state: ProcessState::Running,
         user_entry: None,
+        personality: Personality::Native,
+        brk: 0,
+        mmap_next: 0,
     };
 
     let mut table = PROCESS_TABLE.lock();
@@ -190,6 +223,9 @@ pub fn create_process(name: &str, parent_cspace: Option<&mut CSpace>) -> (Proces
             tasks: Vec::new(),
             state: ProcessState::Running,
             user_entry: None,
+            personality: Personality::Native,
+            brk: 0,
+            mmap_next: 0,
         };
 
         table.processes.push(Some(process));
@@ -232,6 +268,65 @@ pub fn user_entry(pid: ProcessId) -> Option<(u64, u64)> {
         .get(pid.as_usize())
         .and_then(|slot| slot.as_ref())
         .and_then(|proc| proc.user_entry)
+}
+
+/// The syscall personality of a process (defaults to `Native` for any process
+/// not found). Read on every syscall to pick the native vs Linux dispatch table.
+pub fn personality(pid: ProcessId) -> Personality {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .map(|proc| proc.personality)
+        .unwrap_or(Personality::Native)
+}
+
+/// Set a process's syscall personality (e.g. to `Linux` when launching a
+/// container binary).
+pub fn set_personality(pid: ProcessId, personality: Personality) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        proc.personality = personality;
+    }
+}
+
+/// Read a process's current program break (`brk`), or 0 if unset/not found.
+pub fn get_brk(pid: ProcessId) -> u64 {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .map(|proc| proc.brk)
+        .unwrap_or(0)
+}
+
+/// Set a process's current program break.
+pub fn set_brk(pid: ProcessId, brk: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        proc.brk = brk;
+    }
+}
+
+/// Read a process's next anonymous-`mmap` address, or 0 if unset/not found.
+pub fn get_mmap_next(pid: ProcessId) -> u64 {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .map(|proc| proc.mmap_next)
+        .unwrap_or(0)
+}
+
+/// Set a process's next anonymous-`mmap` address (the bump-allocator cursor).
+pub fn set_mmap_next(pid: ProcessId, next: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        proc.mmap_next = next;
+    }
 }
 
 /// Destroy a process by PID.

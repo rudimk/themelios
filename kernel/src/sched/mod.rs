@@ -148,6 +148,7 @@ pub fn init() {
         stack_phys_base: None,
         kernel_stack_top: 0, // Bootstrap uses Limine's stack; never returns from ring 3
         process_id: ProcessId::KERNEL,
+        fs_base: 0,
     }));
     sched.current_id = bootstrap_id;
     sched.next_id = 1;
@@ -190,6 +191,36 @@ pub fn spawn(name: &str, entry: fn()) -> TaskId {
     let id = create_task(sched, name, entry);
     println!("  Spawned task {} (\"{}\")", id, name);
     id
+}
+
+/// Set the current task's `IA32_FS_BASE` (Linux TLS) and apply it immediately.
+///
+/// Called by `arch_prctl(ARCH_SET_FS)` (Phase 5.1): records the base on the task
+/// so the context switch restores it, and writes the MSR now so `%fs`-relative
+/// accesses work for the rest of this time slice without waiting for a switch.
+pub fn set_current_fs_base(fs_base: u64) {
+    {
+        let mut guard = SCHEDULER.lock();
+        let sched = guard.as_mut().expect("Scheduler not initialized");
+        let id = sched.current_id;
+        if let Some(Some(task)) = sched.tasks.get_mut(id) {
+            task.fs_base = fs_base;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::syscall::write_fs_base(fs_base);
+}
+
+/// Read the current task's `IA32_FS_BASE` value (for `arch_prctl(ARCH_GET_FS)`).
+pub fn current_fs_base() -> u64 {
+    let guard = SCHEDULER.lock();
+    let sched = guard.as_ref().expect("Scheduler not initialized");
+    sched
+        .tasks
+        .get(sched.current_id)
+        .and_then(|t| t.as_ref())
+        .map(|t| t.fs_base)
+        .unwrap_or(0)
 }
 
 /// Preemptive scheduling entry point — called from the timer interrupt.
@@ -252,6 +283,15 @@ pub fn schedule() {
         // RSP=0 and double-faults. See `syscall::refresh_kernel_gs_base`.
         #[cfg(target_arch = "x86_64")]
         crate::arch::x86_64::syscall::refresh_kernel_gs_base();
+
+        // Restore the next task's FS base (Linux TLS, Phase 5.1). Like the GS
+        // base, IA32_FS_BASE is a global register `switch_context` does not save,
+        // so a Linux thread's `%fs`-relative TLS accesses would use whatever base
+        // the previous task left behind. Reload it from the task on every switch.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::syscall::write_fs_base(
+            sched.tasks[next_id].as_ref().unwrap().fs_base,
+        );
 
         // Update TSS.RSP0 and PerCpu.kernel_stack_top for the new task.
         // This must happen BEFORE the context switch so that if the new task
@@ -555,6 +595,7 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
         stack_phys_base: Some(phys_base),
         kernel_stack_top: stack_top_virt.as_u64(),
         process_id: ProcessId::KERNEL, // Default to kernel process; caller can override
+        fs_base: 0, // set by arch_prctl(ARCH_SET_FS) for Linux TLS (Phase 5.1)
     };
 
     // Place the task in its slot (either reusing an empty one or the new end)

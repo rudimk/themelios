@@ -1,0 +1,23 @@
+# Linux syscall-personality smoke-test binary (Phase 5.1).
+#
+# A minimal ring-3 program that speaks the **Linux** syscall ABI (unlike
+# elf-smoke, which speaks the native ThemeliOS ABI). The kernel loads it with the
+# ELF loader (5.0), marks the process `Personality::Linux`, and routes its
+# syscalls through the Linux dispatch table (5.1). Its `_start` self-checks the
+# core 5.1 surface — arch_prctl(SET_FS)+TLS, brk, anonymous mmap, write to fd 1 —
+# and reports success/failure to a kernel-mapped result page, then exits via
+# exit_group. Built as a real ET_EXEC (detached crate; see servers/elf-smoke).
+[workspace]
+
+[package]
+name = "linux-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "linux-smoke"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

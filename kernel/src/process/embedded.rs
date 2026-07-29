@@ -34,6 +34,11 @@ pub static FSTEST_CLIENT: &[u8] = include_bytes!("../../../target/servers/fstest
 pub static NET_SERVER: &[u8] = include_bytes!("../../../target/servers/net-server.bin");
 
 /// Phase 5.0 ELF loader smoke-test binary — a **real ELF** (not a flat binary),
-/// loaded by `crate::linux::elf` in `test_elf_exec`. Built by `build_elf_smoke`.
+/// loaded by `crate::linux::elf` in `test_elf_exec`. Native ThemeliOS ABI.
 #[cfg_attr(not(feature = "test"), allow(dead_code))]
 pub static ELF_SMOKE: &[u8] = include_bytes!("../../../target/servers/elf-smoke.elf");
+
+/// Phase 5.1 Linux-personality smoke-test binary — a real ELF that speaks the
+/// **Linux** syscall ABI, run by `test_linux_exec`.
+#[cfg_attr(not(feature = "test"), allow(dead_code))]
+pub static LINUX_SMOKE: &[u8] = include_bytes!("../../../target/servers/linux-smoke.elf");

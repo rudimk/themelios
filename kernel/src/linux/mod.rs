@@ -18,8 +18,9 @@
 //! independently of Linux-ABI correctness.
 
 pub mod elf;
+pub mod syscall;
 
-use crate::process::{self, ProcessId};
+use crate::process::{self, Personality, ProcessId};
 use elf::{ByteSource, ElfError};
 
 /// Load an ELF image from `src` into a fresh process, build its initial stack
@@ -41,6 +42,8 @@ pub fn exec_elf(
     // an ELF's entry and initial %rsp vary per image, unlike the servers' fixed
     // load address.
     process::set_user_entry(pid, img.entry, rsp);
+    // `exec_elf` runs Linux binaries: route their syscalls through the Linux table.
+    process::set_personality(pid, Personality::Linux);
     spawn_loaded(name, pid);
     Ok(pid)
 }

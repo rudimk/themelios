@@ -69,6 +69,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_udp_echo",         func: test_udp_echo },
     TestCase { name: "test_tcp_client",       func: test_tcp_client },
     TestCase { name: "test_elf_exec",         func: test_elf_exec },
+    TestCase { name: "test_linux_exec",       func: test_linux_exec },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3536,6 +3537,75 @@ fn test_elf_exec() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_elf_exec() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Test the Phase 5.1 Linux syscall personality end to end: load the `linux-smoke`
+/// ELF, mark the process `Personality::Linux`, run it, and verify it self-checked
+/// the core Linux syscall surface — `arch_prctl(SET_FS)` + `%fs` TLS, `brk` growth,
+/// anonymous `mmap`, and `write` — reporting success to a result page.
+///
+/// This exercises: the personality branch in the syscall dispatcher, per-task
+/// FS-base save/restore, and the write/brk/mmap/arch_prctl translators. The probe
+/// speaks the Linux ABI (`write`=1, `exit_group`=231, etc.), so a native process
+/// would misinterpret those numbers — proving the personality routing works.
+/// Deterministic: no external I/O.
+#[cfg(target_arch = "x86_64")]
+fn test_linux_exec() -> Result<(), &'static str> {
+    use crate::linux::elf::{self, SliceSource};
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self, embedded, Personality};
+    use crate::sched;
+
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0x5A11_D0C5_10AD_ED11;
+
+    let (pid, _) = process::create_process("linux-smoke", None);
+    let img = elf::load_into(pid, &SliceSource(embedded::LINUX_SMOKE))
+        .map_err(|_| "linux-smoke elf load failed")?;
+    let rsp = elf::build_initial_stack(pid, &img, &["linux-smoke"], &[])
+        .map_err(|_| "linux-smoke stack build failed")?;
+
+    // The probe writes its result (and uses a TLS slot at +0x800) in this page.
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping result region failed")?;
+
+    process::set_user_entry(pid, img.entry, rsp);
+    // The distinguishing step for 5.1: route this process's syscalls through the
+    // Linux table.
+    process::set_personality(pid, Personality::Linux);
+    crate::linux::spawn_loaded("linux-smoke", pid);
+
+    let mut result_code: Option<u64> = None;
+    for _ in 0..300_000 {
+        // SAFETY: kernel-owned region frames; the guest writes the same memory.
+        let s = unsafe { region.as_slice_mut() };
+        let magic = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        if magic == RESULT_MAGIC {
+            result_code = Some(u64::from_le_bytes(s[8..16].try_into().unwrap()));
+            break;
+        }
+        sched::yield_now();
+    }
+    process::destroy_process(pid);
+
+    match result_code {
+        None => Err("linux-smoke did not run (no magic written)"),
+        Some(0) => Ok(()),
+        Some(1) => Err("linux-smoke: arch_prctl(SET_FS)/TLS check failed"),
+        Some(2) => Err("linux-smoke: brk growth check failed"),
+        Some(3) => Err("linux-smoke: anonymous mmap check failed"),
+        Some(_) => Err("linux-smoke: unknown failure code"),
+    }
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_linux_exec() -> Result<(), &'static str> {
     Ok(())
 }
 
