@@ -4,6 +4,8 @@
 /servers/target/
 # arm64 smoltcp compile gate is its own detached workspace with its own target dir
 /servers/smoltcp-gate/target/
+# ELF loader smoke-test binary — detached workspace, own target dir
+/servers/elf-smoke/target/
 
 # Editor files
 *.swp

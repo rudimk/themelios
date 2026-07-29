@@ -251,6 +251,48 @@ fn build_servers(root: &Path) {
         let size = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
         println!("  {name}: {size} bytes -> {}", staged.display());
     }
+
+    // Build the Phase 5.0 ELF smoke-test binary as a real ELF (not a flat
+    // binary), staged where the kernel embeds it.
+    build_elf_smoke(root, &out_dir);
+}
+
+/// Build the Phase 5.0 ELF loader smoke-test binary (`servers/elf-smoke`).
+///
+/// Unlike the other servers, this one is linked as a **real ELF** — we keep the
+/// default object format (no `--oformat=binary`) and force a static, non-PIE
+/// `ET_EXEC` so the kernel's ELF loader has genuine ELF headers + `PT_LOAD`
+/// segments to parse. It is a detached crate (own workspace), so `build_servers`'
+/// flat-binary flags don't reach it. Staged to `target/servers/elf-smoke.elf`.
+fn build_elf_smoke(root: &Path, out_dir: &Path) {
+    let crate_dir = root.join("servers/elf-smoke");
+    // Static reloc + no-PIE keeps the output ET_EXEC with fixed segment vaddrs.
+    let rustflags = "-C relocation-model=static -C link-arg=-no-pie";
+
+    println!("Building ELF smoke-test binary (Phase 5.0)...");
+    let status = Command::new("cargo")
+        .current_dir(&crate_dir)
+        .env("RUSTFLAGS", rustflags)
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core",
+        ])
+        .status()
+        .expect("Failed to execute cargo build for elf-smoke");
+    if !status.success() {
+        eprintln!("elf-smoke build failed!");
+        process::exit(1);
+    }
+
+    let built = crate_dir.join("target/x86_64-unknown-none/release/elf-smoke");
+    let staged = out_dir.join("elf-smoke.elf");
+    fs::copy(&built, &staged)
+        .unwrap_or_else(|e| panic!("failed to stage elf-smoke: {e} ({})", built.display()));
+    let size = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
+    println!("  elf-smoke.elf: {size} bytes -> {}", staged.display());
 }
 
 // ============================================================================

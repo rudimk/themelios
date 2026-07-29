@@ -68,6 +68,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_socket_list",      func: test_socket_list },
     TestCase { name: "test_udp_echo",         func: test_udp_echo },
     TestCase { name: "test_tcp_client",       func: test_tcp_client },
+    TestCase { name: "test_elf_exec",         func: test_elf_exec },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3455,6 +3456,86 @@ fn test_socket_list() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_socket_list() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Test the Phase 5.0 ELF loader end to end: load the embedded `elf-smoke` ELF
+/// into a fresh process, build its initial stack with a known argv, map a result
+/// page, run it in ring 3, and verify it wrote the expected proof words back.
+///
+/// This validates the whole loader path — ELF header/phdr parsing, `PT_LOAD`
+/// segment mapping (W^X), the SysV initial stack (argc + argv pointers), and a
+/// clean ring-3 entry + `SYS_EXIT` — using the **native** ABI, independent of the
+/// Linux syscall personality (5.1). Deterministic: no external I/O.
+#[cfg(target_arch = "x86_64")]
+fn test_elf_exec() -> Result<(), &'static str> {
+    use crate::linux::elf::{self, SliceSource};
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self, embedded};
+    use crate::sched;
+
+    // Must match elf-smoke: the result page vaddr, magic, and the argv we pass.
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0xE1FC_0DE1_2345_6789;
+
+    // --- Malformed ELF is rejected without a fault ---
+    let (bad_pid, _) = process::create_process("elf-bad", None);
+    if elf::load_into(bad_pid, &SliceSource(&[0x7f, b'E', 0, 0, 1, 2, 3, 4])).is_ok() {
+        return Err("loader accepted a malformed ELF");
+    }
+    process::destroy_process(bad_pid);
+
+    // --- Load and run the real smoke-test ELF ---
+    let (pid, _) = process::create_process("elf-smoke", None);
+    let img = elf::load_into(pid, &SliceSource(embedded::ELF_SMOKE))
+        .map_err(|_| "elf load_into failed")?;
+    // argv = ["elf-smoke", "AB"] → argc must come back as 2, argv[0][0] as 'e'.
+    let rsp = elf::build_initial_stack(pid, &img, &["elf-smoke", "AB"], &[])
+        .map_err(|_| "build_initial_stack failed")?;
+
+    // Map a shared result page at the fixed vaddr the binary writes to. The kernel
+    // reads the same frames back via the region's HHDM alias.
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping result region failed")?;
+
+    process::set_user_entry(pid, img.entry, rsp);
+    crate::linux::spawn_loaded("elf-smoke", pid);
+
+    // Yield until the binary signals (magic written) or we give up.
+    let mut signalled = false;
+    for _ in 0..200_000 {
+        // SAFETY: kernel-owned region frames; the guest writes the same physical
+        // memory via its RESULT_VADDR mapping.
+        let s = unsafe { region.as_slice_mut() };
+        let magic = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        if magic == RESULT_MAGIC {
+            let argc = u64::from_le_bytes(s[8..16].try_into().unwrap());
+            let argv0_c = u64::from_le_bytes(s[16..24].try_into().unwrap());
+            if argc != 2 {
+                return Err("elf-smoke saw wrong argc (initial stack incorrect)");
+            }
+            if argv0_c != b'e' as u64 {
+                return Err("elf-smoke saw wrong argv[0][0] (argv pointers incorrect)");
+            }
+            signalled = true;
+            break;
+        }
+        sched::yield_now();
+    }
+    process::destroy_process(pid);
+    if !signalled {
+        return Err("elf-smoke did not run (no magic written to the result page)");
+    }
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_elf_exec() -> Result<(), &'static str> {
     Ok(())
 }
 

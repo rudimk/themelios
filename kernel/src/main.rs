@@ -169,6 +169,10 @@ mod fs;
 /// TCP/IP implementation for container networking and the management API.
 mod net;
 
+/// Linux compatibility layer (Phase 5): ELF loader and, later, the Linux syscall
+/// personality that lets ThemeliOS run unmodified OCI container binaries.
+mod linux;
+
 // ----- Kernel entry point -----
 
 /// The kernel entry point. Limine bootloader jumps here after loading the

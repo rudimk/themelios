@@ -81,6 +81,13 @@ pub struct Process {
 
     /// Current process state.
     pub state: ProcessState,
+
+    /// Ring-3 entry point for a process launched from a loaded image (an ELF, as
+    /// of Phase 5.0): `(entry_rip, entry_rsp)`. The generic ELF trampoline reads
+    /// this to `iretq` into the program — unlike the fixed-address server
+    /// trampoline, an ELF's entry and initial `%rsp` vary per image. `None` for
+    /// the kernel process and flat-binary servers (which use the fixed layout).
+    pub user_entry: Option<(u64, u64)>,
 }
 
 /// The global process table, protected by an interrupt-disabling mutex.
@@ -130,6 +137,7 @@ pub fn init() {
         cspace: None,
         tasks: Vec::new(), // Tasks will be assigned via assign_task_to_kernel()
         state: ProcessState::Running,
+        user_entry: None,
     };
 
     let mut table = PROCESS_TABLE.lock();
@@ -181,6 +189,7 @@ pub fn create_process(name: &str, parent_cspace: Option<&mut CSpace>) -> (Proces
             cspace: Some(cspace),
             tasks: Vec::new(),
             state: ProcessState::Running,
+            user_entry: None,
         };
 
         table.processes.push(Some(process));
@@ -203,6 +212,26 @@ pub fn create_process(name: &str, parent_cspace: Option<&mut CSpace>) -> (Proces
     println!("[process] Created process {} (\"{}\")", pid, name);
 
     (pid, cap_handle)
+}
+
+/// Record a process's ring-3 entry point `(entry_rip, entry_rsp)`, as computed by
+/// the ELF loader (Phase 5.0). The generic ELF trampoline reads it back via
+/// [`user_entry`] to `iretq` into the loaded program.
+pub fn set_user_entry(pid: ProcessId, entry_rip: u64, entry_rsp: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        proc.user_entry = Some((entry_rip, entry_rsp));
+    }
+}
+
+/// Read back a process's ring-3 entry point, if one was recorded by the loader.
+pub fn user_entry(pid: ProcessId) -> Option<(u64, u64)> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc| proc.user_entry)
 }
 
 /// Destroy a process by PID.
