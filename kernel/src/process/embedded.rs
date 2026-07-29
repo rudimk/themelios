@@ -32,3 +32,8 @@ pub static FSTEST_CLIENT: &[u8] = include_bytes!("../../../target/servers/fstest
 /// The net server: the ring-3 TCP/IP stack (smoltcp) driven over the kernel net
 /// service's frame bridge (Phase 4.2).
 pub static NET_SERVER: &[u8] = include_bytes!("../../../target/servers/net-server.bin");
+
+/// Phase 5.0 ELF loader smoke-test binary — a **real ELF** (not a flat binary),
+/// loaded by `crate::linux::elf` in `test_elf_exec`. Built by `build_elf_smoke`.
+#[cfg_attr(not(feature = "test"), allow(dead_code))]
+pub static ELF_SMOKE: &[u8] = include_bytes!("../../../target/servers/elf-smoke.elf");

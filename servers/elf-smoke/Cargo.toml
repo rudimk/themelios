@@ -1,0 +1,26 @@
+# ELF loader smoke-test binary (Phase 5.0).
+#
+# A minimal `no_std`/`no_main` x86-64 program with a hand-written `_start`, built
+# as a real **ELF** (unlike the other servers, which link with `--oformat=binary`
+# to a flat image). The kernel's Phase 5.0 ELF loader loads and runs this to prove
+# it parses ELF headers, maps PT_LOAD segments, and builds a correct initial
+# stack. It speaks the *native* ThemeliOS syscall ABI (SYS_EXIT), so it validates
+# the loader independently of the Linux syscall personality (5.1).
+#
+# Detached from the servers workspace (empty [workspace]) so `build_servers`'
+# flat-binary link flags don't apply to it — xtask builds it separately, keeping
+# the ELF output. See servers/smoltcp-gate for the same detached-crate pattern.
+[workspace]
+
+[package]
+name = "elf-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "elf-smoke"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

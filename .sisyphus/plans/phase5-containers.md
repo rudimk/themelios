@@ -279,13 +279,26 @@ existing server build with one linker-flag change.
 **Modules**: `kernel/src/linux/elf.rs`, `kernel/src/container/mod.rs`,
 `servers/linker.ld` / xtask (emit an ELF for the test binary)
 
-**Acceptance**:
-- [ ] A static `ET_EXEC` ELF64 is parsed and its `PT_LOAD` segments mapped W^X
-- [ ] Initial stack (argc/argv/envp/auxv, 16-byte `%rsp`) is correct; the program
-      reads its own argv[0]
-- [ ] The program runs in ring 3 and exits cleanly (native-ABI `SYS_EXIT`)
-- [ ] The loader reads from a byte-source (embedded now; VFS-ready)
-- [ ] Malformed/truncated ELF and non-`ET_EXEC` are rejected without a kernel fault
+**Acceptance** (all met — `test_elf_exec`, 36 tests green, 4/4 soak):
+- [x] A static `ET_EXEC` ELF64 is parsed and its `PT_LOAD` segments mapped W^X
+- [x] Initial stack (argc/argv/envp/auxv, 16-byte `%rsp`) is correct; the program
+      reads its own argv[0] (verified: argc==2, argv[0][0]=='e')
+- [x] The program runs in ring 3 and exits cleanly (native-ABI `SYS_EXIT`)
+- [x] The loader reads from a byte-source (`SliceSource` now; VFS-ready trait)
+- [x] Malformed/truncated ELF and non-`ET_EXEC` are rejected without a kernel fault
+
+**Implementation notes** (branch `claude/phase-5.0-elf-loader`): `kernel/src/linux/
+elf.rs` (parser + `ByteSource` trait + `SliceSource`, `load_into`, `map_segment`
+W^X, `build_initial_stack`), `kernel/src/linux/mod.rs` (`exec_elf`/`spawn_loaded`
++ a per-process `elf_trampoline` that `iretq`s to the recorded `(entry, rsp)` —
+`Process` gained a `user_entry` field + `set_user_entry`/`user_entry`).
+`servers/elf-smoke` is a detached crate built as a real ELF by a new
+`build_elf_smoke` xtask step (static, `-no-pie` → `ET_EXEC`); it writes proof
+words (magic, argc, argv[0][0]) to a kernel-mapped result page and exits via the
+native `SYS_EXIT`. Deferred as planned: static-PIE relocations, and reclaiming
+mapped data frames on `destroy_process` (`AddressSpace::destroy` frees only
+page-table frames today — a small per-run leak, fine for the test; proper teardown
+is later-phase work).
 
 ---
 
