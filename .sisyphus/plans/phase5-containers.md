@@ -1,7 +1,11 @@
 # Phase 5 — OCI Containers & Linux Syscall Compatibility
 
-**Status**: NOT STARTED (draft plan)
+**Status**: 5.0 IN PROGRESS (plan Momus-reviewed 2026-07-25 → REVISE fixes applied)
 **Created**: 2026-07-25
+**Reviewed**: 2026-07-25 (Momus: verified kernel gaps — per-task FS base, process
+exit-status/wait, and an address-keyed futex queue are all net-new; 5.0 uses the
+native ABI to isolate loader bugs; ET_EXEC-only, byte-source loader; image source
+locked to a local `docker save` bundle)
 **Phase**: 5
 **Depends on**: Phase 2 (capabilities, processes, IPC), Phase 3 (VFS + overlay +
 ext2), Phase 4 (TCP/IP + sockets) — all complete.
@@ -12,9 +16,13 @@ Run **unmodified OCI/Docker container images** as capability-isolated ring-3
 processes on ThemeliOS. Concretely, the off-ramp deliverable is:
 
 ```
-> run docker.io/library/busybox echo hello from a container
+> run busybox echo hello from a container      # busybox from a local docker-save bundle
 hello from a container
 ```
+
+(The off-ramp uses a **local image** — a `docker save` bundle staged on the data
+disk — not `docker.io`, which needs the TLS registry path deferred past this
+phase. See sub-phase 5.6.)
 
 Getting there means four new capabilities layered on the existing kernel:
 
@@ -63,6 +71,31 @@ container lifecycle on top.
 | gzip/tar deps | **Reuse `miniz_oxide` (already vendored for SquashFS) for gzip; a small in-tree tar reader** | miniz_oxide is already accepted, ring-3-contained, and handles DEFLATE (gzip layers). Tar is a trivial 512-byte-header format — a purpose-built reader avoids a new dependency. |
 | Target architecture | **amd64 only; arm64 in Phase 7** | Consistent with Phases 1–5; the ELF loader and syscall table are arch-specific by nature. |
 
+## Net-new kernel primitives (verified gaps)
+
+A code audit for this plan confirmed the following do **not** exist today and are
+net-new work, not "translations" of existing primitives. They are called out here
+so no sub-phase treats them as free:
+
+- **Per-task FS-base save/restore.** The context switch handles the GS base (the
+  Phase 4 fix in `kernel/src/arch/x86_64/syscall.rs`) but never sets
+  `IA32_FS_BASE` (`0xC000_0100`). Linux TLS via `arch_prctl(SET_FS)` requires
+  adding a per-`Task` FS base that the context switch loads on every switch —
+  modelled on the Phase 4 GS-base handling. (5.1)
+- **Process exit-status + `wait`/reaping.** `ProcessState` is only
+  `Running`/`Exited` (`kernel/src/process/mod.rs`); there is no exit code and no
+  wait/reap. `wait4` and `run`'s exit-status propagation need a new exit-status
+  field and a parent-wait/reap primitive. (5.5)
+- **Address-keyed wait queue for `futex`.** Kernel blocking today is
+  endpoint-based (`kernel/src/ipc/`); there is no wait queue keyed by a memory
+  address. `futex` needs one, scoped to **private WAIT/WAKE** (no PI, no requeue,
+  no cross-process shared futex initially). (5.3)
+
+*Good news from the same audit*: multiple tasks per process/address space is
+**already** supported (`Process.tasks: Vec<TaskId>`, `add_task_to_process`), so
+`clone(CLONE_THREAD)` has structural support — the threading half of 5.3 is a fit,
+and the risk concentrates in TLS + futex.
+
 ## Security Architecture
 
 ```
@@ -102,12 +135,15 @@ capability-gated resources, never on raw image/network bytes.
 
 ## Deliverables
 
-- **ELF64 loader**: parse `ET_EXEC` and static-`ET_DYN` (static-PIE) headers, map
-  `PT_LOAD` segments with per-segment W^X, honour `PT_GNU_STACK`, set up TLS from
-  `PT_TLS`, build the Linux initial stack (`argc`, `argv[]`, `envp[]`, `auxv[]`
-  incl. `AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/AT_PAGESZ/AT_RANDOM/AT_HWCAP`), and
-  enter at `e_entry`.
+- **ELF64 loader**: parse `ET_EXEC` headers (static-PIE `ET_DYN` deferred — needs
+  `R_X86_64_RELATIVE` relocation), map `PT_LOAD` segments with per-segment W^X,
+  honour `PT_GNU_STACK`, set up TLS from `PT_TLS`, build the Linux initial stack
+  (`argc`, `argv[]`, `envp[]`, `auxv[]` incl. `AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/
+  AT_PAGESZ/AT_RANDOM/AT_HWCAP`), and enter at `e_entry`. Reads from a
+  **byte-source** (embedded or VFS file), not a fixed `&[u8]`.
 - **Linux personality** flag on `Process`; the `syscall` entry routes by it.
+- **Per-task FS base** (`Task.fs_base` + context-switch load) for `arch_prctl`
+  TLS, and **process exit-status + wait/reap** — both confirmed net-new.
 - **Linux syscall table** (x86-64 numbers), with a growing set of translators:
   - *Process/thread*: `exit`, `exit_group`, `clone`(thread), `set_tid_address`,
     `gettid`, `getpid`, `getppid`, `wait4`, `futex`(WAIT/WAKE), `sched_yield`,
@@ -211,28 +247,45 @@ explicitly beyond this phase's off-ramp.
 
 ### Sub-phase 5.0 — ELF64 loader and `exec`
 
-**Goal**: Load a statically-linked ELF64 executable into a fresh ring-3 process
-and run it — replacing the flat-binary path for Linux programs.
+**Goal**: Load a statically-linked `ET_EXEC` ELF64 into a fresh ring-3 process and
+run it — replacing the flat-binary path with a real loader.
+
+**Sequencing note (verified)**: the Linux syscall personality does not exist until
+5.1, but a loaded program still needs *some* syscall ABI to exit. So **5.0's test
+binary uses the native ThemeliOS ABI** — reuse `libthemelios` (its raw `syscall`
+wrappers), but link it as a **normal ELF** (drop the servers' `--oformat=binary`)
+instead of a flat image. This proves segment mapping + entry + initial stack
+*independent of* Linux-ABI correctness (which 5.1 validates by swapping in a
+musl binary). It also means 5.0 needs no external toolchain — it reuses the
+existing server build with one linker-flag change.
 
 **What to build**:
-- ELF64 header + program-header parsing (validate `EI_CLASS=64`,
-  `EI_DATA=LSB`, `e_machine=x86-64`, `ET_EXEC` or static `ET_DYN`).
-- Map each `PT_LOAD` at its `p_vaddr` (or base+offset for PIE) with W^X derived
-  from `p_flags`; zero the `.bss` tail (`p_memsz > p_filesz`).
-- Build the Linux initial stack: `argc`/`argv`/`envp`/`auxv` + a 16-byte-aligned
-  entry `%rsp`; seed `AT_RANDOM` (16 bytes) from `getrandom` source.
-- An `exec`-style entry that swaps a process's address space to the loaded image
-  and enters at `e_entry` in ring 3.
-- A test harness that embeds a tiny **native-built static ELF** (compiled from a
-  no_std stub with a Linux-style `_start`) and runs it.
+- ELF64 header + program-header parsing (validate `EI_CLASS=64`, `EI_DATA=LSB`,
+  `e_machine=x86-64`, **`ET_EXEC`**). *Static-PIE (`ET_DYN`) is deferred* — it
+  requires applying `R_X86_64_RELATIVE` relocations at load; build musl test
+  binaries `-no-pie -static` to stay `ET_EXEC`.
+- Map each `PT_LOAD` at its `p_vaddr` with W^X derived from `p_flags`; zero the
+  `.bss` tail (`p_memsz > p_filesz`).
+- **Byte-source abstraction**: the loader reads the ELF via an "read `n` bytes at
+  offset" trait, so it works from an embedded `&[u8]` (5.0 test) *and* from a VFS
+  file on the rootfs (5.5) without a rewrite. Do **not** hardcode `&'static [u8]`.
+- Build the initial stack: `argc`/`argv`/`envp`/`auxv` (`AT_PHDR`/`AT_PHENT`/
+  `AT_PHNUM`/`AT_ENTRY`/`AT_PAGESZ`/`AT_RANDOM`/`AT_HWCAP`) + a 16-byte-aligned
+  entry `%rsp` per the SysV/Linux entry contract; seed `AT_RANDOM` (16 bytes).
+- An `exec`-style entry that installs the loaded image into a process address
+  space and enters at `e_entry` in ring 3.
+- Test harness: embed the native-ABI ELF (built as above) and run it.
 
-**Modules**: `kernel/src/linux/elf.rs`, `kernel/src/container/mod.rs`
+**Modules**: `kernel/src/linux/elf.rs`, `kernel/src/container/mod.rs`,
+`servers/linker.ld` / xtask (emit an ELF for the test binary)
 
 **Acceptance**:
-- [ ] A static ELF64 is parsed and its `PT_LOAD` segments mapped W^X
-- [ ] Initial stack (argc/argv/envp/auxv) is correct; program reads its own argv
-- [ ] The program runs in ring 3 and exits cleanly via a syscall
-- [ ] Malformed ELF is rejected without a kernel fault
+- [ ] A static `ET_EXEC` ELF64 is parsed and its `PT_LOAD` segments mapped W^X
+- [ ] Initial stack (argc/argv/envp/auxv, 16-byte `%rsp`) is correct; the program
+      reads its own argv[0]
+- [ ] The program runs in ring 3 and exits cleanly (native-ABI `SYS_EXIT`)
+- [ ] The loader reads from a byte-source (embedded now; VFS-ready)
+- [ ] Malformed/truncated ELF and non-`ET_EXEC` are rejected without a kernel fault
 
 ---
 
@@ -242,19 +295,34 @@ and run it — replacing the flat-binary path for Linux programs.
 table; implement the minimum to run a static "hello world" (musl) binary.
 
 **What to build**:
-- A `personality` field on `Process`; the `syscall` entry branches on it.
-- Linux syscall table with: `write`(→ serial/log for fd 1/2), `writev`, `read`
-  (fd 0 stub), `brk`, `mmap`(anon)/`munmap`/`mprotect`, `arch_prctl`(SET_FS for
-  TLS), `set_tid_address`, `exit`/`exit_group`, `rt_sigprocmask`(stub),
-  `getrandom`, `clock_gettime`, `getpid`/`getuid`(0).
-- Linux error-return convention (`-errno` in rax).
-- Run a **statically-linked musl** hello-world (built off-tree, embedded like the
-  test ELF) that prints to stdout and exits.
+- A `personality` field on `Process`; the `syscall` entry branches on it (native
+  dispatch vs Linux dispatch) — Linux `write`=1 collides with native `SYS_SEND`=1,
+  so the branch is mandatory, not cosmetic.
+- **Per-task FS-base save/restore** (net-new, see the primitives section): add an
+  `fs_base` to `Task`, load it into `IA32_FS_BASE` on every context switch, and
+  set it from `arch_prctl(SET_FS)`. Without this, musl TLS (`errno`, stdio locks)
+  is broken. Model on the Phase 4 GS-base handling.
+- Linux syscall table with the *actual* static-musl `_start` set (verified —
+  musl's stdio probes the tty and uses `writev`, so these belong in 5.1, not 5.2):
+  `write`, **`writev`**, `read`(fd 0 → 0/EOF), `brk`, `mmap`(anon)/`munmap`/
+  `mprotect`, `arch_prctl`(SET_FS), `set_tid_address`, **`ioctl`(TCGETS/
+  TIOCGWINSZ → `-ENOTTY`)** so `isatty` resolves, `exit`/`exit_group`,
+  `rt_sigprocmask`(stub), `getrandom`, `clock_gettime`, `getpid`/`getuid`(0).
+- **stdio routing**: container fd `1`/`2` → the kernel serial writer (the same
+  sink as `println!`, so container output reaches the console); fd `0` → EOF.
+  (Output interleaves with kernel logs until 5.5 adds per-container capture.)
+- Linux error-return convention (`-errno` in rax); a syscall trace so unimplemented
+  numbers surface as "add this next," not silent failures.
+- Run a **statically-linked musl** (`-no-pie -static`) hello-world (embedded like
+  the 5.0 test ELF) that prints to stdout and exits.
 
 **Acceptance**:
-- [ ] A static musl binary prints to stdout via `write` and exits via `exit_group`
+- [ ] A static musl binary prints to stdout via `write`/`writev` and exits via
+      `exit_group`
 - [ ] `brk` + anonymous `mmap` back musl's allocator
-- [ ] `arch_prctl(SET_FS)` sets a working TLS base (musl `errno`/stdio work)
+- [ ] `arch_prctl(SET_FS)` + per-task FS-base restore give working TLS (musl
+      `errno`/stdio work across a context switch)
+- [ ] `ioctl(1, TCGETS)` returns `-ENOTTY` and musl stdio proceeds
 - [ ] Unimplemented syscalls return `-ENOSYS`, not a fault
 
 ---
@@ -288,17 +356,22 @@ real allocator.
 **What to build**:
 - Full `mmap`/`munmap`/`mprotect`/`mremap`(min); file-backed `mmap` (via VFS
   read into mapped pages; shared/private semantics as feasible).
-- `clone`(CLONE_THREAD|CLONE_VM|…): a new task sharing the address space, with its
-  own TLS and stack; `gettid`.
-- `futex`(WAIT/WAKE) on a shared address — the primitive pthreads mutexes/condvars
-  need. Reuse the kernel's block/wake machinery keyed by physical address.
+- `clone`(CLONE_THREAD|CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SETTLS|…): a new task in
+  the **same** process/address space (already supported — `Process.tasks`), with
+  its own user stack and TLS (`CLONE_SETTLS` → the new task's FS base); `gettid`.
+- `futex`(WAIT/WAKE) — **net-new primitive** (the kernel has no address-keyed wait
+  queue; IPC blocking is endpoint-based). Add a wait queue keyed by
+  `(address_space, virtual address)`; scope to **private** WAIT/WAKE only — no PI,
+  no `FUTEX_REQUEUE`, no cross-process shared futex. This is the primitive pthreads
+  mutexes/condvars block on.
 - `set_robust_list`/`rseq`(stub), `sched_yield`.
 
 **Acceptance**:
 - [ ] A multi-threaded static binary spawns threads via `clone` and joins
-- [ ] `futex` WAIT/WAKE correctly blocks/wakes threads (a mutex round-trips)
+- [ ] `futex` WAIT/WAKE correctly blocks/wakes threads (a pthread mutex round-trips)
 - [ ] File-backed `mmap` reads file contents into the mapping
-- [ ] No leaks/faults across thread create/exit
+- [ ] Free-frame count (via `mm::frame::free_frame_count`, as `test_frame_allocator`
+      does) returns to baseline after a create-join loop of N threads — no leak
 
 ---
 
@@ -312,7 +385,10 @@ real allocator.
 - gzip-decompress (miniz_oxide) + tar-extract each layer in order onto the Phase 3
   **overlay** (upper on ext2); apply OCI whiteouts (`.wh.<name>`, `.wh..wh..opq`).
 - Stage input from a **`docker save` tarball** placed on the ext2 data volume by
-  xtask (no network yet).
+  xtask (**locked decision** — no network enters until 5.6; a local HTTP registry
+  is explicitly *not* used here). xtask produces the bundle at image-build time
+  (`docker save busybox -o …`, unpacked into the data-disk image), so tests are
+  deterministic and offline.
 - Expose the assembled rootfs as a VFS mount id.
 
 **Acceptance**:
@@ -329,9 +405,17 @@ real allocator.
 Linux process, and wait for it.
 
 **What to build**:
+- **Process exit-status + wait/reap** (net-new — `ProcessState` is only
+  `Running`/`Exited`, no code, no wait): add an exit-status field set by
+  `exit_group`, and a parent-side wait/reap so `run` can block for the container's
+  exit code and `wait4` inside the container works.
 - Kernel `container` glue: create a Linux-ABI process whose CSpace holds **only**
   the rootfs mount cap (+ optionally a socket-factory cap), apply the image
-  config (entrypoint+cmd → argv, env → envp, workdir → cwd), `exec`, and `wait4`.
+  config (entrypoint+cmd → argv, env → envp, workdir → cwd), load the entrypoint
+  ELF **from the rootfs via the byte-source loader** (5.0), `exec`, and `wait`.
+- **Per-container stdout capture**: route the container's fd 1/2 to a buffer/stream
+  the `run` command prints, rather than raw-interleaving with kernel logs (the
+  5.1 direct-to-serial routing was the bootstrap).
 - `run <image-ref> [cmd…]` shell command driving oci-server unpack → runtime exec.
 - `ps` (list running containers) and `kill <id>`.
 
@@ -416,8 +500,10 @@ whole-image-in-RAM where possible.
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| ELF initial-stack / auxv / TLS subtleties | High | High | 5.0/5.1 validate incrementally against a known static musl binary; `AT_RANDOM`, `AT_PHDR`, 16-byte `%rsp` alignment are the usual traps — test early. |
-| `futex` correctness (pthreads) | High | High | 5.3 keys a wait-queue by physical address, reusing the kernel's block/wake; test with a real pthread mutex round-trip. |
+| ELF initial-stack / auxv / TLS subtleties | High | High | 5.0/5.1 validate incrementally; 5.0 uses the native ABI so loader bugs are isolated from Linux-ABI bugs. `AT_RANDOM`, `AT_PHDR`, 16-byte `%rsp` alignment are the usual traps — test early. |
+| Per-task FS-base save/restore is net-new (TLS) | High | High | Confirmed missing (only GS base is switched today). Add `Task.fs_base` + a context-switch load, modelled on the Phase 4 GS-base fix; 5.1 gates on musl TLS working across a switch. |
+| `futex` correctness — net-new address-keyed wait queue | High | High | No such primitive exists (IPC blocking is endpoint-based). 5.3 adds a queue keyed by `(address_space, vaddr)`, scoped to private WAIT/WAKE; test with a real pthread mutex round-trip. |
+| Process exit-status / wait / reaping is net-new | Medium | Medium | Confirmed missing (`ProcessState` = Running/Exited only). 5.5 adds an exit-status field + parent wait/reap before `run` can report exit codes. |
 | `mmap` semantics (MAP_FIXED, file-backed, shared) | Medium | High | Start anon-only (5.1), add file-backed private (5.3); defer shared/MAP_FIXED-overmap edge cases with explicit `-ENOSYS`. |
 | Static-musl still hits unimplemented syscalls | Medium | Medium | `-ENOSYS` + a syscall trace so gaps surface as clear "add this next," not faults; grow the table driven by real binaries. |
 | Image parsing surface (tar/gzip/JSON) | Medium | Medium | All in ring-3 oci-server — a bug is a server crash, not a kernel compromise (Phase 3/4 precedent). |
