@@ -20,6 +20,7 @@
 pub mod elf;
 pub mod fs;
 pub mod syscall;
+pub mod thread;
 
 use crate::process::{self, Personality, ProcessId};
 use elf::{ByteSource, ElfError};

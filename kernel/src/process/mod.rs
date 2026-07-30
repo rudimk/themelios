@@ -308,6 +308,17 @@ pub fn user_entry(pid: ProcessId) -> Option<(u64, u64)> {
         .and_then(|proc| proc.user_entry)
 }
 
+/// The task ids currently belonging to a process (Phase 5.3, for `exit_group`).
+pub fn task_ids(pid: ProcessId) -> Vec<TaskId> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .map(|proc| proc.tasks.clone())
+        .unwrap_or_default()
+}
+
 /// The syscall personality of a process (defaults to `Native` for any process
 /// not found). Read on every syscall to pick the native vs Linux dispatch table.
 pub fn personality(pid: ProcessId) -> Personality {

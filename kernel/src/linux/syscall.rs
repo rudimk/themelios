@@ -39,6 +39,8 @@ const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
 const SYS_SCHED_YIELD: u64 = 24;
+const SYS_CLONE: u64 = 56;
+const SYS_FUTEX: u64 = 202;
 const SYS_GETPID: u64 = 39;
 const SYS_EXIT: u64 = 60;
 const SYS_GETUID: u64 = 102;
@@ -96,7 +98,14 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         SYS_ARCH_PRCTL => frame.rax = sys_arch_prctl(frame.rdi, frame.rsi),
         // isatty(): report "not a terminal" so stdio picks full buffering.
         SYS_IOCTL => frame.rax = err(ENOTTY),
-        SYS_SET_TID_ADDRESS => frame.rax = crate::sched::current_task_id() as u64,
+        // Threads + futex (Phase 5.3).
+        SYS_CLONE => frame.rax = super::thread::sys_clone(frame),
+        SYS_FUTEX => {
+            // FUTEX_WAIT may block, so enable interrupts first (like SYS_YIELD).
+            crate::arch::x86_64::cpu::sti();
+            frame.rax = super::thread::sys_futex(frame);
+        }
+        SYS_SET_TID_ADDRESS => frame.rax = super::thread::sys_set_tid_address(frame.rdi),
         SYS_GETTID => frame.rax = crate::sched::current_task_id() as u64,
         SYS_GETPID => frame.rax = pid.as_usize() as u64,
         // Everything runs as root (uid/gid 0) for now.
@@ -111,20 +120,10 @@ pub fn dispatch(frame: &mut SyscallFrame) {
             crate::sched::yield_now();
             frame.rax = 0;
         }
-        SYS_EXIT | SYS_EXIT_GROUP => {
-            crate::println!(
-                "[linux] exit_group: task {} code {}",
-                crate::sched::current_task_id(),
-                frame.rdi
-            );
-            // Mirror the native SYS_EXIT: the exit stub never runs (the task is
-            // destroyed), so undo the entry `swapgs` by hand before switching away.
-            // SAFETY: matches the syscall entry's swapgs; single-core.
-            unsafe {
-                crate::arch::x86_64::cpu::swapgs();
-            }
-            crate::sched::exit_current_task();
-        }
+        // `exit` terminates just the calling thread (honouring CLONE_CHILD_
+        // CLEARTID so a joiner wakes); `exit_group` terminates the whole process.
+        SYS_EXIT => super::thread::thread_exit(frame.rdi),
+        SYS_EXIT_GROUP => super::thread::exit_group(frame.rdi),
         n => {
             crate::println!("[linux] ENOSYS: unimplemented syscall {}", n);
             frame.rax = err(ENOSYS);
