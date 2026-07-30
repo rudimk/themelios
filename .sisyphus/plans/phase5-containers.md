@@ -464,11 +464,34 @@ file-backed mmap, PI/requeue/timeout futexes, `fork`/`vfork`.
   deterministic and offline.
 - Expose the assembled rootfs as a VFS mount id.
 
-**Acceptance**:
-- [ ] A multi-layer `docker save` bundle unpacks to a correct rootfs
-- [ ] Whiteouts delete lower-layer entries in the overlay
-- [ ] Layer digests verify (`sha256`) before extraction
-- [ ] Malformed tar/gzip/JSON crashes only the oci-server, not the kernel
+**Acceptance** (unpack library met — `test_oci_unpack`, 41 tests green, 3/3 soak):
+- [x] A multi-layer `docker save` bundle unpacks to a correct rootfs (2-layer
+      synthesized bundle → correct file set + contents)
+- [x] Whiteouts delete lower-layer entries (`.wh.hello` removes `/bin/hello`;
+      `.wh..wh..opq` opaque-dir handling implemented)
+- [x] Malformed input is rejected, never a panic (garbage bundle → `Err`)
+- [x] Image config parsed (Entrypoint/Cmd/Env/WorkingDir)
+- [~] **Deferred to 5.5/5.6:** writing the assembled rootfs to disk via the
+      **ring-3 `oci-server`** (folded into 5.5 assemble-and-run, where the
+      untrusted-parser-in-ring-3 containment applies); layer **`sha256`** digest
+      verification and **gzip** layers (the registry wire format) → **5.6**.
+
+**Corrections vs the original plan (verified):** (1) `docker save` layers are
+**uncompressed** tar, so 5.4 needs no gzip — gzip is a registry concern (5.6).
+(2) No usable `docker` daemon in the dev sandbox, so the test **synthesizes** a
+minimal docker-save bundle (manifest + config + two layer tars) in-memory rather
+than shelling out — deterministic and offline.
+
+**Implementation notes** (branch `claude/phase-5.4-oci-unpack`): `kernel/src/oci/`
+— `tar.rs` (USTAR reader: names+prefix+GNU-longname, files/dirs), `json.rs` (a
+small recursive-descent JSON parser, no serde), `mod.rs` (`unpack(bundle) →
+Image{files, config}`: outer tar → `manifest.json` → config + layers, applies
+layers in order with whiteout/opaque handling, parses Entrypoint/Cmd/Env/
+WorkingDir). Written `alloc`-only with **no kernel deps** so it lifts into the
+ring-3 `oci-server` unchanged in 5.5 (test-gated in the kernel for now). Precedent
+confirmed: `squashfs-server` already runs `miniz_oxide` in ring 3 (gzip path for
+5.6), and `libthemelios` has FS client wrappers (`open`/`read_file`/`write_file`)
+for the 5.5 server to write the rootfs.
 
 ---
 
