@@ -72,6 +72,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_linux_exec",       func: test_linux_exec },
     TestCase { name: "test_path_resolve",     func: test_path_resolve },
     TestCase { name: "test_linux_fs",         func: test_linux_fs },
+    TestCase { name: "test_linux_threads",    func: test_linux_threads },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3765,6 +3766,67 @@ fn test_linux_fs() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_linux_fs() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Test the Phase 5.3 threads + futex path end to end: run `threads-smoke`, which
+/// `clone`s a thread (sharing the address space, with its own TLS), has the child
+/// write a magic and `exit`, then **joins** by `futex`-waiting on the
+/// `CLONE_CHILD_CLEARTID` word until the kernel clears + wakes it on thread exit.
+///
+/// A green result exercises: `clone(CLONE_THREAD)` + the thread trampoline
+/// (ring-3 entry with `rax=0` on the child stack), per-task FS base, the
+/// address-keyed `futex` WAIT/WAKE queue, and `CLONE_CHILD_SETTID`/`CLEARTID`.
+/// Deterministic.
+#[cfg(target_arch = "x86_64")]
+fn test_linux_threads() -> Result<(), &'static str> {
+    use crate::linux::elf::{self, SliceSource};
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self, embedded, Personality};
+    use crate::sched;
+
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0x7C0D_E57C_0DE5_7C01;
+
+    let (pid, _) = process::create_process("threads-smoke", None);
+    let img = elf::load_into(pid, &SliceSource(embedded::THREADS_SMOKE))
+        .map_err(|_| "threads-smoke elf load failed")?;
+    let rsp = elf::build_initial_stack(pid, &img, &["threads-smoke"], &[])
+        .map_err(|_| "threads-smoke stack build failed")?;
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping result region failed")?;
+    process::set_user_entry(pid, img.entry, rsp);
+    process::set_personality(pid, Personality::Linux);
+    crate::linux::spawn_loaded("threads-smoke", pid);
+
+    let mut code: Option<u64> = None;
+    for _ in 0..400_000 {
+        // SAFETY: kernel-owned region; the guest threads write the same memory.
+        let s = unsafe { region.as_slice_mut() };
+        if u64::from_le_bytes(s[0..8].try_into().unwrap()) == RESULT_MAGIC {
+            code = Some(u64::from_le_bytes(s[8..16].try_into().unwrap()));
+            break;
+        }
+        sched::yield_now();
+    }
+    process::destroy_process(pid);
+
+    match code {
+        None => Err("threads-smoke did not finish (no magic; possible futex-join hang)"),
+        Some(0) => Ok(()),
+        Some(1) => Err("threads-smoke: child thread did not run (clone/trampoline)"),
+        Some(2) => Err("threads-smoke: clone/mmap failed"),
+        Some(_) => Err("threads-smoke: unknown failure code"),
+    }
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_linux_threads() -> Result<(), &'static str> {
     Ok(())
 }
 

@@ -149,6 +149,8 @@ pub fn init() {
         kernel_stack_top: 0, // Bootstrap uses Limine's stack; never returns from ring 3
         process_id: ProcessId::KERNEL,
         fs_base: 0,
+        clone_entry: None,
+        clear_child_tid: 0,
     }));
     sched.current_id = bootstrap_id;
     sched.next_id = 1;
@@ -209,6 +211,70 @@ pub fn set_current_fs_base(fs_base: u64) {
     }
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall::write_fs_base(fs_base);
+}
+
+/// Set another task's FS base (Linux TLS) by id — used by `clone(CLONE_SETTLS)`
+/// to seed a freshly-created thread's `%fs` before it first runs.
+pub fn set_task_fs_base(id: TaskId, fs_base: u64) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+    if let Some(Some(task)) = sched.tasks.get_mut(id) {
+        task.fs_base = fs_base;
+    }
+}
+
+/// Record a `clone`-created thread's ring-3 entry `(rip, rsp)` (Phase 5.3). The
+/// [`thread_trampoline`](crate::linux::thread::thread_trampoline) reads it back.
+pub fn set_task_clone_entry(id: TaskId, rip: u64, rsp: u64) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+    if let Some(Some(task)) = sched.tasks.get_mut(id) {
+        task.clone_entry = Some((rip, rsp));
+    }
+}
+
+/// Set a task's `CLONE_CHILD_CLEARTID` futex word address (Phase 5.3).
+pub fn set_task_clear_child_tid(id: TaskId, addr: u64) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+    if let Some(Some(task)) = sched.tasks.get_mut(id) {
+        task.clear_child_tid = addr;
+    }
+}
+
+/// Read the current task's `clone` entry `(rip, rsp)`, if it was created by
+/// `clone` (used by the thread trampoline to enter ring 3).
+pub fn current_clone_entry() -> Option<(u64, u64)> {
+    let guard = SCHEDULER.lock();
+    let sched = guard.as_ref().expect("Scheduler not initialized");
+    sched
+        .tasks
+        .get(sched.current_id)
+        .and_then(|t| t.as_ref())
+        .and_then(|t| t.clone_entry)
+}
+
+/// Read (and clear) the current task's `clear_child_tid` address — called on
+/// thread exit so the kernel can zero + futex-wake the join word exactly once.
+pub fn take_current_clear_child_tid() -> u64 {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+    if let Some(Some(task)) = sched.tasks.get_mut(sched.current_id) {
+        let addr = task.clear_child_tid;
+        task.clear_child_tid = 0;
+        addr
+    } else {
+        0
+    }
+}
+
+/// Set the current task's `clear_child_tid` (Linux `set_tid_address`).
+pub fn set_current_clear_child_tid(addr: u64) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+    if let Some(Some(task)) = sched.tasks.get_mut(sched.current_id) {
+        task.clear_child_tid = addr;
+    }
 }
 
 /// Read the current task's `IA32_FS_BASE` value (for `arch_prctl(ARCH_GET_FS)`).
@@ -596,6 +662,8 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
         kernel_stack_top: stack_top_virt.as_u64(),
         process_id: ProcessId::KERNEL, // Default to kernel process; caller can override
         fs_base: 0, // set by arch_prctl(ARCH_SET_FS) for Linux TLS (Phase 5.1)
+        clone_entry: None, // set by Linux clone() for thread tasks (Phase 5.3)
+        clear_child_tid: 0,
     };
 
     // Place the task in its slot (either reusing an empty one or the new end)

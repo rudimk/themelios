@@ -47,3 +47,8 @@ pub static LINUX_SMOKE: &[u8] = include_bytes!("../../../target/servers/linux-sm
 /// container rootfs and checks path clamping, run by `test_linux_fs`.
 #[cfg_attr(not(feature = "test"), allow(dead_code))]
 pub static FS_SMOKE: &[u8] = include_bytes!("../../../target/servers/fs-smoke.elf");
+
+/// Phase 5.3 Linux threads/futex smoke-test binary — clones a thread and joins it
+/// via futex, run by `test_linux_threads`.
+#[cfg_attr(not(feature = "test"), allow(dead_code))]
+pub static THREADS_SMOKE: &[u8] = include_bytes!("../../../target/servers/threads-smoke.elf");

@@ -152,4 +152,14 @@ pub struct Task {
     /// like the GS base — the scheduler restores it from here on every context
     /// switch. 0 for tasks that don't use TLS (kernel tasks, native servers).
     pub fs_base: u64,
+
+    /// Ring-3 entry for a task created by Linux `clone` (Phase 5.3): the child
+    /// resumes at the parent's post-`syscall` RIP on its own stack. `(rip, rsp)`;
+    /// `None` for tasks that enter ring 3 by other means (ELF exec, servers).
+    pub clone_entry: Option<(u64, u64)>,
+
+    /// The Linux `CLONE_CHILD_CLEARTID` / `set_tid_address` futex word (Phase
+    /// 5.3): on thread exit the kernel writes 0 here and futex-wakes it, which is
+    /// how `pthread_join` observes a thread has finished. 0 if unset.
+    pub clear_child_tid: u64,
 }

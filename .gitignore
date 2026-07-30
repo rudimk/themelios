@@ -10,6 +10,8 @@
 /servers/linux-smoke/target/
 # Linux FS-syscall smoke-test binary — detached workspace, own target dir
 /servers/fs-smoke/target/
+# Linux threads/futex smoke-test binary — detached workspace, own target dir
+/servers/threads-smoke/target/
 
 # Editor files
 *.swp

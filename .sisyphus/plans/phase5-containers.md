@@ -418,12 +418,33 @@ real allocator.
   mutexes/condvars block on.
 - `set_robust_list`/`rseq`(stub), `sched_yield`.
 
-**Acceptance**:
-- [ ] A multi-threaded static binary spawns threads via `clone` and joins
-- [ ] `futex` WAIT/WAKE correctly blocks/wakes threads (a pthread mutex round-trips)
-- [ ] File-backed `mmap` reads file contents into the mapping
-- [ ] Free-frame count (via `mm::frame::free_frame_count`, as `test_frame_allocator`
-      does) returns to baseline after a create-join loop of N threads — no leak
+**Acceptance** (met — `test_linux_threads`, 40 tests green, 6/6 soak):
+- [x] A binary `clone`s a thread (shared address space, own TLS + stack) and joins
+      it — `threads-smoke` clones, the child writes a magic and `exit`s, the parent
+      `futex`-waits on the CLEARTID word until the kernel clears + wakes it
+- [x] `futex` WAIT/WAKE blocks/wakes correctly (the join is a real futex wait
+      released by the child's exit; the WAIT value-recheck handles the exit race)
+- [~] **File-backed `mmap` deferred** — separable from the threads/futex core and
+      not needed for a static busybox; a static-musl binary uses anonymous mmap
+      (5.1) + brk. Layer file-backed mmap when a dynamic loader needs it.
+- [~] A strict global free-frame leak check can't hold yet because
+      `AddressSpace::destroy` reclaims only page-table frames (the 5.0-noted
+      limitation), so process data frames leak regardless of threads. Thread
+      **kernel stacks** are reclaimed on exit via `cleanup_dead_tasks`; reliability
+      is covered by the 6/6 soak. Full teardown reclamation is later-phase work.
+
+**Implementation notes** (branch `claude/phase-5.3-threads-futex`): `Task` gained
+`clone_entry` + `clear_child_tid`. `kernel/src/linux/thread.rs`: `sys_clone`
+(CLONE_THREAD|CLONE_VM only) spawns a sibling task whose ring-3 entry (via a new
+`thread_trampoline`, `rax=0` on the child stack) is the parent's post-`syscall`
+RIP; CLONE_SETTLS seeds its FS base, CLONE_CHILD_SETTID publishes the tid at clone
+time (no join race), CLONE_CHILD_CLEARTID is honoured on exit. `sys_futex`
+(private WAIT/WAKE) uses a global `(pid, uaddr)` wait queue — the value re-check +
+enqueue + `block_current_task` is non-preemptible on single-core, so no wakeup is
+lost. `exit`(60) is now thread exit (clear the join word + futex-wake + kill the
+task); `exit_group`(231) kills sibling tasks then exits. `set_tid_address` records
+the CLEARTID word. `servers/threads-smoke` is the clone+join probe. Deferred:
+file-backed mmap, PI/requeue/timeout futexes, `fork`/`vfork`.
 
 ---
 

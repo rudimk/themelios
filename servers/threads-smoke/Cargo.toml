@@ -1,0 +1,21 @@
+# Linux threads/futex smoke-test binary (Phase 5.3).
+#
+# A ring-3 Linux-ABI program that mmaps a stack, `clone`s a thread (CLONE_THREAD
+# | CLONE_VM | CLONE_SETTLS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID), has the
+# child write a magic and `exit`, then joins by `futex`-waiting on the CLEARTID
+# word — exercising the whole 5.3 clone + futex + thread-exit path. Reports to a
+# kernel-mapped result page. Built as a real ET_EXEC (detached crate).
+[workspace]
+
+[package]
+name = "threads-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "threads-smoke"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
