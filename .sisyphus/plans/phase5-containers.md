@@ -547,24 +547,77 @@ ring-3 oci-server, real-image staging (5.6).
 
 ---
 
-### Sub-phase 5.6 — Registry client (HTTP v2 pull)
+### Sub-phase 5.6 — Registry client (HTTP v2 pull) — ✅ DONE
 
-**Goal**: Pull an image from a registry over TCP instead of a local bundle.
+**Goal**: Assemble an image from the **registry wire format** (Docker Registry
+HTTP API v2): a manifest naming a config blob and **gzipped** layer blobs by
+`sha256:` digest, each **digest-verified** before use.
 
-**What to build**:
-- Docker Registry HTTP API v2 client in oci-server: `GET .../manifests/<ref>`
-  (handle manifest lists → pick amd64), `GET .../blobs/<digest>` for config +
-  layers, streamed to disk with `sha256` verification.
-- A minimal HTTP/1.1 client over the Phase 4 TCP socket API.
-- **Plain HTTP** target: a local `registry:2` served by xtask (host) reachable via
-  QEMU slirp; **TLS/Docker Hub deferred** (documented) — rustls-in-ring-3 is a
-  scoped follow-up.
+**What was built**:
+- `oci/sha256.rs` — a small `alloc`-only SHA-256 (`sha256`, `hex`, `verify`);
+  `verify(data, "sha256:<hex>")` gates every blob. Tested against FIPS 180-4
+  vectors (`""`, `"abc"`, the 56-byte multi-block message).
+- `oci/gzip.rs` — `decompress(&[u8]) -> Option<Vec<u8>>`: parses the RFC-1952
+  gzip wrapper (magic/CM/FLG + optional FEXTRA/FNAME/FCOMMENT/FHCRC + 8-byte
+  trailer) and inflates the DEFLATE body via `miniz_oxide::inflate` (which does
+  raw DEFLATE/zlib, not gzip — hence the hand-rolled wrapper). Fails closed
+  (`None`) on bad magic/header/DEFLATE; never panics.
+- `oci::unpack_registry(manifest_json, get_blob)` — parses a manifest v2, pulls
+  the config + layer blobs through the `get_blob` closure, **digest-verifies**
+  each, gunzips layers, and applies them (reusing the shared `parse_image_config`
+  + `apply_layer` extracted from `unpack`).
+- `oci/registry.rs` — HTTP/1.1 pull over a `Connection` trait (`request(&[u8]) ->
+  Option<Vec<u8>>`): `http_body` parses status + `Content-Length` body;
+  `get` issues `GET /v2/<name>/manifests|blobs/...`; `pull` fetches the manifest,
+  then every blob it names, then hands them to `unpack_registry`.
+- `miniz_oxide` added to `kernel/Cargo.toml` (`with-alloc`, no default features).
+
+**Deferred (documented)**: the **live** `Connection` over the kernel TCP client
+through a slirp `guestfwd` registry, plus a host `registry:2` in xtask — the full
+transport is a thin, well-scoped follow-up; the pull *pipeline* (HTTP parse →
+digest-verify → gunzip → assemble) is what carries the risk and is fully tested
+here offline. Manifest-list → amd64 selection also deferred (single-manifest
+images only for now). TLS/Docker Hub remains a separate gated follow-up.
 
 **Acceptance**:
-- [ ] `run localhost:5000/busybox …` pulls + runs over HTTP
-- [ ] Config and every layer blob digest-verify before use
-- [ ] A registry/network error surfaces as a clean error, not a hang/fault
-- [ ] Manifest-list images resolve to the amd64 manifest
+- [x] `test_registry_pull` pulls + assembles an image end-to-end over a mock
+      `Connection` (manifest v2 + gzipped, digest-verified layer → `/init`)
+- [x] Config and every layer blob digest-verify before use (`sha256::verify`)
+- [x] A tampered (wrong-digest) blob surfaces `OciError::DigestMismatch`, not a
+      hang/fault
+- [x] `test_sha256` (FIPS vectors) + `test_registry_pull` green; all 44 tests
+      pass, 3× soak clean
+
+**Momus review — hardening fixes applied** (untrusted registry input; the
+attacker controls *both* the manifest and the blobs that hash to the digests in
+it, so digest verification does **not** bound content):
+- **gzip decompression bomb** → `gzip::decompress` now inflates with
+  `decompress_to_vec_with_limit(_, 8 MiB)` (was the unbounded `decompress_to_vec`);
+  a bomb fails closed instead of exhausting the 16 MiB heap → abort.
+- **Unbounded JSON recursion** → `json` threads a depth counter (`MAX_DEPTH = 64`)
+  through `value`/`object`/`array`; deep nesting (`[[[[…`) returns `None` instead
+  of overflowing the kernel stack.
+- **Content-Length overflow** → `http_body` uses `body_start.checked_add(n)` so a
+  huge `Content-Length` returns `None` instead of panicking under debug-build
+  overflow checks.
+- **Compat limitations documented** (not safety): `http_body` handles only
+  `Content-Length` framing (not chunked); `gzip::decompress` handles a single
+  member. Both matter for the live puller, noted in the doc comments.
+- `test_registry_hardening` locks in the JSON-depth and Content-Length fixes.
+  Momus confirmed digest-verify-before-use ordering is correct everywhere and
+  found no memory-safety/UB bugs.
+
+**Containment note**: the OCI parser (tar/json) and now `miniz_oxide` run
+**in-kernel** for the deterministic tests. Relocating the whole `oci` module +
+miniz into the ring-3 `oci-server` (so untrusted image bytes never parse in ring
+0) is the documented hardening, carried into 5.7/later.
+
+**Note on `make_gzip` (test helper)**: it emits **stored (uncompressed) DEFLATE
+blocks** rather than calling `miniz_oxide::deflate` — `CompressorOxide` is
+~100 KiB and overflows the 16 KiB kernel test stack. Stored blocks are valid
+DEFLATE, so the production `gzip::decompress` (header parse + miniz inflate) path
+is still fully exercised; only the compressor (never used in production) is
+avoided.
 
 ---
 

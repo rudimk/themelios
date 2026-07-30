@@ -64,11 +64,19 @@ struct Parser<'a> {
     i: usize,
 }
 
-/// Parse a complete JSON document. Returns `None` on any syntax error.
+/// Maximum container-nesting depth. The manifest/config JSON is **untrusted**
+/// registry input, and this is a recursive-descent parser: a document like
+/// `[[[[…` nests one `array()`/`value()` stack frame per bracket, so without a
+/// bound a few thousand `[` bytes overflow the kernel stack (guard-page fault →
+/// kernel death). 64 levels is far beyond any real OCI manifest/config.
+const MAX_DEPTH: usize = 64;
+
+/// Parse a complete JSON document. Returns `None` on any syntax error (including
+/// nesting past [`MAX_DEPTH`]).
 pub fn parse(input: &[u8]) -> Option<Value> {
     let mut p = Parser { b: input, i: 0 };
     p.skip_ws();
-    let v = p.value()?;
+    let v = p.value(0)?;
     Some(v)
 }
 
@@ -98,12 +106,12 @@ impl Parser<'_> {
         }
     }
 
-    fn value(&mut self) -> Option<Value> {
+    fn value(&mut self, depth: usize) -> Option<Value> {
         self.skip_ws();
         match self.peek()? {
             b'"' => self.string().map(Value::Str),
-            b'{' => self.object(),
-            b'[' => self.array(),
+            b'{' => self.object(depth),
+            b'[' => self.array(depth),
             b't' | b'f' => self.boolean(),
             b'n' => self.null(),
             _ => self.number(),
@@ -175,7 +183,11 @@ impl Parser<'_> {
         }
     }
 
-    fn object(&mut self) -> Option<Value> {
+    fn object(&mut self, depth: usize) -> Option<Value> {
+        // Guard container nesting before recursing (untrusted-input stack safety).
+        if depth >= MAX_DEPTH {
+            return None;
+        }
         self.expect(b'{')?;
         let mut pairs = Vec::new();
         self.skip_ws();
@@ -188,7 +200,7 @@ impl Parser<'_> {
             let key = self.string()?;
             self.skip_ws();
             self.expect(b':')?;
-            let val = self.value()?;
+            let val = self.value(depth + 1)?;
             pairs.push((key, val));
             self.skip_ws();
             match self.bump()? {
@@ -199,7 +211,11 @@ impl Parser<'_> {
         }
     }
 
-    fn array(&mut self) -> Option<Value> {
+    fn array(&mut self, depth: usize) -> Option<Value> {
+        // Guard container nesting before recursing (untrusted-input stack safety).
+        if depth >= MAX_DEPTH {
+            return None;
+        }
         self.expect(b'[')?;
         let mut items = Vec::new();
         self.skip_ws();
@@ -208,7 +224,7 @@ impl Parser<'_> {
             return Some(Value::Array(items));
         }
         loop {
-            let val = self.value()?;
+            let val = self.value(depth + 1)?;
             items.push(val);
             self.skip_ws();
             match self.bump()? {
@@ -248,6 +264,11 @@ impl Parser<'_> {
             } else {
                 break;
             }
+        }
+        // If nothing was consumed the input isn't a value here — fail instead of
+        // returning without advancing (which would spin the array/object loop).
+        if self.i == start {
+            return None;
         }
         let s = core::str::from_utf8(&self.b[start..self.i]).ok()?;
         // Integer-only parse is enough for our needs; fall back to 0.0.
