@@ -74,6 +74,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_linux_fs",         func: test_linux_fs },
     TestCase { name: "test_linux_threads",    func: test_linux_threads },
     TestCase { name: "test_oci_unpack",       func: test_oci_unpack },
+    TestCase { name: "test_container_run",    func: test_container_run },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3951,6 +3952,138 @@ fn test_oci_unpack() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_oci_unpack() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Bring up an ext2 server on the ext2 disk and register it as a VFS mount,
+/// returning the mount id. Shared by the FS/container tests.
+#[cfg(target_arch = "x86_64")]
+fn bring_up_ext2_mount(block_name: &'static str, ep_name: &'static str) -> Result<u64, &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::ipc;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let mut ext2_index = None;
+    for dev in devs.iter().filter(|d| d.class == 0x01) {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 512];
+        if blk.read_blocks(2, &mut buf).is_ok() && buf[56] == 0x53 && buf[57] == 0xEF {
+            ext2_index = Some(block::register(block_name, Box::new(blk)));
+            break;
+        }
+    }
+    let idx = ext2_index.ok_or("no ext2 disk found")?;
+    let block_handle = block_server::start(idx);
+    let client = SharedRegion::alloc(128 * 1024).ok_or("client region alloc failed")?;
+    let fs_ep = ipc::create_endpoint(ep_name);
+    spawn_server(ServerConfig {
+        name: "ext2-server",
+        binary: embedded::EXT2_SERVER,
+        fs_endpoint: fs_ep,
+        block_endpoint: block_handle.endpoint,
+        shared: Some(block_handle.region),
+        client_shared: Some(client),
+        heap_bytes: 2 * 1024 * 1024,
+        arg0: 0,
+        arg1: 0,
+        filesystem_mount: None,
+    });
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+    Ok(crate::fs::register_mount(fs_ep, client))
+}
+
+/// Test the Phase 5.5 container runtime end to end: synthesize an image whose
+/// entrypoint `/init` is a real Linux ELF, assemble its rootfs on an ext2 mount,
+/// launch it as a capability-isolated Linux container, and verify it ran and
+/// exited cleanly.
+///
+/// This is the payoff of Phases 5.0–5.4: the entrypoint ELF round-trips **image
+/// bundle → written to the rootfs → loaded back from the rootfs via the VFS →
+/// run as a Linux process rooted at that rootfs**. The `linux-smoke` probe serves
+/// as the entrypoint (it self-checks the Linux syscall surface and reports to a
+/// result page), so a green run also proves syscalls work inside the container.
+#[cfg(target_arch = "x86_64")]
+fn test_container_run() -> Result<(), &'static str> {
+    use crate::container;
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self, embedded};
+    use crate::sched;
+
+    // linux-smoke's result page + success magic (it is our entrypoint here).
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0x5A11_D0C5_10AD_ED11;
+
+    let mount = bring_up_ext2_mount("ext2-disk-container", "ext2-container")?;
+
+    // Build an image bundle whose single layer contains /init = the linux-smoke
+    // ELF, with an Entrypoint of ["/init"].
+    let layer = make_tar(&[("init", embedded::LINUX_SMOKE, b'0')]);
+    let config = br#"{"config":{"Entrypoint":["/init"],"Env":["PATH=/bin"],"WorkingDir":"/"}}"#;
+    let manifest = br#"[{"Config":"config.json","Layers":["layer.tar"]}]"#;
+    let bundle = make_tar(&[
+        ("manifest.json", manifest, b'0'),
+        ("config.json", config, b'0'),
+        ("layer.tar", &layer, b'0'),
+    ]);
+
+    // Assemble the rootfs + create the container process (not yet running).
+    let pid = container::create(&bundle, mount).map_err(|_| "container::create failed")?;
+
+    // Map the entrypoint's result page before launch.
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping result region failed")?;
+
+    container::start(pid);
+
+    // Wait for the container to signal success on its result page.
+    let mut signalled = false;
+    for _ in 0..400_000 {
+        // SAFETY: kernel-owned region; the container writes the same memory.
+        let s = unsafe { region.as_slice_mut() };
+        if u64::from_le_bytes(s[0..8].try_into().unwrap()) == RESULT_MAGIC {
+            if u64::from_le_bytes(s[8..16].try_into().unwrap()) != 0 {
+                process::destroy_process(pid);
+                return Err("container entrypoint reported a failure code");
+            }
+            signalled = true;
+            break;
+        }
+        sched::yield_now();
+    }
+    if !signalled {
+        process::destroy_process(pid);
+        return Err("container entrypoint did not run (loaded from rootfs?)");
+    }
+
+    // The exit status was captured by exit_group.
+    let status = process::exit_status(pid);
+    process::destroy_process(pid);
+    match status {
+        Some(0) => Ok(()),
+        Some(_) => Err("container exit status was non-zero"),
+        None => Err("container exit status was not captured"),
+    }
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_container_run() -> Result<(), &'static str> {
     Ok(())
 }
 

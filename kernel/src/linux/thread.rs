@@ -196,6 +196,8 @@ pub fn exit_group(code: u64) -> ! {
             sched::kill_task(tid);
         }
     }
+    // Record the process exit status so a waiter (e.g. `run`) can report it.
+    process::set_exit_code(pid, code);
     crate::println!("[linux] exit_group: task {} code {}", me, code);
     // SAFETY: matches the syscall entry's swapgs; single-core.
     unsafe {

@@ -88,6 +88,7 @@ fn shell_entry() {
             "ping" => commands::cmd_ping(args),
             "udpsend" => commands::cmd_udpsend(args),
             "tcpconnect" => commands::cmd_tcpconnect(args),
+            "run" => commands::cmd_run(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
             }
