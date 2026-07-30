@@ -22,7 +22,10 @@
 //! gzip-compressed layers (the *registry* wire format) are out of scope here —
 //! `docker save` layers are uncompressed; gzip arrives with the registry in 5.6.
 
+pub mod gzip;
 pub mod json;
+pub mod registry;
+pub mod sha256;
 pub mod tar;
 
 use alloc::string::String;
@@ -76,6 +79,12 @@ pub enum OciError {
     NoLayer,
     /// The manifest is structurally not what we expect.
     BadManifest,
+    /// A blob's content did not match its `sha256:` digest (registry pull).
+    DigestMismatch,
+    /// A gzip-compressed layer failed to decompress (registry pull).
+    BadGzip,
+    /// A referenced blob was not available (registry pull).
+    MissingBlob,
 }
 
 /// Find a member of the outer tar by exact normalized path (`name` is given as it
@@ -133,6 +142,23 @@ pub fn unpack(bundle: &[u8]) -> Result<Image, OciError> {
     // 3. Parse the image config JSON.
     let config_bytes = find(&entries, config_name).ok_or(OciError::NoConfig)?;
     let cfg = json::parse(config_bytes).ok_or(OciError::BadJson)?;
+    let config = parse_image_config(&cfg);
+
+    // 4. Apply each (uncompressed) layer in order, resolving whiteouts.
+    let mut files: Vec<OciFile> = Vec::new();
+    for layer_name in &layers {
+        let layer_bytes = find(&entries, layer_name).ok_or(OciError::NoLayer)?;
+        let layer = tar::read_all(layer_bytes).ok_or(OciError::BadTar)?;
+        apply_layer(&mut files, &layer);
+    }
+
+    Ok(Image { files, config })
+}
+
+/// Extract the runtime config from a parsed image-config JSON value (the `config`
+/// object holds `Entrypoint`/`Cmd`/`Env`/`WorkingDir`). Shared by the docker-save
+/// and registry paths.
+fn parse_image_config(cfg: &json::Value) -> ImageConfig {
     let cfg_obj = cfg.get("config");
     let entrypoint = cfg_obj
         .and_then(|c| c.get("Entrypoint"))
@@ -152,61 +178,99 @@ pub fn unpack(bundle: &[u8]) -> Result<Image, OciError> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .unwrap_or_else(|| String::from("/"));
+    ImageConfig { entrypoint, cmd, env, cwd }
+}
 
-    // 4. Apply each layer in order, resolving whiteouts, into a flat file set.
-    let mut files: Vec<OciFile> = Vec::new();
-    for layer_name in &layers {
-        let layer_bytes = find(&entries, layer_name).ok_or(OciError::NoLayer)?;
-        let layer = tar::read_all(layer_bytes).ok_or(OciError::BadTar)?;
-        for e in &layer {
-            let base = basename(&e.name);
-            if base == ".wh..wh..opq" {
-                // Opaque dir: drop all existing entries under this directory.
-                let dir = dirname(&e.name);
-                let prefix = {
-                    let mut p = String::from(dir);
-                    if !p.ends_with('/') {
-                        p.push('/');
-                    }
-                    p
-                };
-                files.retain(|f| !f.path.starts_with(&prefix));
-                continue;
+/// Apply one layer's tar entries over the accumulated file set, resolving OCI
+/// whiteouts (`.wh.<name>`) and opaque directories (`.wh..wh..opq`). Later layers
+/// win. Shared by the docker-save and registry paths.
+fn apply_layer(files: &mut Vec<OciFile>, layer: &[tar::TarEntry]) {
+    for e in layer {
+        let base = basename(&e.name);
+        if base == ".wh..wh..opq" {
+            let dir = dirname(&e.name);
+            let mut prefix = String::from(dir);
+            if !prefix.ends_with('/') {
+                prefix.push('/');
             }
-            if let Some(name) = base.strip_prefix(".wh.") {
-                // Whiteout: remove `<dir>/<name>` (and anything beneath it).
-                let dir = dirname(&e.name);
-                let mut target = String::from(dir);
-                if !target.ends_with('/') {
-                    target.push('/');
-                }
-                target.push_str(name);
-                files.retain(|f| f.path != target && !f.path.starts_with(&{
-                    let mut p = target.clone();
-                    p.push('/');
-                    p
-                }));
-                continue;
+            files.retain(|f| !f.path.starts_with(&prefix));
+            continue;
+        }
+        if let Some(name) = base.strip_prefix(".wh.") {
+            let dir = dirname(&e.name);
+            let mut target = String::from(dir);
+            if !target.ends_with('/') {
+                target.push('/');
             }
-            if !e.is_file() && !e.is_dir() {
-                continue; // skip symlinks/devices/etc. in 5.4
-            }
-            // Insert or replace (later layer wins).
-            let file = OciFile {
-                path: e.name.clone(),
-                data: e.data.to_vec(),
-                is_dir: e.is_dir(),
-            };
-            if let Some(slot) = files.iter_mut().find(|f| f.path == file.path) {
-                *slot = file;
-            } else {
-                files.push(file);
-            }
+            target.push_str(name);
+            let mut sub = target.clone();
+            sub.push('/');
+            files.retain(|f| f.path != target && !f.path.starts_with(&sub));
+            continue;
+        }
+        if !e.is_file() && !e.is_dir() {
+            continue; // symlinks/devices/etc. are out of scope
+        }
+        let file = OciFile {
+            path: e.name.clone(),
+            data: e.data.to_vec(),
+            is_dir: e.is_dir(),
+        };
+        if let Some(slot) = files.iter_mut().find(|f| f.path == file.path) {
+            *slot = file;
+        } else {
+            files.push(file);
         }
     }
+}
 
-    Ok(Image {
-        files,
-        config: ImageConfig { entrypoint, cmd, env, cwd },
-    })
+/// Unpack a **registry** image (OCI / Docker manifest v2): the manifest names a
+/// config blob and gzipped layer blobs by `sha256:` digest, fetched via
+/// `get_blob`. Each blob is **digest-verified** before use; layers are
+/// gunzipped, then applied like docker-save layers. This is the assembly the
+/// registry puller drives after fetching the manifest + blobs over HTTP.
+pub fn unpack_registry(
+    manifest_json: &[u8],
+    get_blob: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<Image, OciError> {
+    let manifest = json::parse(manifest_json).ok_or(OciError::BadJson)?;
+    let config_digest = manifest
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|v| v.as_str())
+        .ok_or(OciError::BadManifest)?;
+    let layer_digests: Vec<String> = manifest
+        .get("layers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("digest").and_then(|d| d.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if layer_digests.is_empty() {
+        return Err(OciError::BadManifest);
+    }
+
+    // Config blob: fetch, verify, parse.
+    let config_blob = get_blob(config_digest).ok_or(OciError::MissingBlob)?;
+    if !sha256::verify(&config_blob, config_digest) {
+        return Err(OciError::DigestMismatch);
+    }
+    let cfg = json::parse(&config_blob).ok_or(OciError::BadJson)?;
+    let config = parse_image_config(&cfg);
+
+    // Layers: fetch, verify, gunzip, apply in order.
+    let mut files: Vec<OciFile> = Vec::new();
+    for digest in &layer_digests {
+        let blob = get_blob(digest).ok_or(OciError::MissingBlob)?;
+        if !sha256::verify(&blob, digest) {
+            return Err(OciError::DigestMismatch);
+        }
+        let tar_bytes = gzip::decompress(&blob).ok_or(OciError::BadGzip)?;
+        let layer = tar::read_all(&tar_bytes).ok_or(OciError::BadTar)?;
+        apply_layer(&mut files, &layer);
+    }
+
+    Ok(Image { files, config })
 }

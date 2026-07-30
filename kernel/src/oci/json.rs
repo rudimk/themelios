@@ -249,6 +249,11 @@ impl Parser<'_> {
                 break;
             }
         }
+        // If nothing was consumed the input isn't a value here — fail instead of
+        // returning without advancing (which would spin the array/object loop).
+        if self.i == start {
+            return None;
+        }
         let s = core::str::from_utf8(&self.b[start..self.i]).ok()?;
         // Integer-only parse is enough for our needs; fall back to 0.0.
         let n = s.parse::<f64>().unwrap_or(0.0);

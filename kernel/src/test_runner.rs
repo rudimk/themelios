@@ -75,6 +75,8 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_linux_threads",    func: test_linux_threads },
     TestCase { name: "test_oci_unpack",       func: test_oci_unpack },
     TestCase { name: "test_container_run",    func: test_container_run },
+    TestCase { name: "test_sha256",           func: test_sha256 },
+    TestCase { name: "test_registry_pull",    func: test_registry_pull },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -4084,6 +4086,188 @@ fn test_container_run() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_container_run() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Test SHA-256 against known FIPS 180-4 vectors (used for registry blob digest
+/// verification, Phase 5.6).
+#[cfg(target_arch = "x86_64")]
+fn test_sha256() -> Result<(), &'static str> {
+    use crate::oci::sha256;
+    if sha256::hex(&sha256::sha256(b"")) != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+        return Err("sha256(\"\") mismatch");
+    }
+    if sha256::hex(&sha256::sha256(b"abc")) != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {
+        return Err("sha256(\"abc\") mismatch");
+    }
+    // A message spanning multiple blocks (56 bytes → padding crosses a block).
+    let msg = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    if sha256::hex(&sha256::sha256(msg)) != "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1" {
+        return Err("sha256(multi-block) mismatch");
+    }
+    if !sha256::verify(b"abc", "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+        return Err("sha256::verify accepted-form failed");
+    }
+    if sha256::verify(b"abc", "sha256:0000000000000000000000000000000000000000000000000000000000000000") {
+        return Err("sha256::verify accepted a wrong digest");
+    }
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_sha256() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Wrap `data` in a minimal RFC-1952 gzip member (test helper).
+///
+/// The DEFLATE body uses **stored (uncompressed) blocks** (BTYPE=00) rather than
+/// an actual compressor: `miniz_oxide::deflate::CompressorOxide` is ~100 KiB and
+/// blows the 16 KiB kernel test stack, whereas emitting stored blocks needs no
+/// working state. This still fully exercises the production `pull` decompress
+/// path — `gzip::decompress` parses the RFC-1952 header and inflates via
+/// `miniz_oxide::inflate` (which handles stored blocks like any other).
+#[cfg(target_arch = "x86_64")]
+fn make_gzip(data: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0xff]); // header (FLG=0)
+    // DEFLATE stored blocks: one per <=65535-byte chunk. Each block header byte is
+    // BFINAL (bit 0) | BTYPE=00 (bits 1-2); a stored block then byte-aligns and is
+    // LEN(2, LE) NLEN(2, LE = ~LEN) followed by LEN literal bytes.
+    if data.is_empty() {
+        out.push(0x01); // a single final, empty stored block
+        out.extend_from_slice(&[0, 0, 0xff, 0xff]);
+    } else {
+        let mut chunks = data.chunks(0xFFFF).peekable();
+        while let Some(chunk) = chunks.next() {
+            let last = chunks.peek().is_none();
+            out.push(if last { 0x01 } else { 0x00 });
+            let len = chunk.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+    }
+    out.extend_from_slice(&[0, 0, 0, 0]); // CRC32 (not checked by our decompressor)
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // ISIZE
+    out
+}
+
+/// Test the Phase 5.6 registry pull pipeline end to end over a mock HTTP
+/// connection: manifest v2 + digest-verified config/gzipped-layer blobs → an
+/// assembled [`Image`]. Exercises the HTTP response parser, SHA-256 verification,
+/// gzip decompression, and registry-format layer assembly — deterministically,
+/// with no live network. (The live TCP `Connection` + a `guestfwd` registry is a
+/// documented follow-up.)
+#[cfg(target_arch = "x86_64")]
+fn test_registry_pull() -> Result<(), &'static str> {
+    use crate::oci::{self, registry, sha256};
+    use crate::process::embedded;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    // Build the blobs: an image config, and a gzipped single-layer tar with /init.
+    let config_blob = br#"{"config":{"Entrypoint":["/init"],"Env":["PATH=/bin"],"WorkingDir":"/"}}"#.to_vec();
+    let layer_tar = make_tar(&[("init", embedded::LINUX_SMOKE, b'0')]);
+    let layer_blob = make_gzip(&layer_tar);
+
+    let cfg_digest = alloc::format!("sha256:{}", sha256::hex(&sha256::sha256(&config_blob)));
+    let layer_digest = alloc::format!("sha256:{}", sha256::hex(&sha256::sha256(&layer_blob)));
+
+    let manifest = alloc::format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{{"mediaType":"application/vnd.docker.container.image.v1+json","digest":"{cfg}"}},"layers":[{{"mediaType":"application/vnd.docker.image.rootfs.diff.tar.gzip","digest":"{lyr}"}}]}}"#,
+        cfg = cfg_digest,
+        lyr = layer_digest,
+    )
+    .into_bytes();
+
+    // Wrap a body in a minimal HTTP/1.1 200 response.
+    let http = |body: &[u8]| -> Vec<u8> {
+        let mut r = alloc::format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        r.extend_from_slice(body);
+        r
+    };
+
+    // A mock Connection that answers by the request path.
+    struct MockConn {
+        manifest: Vec<u8>,
+        config: Vec<u8>,
+        layer: Vec<u8>,
+        cfg_digest: String,
+        layer_digest: String,
+    }
+    impl registry::Connection for MockConn {
+        fn request(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+            let s = core::str::from_utf8(request).ok()?;
+            if s.contains("/manifests/") {
+                Some(self.manifest.clone())
+            } else if s.contains(&self.cfg_digest) {
+                Some(self.config.clone())
+            } else if s.contains(&self.layer_digest) {
+                Some(self.layer.clone())
+            } else {
+                None
+            }
+        }
+    }
+
+    // Sanity-check the HTTP response parser directly.
+    let (status, body) = registry::http_body(&http(b"hello")).ok_or("http_body parse failed")?;
+    if status != 200 || body != b"hello" {
+        return Err("http_body returned wrong status/body");
+    }
+
+    let mut conn = MockConn {
+        manifest: http(&manifest),
+        config: http(&config_blob),
+        layer: http(&layer_blob),
+        cfg_digest,
+        layer_digest,
+    };
+
+    let image = registry::pull(&mut conn, "registry.local", "library/demo", "latest")
+        .map_err(|_| "registry::pull failed")?;
+
+    // The layer's /init survived gunzip + untar + digest verification.
+    let init = image
+        .files
+        .iter()
+        .find(|f| f.path == "/init")
+        .ok_or("/init missing from pulled image")?;
+    if init.data != embedded::LINUX_SMOKE {
+        return Err("/init contents wrong after registry pull");
+    }
+    if image.config.entrypoint != ["/init"] {
+        return Err("pulled image entrypoint wrong");
+    }
+
+    // A tampered layer blob must fail digest verification.
+    let mut bad_layer = image_bad_layer(&layer_blob);
+    conn.layer = http(&bad_layer);
+    bad_layer.clear();
+    match registry::pull(&mut conn, "registry.local", "library/demo", "latest") {
+        Err(oci::OciError::DigestMismatch) => {}
+        _ => return Err("registry::pull accepted a tampered (wrong-digest) layer"),
+    }
+    Ok(())
+}
+
+/// Flip a byte in a copy of a blob (to break its digest), test helper.
+#[cfg(target_arch = "x86_64")]
+fn image_bad_layer(blob: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut b = blob.to_vec();
+    if let Some(x) = b.last_mut() {
+        *x ^= 0xff;
+    }
+    b
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_sha256_stub() {}
+#[cfg(not(target_arch = "x86_64"))]
+fn test_registry_pull() -> Result<(), &'static str> {
     Ok(())
 }
 
