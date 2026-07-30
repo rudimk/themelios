@@ -73,6 +73,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_path_resolve",     func: test_path_resolve },
     TestCase { name: "test_linux_fs",         func: test_linux_fs },
     TestCase { name: "test_linux_threads",    func: test_linux_threads },
+    TestCase { name: "test_oci_unpack",       func: test_oci_unpack },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3827,6 +3828,129 @@ fn test_linux_threads() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_linux_threads() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Build one 512-byte USTAR header for `name`/`size`/`typeflag` (test helper).
+fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    let nb = name.as_bytes();
+    let n = nb.len().min(100);
+    h[..n].copy_from_slice(&nb[..n]);
+    h[100..108].copy_from_slice(b"0000644\0"); // mode
+    h[108..116].copy_from_slice(b"0000000\0"); // uid
+    h[116..124].copy_from_slice(b"0000000\0"); // gid
+    // size: 11 octal digits + NUL
+    let s = alloc::format!("{:011o}\0", size);
+    h[124..136].copy_from_slice(s.as_bytes());
+    h[136..148].copy_from_slice(b"00000000000\0"); // mtime
+    h[156] = typeflag;
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    // checksum: spaces in the field, sum all bytes, then write "%06o\0 ".
+    h[148..156].copy_from_slice(b"        ");
+    let sum: u32 = h.iter().map(|&b| b as u32).sum();
+    let cs = alloc::format!("{:06o}\0 ", sum);
+    h[148..156].copy_from_slice(cs.as_bytes());
+    h
+}
+
+/// Assemble a tar archive from `(name, data, typeflag)` entries (test helper).
+fn make_tar(entries: &[(&str, &[u8], u8)]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    for (name, data, tf) in entries {
+        out.extend_from_slice(&tar_header(name, data.len(), *tf));
+        out.extend_from_slice(data);
+        // pad the data to a 512-byte block
+        let pad = (512 - (data.len() % 512)) % 512;
+        out.extend(core::iter::repeat(0u8).take(pad));
+    }
+    // two zero blocks terminate the archive
+    out.extend(core::iter::repeat(0u8).take(1024));
+    out
+}
+
+/// Test the Phase 5.4 OCI / docker-save image unpacker: synthesize a bundle
+/// in-memory (manifest + config + uncompressed layer tars), unpack it, and verify
+/// the assembled rootfs files, the parsed runtime config, and whiteout handling.
+///
+/// Deterministic and self-contained — no `docker`, no disk. Exercises the tar
+/// reader, the JSON parser, and the layer/whiteout assembly that the ring-3
+/// `oci-server` will use in 5.5.
+#[cfg(target_arch = "x86_64")]
+fn test_oci_unpack() -> Result<(), &'static str> {
+    use crate::oci;
+
+    const HELLO: &[u8] = b"#!hello binary\n";
+    const MOTD: &[u8] = b"welcome to the container\n";
+    const WORLD: &[u8] = b"#!world binary\n";
+
+    // Layer 0: /bin/hello, /etc (dir), /etc/motd.
+    let layer0 = make_tar(&[
+        ("bin/hello", HELLO, b'0'),
+        ("etc/", b"", b'5'),
+        ("etc/motd", MOTD, b'0'),
+    ]);
+    // Layer 1: whiteout /bin/hello and add /bin/world.
+    let layer1 = make_tar(&[
+        ("bin/.wh.hello", b"", b'0'),
+        ("bin/world", WORLD, b'0'),
+    ]);
+    let config = br#"{"config":{"Entrypoint":["/bin/world","--flag"],"Cmd":["arg1"],"Env":["PATH=/bin","TERM=linux"],"WorkingDir":"/root"}}"#;
+    let manifest = br#"[{"Config":"config.json","RepoTags":["test:latest"],"Layers":["layer0.tar","layer1.tar"]}]"#;
+    let bundle = make_tar(&[
+        ("manifest.json", manifest, b'0'),
+        ("config.json", config, b'0'),
+        ("layer0.tar", &layer0, b'0'),
+        ("layer1.tar", &layer1, b'0'),
+    ]);
+
+    let image = oci::unpack(&bundle).map_err(|_| "oci::unpack failed on a valid bundle")?;
+
+    // --- Files: layer1 whiteout removed hello; world + motd remain ---
+    let find = |p: &str| image.files.iter().find(|f| f.path == p);
+    if find("/bin/hello").is_some() {
+        return Err("whiteout did not remove /bin/hello");
+    }
+    let world = find("/bin/world").ok_or("/bin/world missing from assembled rootfs")?;
+    if world.data != WORLD {
+        return Err("/bin/world has wrong contents");
+    }
+    let motd = find("/etc/motd").ok_or("/etc/motd missing from assembled rootfs")?;
+    if motd.data != MOTD {
+        return Err("/etc/motd has wrong contents");
+    }
+    match find("/etc") {
+        Some(d) if d.is_dir => {}
+        _ => return Err("/etc directory missing from assembled rootfs"),
+    }
+
+    // --- Config parsed correctly ---
+    let c = &image.config;
+    if c.entrypoint != ["/bin/world", "--flag"] {
+        return Err("image entrypoint parsed incorrectly");
+    }
+    if c.cmd != ["arg1"] {
+        return Err("image cmd parsed incorrectly");
+    }
+    if !c.env.iter().any(|e| e == "PATH=/bin") {
+        return Err("image env missing PATH");
+    }
+    if c.cwd != "/root" {
+        return Err("image WorkingDir parsed incorrectly");
+    }
+
+    // --- A garbage bundle is rejected, not a panic ---
+    if oci::unpack(b"not a tar at all, just bytes").is_ok() {
+        return Err("unpack accepted a non-tar bundle");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_oci_unpack() -> Result<(), &'static str> {
     Ok(())
 }
 

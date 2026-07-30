@@ -173,6 +173,13 @@ mod net;
 /// personality that lets ThemeliOS run unmodified OCI container binaries.
 mod linux;
 
+/// OCI / docker-save image unpacking (Phase 5.4): tar + JSON + layer assembly.
+/// Dependency-light (alloc-only) so it lifts into the ring-3 `oci-server` in 5.5;
+/// for now it is exercised by `test_oci_unpack`, hence gated to test builds.
+#[cfg(feature = "test")]
+#[allow(dead_code)] // a complete tar/JSON reader; 5.4's test uses a subset
+mod oci;
+
 // ----- Kernel entry point -----
 
 /// The kernel entry point. Limine bootloader jumps here after loading the
