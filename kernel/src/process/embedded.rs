@@ -42,3 +42,8 @@ pub static ELF_SMOKE: &[u8] = include_bytes!("../../../target/servers/elf-smoke.
 /// **Linux** syscall ABI, run by `test_linux_exec`.
 #[cfg_attr(not(feature = "test"), allow(dead_code))]
 pub static LINUX_SMOKE: &[u8] = include_bytes!("../../../target/servers/linux-smoke.elf");
+
+/// Phase 5.2 Linux FS-syscall smoke-test binary — opens/reads a file from its
+/// container rootfs and checks path clamping, run by `test_linux_fs`.
+#[cfg_attr(not(feature = "test"), allow(dead_code))]
+pub static FS_SMOKE: &[u8] = include_bytes!("../../../target/servers/fs-smoke.elf");

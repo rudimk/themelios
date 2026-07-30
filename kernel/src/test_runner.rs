@@ -70,6 +70,8 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_tcp_client",       func: test_tcp_client },
     TestCase { name: "test_elf_exec",         func: test_elf_exec },
     TestCase { name: "test_linux_exec",       func: test_linux_exec },
+    TestCase { name: "test_path_resolve",     func: test_path_resolve },
+    TestCase { name: "test_linux_fs",         func: test_linux_fs },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -3606,6 +3608,163 @@ fn test_linux_exec() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_linux_exec() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Unit-test the security-critical Linux path resolver (Phase 5.2): `..` must be
+/// clamped at the root so a container path can never escape its rootfs.
+#[cfg(target_arch = "x86_64")]
+fn test_path_resolve() -> Result<(), &'static str> {
+    use crate::linux::fs::resolve_path;
+    let cases: &[(&str, &str, &str)] = &[
+        ("/", "/hello.txt", "/hello.txt"),
+        ("/", "hello.txt", "/hello.txt"),
+        // Escape attempts clamp at the root — the whole point.
+        ("/", "../../../hello.txt", "/hello.txt"),
+        ("/", "..", "/"),
+        ("/", "../..", "/"),
+        ("/foo", "bar", "/foo/bar"),
+        ("/foo/bar", "../baz", "/foo/baz"),
+        ("/", "a/./b/../c", "/a/c"),
+        ("/x", "/etc/../y", "/y"),
+        ("/a/b/c", "../../../../../etc/passwd", "/etc/passwd"),
+    ];
+    for (cwd, path, expect) in cases {
+        let got = resolve_path(cwd, path);
+        if got != *expect {
+            crate::println!("  resolve_path({:?}, {:?}) = {:?}, want {:?}", cwd, path, got, expect);
+            return Err("path resolution mismatch (possible container escape)");
+        }
+    }
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_path_resolve() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Test the Phase 5.2 Linux filesystem syscalls end to end: stage a file on an
+/// ext2 mount, use it as a Linux process's container rootfs, and run `fs-smoke`,
+/// which `openat`/`read`s the file and checks path clamping. Verifies the bytes
+/// the container read match what we staged.
+#[cfg(target_arch = "x86_64")]
+fn test_linux_fs() -> Result<(), &'static str> {
+    use alloc::boxed::Box;
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+    use crate::drivers::{block, block_server, pci};
+    use crate::ipc;
+    use crate::linux::elf::{self, SliceSource};
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self, embedded, Personality};
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::sched;
+
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0xF5C0_DE55_10AD_ED55;
+    const CONTENT: &[u8] = b"THEMELIOS_FS_OK\n"; // 16 bytes staged at /hello.txt
+
+    // --- Bring up an ext2 server on the ext2 disk and register it as a mount ---
+    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
+    let mut ext2_index = None;
+    for dev in devs.iter().filter(|d| d.class == 0x01) {
+        let blk = match VirtioBlk::init_from_pci(dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 512];
+        if blk.read_blocks(2, &mut buf).is_ok() && buf[56] == 0x53 && buf[57] == 0xEF {
+            ext2_index = Some(block::register("ext2-disk-linuxfs", Box::new(blk)));
+            break;
+        }
+    }
+    let idx = ext2_index.ok_or("no ext2 disk found")?;
+    let block_handle = block_server::start(idx);
+    let client = SharedRegion::alloc(128 * 1024).ok_or("client region alloc failed")?;
+    let fs_ep = ipc::create_endpoint("ext2-linuxfs");
+    spawn_server(ServerConfig {
+        name: "ext2-server",
+        binary: embedded::EXT2_SERVER,
+        fs_endpoint: fs_ep,
+        block_endpoint: block_handle.endpoint,
+        shared: Some(block_handle.region),
+        client_shared: Some(client),
+        heap_bytes: 2 * 1024 * 1024,
+        arg0: 0,
+        arg1: 0,
+        filesystem_mount: None,
+    });
+    for _ in 0..1000 {
+        sched::yield_now();
+    }
+    let mount = crate::fs::register_mount(fs_ep, client);
+
+    // --- Stage /hello.txt with known content (overwrite if it already exists) ---
+    let fd = match crate::fs::kcreate(mount, b"/hello.txt") {
+        Ok(fd) => fd,
+        Err(_) => crate::fs::kopen(mount, b"/hello.txt").map_err(|_| "stage: open hello.txt")?,
+    };
+    crate::fs::kwrite(mount, fd, 0, CONTENT).map_err(|_| "stage: kwrite hello.txt")?;
+    let _ = crate::fs::kclose(mount, fd);
+
+    // --- Run fs-smoke with this mount as its rootfs ---
+    let (pid, _) = process::create_process("fs-smoke", None);
+    let img = elf::load_into(pid, &SliceSource(embedded::FS_SMOKE))
+        .map_err(|_| "fs-smoke elf load failed")?;
+    let rsp = elf::build_initial_stack(pid, &img, &["fs-smoke"], &[])
+        .map_err(|_| "fs-smoke stack build failed")?;
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping result region failed")?;
+    process::set_user_entry(pid, img.entry, rsp);
+    process::set_personality(pid, Personality::Linux);
+    process::set_rootfs_mount(pid, mount);
+    crate::linux::spawn_loaded("fs-smoke", pid);
+
+    let mut done: Option<(u64, u64, u64)> = None; // (code, first8, len)
+    for _ in 0..400_000 {
+        // SAFETY: kernel-owned region; the guest writes the same memory.
+        let s = unsafe { region.as_slice_mut() };
+        if u64::from_le_bytes(s[0..8].try_into().unwrap()) == RESULT_MAGIC {
+            done = Some((
+                u64::from_le_bytes(s[8..16].try_into().unwrap()),
+                u64::from_le_bytes(s[16..24].try_into().unwrap()),
+                u64::from_le_bytes(s[24..32].try_into().unwrap()),
+            ));
+            break;
+        }
+        sched::yield_now();
+    }
+    process::destroy_process(pid);
+
+    match done {
+        None => Err("fs-smoke did not run (no magic written)"),
+        Some((1, _, _)) => Err("fs-smoke: openat(/hello.txt) failed"),
+        Some((2, _, _)) => Err("fs-smoke: read(/hello.txt) failed/empty"),
+        Some((3, _, _)) => Err("fs-smoke: '..' clamp broke (clamped-open failed)"),
+        Some((4, _, _)) => Err("fs-smoke: nonexistent path opened (phantom file)"),
+        Some((0, first8, len)) => {
+            let expect = u64::from_le_bytes(CONTENT[0..8].try_into().unwrap());
+            if first8 != expect {
+                return Err("fs-smoke: read wrong file content");
+            }
+            if len < CONTENT.len() as u64 {
+                return Err("fs-smoke: short read");
+            }
+            Ok(())
+        }
+        Some(_) => Err("fs-smoke: unknown failure code"),
+    }
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_linux_fs() -> Result<(), &'static str> {
     Ok(())
 }
 

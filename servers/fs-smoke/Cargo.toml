@@ -1,0 +1,21 @@
+# Linux filesystem-syscall smoke-test binary (Phase 5.2).
+#
+# A ring-3 Linux-ABI program that opens and reads a file from its container
+# rootfs via openat/read, checks that `..` is clamped at the root (a "../.." path
+# resolves back inside the rootfs) and that a nonexistent path fails, then reports
+# the bytes it read to a kernel-mapped result page. Built as a real ET_EXEC
+# (detached crate; see servers/elf-smoke).
+[workspace]
+
+[package]
+name = "fs-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fs-smoke"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

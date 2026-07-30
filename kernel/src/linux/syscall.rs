@@ -29,8 +29,6 @@ use crate::process::{self, LINUX_BRK_BASE, LINUX_MMAP_BASE};
 extern crate alloc;
 
 // --- Linux x86-64 syscall numbers (the subset we handle) ---
-const SYS_READ: u64 = 0;
-const SYS_WRITE: u64 = 1;
 const SYS_CLOSE: u64 = 3;
 const SYS_MMAP: u64 = 9;
 const SYS_MPROTECT: u64 = 10;
@@ -79,12 +77,17 @@ const MAP_ANONYMOUS: u64 = 0x20;
 /// Dispatch one Linux syscall. Reads the number/args from `frame` and writes the
 /// result (or `-errno`) into `frame.rax`.
 pub fn dispatch(frame: &mut SyscallFrame) {
+    // Filesystem syscalls (read/write/open/openat/close/fstat/lseek/getdents64/
+    // getcwd/chdir/newfstatat/…) are serviced by the VFS-backed `fs` module,
+    // which owns those numbers (Phase 5.2). If it doesn't recognise the number,
+    // fall through to the process/memory/misc table below.
+    if let Some(r) = super::fs::dispatch(frame.rax, frame) {
+        frame.rax = r;
+        return;
+    }
     let pid = crate::sched::current_process_id();
     match frame.rax {
-        SYS_WRITE => frame.rax = sys_write(frame.rdi, frame.rsi, frame.rdx),
         SYS_WRITEV => frame.rax = sys_writev(frame.rdi, frame.rsi, frame.rdx),
-        // Nothing to read from stdin yet — report EOF (0). Non-stdin fds: EBADF.
-        SYS_READ => frame.rax = if frame.rdi == 0 { 0 } else { err(EBADF) },
         SYS_BRK => frame.rax = sys_brk(pid, frame.rdi),
         SYS_MMAP => frame.rax = sys_mmap(pid, frame.rsi, frame.r10, frame.r8),
         // Accept mprotect/munmap as no-ops for now (W^X refinement + real unmap
@@ -129,29 +132,11 @@ pub fn dispatch(frame: &mut SyscallFrame) {
     }
 }
 
-/// Write bytes to the console (serial). Container fd 1/2 route here in 5.1; per-
-/// container capture arrives with the runtime in 5.5.
+/// Write bytes to the console (serial). Container fd 1/2 route here; per-container
+/// capture arrives with the runtime in 5.5.
 fn console_write(bytes: &[u8]) {
     for &b in bytes {
         crate::print!("{}", b as char);
-    }
-}
-
-/// `write(fd, buf, len)` — fd 1/2 → console; others → `EBADF`.
-fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
-    if fd != 1 && fd != 2 {
-        return err(EBADF);
-    }
-    let len = len as usize;
-    if len == 0 {
-        return 0;
-    }
-    match copy_from_user(buf, len) {
-        Some(data) => {
-            console_write(&data);
-            len as u64
-        }
-        None => err(EFAULT),
     }
 }
 

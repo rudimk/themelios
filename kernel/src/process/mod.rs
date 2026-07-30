@@ -103,6 +103,38 @@ pub struct Process {
     /// Next free virtual address for anonymous Linux `mmap` (Phase 5.1). A simple
     /// upward bump allocator from [`LINUX_MMAP_BASE`]; 0 until first use.
     pub mmap_next: u64,
+
+    /// The VFS mount id serving this Linux process's root filesystem (Phase 5.2).
+    /// Linux syscalls carry paths, not capabilities — so a container's isolation
+    /// is that the kernel only ever resolves its paths against *this one* mount,
+    /// and path resolution clamps `..` at the root. `None` for non-container
+    /// processes.
+    pub rootfs_mount: Option<u64>,
+
+    /// Current working directory for cwd-relative Linux path resolution (Phase
+    /// 5.2). An absolute, already-normalized rootfs path; defaults to "/".
+    pub cwd: alloc::string::String,
+
+    /// Per-process Linux file-descriptor table (Phase 5.2). Integer fds ≥ 3 index
+    /// here (0/1/2 are stdio, handled directly); a `Some` entry maps an fd to an
+    /// open file on [`rootfs_mount`]. Linux fds are integers, not capabilities.
+    pub fd_table: Vec<Option<LinuxFd>>,
+}
+
+/// An open Linux file descriptor (Phase 5.2): the mount + server-side fd it
+/// resolves to, the current read/write offset, and whether it is a directory.
+#[derive(Clone, Copy)]
+pub struct LinuxFd {
+    /// The VFS mount serving this fd (always the process's rootfs mount for now).
+    pub mount: u64,
+    /// The filesystem server's own fd handle (from `fs::kopen`).
+    pub server_fd: u64,
+    /// Current file offset for `read`/`getdents64`/`lseek`.
+    pub offset: u64,
+    /// File size at open time (for `SEEK_END` / `fstat`).
+    pub size: u64,
+    /// True if this fd refers to a directory (for `getdents64`/`fstat`).
+    pub is_dir: bool,
 }
 
 /// A process's syscall personality — which ABI its `syscall`s speak.
@@ -171,6 +203,9 @@ pub fn init() {
         personality: Personality::Native,
         brk: 0,
         mmap_next: 0,
+        rootfs_mount: None,
+        cwd: String::from("/"),
+        fd_table: Vec::new(),
     };
 
     let mut table = PROCESS_TABLE.lock();
@@ -226,6 +261,9 @@ pub fn create_process(name: &str, parent_cspace: Option<&mut CSpace>) -> (Proces
             personality: Personality::Native,
             brk: 0,
             mmap_next: 0,
+            rootfs_mount: None,
+            cwd: String::from("/"),
+            fd_table: Vec::new(),
         };
 
         table.processes.push(Some(process));
@@ -327,6 +365,111 @@ pub fn set_mmap_next(pid: ProcessId, next: u64) {
     if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
         proc.mmap_next = next;
     }
+}
+
+// --- Linux rootfs / cwd / fd table (Phase 5.2) ---
+
+/// Set the VFS mount serving a Linux process's root filesystem.
+pub fn set_rootfs_mount(pid: ProcessId, mount: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        proc.rootfs_mount = Some(mount);
+    }
+}
+
+/// The VFS mount serving a Linux process's root filesystem, if any.
+pub fn rootfs_mount(pid: ProcessId) -> Option<u64> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc| proc.rootfs_mount)
+}
+
+/// A copy of a Linux process's current working directory (defaults to "/").
+pub fn get_cwd(pid: ProcessId) -> String {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .map(|proc| proc.cwd.clone())
+        .unwrap_or_else(|| String::from("/"))
+}
+
+/// Set a Linux process's current working directory (already-normalized path).
+pub fn set_cwd(pid: ProcessId, cwd: String) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        proc.cwd = cwd;
+    }
+}
+
+/// Allocate a Linux file descriptor for `entry`, returning the integer fd (≥ 3),
+/// or -1 if the process is not found. Reuses freed slots before growing.
+pub fn linux_fd_alloc(pid: ProcessId, entry: LinuxFd) -> i32 {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        // Reuse a freed slot if one exists, else append.
+        let idx = match proc.fd_table.iter().position(|e| e.is_none()) {
+            Some(i) => {
+                proc.fd_table[i] = Some(entry);
+                i
+            }
+            None => {
+                proc.fd_table.push(Some(entry));
+                proc.fd_table.len() - 1
+            }
+        };
+        (idx + 3) as i32 // fds 0/1/2 are stdio
+    } else {
+        -1
+    }
+}
+
+/// Look up a Linux fd (≥ 3). Returns a copy of the entry, or `None`.
+pub fn linux_fd_get(pid: ProcessId, fd: i32) -> Option<LinuxFd> {
+    if fd < 3 {
+        return None;
+    }
+    let idx = (fd - 3) as usize;
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc| proc.fd_table.get(idx).copied().flatten())
+}
+
+/// Update the stored offset of an open Linux fd (for `read`/`lseek`/`getdents64`).
+pub fn linux_fd_set_offset(pid: ProcessId, fd: i32, offset: u64) {
+    if fd < 3 {
+        return;
+    }
+    let idx = (fd - 3) as usize;
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        if let Some(Some(e)) = proc.fd_table.get_mut(idx) {
+            e.offset = offset;
+        }
+    }
+}
+
+/// Close a Linux fd, returning the entry that was there (so the caller can close
+/// the underlying server fd), or `None` if it wasn't open.
+pub fn linux_fd_close(pid: ProcessId, fd: i32) -> Option<LinuxFd> {
+    if fd < 3 {
+        return None;
+    }
+    let idx = (fd - 3) as usize;
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        if let Some(slot) = proc.fd_table.get_mut(idx) {
+            return slot.take();
+        }
+    }
+    None
 }
 
 /// Destroy a process by PID.

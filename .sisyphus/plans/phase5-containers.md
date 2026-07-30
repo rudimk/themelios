@@ -374,11 +374,29 @@ page. `exec_elf` now marks its process `Linux`.
 - Linux `struct stat`/`dirent64` layout marshalling.
 - Run static **busybox** applets that touch the FS: `echo`, `cat <file>`, `ls`.
 
-**Acceptance**:
-- [ ] `openat`+`read` returns file bytes from the rootfs mount
-- [ ] `getdents64` lists a directory; `ls` works
-- [ ] Paths cannot escape the rootfs mount (no `..`-escape, no host access)
-- [ ] `fstat`/`newfstatat` return a Linux-shaped `stat`
+**Acceptance** (met — `test_linux_fs` + `test_path_resolve`, 39 tests green, 4/4 soak):
+- [x] `openat`+`read` returns file bytes from the rootfs mount (fs-smoke reads a
+      staged `/hello.txt` and the bytes match)
+- [x] Paths cannot escape the rootfs — `test_path_resolve` asserts `..` clamps at
+      root (incl. `../../../../../etc/passwd` → `/etc/passwd`); the kernel only ever
+      passes the process's single `rootfs_mount` to the VFS
+- [x] `fstat`/`newfstatat` return a Linux-shaped `stat` (144-byte layout, st_mode/
+      st_size); `getdents64` emits `linux_dirent64` records
+- [~] A `getdents64`-driven `ls` and interactive shell use are deferred to the
+      container runtime (5.5) — 5.2 validates the syscall via the probe
+
+**Implementation notes** (branch `claude/phase-5.2-linux-fs-syscalls`): `Process`
+gained `rootfs_mount`, `cwd`, and a **Linux fd table** (`LinuxFd`: mount +
+server_fd + offset + size + is_dir); fds 0/1/2 are stdio, ≥3 index the table.
+`kernel/src/linux/fs.rs` translates `openat`/`open`/`read`/`write`/`close`/
+`lseek`/`fstat`/`newfstatat`/`getdents64`/`getcwd`/`chdir` onto the mount-keyed
+`fs::k*` VFS calls against `rootfs_mount`. The security boundary is the factored,
+unit-tested [`resolve_path`], which clamps `..` at the root — a container path can
+never reach above its rootfs, and since Linux syscalls carry no capabilities, the
+kernel enforces isolation by only ever resolving against the one `rootfs_mount` the
+process holds. `servers/fs-smoke` opens/reads a staged file and checks clamping.
+Deferred: `statx`, `readlinkat`/symlinks, real `dirfd` (non-`AT_FDCWD`) resolution,
+and a streaming `getdents64` cursor (5.2 requires the batch fit the caller buffer).
 
 ---
 
