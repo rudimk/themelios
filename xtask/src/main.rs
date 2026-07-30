@@ -252,24 +252,25 @@ fn build_servers(root: &Path) {
         println!("  {name}: {size} bytes -> {}", staged.display());
     }
 
-    // Build the Phase 5.0 ELF smoke-test binary as a real ELF (not a flat
-    // binary), staged where the kernel embeds it.
-    build_elf_smoke(root, &out_dir);
+    // Build the Phase 5.0/5.1 smoke-test binaries as real ELFs (not flat
+    // binaries), staged where the kernel embeds them.
+    build_detached_elf(root, &out_dir, "elf-smoke"); // 5.0 loader test (native ABI)
+    build_detached_elf(root, &out_dir, "linux-smoke"); // 5.1 Linux-personality test
 }
 
-/// Build the Phase 5.0 ELF loader smoke-test binary (`servers/elf-smoke`).
+/// Build a detached smoke-test crate as a **real ELF** (not a flat binary).
 ///
-/// Unlike the other servers, this one is linked as a **real ELF** — we keep the
-/// default object format (no `--oformat=binary`) and force a static, non-PIE
-/// `ET_EXEC` so the kernel's ELF loader has genuine ELF headers + `PT_LOAD`
-/// segments to parse. It is a detached crate (own workspace), so `build_servers`'
-/// flat-binary flags don't reach it. Staged to `target/servers/elf-smoke.elf`.
-fn build_elf_smoke(root: &Path, out_dir: &Path) {
-    let crate_dir = root.join("servers/elf-smoke");
+/// Unlike the other servers, these are linked with the default object format (no
+/// `--oformat=binary`) and forced to a static, non-PIE `ET_EXEC`, so the kernel's
+/// ELF loader has genuine ELF headers + `PT_LOAD` segments to parse. Each is a
+/// detached crate (own workspace), so `build_servers`' flat-binary flags don't
+/// reach it. Staged to `target/servers/<name>.elf`.
+fn build_detached_elf(root: &Path, out_dir: &Path, name: &str) {
+    let crate_dir = root.join("servers").join(name);
     // Static reloc + no-PIE keeps the output ET_EXEC with fixed segment vaddrs.
     let rustflags = "-C relocation-model=static -C link-arg=-no-pie";
 
-    println!("Building ELF smoke-test binary (Phase 5.0)...");
+    println!("Building {name} (real ELF)...");
     let status = Command::new("cargo")
         .current_dir(&crate_dir)
         .env("RUSTFLAGS", rustflags)
@@ -281,18 +282,18 @@ fn build_elf_smoke(root: &Path, out_dir: &Path) {
             "-Zbuild-std=core",
         ])
         .status()
-        .expect("Failed to execute cargo build for elf-smoke");
+        .unwrap_or_else(|e| panic!("Failed to execute cargo build for {name}: {e}"));
     if !status.success() {
-        eprintln!("elf-smoke build failed!");
+        eprintln!("{name} build failed!");
         process::exit(1);
     }
 
-    let built = crate_dir.join("target/x86_64-unknown-none/release/elf-smoke");
-    let staged = out_dir.join("elf-smoke.elf");
+    let built = crate_dir.join(format!("target/x86_64-unknown-none/release/{name}"));
+    let staged = out_dir.join(format!("{name}.elf"));
     fs::copy(&built, &staged)
-        .unwrap_or_else(|e| panic!("failed to stage elf-smoke: {e} ({})", built.display()));
+        .unwrap_or_else(|e| panic!("failed to stage {name}: {e} ({})", built.display()));
     let size = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
-    println!("  elf-smoke.elf: {size} bytes -> {}", staged.display());
+    println!("  {name}.elf: {size} bytes -> {}", staged.display());
 }
 
 // ============================================================================

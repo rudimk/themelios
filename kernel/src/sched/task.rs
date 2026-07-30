@@ -145,4 +145,11 @@ pub struct Task {
     /// that spawned them. The scheduler uses this to determine whether a CR3
     /// switch is needed on context switch (different process → different address space).
     pub process_id: ProcessId,
+
+    /// The x86-64 `IA32_FS_BASE` value for this task (Phase 5.1). Linux thread-
+    /// local storage is addressed via `%fs`, set by `arch_prctl(ARCH_SET_FS)`.
+    /// FS base is a global register not saved by `switch_context`, so — exactly
+    /// like the GS base — the scheduler restores it from here on every context
+    /// switch. 0 for tasks that don't use TLS (kernel tasks, native servers).
+    pub fs_base: u64,
 }

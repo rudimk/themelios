@@ -477,6 +477,17 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
         frame.rax,
     );
 
+    // Linux-personality processes (Phase 5.1) route their `syscall`s through the
+    // Linux dispatch table — Linux syscall numbers collide with the native ones
+    // (Linux `write`=1 vs native `SYS_SEND`=1), so the process's personality, not
+    // the number, selects the ABI. A native process falls through to the match.
+    if crate::process::personality(crate::sched::current_process_id())
+        == crate::process::Personality::Linux
+    {
+        crate::linux::syscall::dispatch(frame);
+        return;
+    }
+
     match frame.rax {
         SYS_NULL => {
             // No-op syscall. Returns 0 to confirm the syscall path works.
@@ -656,7 +667,7 @@ const FS_MAX_XFER: usize = 256 * 1024;
 
 /// Validate that `[uptr, uptr+len)` is wholly mapped in the current process's
 /// address space and lies in the user half. Returns false on any gap.
-fn user_range_ok(uptr: u64, len: usize) -> bool {
+pub(crate) fn user_range_ok(uptr: u64, len: usize) -> bool {
     if len == 0 {
         return true;
     }
@@ -682,7 +693,7 @@ fn user_range_ok(uptr: u64, len: usize) -> bool {
 }
 
 /// Copy `len` bytes from a validated user pointer into a kernel `Vec`.
-fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+pub(crate) fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
     // A zero-length transfer touches no memory — never dereference the pointer
     // (which may be null): `from_raw_parts(null, 0)` is UB even for len 0.
     if len == 0 {
@@ -698,7 +709,7 @@ fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
 }
 
 /// Copy `data` to a validated user pointer. Returns false if the range is bad.
-fn copy_to_user(uptr: u64, data: &[u8]) -> bool {
+pub(crate) fn copy_to_user(uptr: u64, data: &[u8]) -> bool {
     // Nothing to copy → success without dereferencing a possibly-null pointer.
     if data.is_empty() {
         return true;
@@ -1104,6 +1115,22 @@ pub fn refresh_kernel_gs_base() {
         cpu::wrmsr(IA32_GS_BASE, per_cpu);
         // Swap target — what the next `swapgs` (syscall entry) brings in.
         cpu::wrmsr(IA32_KERNEL_GS_BASE, per_cpu);
+    }
+}
+
+/// `IA32_FS_BASE` — the base of the `%fs` segment, used by Linux for thread-local
+/// storage (`arch_prctl(ARCH_SET_FS)`). See [`write_fs_base`].
+const IA32_FS_BASE: u32 = 0xC000_0100;
+
+/// Write `base` into `IA32_FS_BASE` (Phase 5.1). Called by the scheduler on every
+/// context switch to restore a Linux task's TLS base, and by `arch_prctl` to set
+/// it. FS base is a global register `switch_context` doesn't save, so — like the
+/// GS base — it must be reloaded per task.
+pub fn write_fs_base(base: u64) {
+    // SAFETY: writing IA32_FS_BASE only changes the %fs segment base; single-core,
+    // called with interrupts disabled (context switch) or from a syscall handler.
+    unsafe {
+        cpu::wrmsr(IA32_FS_BASE, base);
     }
 }
 
