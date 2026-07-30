@@ -621,22 +621,71 @@ avoided.
 
 ---
 
-### Sub-phase 5.7 — Process management, signals, isolation test, docs
+### Sub-phase 5.7 — Container isolation enforcement, process teardown, finalize
 
-**Goal**: Round out process lifecycle and finalize the phase.
+**Goal**: Make container isolation an *enforced, tested* property (not just a
+structural accident), give containers a clean teardown/kill path, and reconcile
+the (badly stale) docs so Phase 5 is properly closed out.
+
+**Grounding (from a codebase survey — see notes):**
+- FS escape is *already* prevented structurally: `linux::fs::resolve_path` clamps
+  `..` at rootfs, so `openat("../../../etc/passwd")` resolves back inside the
+  container and returns **`-ENOENT`** (the host file is never reachable). The
+  right assertion is "the escape never reaches a host file," **not** `-EACCES`.
+- A container runs under `Personality::Linux` with an **empty CSpace** (no caps).
+  But Linux `socket()` (nr **41**) is currently *unwired*, so the attempt falls
+  through to the `-ENOSYS` default — isolation by *absence*, not by *enforcement*.
+- There is **no parent/child PID linkage** and no signal-handler machinery. So
+  `wait4`/full signal delivery have nothing real to build on; `exit_status`
+  (5.5) already is the "wait" primitive (`cmd_run` polls it).
 
 **What to build**:
-- `exec` into a running container (a second process sharing its rootfs);
-  `wait4`/exit-status plumbing; minimal signal delivery (`SIGTERM`/`SIGKILL`).
-- A deterministic **isolation test**: a container binary tries to `openat` a host
-  path and to open an ungranted socket, and gets `-EACCES`/`-EPERM`.
-- mdbook `containers.md`; update `milestones.md` + `CLAUDE.md` to Phase 5 status.
+1. **Enforced socket isolation (security centerpiece).** Wire Linux `SYS_SOCKET`
+   (41) to a capability check: look up a `CapType::Socket{SOCKET_FACTORY}` in the
+   caller's CSpace; if absent (the container case) return **`-EPERM`**. This turns
+   "a container can't open an ungranted socket" into a *checked* denial with a
+   real Linux errno, not a missing-syscall accident. (A granted process would
+   route on to the native socket path — but nothing grants a container the
+   factory cap, so the container path is deterministically `-EPERM`.)
+2. **`isolation-smoke` probe + `test_container_isolation`.** A new probe ELF run
+   as a container `/init` that: (a) **positive control** — `openat` a file that
+   *is* in its rootfs and reads it (proves the test isn't trivially all-deny);
+   (b) `openat("../../../../etc/passwd", O_RDONLY)` → asserts `-ENOENT` (clamped,
+   no host escape); (c) `socket(AF_INET, SOCK_DGRAM, 0)` → asserts `-EPERM`
+   (ungranted). Reports a bitmask to the result page; the test asserts all three.
+3. **Container teardown / `kill`.** `container::kill(pid)` wrapping
+   `process::destroy_process` (frees tasks + address space); a `kill <pid>` shell
+   command. This is minimal SIGKILL semantics (force-terminate). Wire the Linux
+   syscalls honestly: `SYS_KILL` (62) → terminate-self / `-EPERM` for others (no
+   cross-process signal right), `SYS_WAIT4` (61) → `-ECHILD` (no child linkage),
+   adding `ESRCH`/`ECHILD` to the errno set. Full signal *handler* delivery
+   (`rt_sigaction` beyond the current no-op) is **documented-deferred**.
+4. **Finalize docs (reconcile ~6 sub-phases of drift).** Write mdbook
+   `containers.md` (ELF/Linux-ABI → rootfs assembly → capability isolation →
+   registry pull). Advance **all three** milestone trackers per the CLAUDE.md
+   sync rule: CLAUDE.md milestone table (Phase 5 → Complete), CLAUDE.md **Current
+   Status** section (add the Phase 5.0–5.7 narrative bullets, flip the header off
+   Phase 4, set "Next up: Phase 6"), and `docs/src/milestones.md` (summary table
+   row + the `## Phase 5` heading status). Add `containers.md` to `SUMMARY.md`.
 
 **Acceptance**:
-- [ ] `kill` terminates a container; exit status is observable
-- [ ] Isolation test: no host-FS/ungranted-socket access from inside a container
-- [ ] All new tests pass; Phases 1–4 tests still pass; arm64 gate still green
-- [ ] Containers architecture documented in mdbook
+- [ ] Linux `socket()` from a capless container returns `-EPERM` (enforced, not
+      `-ENOSYS`); a factory-granted process is unaffected.
+- [ ] `test_container_isolation`: positive-control read succeeds; host-path escape
+      returns `-ENOENT`; ungranted socket returns `-EPERM`.
+- [ ] `container::kill` tears a container down; `kill` shell cmd works;
+      `SYS_KILL`/`SYS_WAIT4` return correct errnos (no panic).
+- [ ] Full suite green (incl. all Phase 1–5.6 tests); 3× soak clean; arm64 gate
+      still compiles.
+- [ ] mdbook `containers.md` written; CLAUDE.md + `milestones.md` reconciled to
+      "Phase 5 complete" across all three tracked locations.
+
+**Deferred (documented)**: `exec` into a running container (needs process-group /
+shared-rootfs spawn semantics we don't need yet); real `wait4` (needs
+parent/child PID tracking); signal-handler delivery + `SIGTERM` soft-kill (needs
+a per-process signal-disposition table + delivery on kernel→user transition);
+moving the `oci` parser + miniz into a ring-3 `oci-server` (the standing
+containment hardening).
 
 ---
 
