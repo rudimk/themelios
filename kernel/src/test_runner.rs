@@ -77,6 +77,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_container_run",    func: test_container_run },
     TestCase { name: "test_sha256",           func: test_sha256 },
     TestCase { name: "test_registry_pull",    func: test_registry_pull },
+    TestCase { name: "test_registry_hardening", func: test_registry_hardening },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -4263,11 +4264,59 @@ fn image_bad_layer(blob: &[u8]) -> alloc::vec::Vec<u8> {
     b
 }
 
+/// Registry-input hardening (Phase 5.6, Momus review): the manifest/config JSON
+/// and layer blobs are **untrusted** — a hostile registry controls both — so the
+/// parsers must fail closed on hostile shapes instead of exhausting the stack,
+/// exhausting the heap, or panicking. This locks in the fixes:
+///
+/// - **Deep JSON** (`[[[[…`) must return `None` (bounded recursion), not overflow
+///   the kernel stack.
+/// - **Content-Length overflow** (`Content-Length: <usize::MAX>`) must return
+///   `None`, not panic on `body_start + n` (debug-build overflow check).
+#[cfg(target_arch = "x86_64")]
+fn test_registry_hardening() -> Result<(), &'static str> {
+    use crate::oci::{json, registry};
+    use alloc::vec::Vec;
+
+    // Deeply-nested JSON well past MAX_DEPTH (64): must reject, not crash.
+    let mut deep = Vec::new();
+    for _ in 0..500 {
+        deep.push(b'[');
+    }
+    for _ in 0..500 {
+        deep.push(b']');
+    }
+    if json::parse(&deep).is_some() {
+        return Err("json::parse accepted 500-deep nesting (should bound recursion)");
+    }
+    // A modestly-nested valid document still parses (depth well under the limit).
+    if json::parse(br#"{"a":{"b":{"c":[1,2,3]}}}"#).is_none() {
+        return Err("json::parse rejected a shallow valid document");
+    }
+
+    // Absurd Content-Length must yield None (no arithmetic-overflow panic), not a
+    // truncated/over-read body.
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nhi".to_vec();
+    if registry::http_body(&resp).is_some() {
+        return Err("http_body accepted an overflowing Content-Length");
+    }
+    // A sane Content-Length still parses.
+    let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+    match registry::http_body(&ok) {
+        Some((200, body)) if body == b"hi" => Ok(()),
+        _ => Err("http_body mis-parsed a valid response"),
+    }
+}
+
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_sha256_stub() {}
 #[cfg(not(target_arch = "x86_64"))]
 fn test_registry_pull() -> Result<(), &'static str> {
+    Ok(())
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn test_registry_hardening() -> Result<(), &'static str> {
     Ok(())
 }
 

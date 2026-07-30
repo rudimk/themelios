@@ -9,6 +9,15 @@ use alloc::vec::Vec;
 
 extern crate alloc;
 
+/// Maximum inflated size for a single layer (8 MiB). The blob's `sha256` proves
+/// it matches the manifest — **not** that it's benign: a hostile registry can put
+/// the real digest of a decompression bomb (a tiny DEFLATE stream of zeros that
+/// inflates to gigabytes) in a manifest it also serves, so digest verification
+/// does not bound the output. We inflate with an explicit cap (well under the
+/// kernel's 16 MiB heap ceiling) so a bomb fails cleanly instead of exhausting
+/// the heap and aborting the kernel. Real OCI base layers are a few MiB.
+const MAX_INFLATED: usize = 8 * 1024 * 1024;
+
 // gzip header FLG bits (RFC 1952 §2.3.1).
 const FTEXT: u8 = 1 << 0;
 const FHCRC: u8 = 1 << 1;
@@ -17,7 +26,13 @@ const FNAME: u8 = 1 << 3;
 const FCOMMENT: u8 = 1 << 4;
 
 /// Decompress a gzip member, returning the inflated bytes. Returns `None` on a
-/// bad magic/header or a DEFLATE error — never panics on malformed input.
+/// bad magic/header, a DEFLATE error, or output exceeding [`MAX_INFLATED`] —
+/// never panics on malformed input.
+///
+/// LIMITATION (documented): a **single** gzip member only — the trailer is
+/// assumed to sit at the very end (`data[..len-8]`). OCI layers are single-member
+/// gzip in practice, so this holds; concatenated multi-member streams are not
+/// supported.
 pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
     // Fixed 10-byte header: magic (0x1f 0x8b), CM=8 (deflate), FLG, MTIME(4),
     // XFL, OS.
@@ -54,7 +69,10 @@ pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let deflate = &data[pos..data.len() - 8];
-    miniz_oxide::inflate::decompress_to_vec(deflate).ok()
+    // Bounded inflate: `decompress_to_vec` is unbounded and would let a
+    // decompression bomb grow until the allocator aborts; the `_with_limit`
+    // variant fails (returns `Err`) once the output would exceed `MAX_INFLATED`.
+    miniz_oxide::inflate::decompress_to_vec_with_limit(deflate, MAX_INFLATED).ok()
 }
 
 /// Advance past a NUL-terminated string starting at `pos`.

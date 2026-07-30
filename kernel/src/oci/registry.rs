@@ -36,6 +36,12 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Parse an HTTP/1.1 response into `(status_code, body)`. Uses `Content-Length`
 /// when present, else the bytes after the header terminator. Testable directly.
+///
+/// LIMITATION (documented, not a safety issue): only `Content-Length` framing is
+/// handled — a `Transfer-Encoding: chunked` response with no `Content-Length`
+/// returns the raw chunked framing as the body (JSON parse / digest then fails
+/// cleanly, no panic). Some registries/CDNs chunk blob responses, so the live
+/// puller will need chunked decoding; the offline pipeline here does not.
 pub fn http_body(resp: &[u8]) -> Option<(u16, Vec<u8>)> {
     let sep = find_sub(resp, b"\r\n\r\n")?;
     let head = &resp[..sep];
@@ -46,10 +52,17 @@ pub fn http_body(resp: &[u8]) -> Option<(u16, Vec<u8>)> {
     let status_line = core::str::from_utf8(&head[..line_end]).ok()?;
     let status: u16 = status_line.split(' ').nth(1)?.parse().ok()?;
 
-    // Content-Length (case-insensitive header search).
+    // Content-Length (case-insensitive header search). `n` is attacker-controlled,
+    // so compute the end with `checked_add` — a huge Content-Length would otherwise
+    // overflow `body_start + n` (an arithmetic-overflow panic under debug/test
+    // builds where `overflow-checks` is on). A truncated body (end past the buffer)
+    // falls out as `None` via `.get(..)`.
     let clen = find_content_length(head);
     let body = match clen {
-        Some(n) => resp.get(body_start..body_start + n)?.to_vec(),
+        Some(n) => {
+            let end = body_start.checked_add(n)?;
+            resp.get(body_start..end)?.to_vec()
+        }
         None => resp[body_start..].to_vec(),
     };
     Some((status, body))

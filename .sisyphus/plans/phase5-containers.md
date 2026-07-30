@@ -588,6 +588,25 @@ images only for now). TLS/Docker Hub remains a separate gated follow-up.
 - [x] `test_sha256` (FIPS vectors) + `test_registry_pull` green; all 44 tests
       pass, 3× soak clean
 
+**Momus review — hardening fixes applied** (untrusted registry input; the
+attacker controls *both* the manifest and the blobs that hash to the digests in
+it, so digest verification does **not** bound content):
+- **gzip decompression bomb** → `gzip::decompress` now inflates with
+  `decompress_to_vec_with_limit(_, 8 MiB)` (was the unbounded `decompress_to_vec`);
+  a bomb fails closed instead of exhausting the 16 MiB heap → abort.
+- **Unbounded JSON recursion** → `json` threads a depth counter (`MAX_DEPTH = 64`)
+  through `value`/`object`/`array`; deep nesting (`[[[[…`) returns `None` instead
+  of overflowing the kernel stack.
+- **Content-Length overflow** → `http_body` uses `body_start.checked_add(n)` so a
+  huge `Content-Length` returns `None` instead of panicking under debug-build
+  overflow checks.
+- **Compat limitations documented** (not safety): `http_body` handles only
+  `Content-Length` framing (not chunked); `gzip::decompress` handles a single
+  member. Both matter for the live puller, noted in the doc comments.
+- `test_registry_hardening` locks in the JSON-depth and Content-Length fixes.
+  Momus confirmed digest-verify-before-use ordering is correct everywhere and
+  found no memory-safety/UB bugs.
+
 **Containment note**: the OCI parser (tar/json) and now `miniz_oxide` run
 **in-kernel** for the deterministic tests. Relocating the whole `oci` module +
 miniz into the ring-3 `oci-server` (so untrusted image bytes never parse in ring
