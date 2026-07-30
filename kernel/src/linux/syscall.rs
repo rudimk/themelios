@@ -38,6 +38,12 @@ const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
+/// `socket(2)` — deliberately denied for containers (see the dispatch arm).
+const SYS_SOCKET: u64 = 41;
+/// `wait4(2)` — no parent/child linkage exists, so it reports "no children".
+const SYS_WAIT4: u64 = 61;
+/// `kill(2)` — a process may only signal itself (no cross-process signal cap).
+const SYS_KILL: u64 = 62;
 const SYS_SCHED_YIELD: u64 = 24;
 const SYS_CLONE: u64 = 56;
 const SYS_FUTEX: u64 = 202;
@@ -56,7 +62,9 @@ const SYS_GETRANDOM: u64 = 318;
 
 // --- errno values (negated on return) ---
 const EPERM: i64 = 1;
+const ESRCH: i64 = 3;
 const EBADF: i64 = 9;
+const ECHILD: i64 = 10;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
@@ -111,7 +119,20 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         // Everything runs as root (uid/gid 0) for now.
         SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => frame.rax = 0,
         // Signals are stubbed: accept sigaction/sigprocmask so runtimes proceed.
+        // (Signal-handler *delivery* is deferred — see Phase 5.7 notes.)
         SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK => frame.rax = 0,
+        // Capability isolation (Phase 5.7): a container holds no `SOCKET_FACTORY`
+        // capability, and the Linux `socket()` ABI carries no capability handle to
+        // present one. So `socket()` is an unconditional, *enforced* `-EPERM` —
+        // a checked denial with a real Linux errno, not the `-ENOSYS` default.
+        // (Reusing the native `socket::sys_socket` would be wrong twice over: its
+        // `SockError` uses the native high-bit ABI, which Linux userspace misreads
+        // as a huge valid fd, and it needs a cap handle the ABI can't supply.)
+        SYS_SOCKET => frame.rax = err(EPERM),
+        // `kill(2)`: no cross-process signal capability exists, so a process may
+        // only signal itself. `wait4(2)`: no parent/child linkage, so "no children".
+        SYS_KILL => sys_kill(pid, frame.rdi, frame.rsi, &mut frame.rax),
+        SYS_WAIT4 => frame.rax = err(ECHILD),
         SYS_CLOSE => frame.rax = 0,
         SYS_CLOCK_GETTIME => frame.rax = sys_clock_gettime(frame.rsi),
         SYS_GETRANDOM => frame.rax = sys_getrandom(frame.rdi, frame.rsi),
@@ -129,6 +150,29 @@ pub fn dispatch(frame: &mut SyscallFrame) {
             frame.rax = err(ENOSYS);
         }
     }
+}
+
+/// `kill(pid, sig)` (Phase 5.7). ThemeliOS tracks no cross-process signal
+/// capability, so a process may only signal **itself**:
+/// - target ≠ self → `-EPERM` (we hold no right to signal another process);
+/// - `sig == 0` (existence probe) on self → `0` (we're alive);
+/// - fatal self-signal → terminate the whole thread group via `exit_group`,
+///   recording the conventional `128 + signo` exit status (never returns).
+///
+/// Writes the result into `*rax` for the non-terminating paths. `ESRCH` is in the
+/// errno set for completeness (a signal to a vanished target) but unreachable on
+/// the self-only path.
+fn sys_kill(current: crate::process::ProcessId, target: u64, sig: u64, rax: &mut u64) {
+    if target as usize != current.as_usize() {
+        *rax = err(EPERM);
+        return;
+    }
+    if sig == 0 {
+        *rax = 0;
+        return;
+    }
+    // Fatal self-signal: never returns.
+    super::thread::exit_group(128 + sig);
 }
 
 /// Write bytes to the console (serial). Container fd 1/2 route here; per-container

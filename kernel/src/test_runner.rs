@@ -75,6 +75,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_linux_threads",    func: test_linux_threads },
     TestCase { name: "test_oci_unpack",       func: test_oci_unpack },
     TestCase { name: "test_container_run",    func: test_container_run },
+    TestCase { name: "test_container_isolation", func: test_container_isolation },
     TestCase { name: "test_sha256",           func: test_sha256 },
     TestCase { name: "test_registry_pull",    func: test_registry_pull },
     TestCase { name: "test_registry_hardening", func: test_registry_hardening },
@@ -4087,6 +4088,92 @@ fn test_container_run() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_container_run() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Container isolation is *enforced*, not incidental (Phase 5.7). Runs the
+/// `isolation-smoke` probe as a container `/init` over a bundle that also stages
+/// `/only` (known bytes). The probe (see `servers/isolation-smoke`) asserts, from
+/// inside the container:
+///   1. it can read its own rootfs file (`/only`) — positive control;
+///   2. `openat("../../../../only")` **succeeds and returns the same bytes** —
+///      the `..` clamp is live on the syscall path (not a vacuous `-ENOENT`);
+///   3. a genuinely-absent path fails;
+///   4. `socket(AF_INET, SOCK_DGRAM, 0)` returns exactly `-EPERM` — the container
+///      holds no `SOCKET_FACTORY` capability.
+/// The probe reports code 0 only if *all four* hold; any failure carries a
+/// distinct code (see the probe's module doc). We assert code 0.
+#[cfg(target_arch = "x86_64")]
+fn test_container_isolation() -> Result<(), &'static str> {
+    use crate::container;
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self, embedded};
+    use crate::sched;
+
+    // isolation-smoke's result page + success magic.
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0x1501_A710_0ADE_D011;
+
+    let mount = bring_up_ext2_mount("ext2-disk-isolation", "ext2-isolation")?;
+
+    // Bundle: /init = the isolation probe, /only = a known >=8-byte payload (the
+    // probe reads an 8-byte word and byte-compares the direct vs clamped reads).
+    let layer = make_tar(&[
+        ("init", embedded::ISOLATION_SMOKE, b'0'),
+        ("only", b"ISOLATED\n", b'0'),
+    ]);
+    let config = br#"{"config":{"Entrypoint":["/init"],"Env":["PATH=/bin"],"WorkingDir":"/"}}"#;
+    let manifest = br#"[{"Config":"config.json","Layers":["layer.tar"]}]"#;
+    let bundle = make_tar(&[
+        ("manifest.json", manifest, b'0'),
+        ("config.json", config, b'0'),
+        ("layer.tar", &layer, b'0'),
+    ]);
+
+    let pid = container::create(&bundle, mount).map_err(|_| "container::create failed")?;
+
+    // Map the probe's result page before launch.
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping result region failed")?;
+
+    container::start(pid);
+
+    let mut code: Option<u64> = None;
+    for _ in 0..400_000 {
+        // SAFETY: kernel-owned region; the container writes the same memory.
+        let s = unsafe { region.as_slice_mut() };
+        if u64::from_le_bytes(s[0..8].try_into().unwrap()) == RESULT_MAGIC {
+            code = Some(u64::from_le_bytes(s[8..16].try_into().unwrap()));
+            break;
+        }
+        sched::yield_now();
+    }
+
+    // Tear the container down regardless of outcome (also exercises the teardown
+    // path on an already-Exited process).
+    process::destroy_process(pid);
+
+    match code {
+        Some(0) => Ok(()),
+        Some(1) => Err("isolation: positive-control open(/only) failed"),
+        Some(2) => Err("isolation: positive-control read(/only) failed"),
+        Some(3) => Err("isolation: clamped open/read of ../../../../only failed"),
+        Some(4) => Err("isolation: escape read != direct read (clamp not live)"),
+        Some(5) => Err("isolation: an absent path opened (phantom file)"),
+        Some(6) => Err("isolation: socket() was ALLOWED (capability bypass!)"),
+        Some(7) => Err("isolation: socket() denied but not with -EPERM"),
+        Some(_) => Err("isolation: probe reported an unknown code"),
+        None => Err("isolation probe did not run"),
+    }
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_container_isolation() -> Result<(), &'static str> {
     Ok(())
 }
 

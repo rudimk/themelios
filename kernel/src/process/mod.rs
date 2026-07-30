@@ -534,25 +534,30 @@ pub fn destroy_process(pid: ProcessId) -> bool {
         None => return false,
     };
 
-    // Kill all tasks belonging to this process.
-    // We need to drop the table lock before calling kill_task (which acquires
-    // the scheduler lock). But since we've already taken the process out of
-    // the table, we can safely drop the lock.
+    // We've already taken the process out of the table, so we can drop the table
+    // lock before calling kill_task (which acquires the scheduler lock).
     let task_ids = process.tasks.clone();
-
-    // Destroy the address space (frees all user-half page table frames).
-    if let Some(address_space) = process.address_space {
-        address_space.destroy();
-    }
-
-    // CSpace is dropped automatically when process goes out of scope.
-
-    // Drop the lock before killing tasks (which acquires scheduler lock)
     drop(table);
 
+    // ORDER IS SECURITY-CRITICAL (Phase 5.7): mark every task Dead *before* freeing
+    // the address space. `kill_task` removes each task from the run queue, so once
+    // this loop finishes no task can be scheduled with a CR3 pointing into the page
+    // tables we're about to free. The previous order (free address space, then kill
+    // tasks — with the lock dropped and interrupts re-enabled in between) left a
+    // window in which a timer tick could context-switch INTO a still-`Runnable`
+    // task whose saved CR3 referenced a just-freed (and possibly recycled) PML4
+    // frame: a use-after-free / triple fault. Exit-path callers pass already-Dead
+    // tasks, so this is a no-op for them; `container::terminate` on a *live*
+    // container is the first caller that depends on the reorder.
     for task_id in &task_ids {
         crate::sched::kill_task(*task_id);
     }
+
+    // Now that no task can run in this address space, free its page-table frames.
+    if let Some(address_space) = process.address_space {
+        address_space.destroy();
+    }
+    // CSpace is dropped automatically when `process` goes out of scope.
 
     println!("[process] Destroyed process {} (\"{}\")", pid, process.name);
     true

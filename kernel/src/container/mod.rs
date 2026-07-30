@@ -168,6 +168,25 @@ pub fn start(pid: ProcessId) {
     crate::linux::spawn_loaded("container", pid);
 }
 
+/// Force-terminate a running container (Phase 5.7): the minimal `SIGKILL`
+/// equivalent. Tears the process down — killing its tasks and freeing its
+/// address space — via [`process::destroy_process`].
+///
+/// **Safety guard**: only a *container* is a valid target. We refuse anything
+/// that isn't a Linux process rooted at a rootfs mount (`personality == Linux &&
+/// rootfs_mount.is_some()`, both set by [`create`]). This stops a stray
+/// `stop <pid>` from destroying a kernel service (the block/ext2/net servers),
+/// which `destroy_process` itself would otherwise permit for any non-PID-0
+/// process. Returns `false` if `pid` is not a live container.
+pub fn terminate(pid: ProcessId) -> bool {
+    let is_container = matches!(process::personality(pid), Personality::Linux)
+        && process::rootfs_mount(pid).is_some();
+    if !is_container {
+        return false;
+    }
+    process::destroy_process(pid)
+}
+
 // --- Demo image (for the `run` shell command) ---
 
 /// Build one 512-byte USTAR header (see `oci::tar` for the reader side).
