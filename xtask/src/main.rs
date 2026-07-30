@@ -256,6 +256,7 @@ fn build_servers(root: &Path) {
     // binaries), staged where the kernel embeds them.
     build_detached_elf(root, &out_dir, "elf-smoke"); // 5.0 loader test (native ABI)
     build_detached_elf(root, &out_dir, "linux-smoke"); // 5.1 Linux-personality test
+    build_detached_elf(root, &out_dir, "fs-smoke"); // 5.2 Linux FS-syscall test
 }
 
 /// Build a detached smoke-test crate as a **real ELF** (not a flat binary).

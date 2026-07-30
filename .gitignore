@@ -8,6 +8,8 @@
 /servers/elf-smoke/target/
 # Linux-personality smoke-test binary — detached workspace, own target dir
 /servers/linux-smoke/target/
+# Linux FS-syscall smoke-test binary — detached workspace, own target dir
+/servers/fs-smoke/target/
 
 # Editor files
 *.swp

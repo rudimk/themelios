@@ -18,6 +18,7 @@
 //! independently of Linux-ABI correctness.
 
 pub mod elf;
+pub mod fs;
 pub mod syscall;
 
 use crate::process::{self, Personality, ProcessId};
