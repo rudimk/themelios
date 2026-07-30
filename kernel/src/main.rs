@@ -174,11 +174,14 @@ mod net;
 mod linux;
 
 /// OCI / docker-save image unpacking (Phase 5.4): tar + JSON + layer assembly.
-/// Dependency-light (alloc-only) so it lifts into the ring-3 `oci-server` in 5.5;
-/// for now it is exercised by `test_oci_unpack`, hence gated to test builds.
-#[cfg(feature = "test")]
-#[allow(dead_code)] // a complete tar/JSON reader; 5.4's test uses a subset
+/// Dependency-light (alloc-only) so it can lift into a ring-3 `oci-server`. Used
+/// by the Phase 5.5 container runtime.
+#[allow(dead_code)] // a complete tar/JSON reader; callers use a subset
 mod oci;
+
+/// Container runtime (Phase 5.5): unpack an image, assemble its rootfs, and launch
+/// its entrypoint as a capability-isolated Linux process.
+mod container;
 
 // ----- Kernel entry point -----
 

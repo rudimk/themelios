@@ -72,7 +72,7 @@ const SHARED_REGION_BYTES: u64 = 128 * 1024;
 
 /// Maximum number of concurrent block server instances. Phase 3 needs two (root
 /// SquashFS + data ext2); the headroom covers future data volumes cheaply.
-const MAX_INSTANCES: usize = 8;
+const MAX_INSTANCES: usize = 16;
 
 /// Per-instance configuration for one block server task. Fully self-contained so
 /// a task only ever touches its own slot after claiming it.

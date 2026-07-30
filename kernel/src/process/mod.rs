@@ -119,6 +119,11 @@ pub struct Process {
     /// here (0/1/2 are stdio, handled directly); a `Some` entry maps an fd to an
     /// open file on [`rootfs_mount`]. Linux fds are integers, not capabilities.
     pub fd_table: Vec<Option<LinuxFd>>,
+
+    /// Exit status once the process has terminated (Phase 5.5). Set by
+    /// `exit_group` (the whole-process exit); read by a waiter (`run`) to report
+    /// the container's exit code. `None` while running.
+    pub exit_code: Option<u64>,
 }
 
 /// An open Linux file descriptor (Phase 5.2): the mount + server-side fd it
@@ -206,6 +211,7 @@ pub fn init() {
         rootfs_mount: None,
         cwd: String::from("/"),
         fd_table: Vec::new(),
+        exit_code: None,
     };
 
     let mut table = PROCESS_TABLE.lock();
@@ -264,6 +270,7 @@ pub fn create_process(name: &str, parent_cspace: Option<&mut CSpace>) -> (Proces
             rootfs_mount: None,
             cwd: String::from("/"),
             fd_table: Vec::new(),
+            exit_code: None,
         };
 
         table.processes.push(Some(process));
@@ -306,6 +313,26 @@ pub fn user_entry(pid: ProcessId) -> Option<(u64, u64)> {
         .get(pid.as_usize())
         .and_then(|slot| slot.as_ref())
         .and_then(|proc| proc.user_entry)
+}
+
+/// Record a process's exit status and mark it `Exited` (Phase 5.5). Called by
+/// `exit_group`; a waiter (`run`) reads it back via [`exit_status`].
+pub fn set_exit_code(pid: ProcessId, code: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        proc.exit_code = Some(code);
+        proc.state = ProcessState::Exited;
+    }
+}
+
+/// The exit status of a process, or `None` if it is still running / not found.
+pub fn exit_status(pid: ProcessId) -> Option<u64> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc| proc.exit_code)
 }
 
 /// The task ids currently belonging to a process (Phase 5.3, for `exit_group`).

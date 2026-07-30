@@ -43,6 +43,7 @@ pub fn cmd_help(_args: &str) {
     println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
     println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
     println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
+    println!("  run              — launch a demo container (linux-smoke as /init)");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -985,4 +986,43 @@ pub fn cmd_ping(args: &str) {
 /// the `ping` round-trip timer. The 100 Hz tick gives ~10 ms resolution.
 fn now_ms() -> u64 {
     crate::arch::x86_64::idt::tick_count().wrapping_mul(10)
+}
+
+/// `run` — launch a demo container (Phase 5.5).
+///
+/// Assembles a self-contained demo image (its `/init` entrypoint is the embedded
+/// `linux-smoke` binary) onto the `/data` mount, launches it as a
+/// capability-isolated Linux container, waits for it to exit, and prints the exit
+/// code. This demonstrates the whole 5.0–5.5 pipeline live: unpack → assemble
+/// rootfs → load the entrypoint from that rootfs → run it in ring 3. Real image
+/// staging (pulling `run <image>` from a registry) arrives in Phase 5.6.
+pub fn cmd_run(_args: &str) {
+    use crate::container;
+    let mount = match crate::fs::data_mount() {
+        Some(m) => m,
+        None => {
+            println!("run: no writable filesystem (/data) available");
+            return;
+        }
+    };
+    println!("run: launching demo container (entrypoint /init = linux-smoke)...");
+    let bundle = container::demo_bundle();
+    let pid = match container::create(&bundle, mount) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("run: failed to create container: {:?}", e);
+            return;
+        }
+    };
+    container::start(pid);
+    // Wait (bounded) for the container to exit, then report its status.
+    for _ in 0..5_000_000 {
+        if let Some(code) = crate::process::exit_status(pid) {
+            println!("run: container exited with code {}", code);
+            crate::process::destroy_process(pid);
+            return;
+        }
+        crate::sched::yield_now();
+    }
+    println!("run: container is still running (timed out waiting for exit)");
 }
