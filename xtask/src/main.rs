@@ -258,6 +258,7 @@ fn build_servers(root: &Path) {
     build_detached_elf(root, &out_dir, "linux-smoke"); // 5.1 Linux-personality test
     build_detached_elf(root, &out_dir, "fs-smoke"); // 5.2 Linux FS-syscall test
     build_detached_elf(root, &out_dir, "threads-smoke"); // 5.3 threads/futex test
+    build_detached_elf(root, &out_dir, "isolation-smoke"); // 5.7 container-isolation test
 }
 
 /// Build a detached smoke-test crate as a **real ELF** (not a flat binary).

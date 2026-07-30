@@ -621,22 +621,107 @@ avoided.
 
 ---
 
-### Sub-phase 5.7 — Process management, signals, isolation test, docs
+### Sub-phase 5.7 — Container isolation enforcement, process teardown, finalize
 
-**Goal**: Round out process lifecycle and finalize the phase.
+**Goal**: Make container isolation an *enforced, tested* property (not just a
+structural accident), give containers a clean teardown/kill path, and reconcile
+the (badly stale) docs so Phase 5 is properly closed out.
 
-**What to build**:
-- `exec` into a running container (a second process sharing its rootfs);
-  `wait4`/exit-status plumbing; minimal signal delivery (`SIGTERM`/`SIGKILL`).
-- A deterministic **isolation test**: a container binary tries to `openat` a host
-  path and to open an ungranted socket, and gets `-EACCES`/`-EPERM`.
-- mdbook `containers.md`; update `milestones.md` + `CLAUDE.md` to Phase 5 status.
+**Grounding (from a codebase survey — see notes):**
+- FS escape is *already* prevented structurally: `linux::fs::resolve_path` clamps
+  `..` at rootfs, so `openat("../../../etc/passwd")` resolves back inside the
+  container and returns **`-ENOENT`** (the host file is never reachable). The
+  right assertion is "the escape never reaches a host file," **not** `-EACCES`.
+- A container runs under `Personality::Linux` with an **empty CSpace** (no caps).
+  But Linux `socket()` (nr **41**) is currently *unwired*, so the attempt falls
+  through to the `-ENOSYS` default — isolation by *absence*, not by *enforcement*.
+- There is **no parent/child PID linkage** and no signal-handler machinery. So
+  `wait4`/full signal delivery have nothing real to build on; `exit_status`
+  (5.5) already is the "wait" primitive (`cmd_run` polls it).
 
-**Acceptance**:
-- [ ] `kill` terminates a container; exit status is observable
-- [ ] Isolation test: no host-FS/ungranted-socket access from inside a container
-- [ ] All new tests pass; Phases 1–4 tests still pass; arm64 gate still green
-- [ ] Containers architecture documented in mdbook
+**What to build** (revised per Momus review — see the four fixes below):
+1. **Enforced socket isolation (security centerpiece).** Add a single Linux
+   dispatch arm `41 => frame.rax = err(EPERM)` — **unconditional**. Do **not**
+   call `net::socket::sys_socket`/`SockError::as_syscall_ret()`: that encoding is
+   the *native* high-bit ABI (`1<<63 | disc`), which Linux userspace misreads as a
+   huge valid fd, not a `-errno`. And Linux `socket(domain,type,proto)` carries no
+   capability handle, so `resolve_factory(pid, handle)` can't be driven from it.
+   No container is ever granted `SOCKET_FACTORY` this phase, so a real cap lookup
+   here would be dead weight + attack surface (an fd the Linux `fd_table` never
+   learns about, with no bind/connect wired). Unconditional `-EPERM` is the
+   correct, honest denial.
+2. **`isolation-smoke` probe + `test_container_isolation`.** The isolation bundle
+   stages **two** files: `/init` (the probe) and `/only` (a small file with known
+   bytes). The probe:
+   (a) **positive control** — `openat("/only")`, read → succeeds (proves the FS
+   syscall path works, not all-deny);
+   (b) **live-clamp proof** — `openat("../../../../only")` → must **succeed** and
+   return bytes *identical* to (a). This is the non-vacuous escape check: `..`
+   clamps back to `/only`. (A bare `-ENOENT` on a host path like `/etc/passwd`
+   proves *nothing* — a container has exactly one mount and no host root, so the
+   miss happens whether the clamp works or not. The positive round-trip is what
+   proves the clamp is *live on the syscall path*.)
+   (c) `openat("/nonesuch")` → `-ENOENT` (genuine-absence sanity);
+   (d) `socket(AF_INET, SOCK_DGRAM, 0)` → `-EPERM` (ungranted).
+   Reports a pass-bitmask to the result page; the test asserts all four bits.
+   NB: the bundle must contain **no** file whose name collides with an escape
+   target — we control it (`/init`, `/only`), so this is guaranteed.
+3. **Container teardown / `stop`.** `container::terminate(pid)`: verify the target
+   **is a container** (`personality == Linux && rootfs_mount.is_some()`) before
+   tearing down, then destroy it. Use a **new `stop <pid>` shell verb** — `kill`
+   already exists and means `sched::kill_task(<task_id>)` (different namespace);
+   overloading it could nuke a server (`destroy_process` only guards PID 0).
+   **UAF fix in `destroy_process`:** today it frees the address space first, drops
+   the table lock (re-enabling interrupts), *then* marks tasks Dead — a window in
+   which a still-`Runnable` task has a saved CR3 pointing at the freed PML4 (timer
+   tick → `schedule()` → loads a freed frame as CR3). Reorder so **all tasks are
+   marked Dead before the address space is freed** (existing exit-path callers are
+   unaffected — their tasks are already Dead). `stop` on a *live* container is the
+   first caller to exercise this, so the reorder is a prerequisite.
+   Wire the Linux syscalls honestly: `SYS_KILL` (62) → if target is self with a
+   fatal signal, route to `exit_group` semantics (record code + kill siblings);
+   other pid → `-EPERM` (no cross-process signal cap); `SYS_WAIT4` (61) → `-ECHILD`
+   (no child linkage; `run` polls `exit_status`, not `wait4`). Add `ESRCH`/`ECHILD`
+   to the errno set. Signal-*handler* delivery stays **documented-deferred**.
+4. **Finalize docs (reconcile ~6 sub-phases of drift).** Write mdbook
+   `containers.md` (ELF/Linux-ABI → rootfs assembly → capability isolation →
+   registry pull). Advance the **three formally-synced** trackers (per the
+   CLAUDE.md rule) with an **identical, honest status string** —
+   `Complete (core; real-image busybox, live registry transport, ring-3 oci-server
+   deferred)`: (i) CLAUDE.md milestone table Phase 5 row, (ii) `milestones.md`
+   summary-table row, (iii) `milestones.md` `## Phase 5` heading. Also (extra, not
+   part of the 3-way rule but expected): rewrite CLAUDE.md **Current Status** with
+   Phase 5.0–5.7 bullets + "Next up: Phase 6", and add `containers.md` to
+   `SUMMARY.md`.
+
+**Acceptance** (all met):
+- [x] Linux `socket()` from a container returns `-EPERM` (enforced arm, not the
+      `-ENOSYS` default) — verified by the probe reading `rax == -EPERM`.
+- [x] `test_container_isolation`: positive read OK; **`../../../../only` succeeds
+      and matches `/only`** (live-clamp proof); absent path `-ENOENT`; socket
+      `-EPERM`.
+- [x] `container::terminate` refuses non-containers and tears a *running*
+      container down with **no UAF** (tasks Dead before address-space free);
+      `stop <pid>` shell cmd works; `SYS_KILL`/`SYS_WAIT4` return correct errnos,
+      no panic.
+- [x] Full suite green (46 tests, incl. all Phase 1–5.6); 3× soak clean; arm64
+      gate still compiles.
+- [x] mdbook `containers.md` written; the honest status string is byte-identical
+      across the three synced locations.
+
+**Phase 5 — COMPLETE (core).** Sub-phases 5.0–5.7 done; deferrals documented
+above. Next: Phase 6 (Docker-compatible management API).
+
+**Deferred (documented)**: `exec` into a running container (needs process-group /
+shared-rootfs spawn semantics we don't need yet); real `wait4` (needs
+parent/child PID tracking); signal-handler delivery + `SIGTERM` soft-kill (needs
+a per-process signal-disposition table + delivery on kernel→user transition);
+moving the `oci` parser + miniz into a ring-3 `oci-server` (the standing
+containment hardening). **Honesty note**: Phase 5's stretch goal (`busybox echo`
+from a *real* image over a *live* registry) is **not** demonstrated — the runtime
+was exercised with the synthetic `linux-smoke`/`isolation-smoke` ELFs as `/init`
+and a mock registry `Connection`; hence the qualified "Complete (core; …)"
+status, not a bare "Complete".
 
 ---
 

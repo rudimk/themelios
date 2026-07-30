@@ -12,6 +12,8 @@
 /servers/fs-smoke/target/
 # Linux threads/futex smoke-test binary — detached workspace, own target dir
 /servers/threads-smoke/target/
+# Container-isolation smoke-test binary — detached workspace, own target dir
+/servers/isolation-smoke/target/
 
 # Editor files
 *.swp

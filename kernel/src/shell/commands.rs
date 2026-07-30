@@ -44,6 +44,7 @@ pub fn cmd_help(_args: &str) {
     println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
     println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
     println!("  run              — launch a demo container (linux-smoke as /init)");
+    println!("  stop <pid>       — force-terminate a running container");
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -125,6 +126,29 @@ pub fn cmd_kill(args: &str) {
         Err(_) => {
             println!("Invalid task ID: '{}'", args);
         }
+    }
+}
+
+/// Force-terminate a running container by PID (Phase 5.7). Distinct from `kill`,
+/// which operates on **task** IDs: `stop` takes a **process** ID and only tears
+/// down actual containers (`container::terminate` refuses kernel services), so it
+/// can't be used to nuke the block/ext2/net servers.
+pub fn cmd_stop(args: &str) {
+    let args = args.trim();
+    if args.is_empty() {
+        println!("Usage: stop <container_pid>");
+        return;
+    }
+    match args.parse::<usize>() {
+        Ok(n) => {
+            let pid = crate::process::ProcessId::new(n);
+            if crate::container::terminate(pid) {
+                println!("Stopped container {}", n);
+            } else {
+                println!("Cannot stop {} (not a running container)", n);
+            }
+        }
+        Err(_) => println!("Invalid PID: '{}'", args),
     }
 }
 

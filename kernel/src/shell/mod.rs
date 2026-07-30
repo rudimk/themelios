@@ -89,6 +89,7 @@ fn shell_entry() {
             "udpsend" => commands::cmd_udpsend(args),
             "tcpconnect" => commands::cmd_tcpconnect(args),
             "run" => commands::cmd_run(args),
+            "stop" => commands::cmd_stop(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
             }

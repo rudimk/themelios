@@ -52,3 +52,10 @@ pub static FS_SMOKE: &[u8] = include_bytes!("../../../target/servers/fs-smoke.el
 /// via futex, run by `test_linux_threads`.
 #[cfg_attr(not(feature = "test"), allow(dead_code))]
 pub static THREADS_SMOKE: &[u8] = include_bytes!("../../../target/servers/threads-smoke.elf");
+
+/// Phase 5.7 container-isolation smoke-test binary — as a container `/init`,
+/// proves the rootfs `..` clamp is live (byte-matched escape read) and that
+/// `socket()` is denied with `-EPERM`, run by `test_container_isolation`.
+#[cfg_attr(not(feature = "test"), allow(dead_code))]
+pub static ISOLATION_SMOKE: &[u8] =
+    include_bytes!("../../../target/servers/isolation-smoke.elf");

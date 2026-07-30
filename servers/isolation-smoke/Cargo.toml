@@ -1,0 +1,23 @@
+# Container-isolation smoke-test binary (Phase 5.7).
+#
+# A ring-3 Linux-ABI program run as a container `/init`. It proves the container
+# isolation boundary is *enforced on the live syscall path*, not merely
+# structural: it reads a staged file, proves `..` clamps back to root by reading
+# the same file through an escape path and byte-comparing, confirms a genuinely
+# absent path fails, and confirms `socket()` is denied with `-EPERM` (the
+# container holds no socket-factory capability). Built as a real ET_EXEC
+# (detached crate; see servers/elf-smoke).
+[workspace]
+
+[package]
+name = "isolation-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "isolation-smoke"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
