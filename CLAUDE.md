@@ -142,7 +142,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **2** | Capability system, process isolation, IPC, audit logging | Complete |
 | **3** | VirtIO block driver, read-only FS, ephemeral layers | Complete |
 | **4** | VirtIO net driver, TCP/IP stack | Complete |
-| **5** | OCI containers, Linux syscall compat, exec, registries | Not started |
+| **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Not started |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Not started |
 | **8** | Hyperscaler support (AWS, GCP, Azure), secure boot | Not started |
@@ -158,63 +158,63 @@ line when finishing a sub-phase. Detailed per-sub-phase checklists live in
 `.sisyphus/plans/` (local, gitignored); the git commit history has the full
 narrative per commit._
 
-**Phase 4 — Networking: COMPLETE.** Design: the TCP/IP stack runs in
-a ring-3 **net server** on **smoltcp**; a thin VirtIO-net driver stays in the
-kernel; frames cross via a **pull-based** IPC bridge (net server always initiates,
-kernel replies). amd64 is the run/test target; arm64-ready by design (smoltcp
-compiles for both — enforced by a CI compile gate). `main` is green — keep it
-that way. The suite is reliably green (35 tests); the long-standing intermittent
-double-fault / IPC-race flakiness was root-caused and fixed (see the notes at the
-end of this section). Still, `cargo xtask test` before pushing. **Next up: Phase 5
-(OCI containers, Linux syscall compat).**
+**Phase 5 — Containers: COMPLETE (core).** A container is an ordinary process
+made to believe it's on Linux, in its own rootfs, holding no capabilities:
+(1) a **Linux syscall personality** (a per-process Linux-ABI table, routed by a
+personality flag so it doesn't collide with the native ABI); (2) a **single
+rootfs mount** with a `..`-clamping path resolver; (3) an **empty capability
+space** — so every privileged op is denied by construction. The pipeline is
+`image → unpack (oci) → assemble rootfs (VFS) → load entrypoint ELF → ring-3
+Linux process`. Isolation is the **capability system**, not namespaces — it
+falls out of the microkernel model. `main` is green (46 tests, 3× soak clean);
+`cargo xtask test` before pushing. Full design in mdbook `containers.md`.
+**Next up: Phase 6 (Docker-compatible management API).**
 
-- ✅ **4.0** VirtIO-net driver + `NetDevice` trait
-- ✅ **4.1** Kernel net service (pull-based frame bridge, `SYS_UPTIME_MS`)
-- ✅ **4.2** Ring-3 net server + smoltcp (Device-over-IPC, boot spawn, round-trip test)
-- ✅ **4.3** Ethernet/ARP/IPv4/ICMP bring-up — stack answers ping; default route added.
-  (Interactive `ping` shell cmd + outbound round-trip → moved to 4.5, they need the
-  client request path.)
-- ✅ **4.4** DHCPv4 client — replaces the placeholder static IP. Ring-3 smoltcp
-  `dhcpv4::Socket` acquires addr/gateway/DNS from slirp; the server reports it to
-  the kernel over a new `MSG_CONFIG` opcode; `ifconfig` shell cmd + `test_dhcp`
-  (real end-to-end acquisition vs slirp) added. DHCP is gated behind an `arg1`
-  flag (`NET_ARG_DHCP`) so the static-IP round-trip tests stay deterministic.
-  **Off-ramp milestone reached: link up + DHCP address ("it's on the network").**
-- ✅ **4.5** UDP sockets + `CapType::Socket` + syscalls (15–19). Non-blocking
-  `ipc_try_receive` (`SYS_TRY_RECEIVE` 20) lets the net server serve client
-  requests while polling smoltcp; `CapType::Socket` with a `SOCKET_FACTORY`
-  authority sentinel (create-sockets right) + per-socket caps (send/recv); kernel
-  socket router (`net/socket.rs`) checks caps → routes to the net server → moves
-  payloads via a shared region → audits `NetAccess`. Net server keeps a UDP
-  socket table served over `try_receive`. `udpsend` shell cmd; `test_socket_capability`
-  + `test_udp_echo` (live DNS round-trip vs slirp) added. **32 tests pass.**
-- ✅ **4.6** TCP sockets — **client + server done**. Client: `SOCK_TYPE_TCP`,
-  `connect`/stream `send`/`recv`/`close` (`SYS_CONNECT` 21, `SYS_TCP_SEND` 24,
-  `SYS_TCP_RECV` 25); non-blocking `TcpPhase` state machine (WouldBlock connecting,
-  ConnectionRefused on reset). Server: `bind`/`listen`/`accept` (`SYS_LISTEN` 22,
-  `SYS_ACCEPT` 23) — smoltcp's listening socket *becomes* the connection, so accept
-  promotes it + re-arms a fresh listener; the kernel mints the per-connection cap.
-  `tcpconnect` shell cmd. `test_tcp_client` (plumbing; slirp has no TCP listener)
-  + `test_tcp_server` — **deterministic round-trip**: guest listens on :7, the
-  xtask host thread connects via QEMU `hostfwd` (127.0.0.1:15007 → guest :7), guest
-  accepts + echoes. **34 tests, reliably green.** (`test_tcp_server` runs before the
-  other persistent net-server tests so it is the sole NIC drainer.)
-- ✅ **4.7** Shell + boot integration + tests + arm64 gate + docs — **Phase 4 done**.
-  `sockets` (lists the net server's socket table via a new `OP_SOCK_LIST`) and
-  `ping` (a new ICMP echo socket: `SOCK_TYPE_ICMP` + `OP_SOCK_PING`; best-effort
-  round-trip since slirp's ICMP proxy may lack host privileges). Boot integration
-  was already in place (`net::boot_net` brings the NIC + service + net server up
-  with DHCP in non-test mode). `test_socket_list` (deterministic: opens a UDP/TCP/
-  ICMP socket, verifies the listing, emits an echo request) added — **35 tests,
-  reliably green**. arm64 dependency gate wired into CI (`cargo xtask arm64-gate`
-  compiles the `servers/smoltcp-gate` crate — smoltcp with the net server's exact
-  feature set — for `aarch64-unknown-none`). mdbook `networking.md` written.
-  Deferred (documented): interrupt-driven RX, a DNS resolver, socket readiness
-  wait/wake, per-client payload regions, and a dedicated net-server crash-isolation
-  test (ring-3 containment is structural and exercised implicitly).
+- ✅ **5.0** ELF64 loader + `exec` — parse ET_EXEC, map PT_LOAD (`W^X`), build the
+  SysV initial stack (argc/argv/envp/auxv), enter ring 3 at `e_entry`. `elf-smoke`
+  (native ABI) + `test_elf_exec`.
+- ✅ **5.1** Linux syscall personality — `Personality::{Native,Linux}` routes
+  dispatch to a Linux table (write/writev/brk/mmap/arch_prctl/ioctl/clock_gettime/
+  getrandom/exit_group/…). Per-task `%fs` base restored on context switch (TLS).
+  `linux-smoke` + `test_linux_exec`.
+- ✅ **5.2** Linux filesystem syscalls over the VFS (openat/read/write/close/lseek/
+  fstat/newfstatat/getdents64/getcwd/chdir/readlinkat), rooted at one mount; the
+  path resolver **clamps `..` at rootfs** (container-escape prevention). `fs-smoke`
+  + `test_path_resolve` + `test_linux_fs`.
+- ✅ **5.3** Linux threads — `clone(CLONE_THREAD)` (sibling task, child resumes at
+  parent RIP with rax=0), `futex` WAIT/WAKE (address-keyed wait queue),
+  `set_tid_address`, `exit` vs `exit_group`. `threads-smoke` + `test_linux_threads`.
+- ✅ **5.4** OCI image unpacking — `docker save` bundles (outer tar → manifest +
+  config + uncompressed layer tars), layers applied in order with whiteouts
+  resolved, into a flat rootfs + runtime config. Hand-rolled tar + JSON readers
+  (`alloc`-only). `test_oci_unpack`.
+- ✅ **5.5** Container runtime — unpack → assemble rootfs on the ext2 mount → load
+  the entrypoint **from that rootfs** (`VfsByteSource`) → run as a Linux process;
+  `exit_group` captures the exit status. `run` shell cmd; `test_container_run`
+  (linux-smoke as `/init`, end-to-end).
+- ✅ **5.6** Registry pull — Docker Registry HTTP API v2 over a `Connection` trait:
+  manifest v2 → config + **gzip** layer blobs by `sha256:` digest, each
+  **digest-verified before use**; `oci/{sha256,gzip,registry}.rs` (+ `miniz_oxide`).
+  Fail-closed parsers: bounded gzip inflate (bomb cap), bounded JSON depth,
+  `checked_add` lengths (Momus-hardened). `test_sha256`, `test_registry_pull`,
+  `test_registry_hardening`. Live TCP transport (slirp `guestfwd` + host
+  `registry:2`) deferred; the pull pipeline is fully tested offline.
+- ✅ **5.7** Enforced isolation + teardown + finalize — Linux `socket()` (nr 41) →
+  **`-EPERM`** (no `SOCKET_FACTORY` cap; checked errno, not `-ENOSYS`); `kill`
+  (self-only, else `-EPERM`) / `wait4` (`-ECHILD`); `container::terminate` +
+  `stop <pid>` (container-type-guarded), plus a **`destroy_process` UAF fix**
+  (tasks marked Dead *before* the address space is freed). `isolation-smoke` +
+  `test_container_isolation` prove the boundary on the live syscall path:
+  positive read OK, `../../../../only` **succeeds and byte-matches** `/only`
+  (live `..` clamp), absent path misses, `socket()` → `-EPERM`. mdbook
+  `containers.md` written; milestone trackers reconciled. **46 tests, 3× soak.**
+  Deferred (documented): real static-musl busybox over a live registry, container
+  `exec`, real `wait4`/signal-handler delivery, ring-3 `oci-server` relocation.
 
-Per-milestone branches: 4.7 lives on `claude/phase-4.7-net-integration` (fresh PR),
-cut from `main` after the 4.6 PR (#2) merged.
+Per-milestone branches: each Phase 5 sub-phase was a fresh branch + PR off the
+latest `main` (5.0 #4 … 5.6 #10); 5.7 lives on `claude/phase-5.7-finalize`.
+**Phase 4 (Networking) is complete** — design + sub-phase detail in mdbook
+`networking.md`.
 
 Notable — three long-standing concurrency bugs in the syscall/IPC core were
 root-caused and fixed during Phase 4.5 (they grew from rare to majority-of-runs

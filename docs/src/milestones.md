@@ -9,7 +9,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **2** | Capability system, process isolation, IPC | Complete |
 | **3** | VirtIO block driver, read-only filesystem | Complete |
 | **4** | VirtIO net driver, TCP/IP stack | Complete |
-| **5** | OCI container support | Not started |
+| **5** | OCI container support | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Management API (Docker-compatible) | Not started |
 | **7** | aarch64 port | Not started |
 | **8** | Hyperscaler support (AWS, GCP, Azure) | Not started |
@@ -102,22 +102,36 @@ are capability-checked and kernel-routed. See the
   socket listing, TCP client + server) — 35 tests, reliably green
 - aarch64 smoltcp compile gate in CI (`cargo xtask arm64-gate`)
 
-## Phase 5 — Containers (Not started)
+## Phase 5 — Containers (Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred))
 
-**Goal**: Run OCI container images.
+**Goal**: Run OCI container images as capability-isolated processes. See the
+[Container Runtime](./containers.md) chapter for the full design.
 
-**Deliverables**:
-- Linux syscall compatibility layer (translate Linux syscalls to capability-checked ThemeliOS operations)
-- OCI image format parsing and layer unpacking
-- Container lifecycle (create, start, stop, destroy)
-- Container exec (spawn processes inside a running container's isolation boundary)
-- PTY support for interactive terminal sessions
-- Container-to-capability mapping (each container gets a capability set)
-- Container networking (virtual interfaces, isolation)
-- Log streaming from containers (stdout/stderr capture)
-- Resource limits (CPU, memory) enforced via capabilities
-- Container image registry support (Docker Hub, ECR, GCR, ACR)
-- Registry authentication, TLS, and cloud-specific credential helpers
+**Delivered**:
+- ELF64 loader + `exec` — load a static ELF and enter ring 3 (Phase 5.0)
+- Linux syscall personality — a per-process Linux-ABI table (write/writev/brk/
+  mmap/arch_prctl/clock_gettime/getrandom/exit_group/…), routed by a personality
+  flag so it doesn't collide with the native ABI (Phase 5.1)
+- Linux filesystem syscalls over the VFS, rooted at a single rootfs mount with a
+  `..`-clamping path resolver (Phase 5.2)
+- Linux threads: `clone(CLONE_THREAD)`, `futex` WAIT/WAKE, per-thread `%fs` TLS
+  restored across context switches (Phase 5.3)
+- OCI image unpacking: `docker save` bundles → flat rootfs + config, layers and
+  whiteouts applied (Phase 5.4)
+- Container runtime: unpack → assemble rootfs → load the entrypoint from that
+  rootfs → run it as a Linux process; exit-status capture (Phase 5.5)
+- Registry pull: Docker Registry HTTP API v2, gzip layers, **sha256
+  digest-verified before use**, with fail-closed parsers (Phase 5.6)
+- Enforced capability isolation + lifecycle: `socket()` → `-EPERM` (no
+  capability), live `..`-clamp proof, container teardown (`stop`), honest
+  `kill`/`wait4` errnos, and a `test_container_isolation` that proves the
+  boundary on the live syscall path (Phase 5.7)
+
+**Deferred** (documented — see the [Container Runtime](./containers.md) chapter):
+real static-musl image over a live registry transport; container `exec`; real
+`wait4`/signal-handler delivery; relocating the OCI image parser into a ring-3
+`oci-server`; PTYs; per-container resource limits; registry auth/TLS + cloud
+credential helpers.
 
 ## Phase 6 — Management (Not started)
 
