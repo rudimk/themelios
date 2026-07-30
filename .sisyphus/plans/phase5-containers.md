@@ -694,20 +694,23 @@ the (badly stale) docs so Phase 5 is properly closed out.
    Phase 5.0–5.7 bullets + "Next up: Phase 6", and add `containers.md` to
    `SUMMARY.md`.
 
-**Acceptance**:
-- [ ] Linux `socket()` from a container returns `-EPERM` (enforced arm, not the
+**Acceptance** (all met):
+- [x] Linux `socket()` from a container returns `-EPERM` (enforced arm, not the
       `-ENOSYS` default) — verified by the probe reading `rax == -EPERM`.
-- [ ] `test_container_isolation`: positive read OK; **`../../../../only` succeeds
+- [x] `test_container_isolation`: positive read OK; **`../../../../only` succeeds
       and matches `/only`** (live-clamp proof); absent path `-ENOENT`; socket
       `-EPERM`.
-- [ ] `container::terminate` refuses non-containers and tears a *running*
+- [x] `container::terminate` refuses non-containers and tears a *running*
       container down with **no UAF** (tasks Dead before address-space free);
       `stop <pid>` shell cmd works; `SYS_KILL`/`SYS_WAIT4` return correct errnos,
       no panic.
-- [ ] Full suite green (incl. all Phase 1–5.6 tests); 3× soak clean; arm64 gate
-      still compiles.
-- [ ] mdbook `containers.md` written; the honest status string is byte-identical
+- [x] Full suite green (46 tests, incl. all Phase 1–5.6); 3× soak clean; arm64
+      gate still compiles.
+- [x] mdbook `containers.md` written; the honest status string is byte-identical
       across the three synced locations.
+
+**Phase 5 — COMPLETE (core).** Sub-phases 5.0–5.7 done; deferrals documented
+above. Next: Phase 6 (Docker-compatible management API).
 
 **Deferred (documented)**: `exec` into a running container (needs process-group /
 shared-rootfs spawn semantics we don't need yet); real `wait4` (needs
