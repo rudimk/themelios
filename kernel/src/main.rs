@@ -183,6 +183,13 @@ mod oci;
 /// its entrypoint as a capability-isolated Linux process.
 mod container;
 
+/// Minimal HTTP/1.1 primitives (Phase 6.0): shared byte-scanning helpers plus an
+/// HTTP **request** parser for the management API. Dependency-light (alloc-only)
+/// so it lifts into the ring-3 `api-server`; the registry client reuses the shared
+/// helpers for its response parsing.
+#[allow(dead_code)] // request parser + helpers; the api-server (6.5) uses the full surface
+mod http;
+
 // ----- Kernel entry point -----
 
 /// The kernel entry point. Limine bootloader jumps here after loading the

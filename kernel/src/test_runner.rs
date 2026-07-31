@@ -79,6 +79,8 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_sha256",           func: test_sha256 },
     TestCase { name: "test_registry_pull",    func: test_registry_pull },
     TestCase { name: "test_registry_hardening", func: test_registry_hardening },
+    TestCase { name: "test_http_request",      func: test_http_request },
+    TestCase { name: "test_json_serialize",    func: test_json_serialize },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -4404,6 +4406,151 @@ fn test_registry_pull() -> Result<(), &'static str> {
 }
 #[cfg(not(target_arch = "x86_64"))]
 fn test_registry_hardening() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// HTTP request parser (Phase 6.0): parse a GET with a Docker version prefix +
+/// query and a POST with a JSON body, then confirm hostile/malformed inputs fail
+/// closed (return `None`, never panic/hang).
+#[cfg(target_arch = "x86_64")]
+fn test_http_request() -> Result<(), &'static str> {
+    use crate::http;
+    use alloc::string::String;
+
+    // GET with a `/v1.43` version prefix + query string + headers.
+    let get = b"GET /v1.43/containers/json?all=1&limit=5 HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n";
+    let r = http::parse_request(get).ok_or("GET parse failed")?;
+    if r.method != "GET" {
+        return Err("GET method wrong");
+    }
+    if r.path != "/containers/json" {
+        return Err("version prefix not stripped from path");
+    }
+    if r.api_version.as_deref() != Some("1.43") {
+        return Err("api_version wrong");
+    }
+    if r.query != "all=1&limit=5" {
+        return Err("query wrong");
+    }
+    if r.query_param("all") != Some("1") || r.query_param("limit") != Some("5") {
+        return Err("query_param wrong");
+    }
+    if r.query_param("missing").is_some() {
+        return Err("query_param matched a missing key");
+    }
+    if r.header("host") != Some("localhost") {
+        return Err("case-insensitive header lookup failed");
+    }
+    if r.header("Accept") != Some("application/json") {
+        return Err("header value wrong");
+    }
+    if !r.body.is_empty() {
+        return Err("GET body should be empty");
+    }
+
+    // POST with a JSON body via Content-Length (no version prefix).
+    let payload = br#"{"Image":"busybox"}"#;
+    let mut post = String::from("POST /containers/create HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ");
+    post.push_str(&alloc::format!("{}", payload.len()));
+    post.push_str("\r\n\r\n");
+    let mut bytes = post.into_bytes();
+    bytes.extend_from_slice(payload);
+    let r = http::parse_request(&bytes).ok_or("POST parse failed")?;
+    if r.method != "POST" || r.path != "/containers/create" {
+        return Err("POST request line wrong");
+    }
+    if r.api_version.is_some() {
+        return Err("POST reported a spurious api_version");
+    }
+    if &r.body[..] != &payload[..] {
+        return Err("POST body mismatch");
+    }
+
+    // Malformed / hostile inputs must return None (fail closed), never panic.
+    if http::parse_request(b"not an http request at all").is_some() {
+        return Err("garbage (no CRLFCRLF) was accepted");
+    }
+    // Content-Length beyond MAX_BODY -> reject.
+    if http::parse_request(b"POST / HTTP/1.1\r\nContent-Length: 1000000\r\n\r\n").is_some() {
+        return Err("oversized Content-Length accepted");
+    }
+    // Content-Length present but the body is truncated -> reject.
+    if http::parse_request(b"POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\nshort").is_some() {
+        return Err("truncated body accepted");
+    }
+    // Chunked transfer-encoding is unsupported -> reject.
+    if http::parse_request(b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").is_some() {
+        return Err("chunked transfer-encoding accepted");
+    }
+    // Too many headers -> reject.
+    let mut flood = String::from("GET / HTTP/1.1\r\n");
+    for i in 0..(http::MAX_HEADERS + 2) {
+        flood.push_str(&alloc::format!("X-H{i}: v\r\n"));
+    }
+    flood.push_str("\r\n");
+    if http::parse_request(flood.as_bytes()).is_some() {
+        return Err("header flood accepted");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_http_request() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// JSON serializer (Phase 6.0): exact compact output, correct escaping, and a
+/// parse → serialize round-trip (used to build Docker Engine API responses).
+#[cfg(target_arch = "x86_64")]
+fn test_json_serialize() -> Result<(), &'static str> {
+    use crate::oci::json::{self, Value};
+    use alloc::string::String;
+    use alloc::vec;
+
+    // Exact compact output, keys in insertion order.
+    let v = Value::Object(vec![
+        (String::from("Id"), Value::Str(String::from("abc123"))),
+        (String::from("Running"), Value::Bool(true)),
+        (String::from("ExitCode"), Value::Num(0.0)),
+        (
+            String::from("Names"),
+            Value::Array(vec![Value::Str(String::from("/web"))]),
+        ),
+    ]);
+    let expect = br#"{"Id":"abc123","Running":true,"ExitCode":0,"Names":["/web"]}"#;
+    if &v.to_bytes()[..] != &expect[..] {
+        return Err("object serialization mismatch");
+    }
+
+    // String escaping: quote, backslash, newline, tab.
+    let s = Value::Str(String::from("a\"b\\c\nd\te"));
+    if &s.to_bytes()[..] != &br#""a\"b\\c\nd\te""#[..] {
+        return Err("string escaping wrong");
+    }
+    // A control character escapes to \u00XX (U+0001 -> the 8 bytes: backslash-u-0-0-0-1 in quotes).
+    if &Value::Str(String::from("\u{1}")).to_bytes()[..] != b"\"\\u0001\"" {
+        return Err("control-char escaping wrong");
+    }
+    // A non-integer number keeps a decimal; an integer-valued one does not.
+    if &Value::Num(42.0).to_bytes()[..] != b"42" {
+        return Err("integer number serialization wrong");
+    }
+
+    // Round-trip: a compact document parses and re-serializes byte-for-byte.
+    let doc = br#"{"a":1,"b":[true,false,null],"c":"x y","n":42}"#;
+    let parsed = json::parse(doc).ok_or("round-trip parse failed")?;
+    if &parsed.to_bytes()[..] != &doc[..] {
+        return Err("round-trip mismatch");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_json_serialize() -> Result<(), &'static str> {
     Ok(())
 }
 
