@@ -94,12 +94,38 @@ impl ByteSource for VfsByteSource {
     }
 }
 
-/// Create every ancestor directory of `path` on `mount` (best-effort; existing
-/// dirs are fine). `path` is absolute, e.g. `/bin/hello` creates `/bin`.
-fn ensure_parent_dirs(mount: u64, path: &str) {
+/// Map an **image-declared** path to the host path it is written to on `mount`,
+/// applied at assembly time.
+///
+/// SECURITY (Phase 6.1b, Momus): image paths are **untrusted** — a malicious layer
+/// member named `../../host_secret` would, written verbatim under a container
+/// base, be resolved by the ext2 server's `..`-honoring path walk and escape the
+/// base (clobbering the mount root or a sibling container). So every image path is
+/// first run through the same audited `..`-clamp the runtime uses
+/// (`linux::fs::resolve_path`, which collapses `..` at the root), then prefixed
+/// with the container base. Assembly and runtime therefore agree on where a file
+/// lives, and neither can be made to escape.
+fn assembly_host_path(base: Option<&str>, image_path: &str) -> String {
+    let rel = crate::linux::fs::resolve_path("/", image_path); // clamps `..` at root
+    match base {
+        Some(b) if rel != "/" => {
+            let mut s = String::from(b);
+            s.push_str(&rel);
+            s
+        }
+        Some(b) => String::from(b),
+        None => rel,
+    }
+}
+
+/// Create every ancestor directory of `host_path` on `mount` (best-effort;
+/// existing dirs are fine). `host_path` is the already-clamped, base-prefixed host
+/// path (so this also creates the container base dir, e.g. `/c/<id>`, as a side
+/// effect of the first file written under it).
+fn ensure_parent_dirs(mount: u64, host_path: &str) {
     let mut acc = String::new();
     // Split on '/', creating each prefix directory except the final component.
-    let comps: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let comps: Vec<&str> = host_path.trim_start_matches('/').split('/').collect();
     for comp in &comps[..comps.len().saturating_sub(1)] {
         if comp.is_empty() {
             continue;
@@ -110,19 +136,23 @@ fn ensure_parent_dirs(mount: u64, path: &str) {
     }
 }
 
-/// Write an unpacked image's files onto `mount`, creating parent directories.
-fn assemble_rootfs(mount: u64, image: &oci::Image) -> Result<(), RunError> {
+/// Write an unpacked image's files onto `mount` under the container `base`
+/// (`None` = the mount root), creating parent directories. Every image path is
+/// `..`-clamped + base-prefixed by [`assembly_host_path`] before it touches the
+/// server (see its SECURITY note).
+fn assemble_rootfs(mount: u64, base: Option<&str>, image: &oci::Image) -> Result<(), RunError> {
     for f in &image.files {
+        let host = assembly_host_path(base, &f.path);
         if f.is_dir {
-            ensure_parent_dirs(mount, &f.path);
-            let _ = fs::kmkdir(mount, f.path.as_bytes());
+            ensure_parent_dirs(mount, &host);
+            let _ = fs::kmkdir(mount, host.as_bytes());
             continue;
         }
-        ensure_parent_dirs(mount, &f.path);
-        let fd = match fs::kcreate(mount, f.path.as_bytes()) {
+        ensure_parent_dirs(mount, &host);
+        let fd = match fs::kcreate(mount, host.as_bytes()) {
             Ok(fd) => fd,
             // If it already exists, open it and overwrite from the start.
-            Err(_) => fs::kopen(mount, f.path.as_bytes()).map_err(|_| RunError::Rootfs)?,
+            Err(_) => fs::kopen(mount, host.as_bytes()).map_err(|_| RunError::Rootfs)?,
         };
         if !f.data.is_empty() {
             fs::kwrite(mount, fd, 0, &f.data).map_err(|_| RunError::Rootfs)?;
@@ -137,15 +167,42 @@ fn assemble_rootfs(mount: u64, image: &oci::Image) -> Result<(), RunError> {
 /// = entrypoint++cmd, the image env, and cwd. Returns the new pid so the caller
 /// can do any final setup (e.g. mapping a region) before [`start`].
 pub fn create(bundle: &[u8], mount: u64) -> Result<ProcessId, RunError> {
-    create_with_argv(bundle, mount).map(|(pid, _)| pid)
+    create_confined(bundle, mount, None).map(|(pid, _)| pid)
 }
 
 /// Like [`create`], but also returns the resolved argv (entrypoint++cmd) so the
-/// caller can record the container's command in its metadata (Phase 6.1). The
-/// argv is otherwise consumed into the initial stack and discarded.
+/// caller can record the container's command in its metadata (Phase 6.1). Rooted
+/// at the mount root (no confinement).
 pub fn create_with_argv(bundle: &[u8], mount: u64) -> Result<(ProcessId, Vec<String>), RunError> {
+    create_confined(bundle, mount, None)
+}
+
+/// Create a container, optionally **confined** to a `base` subdirectory of `mount`
+/// (Phase 6.1b). `Some("/c/<id>")` assembles the image under that subdir, loads
+/// the entrypoint from there, and marks the process confined so all its path
+/// syscalls are clamped to the subtree; `None` roots it at the mount root.
+///
+/// **Fail-closed (Momus M1):** the process's `rootfs_mount` **and** `rootfs_base`
+/// are set together, before any fallible assembly step. So if assembly or the ELF
+/// load fails, the (unstarted) process is left *confined-but-broken*, never
+/// mount-rooted — a caller that ignored the error and started it would get a
+/// container that can see nothing, not one that escaped its base.
+pub fn create_confined(
+    bundle: &[u8],
+    mount: u64,
+    base: Option<&str>,
+) -> Result<(ProcessId, Vec<String>), RunError> {
     let image = oci::unpack(bundle).map_err(RunError::Unpack)?;
-    assemble_rootfs(mount, &image)?;
+
+    let (pid, _) = process::create_process("container", None);
+    // Set mount AND base together, up front, so the process is never mount-rooted
+    // while confined files are being staged (fail-closed).
+    process::set_rootfs_mount(pid, mount);
+    if let Some(b) = base {
+        process::set_rootfs_base(pid, String::from(b));
+    }
+
+    assemble_rootfs(mount, base, &image)?;
 
     // Entrypoint binary path + argv (entrypoint then cmd); fall back to cmd alone.
     let mut argv: Vec<String> = Vec::new();
@@ -153,11 +210,10 @@ pub fn create_with_argv(bundle: &[u8], mount: u64) -> Result<(ProcessId, Vec<Str
     argv.extend(image.config.cmd.iter().cloned());
     let entry_path = argv.first().cloned().ok_or(RunError::NoEntrypoint)?;
 
-    // Load the entrypoint ELF straight out of the assembled rootfs.
-    let src = VfsByteSource::open(mount, entry_path.as_bytes()).map_err(|_| RunError::Rootfs)?;
-    let (pid, _) = process::create_process("container", None);
-    // Set the rootfs first so path syscalls resolve inside it from the start.
-    process::set_rootfs_mount(pid, mount);
+    // Load the entrypoint ELF from where assembly wrote it (clamped + base-prefixed
+    // by the same mapping, so a `..` in the image's Entrypoint can't read out).
+    let host_entry = assembly_host_path(base, &entry_path);
+    let src = VfsByteSource::open(mount, host_entry.as_bytes()).map_err(|_| RunError::Rootfs)?;
     let load = elf::load_into(pid, &src);
     src.close();
     let img = load.map_err(RunError::Load)?;

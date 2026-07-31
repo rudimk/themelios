@@ -111,8 +111,18 @@ pub struct Process {
     /// processes.
     pub rootfs_mount: Option<u64>,
 
+    /// Rootfs **base subdirectory** on `rootfs_mount` that this process is confined
+    /// to (Phase 6.1b). `Some("/c/<id>")` means the container's `/` maps to
+    /// `/c/<id>` on the shared mount: every path syscall prepends this base to the
+    /// already-`..`-clamped container-relative path, so the container can name
+    /// nothing outside its subtree (not sibling containers, not the mount root).
+    /// `None` = rooted at the mount root (non-container processes, and the
+    /// single-rootfs container path used before confinement).
+    pub rootfs_base: Option<alloc::string::String>,
+
     /// Current working directory for cwd-relative Linux path resolution (Phase
-    /// 5.2). An absolute, already-normalized rootfs path; defaults to "/".
+    /// 5.2). An absolute, already-normalized **container-relative** rootfs path
+    /// (the base is *not* stored here, so `getcwd` never leaks it); defaults to "/".
     pub cwd: alloc::string::String,
 
     /// Per-process Linux file-descriptor table (Phase 5.2). Integer fds ≥ 3 index
@@ -209,6 +219,7 @@ pub fn init() {
         brk: 0,
         mmap_next: 0,
         rootfs_mount: None,
+        rootfs_base: None,
         cwd: String::from("/"),
         fd_table: Vec::new(),
         exit_code: None,
@@ -268,6 +279,7 @@ pub fn create_process(name: &str, parent_cspace: Option<&mut CSpace>) -> (Proces
             brk: 0,
             mmap_next: 0,
             rootfs_mount: None,
+            rootfs_base: None,
             cwd: String::from("/"),
             fd_table: Vec::new(),
             exit_code: None,
@@ -423,6 +435,27 @@ pub fn rootfs_mount(pid: ProcessId) -> Option<u64> {
         .get(pid.as_usize())
         .and_then(|slot| slot.as_ref())
         .and_then(|proc| proc.rootfs_mount)
+}
+
+/// Confine a Linux process to a rootfs base subdirectory on its mount (Phase
+/// 6.1b). After this, every path syscall prepends `base` to the container's
+/// `..`-clamped relative path. `base` must be an absolute, `..`-free path.
+pub fn set_rootfs_base(pid: ProcessId, base: String) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.processes.get_mut(pid.as_usize()) {
+        proc.rootfs_base = Some(base);
+    }
+}
+
+/// The rootfs base subdirectory a Linux process is confined to, if any. `None`
+/// means it is rooted at the mount root.
+pub fn rootfs_base(pid: ProcessId) -> Option<String> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .processes
+        .get(pid.as_usize())
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc| proc.rootfs_base.clone())
 }
 
 /// A copy of a Linux process's current working directory (defaults to "/").

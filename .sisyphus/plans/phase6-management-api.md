@@ -179,12 +179,45 @@ mount root to the subdir root) and deserves its own focused sub-phase + Momus
 review rather than being bolted on here. The registry already stores each
 container's mount id so the confinement lifts in cleanly.
 
-**New sub-phase 6.1b (added): per-container rootfs confinement.** Assemble each
-container under `/c/<id>` on the shared mount; add a per-process rootfs **base
-path** applied in `linux::fs` resolution so a container is clamped to its subdir
-(cannot see `/c/<other>` or the mount root). Security-critical → a dedicated
-isolation probe (a container tries to read a sibling's file and the mount root,
-both must miss). This replaces the infeasible "mount per container."
+### 6.1b — Per-container rootfs confinement — ✅ DONE (Momus-reviewed)
+
+Replaces the infeasible "mount per container": each container is confined to a
+`/c/<id>` **subdirectory** of the shared mount.
+
+**Built**:
+- `Process.rootfs_base: Option<String>` + accessors. `host_path(pid, rel)` in
+  `linux::fs` maps the `..`-clamped container-relative path to `base + rel` at the
+  **5 mount-access sites** (openat kstat/kcreate/kopen, newfstatat kstat, chdir
+  kstat). `cwd` stays container-relative (getcwd never leaks the base; chdir
+  stats the host path but stores the relative one).
+- `container::create_confined(bundle, mount, Some("/c/<id>"))`: assembles under
+  the base, loads the entrypoint from there, sets mount **and** base together up
+  front (fail-closed). `registry::create_on_mount` generates the id first and
+  confines. `create`/`create_with_argv` keep base `None` (mount root).
+- **Critical Momus fix** — assembly-time `..` clamp: image paths are untrusted,
+  and the ext2 server honors `..`, so a layer member `../../host_secret` would
+  escape the base at *assembly*. Every image path (files, dirs, entrypoint) now
+  passes through `resolve_path("/", …)` before base-prefixing, symmetric with the
+  runtime. `confine-smoke` + `test_container_confinement` prove **both** halves:
+  a malicious `../../evil` is clamped into the base (not written at root, and
+  `/host_secret` intact), and the confined probe reads its own `/only` but cannot
+  open a real `/host_secret` at the mount root (directly or via `..`).
+
+**Deferred (Momus M2, documented)**: the kernel↔fs-server **shared per-mount
+region** is copied then handed over a *blocking* `ipc_call` without a lock held
+across the pair, so two *concurrently-running* containers on the same mount could
+interleave (a pre-existing race, not introduced here). The confinement boundary
+is proven for a single running container + static assembly; the concurrent-two-
+containers guarantee additionally needs that forwarding path serialized (a
+per-mount yielding lock across the IPC). **Must be resolved before the API (6.5)
+runs multiple containers concurrently** — tracked as a 6.5 prerequisite. The nit
+(reject overlong host paths rather than silently truncate) is noted for the same
+hardening pass.
+
+**Acceptance**:
+- [x] `test_container_confinement`: assembly `..` clamped into base + `/host_secret`
+      intact; confined probe reads `/only` but not `/host_secret` (direct or `..`).
+- [x] All Phase 5 container tests still green (create with base `None` unchanged).
 
 **Acceptance**:
 - [x] Create two containers; list; look up by id-prefix and name; assert metadata;

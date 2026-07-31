@@ -76,6 +76,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_oci_unpack",       func: test_oci_unpack },
     TestCase { name: "test_container_run",    func: test_container_run },
     TestCase { name: "test_container_isolation", func: test_container_isolation },
+    TestCase { name: "test_container_confinement", func: test_container_confinement },
     TestCase { name: "test_sha256",           func: test_sha256 },
     TestCase { name: "test_registry_pull",    func: test_registry_pull },
     TestCase { name: "test_registry_hardening", func: test_registry_hardening },
@@ -4177,6 +4178,106 @@ fn test_container_isolation() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_container_isolation() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Per-container rootfs confinement (Phase 6.1b). Proves both halves of the
+/// boundary against a container confined to `/c/conftest` on a mount that also
+/// holds a real `/host_secret` at its root:
+///   - **assembly-time clamp**: a malicious image path (`../../evil`) is clamped
+///     *into* the base, not written at the mount root, and `/host_secret` is not
+///     clobbered;
+///   - **runtime confinement**: the `confine-smoke` probe reads its own `/only`
+///     but cannot open `/host_secret` (directly or via `..` escape).
+#[cfg(target_arch = "x86_64")]
+fn test_container_confinement() -> Result<(), &'static str> {
+    use crate::container;
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self, embedded};
+    use crate::sched;
+
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0xC0F1_110E_0ADE_D011;
+
+    let mount = bring_up_ext2_mount("ext2-disk-confine", "ext2-confine")?;
+
+    // Stage a real secret at the MOUNT ROOT (outside any container base). If
+    // confinement were broken, the probe would open this and the test would fail —
+    // so the test is non-vacuous.
+    let fd = crate::fs::kcreate(mount, b"/host_secret").map_err(|_| "stage /host_secret failed")?;
+    crate::fs::kwrite(mount, fd, 0, b"HOSTDATA").map_err(|_| "write /host_secret failed")?;
+    let _ = crate::fs::kclose(mount, fd);
+
+    // Image: /init = confine-smoke, its own /only, and a MALICIOUS layer path
+    // `../../evil` that tries to escape the base at assembly time.
+    let layer = make_tar(&[
+        ("init", embedded::CONFINE_SMOKE, b'0'),
+        ("only", b"OK", b'0'),
+        ("../../evil", b"PWNED", b'0'),
+    ]);
+    let config = br#"{"config":{"Entrypoint":["/init"],"Env":["PATH=/bin"],"WorkingDir":"/"}}"#;
+    let manifest = br#"[{"Config":"config.json","Layers":["layer.tar"]}]"#;
+    let bundle = make_tar(&[
+        ("manifest.json", manifest, b'0'),
+        ("config.json", config, b'0'),
+        ("layer.tar", &layer, b'0'),
+    ]);
+
+    let base = "/c/conftest";
+    let (pid, _) =
+        container::create_confined(&bundle, mount, Some(base)).map_err(|_| "create_confined failed")?;
+
+    // ASSEMBLY CLAMP: `../../evil` must have been clamped INTO the base, not written
+    // at the mount root; `/host_secret` must be intact.
+    if crate::fs::kstat(mount, b"/evil").is_ok() {
+        process::destroy_process(pid);
+        return Err("assembly escape: /evil written at the mount root");
+    }
+    if crate::fs::kstat(mount, b"/c/conftest/evil").is_err() {
+        process::destroy_process(pid);
+        return Err("assembly: clamped file not found under the base");
+    }
+    match crate::fs::kstat(mount, b"/host_secret") {
+        Ok((8, false)) => {}
+        _ => {
+            process::destroy_process(pid);
+            return Err("/host_secret clobbered or wrong size");
+        }
+    }
+
+    // RUNTIME CONFINEMENT: run the probe; map its result page first.
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping result region failed")?;
+    container::start(pid);
+
+    let mut code: Option<u64> = None;
+    for _ in 0..400_000 {
+        // SAFETY: kernel-owned region; the container writes the same memory.
+        let s = unsafe { region.as_slice_mut() };
+        if u64::from_le_bytes(s[0..8].try_into().unwrap()) == RESULT_MAGIC {
+            code = Some(u64::from_le_bytes(s[8..16].try_into().unwrap()));
+            break;
+        }
+        sched::yield_now();
+    }
+    process::destroy_process(pid);
+    match code {
+        Some(0) => Ok(()),
+        Some(1) => Err("confine: positive-control open(/only) failed"),
+        Some(2) => Err("confine: /host_secret was OPENABLE (confinement broken!)"),
+        Some(3) => Err("confine: `..` escape to /host_secret succeeded"),
+        Some(_) => Err("confine: probe reported an unknown code"),
+        None => Err("confine probe did not run"),
+    }
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_container_confinement() -> Result<(), &'static str> {
     Ok(())
 }
 

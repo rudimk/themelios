@@ -117,11 +117,16 @@ pub fn create_from_image(image: &str, name: &str) -> Result<String, RunError> {
 
 /// Like [`create_from_image`] but onto an explicit `mount` rather than the default
 /// `/data` mount. Used where the caller manages the mount directly (tests).
+///
+/// The container is **confined** (Phase 6.1b) to a `/c/<id>` subdirectory of the
+/// mount, so multiple containers on the shared mount cannot see each other's (or
+/// the mount root's) files. The id is generated first so it can name the base.
 pub fn create_on_mount(image: &str, name: &str, mount: u64) -> Result<String, RunError> {
     let bundle = resolve_bundle(image)?;
-    let (pid, command) = super::create_with_argv(&bundle, mount)?;
-
     let id = generate_id();
+    let mut base = String::from("/c/");
+    base.push_str(&id);
+    let (pid, command) = super::create_confined(&bundle, mount, Some(&base))?;
     let name = if name.is_empty() {
         let n = NAME_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut s = String::from("container-");

@@ -79,6 +79,32 @@ pub fn resolve_path(cwd: &str, path: &str) -> String {
     out
 }
 
+/// Map a container-relative resolved path (`rel`, the `..`-clamped output of
+/// [`resolve_path`], always absolute) to the **host** path actually used against
+/// the mount, applying the process's rootfs base subdirectory (Phase 6.1b).
+///
+/// If the process is confined (`rootfs_base = Some("/c/<id>")`), the container's
+/// `/` maps to `/c/<id>`: `rel == "/"` → the base itself (avoiding a trailing-slash
+/// ambiguity), any other `rel` (which always starts with `/`) → `base + rel`.
+/// Because `rel` is already clamped so it can never rise above `/`, `base + rel`
+/// can never escape the base subtree. Unconfined processes (`None`) get `rel`
+/// unchanged (rooted at the mount root). This is the **single choke point** every
+/// mount-by-path access must pass through.
+fn host_path(pid: process::ProcessId, rel: &str) -> String {
+    match process::rootfs_base(pid) {
+        Some(base) => {
+            if rel == "/" {
+                base
+            } else {
+                let mut s = base;
+                s.push_str(rel);
+                s
+            }
+        }
+        None => String::from(rel),
+    }
+}
+
 /// Read a NUL-terminated (or `PATH_MAX`-bounded) path string from userspace.
 fn read_user_path(ptr: u64, cwd: &str) -> Option<String> {
     // Copy up to PATH_MAX bytes, then stop at the first NUL.
@@ -128,10 +154,13 @@ fn sys_openat(pid: process::ProcessId, dirfd: i64, path_ptr: u64, flags: u64) ->
         return err(ENOSYS);
     }
     let cwd = process::get_cwd(pid);
-    let path = match read_user_path(path_ptr, &cwd) {
+    let rel = match read_user_path(path_ptr, &cwd) {
         Some(p) => p,
         None => return err(EFAULT),
     };
+    // Apply the container's rootfs base (confinement choke point). All three
+    // mount accesses below use the host path, never the raw container-relative one.
+    let path = host_path(pid, &rel);
 
     // Determine existence/type; create on O_CREAT if absent.
     let (size, is_dir) = match crate::fs::kstat(mount, path.as_bytes()) {
@@ -325,10 +354,11 @@ fn sys_newfstatat(pid: process::ProcessId, dirfd: i64, path_ptr: u64, statbuf: u
         None => return err(ENOENT),
     };
     let cwd = process::get_cwd(pid);
-    let path = match read_user_path(path_ptr, &cwd) {
+    let rel = match read_user_path(path_ptr, &cwd) {
         Some(p) => p,
         None => return err(EFAULT),
     };
+    let path = host_path(pid, &rel); // confinement choke point
     match crate::fs::kstat(mount, path.as_bytes()) {
         Ok((size, is_dir)) => {
             let st = fill_stat(size, is_dir);
@@ -442,13 +472,16 @@ fn sys_chdir(pid: process::ProcessId, path_ptr: u64) -> u64 {
         None => return err(ENOENT),
     };
     let cwd = process::get_cwd(pid);
-    let path = match read_user_path(path_ptr, &cwd) {
+    let rel = match read_user_path(path_ptr, &cwd) {
         Some(p) => p,
         None => return err(EFAULT),
     };
-    match crate::fs::kstat(mount, path.as_bytes()) {
+    // Verify the target exists on the *host* path, but store the *container-
+    // relative* path as the cwd — storing the host path would double-prefix the
+    // base on the next relative open, and would leak the base to getcwd.
+    match crate::fs::kstat(mount, host_path(pid, &rel).as_bytes()) {
         Ok((_, true)) => {
-            process::set_cwd(pid, path);
+            process::set_cwd(pid, rel);
             0
         }
         Ok((_, false)) => err(ENOTDIR),

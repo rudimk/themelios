@@ -96,6 +96,22 @@ on the real syscall path, not merely that some out-of-tree path happens to miss.
 (A bare "escape returns `-ENOENT`" assertion would prove nothing: with a single
 mount and no host root, the miss happens whether the clamp works or not.)
 
+**Per-container confinement (Phase 6.1b).** Multiple containers share one writable
+mount (a per-container *mount* is infeasible here — mounts need a physical disk and
+are never freed), so each container is instead confined to a `/c/<id>`
+**subdirectory**. Its `rootfs_base` is prepended to every already-`..`-clamped
+path at a single choke point (`linux::fs::host_path`), so the container's `/` *is*
+`/c/<id>` and it can name nothing outside that subtree — not a sibling container's
+files, not the mount root. Because untrusted **image** paths are just as dangerous
+(the ext2 server honors `..`, so a layer member `../../host_secret` would escape at
+*assembly* time), every image path is run through the same clamp before it is
+written. `test_container_confinement` proves both halves: a malicious `../../evil`
+is clamped into the base (never reaching the mount root, and a root `/host_secret`
+is left intact), and a confined probe reads its own file but cannot open that root
+`/host_secret`. (One caveat carried forward: the guarantee is proven for a single
+running container; serializing the kernel↔fs-server forwarding region is a
+prerequisite before the management API runs *multiple* containers concurrently.)
+
 ### Everything else: no capability, no access
 
 A container is created with an **empty capability space**. Ambient authority does
