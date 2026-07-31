@@ -35,6 +35,10 @@ use alloc::vec::Vec;
 
 extern crate alloc;
 
+/// Container metadata registry (Phase 6.1): id/name/image/created/command/state
+/// keyed to the backing pid, surviving the process for `docker ps`/`inspect`.
+pub mod registry;
+
 /// Errors from launching a container.
 #[derive(Debug)]
 pub enum RunError {
@@ -133,6 +137,13 @@ fn assemble_rootfs(mount: u64, image: &oci::Image) -> Result<(), RunError> {
 /// = entrypoint++cmd, the image env, and cwd. Returns the new pid so the caller
 /// can do any final setup (e.g. mapping a region) before [`start`].
 pub fn create(bundle: &[u8], mount: u64) -> Result<ProcessId, RunError> {
+    create_with_argv(bundle, mount).map(|(pid, _)| pid)
+}
+
+/// Like [`create`], but also returns the resolved argv (entrypoint++cmd) so the
+/// caller can record the container's command in its metadata (Phase 6.1). The
+/// argv is otherwise consumed into the initial stack and discarded.
+pub fn create_with_argv(bundle: &[u8], mount: u64) -> Result<(ProcessId, Vec<String>), RunError> {
     let image = oci::unpack(bundle).map_err(RunError::Unpack)?;
     assemble_rootfs(mount, &image)?;
 
@@ -160,7 +171,7 @@ pub fn create(bundle: &[u8], mount: u64) -> Result<ProcessId, RunError> {
     process::set_user_entry(pid, img.entry, rsp);
     process::set_personality(pid, Personality::Linux);
     process::set_cwd(pid, image.config.cwd.clone());
-    Ok(pid)
+    Ok((pid, argv))
 }
 
 /// Start a container process created by [`create`] (spawns its ring-3 task).
@@ -184,6 +195,9 @@ pub fn terminate(pid: ProcessId) -> bool {
     if !is_container {
         return false;
     }
+    // Reflect the force-kill in the metadata registry (128 + SIGKILL(9)), so
+    // `ps` shows the container as exited rather than still running.
+    registry::note_exit(pid, 137);
     process::destroy_process(pid)
 }
 

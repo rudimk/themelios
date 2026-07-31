@@ -81,6 +81,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_registry_hardening", func: test_registry_hardening },
     TestCase { name: "test_http_request",      func: test_http_request },
     TestCase { name: "test_json_serialize",    func: test_json_serialize },
+    TestCase { name: "test_container_registry", func: test_container_registry },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -4551,6 +4552,122 @@ fn test_json_serialize() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_json_serialize() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Container metadata registry (Phase 6.1): create two containers, verify the
+/// table + id-prefix/name lookup + metadata, drive the state machine, run one
+/// end-to-end so a real exit updates its row, then remove a row.
+#[cfg(target_arch = "x86_64")]
+fn test_container_registry() -> Result<(), &'static str> {
+    use crate::container::registry::{self, ContainerState};
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self};
+    use crate::sched;
+
+    // linux-smoke (the demo /init) reports to this page and exits 0.
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0x5A11_D0C5_10AD_ED11;
+
+    let mount = bring_up_ext2_mount("ext2-disk-registry", "ext2-registry")?;
+
+    // Two containers from the demo image, with explicit names.
+    let id1 = registry::create_on_mount("demo", "web", mount).map_err(|_| "create web failed")?;
+    let id2 = registry::create_on_mount("demo", "db", mount).map_err(|_| "create db failed")?;
+    if id1 == id2 {
+        return Err("two containers got the same id");
+    }
+
+    // The table lists both; look up by id-prefix and by name; a miss returns None.
+    let list = registry::list();
+    if list.iter().filter(|c| c.id == id1 || c.id == id2).count() != 2 {
+        return Err("both containers not listed");
+    }
+    let by_prefix = registry::lookup(&id1[..8]).ok_or("id-prefix lookup failed")?;
+    if by_prefix.id != id1 {
+        return Err("id-prefix resolved to the wrong container");
+    }
+    let by_name = registry::lookup("db").ok_or("name lookup failed")?;
+    if by_name.id != id2 {
+        return Err("name lookup resolved to the wrong container");
+    }
+    if registry::lookup("nonesuch-xyz").is_some() {
+        return Err("lookup matched a nonexistent container");
+    }
+
+    // Metadata is captured: image, a non-empty command, and state Created.
+    let web = registry::lookup(&id1).ok_or("web vanished")?;
+    if web.image != "demo" || web.name != "web" {
+        return Err("web metadata wrong");
+    }
+    if web.command.is_empty() {
+        return Err("command not captured");
+    }
+    if web.state != ContainerState::Created {
+        return Err("new container not in Created state");
+    }
+
+    // State machine (pure table ops): Created -> Running -> Exited.
+    registry::set_state(&id1, ContainerState::Running);
+    if registry::lookup(&id1).unwrap().state != ContainerState::Running {
+        return Err("set_state(Running) not reflected");
+    }
+    registry::note_exit(web.pid, 7);
+    if registry::lookup(&id1).unwrap().state != ContainerState::Exited(7) {
+        return Err("note_exit not reflected");
+    }
+    // The web process was created but never started; free it.
+    process::destroy_process(web.pid);
+
+    // Run the db container end-to-end so a *real* exit updates its row.
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(by_name.pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping result region failed")?;
+    registry::set_state(&id2, ContainerState::Running);
+    crate::container::start(by_name.pid);
+
+    let mut ran = false;
+    for _ in 0..400_000 {
+        // SAFETY: kernel-owned region; the container writes the same memory.
+        let s = unsafe { region.as_slice_mut() };
+        if u64::from_le_bytes(s[0..8].try_into().unwrap()) == RESULT_MAGIC {
+            ran = true;
+            break;
+        }
+        sched::yield_now();
+    }
+    if !ran {
+        process::destroy_process(by_name.pid);
+        return Err("db container did not run");
+    }
+    if let Some(code) = process::exit_status(by_name.pid) {
+        registry::note_exit(by_name.pid, code);
+    }
+    process::destroy_process(by_name.pid);
+    if registry::lookup(&id2).unwrap().state != ContainerState::Exited(0) {
+        return Err("db row not Exited(0) after a real exit");
+    }
+
+    // Removal (docker rm): the row is gone; the other remains.
+    if !registry::remove(&id2) {
+        return Err("remove returned false for an existing container");
+    }
+    if registry::lookup(&id2).is_some() {
+        return Err("removed container still resolvable");
+    }
+    if registry::lookup(&id1).is_none() {
+        return Err("removing one container dropped another");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_container_registry() -> Result<(), &'static str> {
     Ok(())
 }
 

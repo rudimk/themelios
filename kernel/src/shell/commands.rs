@@ -43,7 +43,8 @@ pub fn cmd_help(_args: &str) {
     println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
     println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
     println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
-    println!("  run              — launch a demo container (linux-smoke as /init)");
+    println!("  run [image]      — create + launch a container (default: demo)");
+    println!("  ps               — list containers and their state");
     println!("  stop <pid>       — force-terminate a running container");
 }
 
@@ -1012,41 +1013,72 @@ fn now_ms() -> u64 {
     crate::arch::x86_64::idt::tick_count().wrapping_mul(10)
 }
 
-/// `run` — launch a demo container (Phase 5.5).
+/// `run [image]` — create + launch a container and record its metadata (5.5/6.1).
 ///
-/// Assembles a self-contained demo image (its `/init` entrypoint is the embedded
-/// `linux-smoke` binary) onto the `/data` mount, launches it as a
+/// Resolves a staged image (default `demo`, whose `/init` is the embedded
+/// `linux-smoke` binary), records a container-registry row, launches it as a
 /// capability-isolated Linux container, waits for it to exit, and prints the exit
-/// code. This demonstrates the whole 5.0–5.5 pipeline live: unpack → assemble
-/// rootfs → load the entrypoint from that rootfs → run it in ring 3. Real image
-/// staging (pulling `run <image>` from a registry) arrives in Phase 5.6.
-pub fn cmd_run(_args: &str) {
-    use crate::container;
-    let mount = match crate::fs::data_mount() {
-        Some(m) => m,
-        None => {
-            println!("run: no writable filesystem (/data) available");
-            return;
+/// code. State transitions Created → Running → Exited are recorded in the registry
+/// (`ps` shows them). Live registry pull for arbitrary images is deferred.
+pub fn cmd_run(args: &str) {
+    use crate::container::registry::{self, ContainerState};
+    let image = {
+        let a = args.trim();
+        if a.is_empty() {
+            "demo"
+        } else {
+            a
         }
     };
-    println!("run: launching demo container (entrypoint /init = linux-smoke)...");
-    let bundle = container::demo_bundle();
-    let pid = match container::create(&bundle, mount) {
-        Ok(p) => p,
+    let id = match registry::create_from_image(image, "") {
+        Ok(id) => id,
         Err(e) => {
             println!("run: failed to create container: {:?}", e);
             return;
         }
     };
-    container::start(pid);
+    let meta = match registry::lookup(&id) {
+        Some(m) => m,
+        None => {
+            println!("run: internal error (container row missing)");
+            return;
+        }
+    };
+    let pid = meta.pid;
+    let short = &id[..12];
+    println!("run: launching container {} (image {}, /init)...", short, meta.image);
+    registry::set_state(&id, ContainerState::Running);
+    crate::container::start(pid);
     // Wait (bounded) for the container to exit, then report its status.
     for _ in 0..5_000_000 {
         if let Some(code) = crate::process::exit_status(pid) {
-            println!("run: container exited with code {}", code);
+            registry::note_exit(pid, code);
+            println!("run: container {} exited with code {}", short, code);
             crate::process::destroy_process(pid);
             return;
         }
         crate::sched::yield_now();
     }
-    println!("run: container is still running (timed out waiting for exit)");
+    println!("run: container {} is still running (timed out)", short);
+}
+
+/// `ps` — list containers and their metadata (Docker-style, Phase 6.1). Shows all
+/// containers including exited ones (like `docker ps -a`), since a metadata row
+/// survives its process until removed.
+pub fn cmd_ps(_args: &str) {
+    let list = crate::container::registry::list();
+    if list.is_empty() {
+        println!("No containers.");
+        return;
+    }
+    println!("CONTAINER ID   IMAGE      STATE      NAME");
+    for c in &list {
+        let status = match c.state {
+            crate::container::registry::ContainerState::Exited(code) => {
+                alloc::format!("exited({code})")
+            }
+            other => alloc::string::String::from(other.as_str()),
+        };
+        println!("{:<12}   {:<9}  {:<9}  {}", &c.id[..12], c.image, status, c.name);
+    }
 }
