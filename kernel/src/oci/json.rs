@@ -56,6 +56,94 @@ impl Value {
             _ => Vec::new(),
         }
     }
+
+    /// Serialize this value to a compact JSON byte string (Phase 6.0). Object keys
+    /// keep insertion order (the reader preserves it), so `parse` → `to_bytes`
+    /// round-trips a compact document byte-for-byte. Used to build Docker Engine
+    /// API responses in the ring-3 `api-server`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write(&mut out);
+        out
+    }
+
+    /// Append this value's JSON encoding to `out`.
+    fn write(&self, out: &mut Vec<u8>) {
+        match self {
+            Value::Null => out.extend_from_slice(b"null"),
+            Value::Bool(true) => out.extend_from_slice(b"true"),
+            Value::Bool(false) => out.extend_from_slice(b"false"),
+            Value::Num(n) => write_number(*n, out),
+            Value::Str(s) => write_json_string(s, out),
+            Value::Array(items) => {
+                out.push(b'[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    item.write(out);
+                }
+                out.push(b']');
+            }
+            Value::Object(pairs) => {
+                out.push(b'{');
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    write_json_string(k, out);
+                    out.push(b':');
+                    v.write(out);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+}
+
+/// Write a JSON string literal with the mandatory escapes (RFC 8259 §7): `"` and
+/// `\`, the short escapes for the common controls, and `\u00XX` for any other
+/// control character. Non-ASCII is emitted as raw UTF-8 (valid JSON).
+fn write_json_string(s: &str, out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(b'"');
+    for c in s.chars() {
+        match c {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            '\t' => out.extend_from_slice(b"\\t"),
+            '\u{8}' => out.extend_from_slice(b"\\b"),
+            '\u{c}' => out.extend_from_slice(b"\\f"),
+            c if (c as u32) < 0x20 => {
+                let b = c as u32;
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[((b >> 4) & 0xf) as usize]);
+                out.push(HEX[(b & 0xf) as usize]);
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    out.push(b'"');
+}
+
+/// Write a number. Integer-valued finite values print without a decimal point (the
+/// common case — ports, counts, ids, timestamps); other finite values use the
+/// default `f64` formatting; non-finite values (which JSON cannot represent) are
+/// emitted as `null`.
+fn write_number(n: f64, out: &mut Vec<u8>) {
+    use alloc::string::ToString;
+    if !n.is_finite() {
+        out.extend_from_slice(b"null");
+    } else if n == (n as i64) as f64 {
+        out.extend_from_slice((n as i64).to_string().as_bytes());
+    } else {
+        out.extend_from_slice(n.to_string().as_bytes());
+    }
 }
 
 /// A cursor over the input bytes.

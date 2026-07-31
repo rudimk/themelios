@@ -12,6 +12,7 @@
 //! is a thin, documented follow-up — the pipeline value is fully exercised here.
 
 use super::{json, unpack_registry, Image, OciError};
+use crate::http::{content_length, find_sub};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -26,16 +27,10 @@ pub trait Connection {
     fn request(&mut self, request: &[u8]) -> Option<Vec<u8>>;
 }
 
-/// Find the first occurrence of `needle` in `haystack`.
-fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
-}
-
 /// Parse an HTTP/1.1 response into `(status_code, body)`. Uses `Content-Length`
 /// when present, else the bytes after the header terminator. Testable directly.
+/// The byte-scanning helpers (`find_sub`, `content_length`) are shared with the
+/// Phase 6 request parser in [`crate::http`].
 ///
 /// LIMITATION (documented, not a safety issue): only `Content-Length` framing is
 /// handled — a `Transfer-Encoding: chunked` response with no `Content-Length`
@@ -57,7 +52,7 @@ pub fn http_body(resp: &[u8]) -> Option<(u16, Vec<u8>)> {
     // overflow `body_start + n` (an arithmetic-overflow panic under debug/test
     // builds where `overflow-checks` is on). A truncated body (end past the buffer)
     // falls out as `None` via `.get(..)`.
-    let clen = find_content_length(head);
+    let clen = content_length(head);
     let body = match clen {
         Some(n) => {
             let end = body_start.checked_add(n)?;
@@ -66,15 +61,6 @@ pub fn http_body(resp: &[u8]) -> Option<(u16, Vec<u8>)> {
         None => resp[body_start..].to_vec(),
     };
     Some((status, body))
-}
-
-/// Case-insensitively find a `Content-Length:` header and parse its value.
-fn find_content_length(head: &[u8]) -> Option<usize> {
-    let lower: Vec<u8> = head.iter().map(|b| b.to_ascii_lowercase()).collect();
-    let at = find_sub(&lower, b"content-length:")?;
-    let rest = &head[at + b"content-length:".len()..];
-    let end = find_sub(rest, b"\r\n").unwrap_or(rest.len());
-    core::str::from_utf8(&rest[..end]).ok()?.trim().parse().ok()
 }
 
 /// Issue a GET and return the 200 response body (or `None`).
