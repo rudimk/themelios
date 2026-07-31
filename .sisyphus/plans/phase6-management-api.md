@@ -145,26 +145,52 @@ The order is chosen so the **unproven transport (6.4) lands before the api-serve
       never panic/hang.
 - [ ] Serializer round-trips through `json::parse`; `"`,`\`,control chars escape.
 
-### 6.1 — Container metadata table + rootfs-mount lifecycle + image glue
+### 6.1 — Container metadata table + image glue — ✅ DONE (mount-isolation split out)
 
-**Goal**: A first-class "container" owning the metadata, mount, and (6.2) log
-buffer Docker needs, all surviving the pid.
+**Goal**: A first-class "container" owning the metadata Docker needs, surviving
+the pid.
 
-**What to build**:
-- `container::registry` — a `ContainerId`-keyed table: id, name, image ref,
-  `created` (tick), command (argv, captured before it's consumed), state
-  (Created/Running/Exited+code), pid, **owned rootfs mount handle**. Insert on
-  create, update on start/exit/terminate; id-prefix + name lookup.
-- `create_from_image(image_ref, name)` — **allocates a per-container writable
-  rootfs mount**, resolves the image (staged/embedded bundle now; `pull` when a
-  registry is configured), calls `create`, records metadata. Teardown reclaims the
-  mount.
-- Keep the argv/image/name that `create` currently discards.
+**Built**:
+- `container::registry` — a `ContainerId`-keyed table: id (64-hex, SHA-256 of a
+  seq counter + tick; id-prefix lookup like Docker), name (user or auto), image
+  ref, `created_ms` (monotonic since-boot — no wall clock; documented), command
+  (argv, captured via a new `create_with_argv`), state (Created/Running/
+  Exited(code)), pid, rootfs mount. Insert on create, update on start/exit/
+  terminate; id-prefix + name lookup, list, remove. The row **outlives the pid**
+  (removed only by `remove`/`docker rm`).
+- `create_from_image(image, name)` / `create_on_mount(image, name, mount)` —
+  resolves a staged/embedded image (`demo`; live pull deferred), calls
+  `create_with_argv`, records the row. `terminate` marks the row Exited(137).
+- `run [image]` records a row + drives Created→Running→Exited; `ps` lists the
+  table (incl. exited, like `docker ps -a`).
+- `test_container_registry`: two containers, id-prefix + name lookup + miss,
+  metadata, the state machine, one **end-to-end run → Exited(0)**, and removal.
+
+**Deviation from the plan (Momus M2), surfaced and split out**: per-container
+**rootfs mount isolation** is **not** built here, because the plan's model —
+"allocate/free a writable mount per container" — is **infeasible on this fs
+layer**: a mount requires a physical ext2-formatted virtio-blk disk (QEMU has a
+fixed few), spawns a block+ext2 server pair, and `fs::register_mount` is
+append-only (mounts are never freed). Every container therefore currently
+assembles onto the single shared `/data` mount. The correct alternative —
+confining each container to a **subdirectory** (`/c/<id>`) — is a change to the
+**security-critical Phase 5.2 path resolver** (the `..`-clamp would move from the
+mount root to the subdir root) and deserves its own focused sub-phase + Momus
+review rather than being bolted on here. The registry already stores each
+container's mount id so the confinement lifts in cleanly.
+
+**New sub-phase 6.1b (added): per-container rootfs confinement.** Assemble each
+container under `/c/<id>` on the shared mount; add a per-process rootfs **base
+path** applied in `linux::fs` resolution so a container is clamped to its subdir
+(cannot see `/c/<other>` or the mount root). Security-critical → a dedicated
+isolation probe (a container tries to read a sibling's file and the mount root,
+both must miss). This replaces the infeasible "mount per container."
 
 **Acceptance**:
-- [ ] Create two containers; list; look up by id-prefix and name; assert metadata +
-      independent mounts; start one → state transitions; terminate → mount freed.
-- [ ] `run`/`stop` shell cmds record/update rows.
+- [x] Create two containers; list; look up by id-prefix and name; assert metadata;
+      start one → Created→Running→Exited(0); remove → row gone, other remains.
+- [x] `run`/`ps`/`stop` shell cmds record/list/update rows.
+- [ ] (→ 6.1b) two running containers are rootfs-isolated from each other.
 
 ### 6.2 — Per-container stdout/stderr capture (`docker logs` backing)
 
