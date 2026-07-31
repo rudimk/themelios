@@ -1,0 +1,21 @@
+# Container rootfs-confinement smoke-test binary (Phase 6.1b).
+#
+# A ring-3 Linux-ABI program run as a *confined* container `/init` (rootfs base
+# `/c/<id>`). It proves the base confinement is live on the syscall path: it can
+# read its own `/only`, but a `/host_secret` that really exists at the shared
+# mount root is invisible (openat fails), including via `..` escape paths. Built
+# as a real ET_EXEC (detached crate; see servers/elf-smoke).
+[workspace]
+
+[package]
+name = "confine-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "confine-smoke"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

@@ -59,3 +59,10 @@ pub static THREADS_SMOKE: &[u8] = include_bytes!("../../../target/servers/thread
 #[cfg_attr(not(feature = "test"), allow(dead_code))]
 pub static ISOLATION_SMOKE: &[u8] =
     include_bytes!("../../../target/servers/isolation-smoke.elf");
+
+/// Phase 6.1b container rootfs-confinement smoke-test binary — as a *confined*
+/// container `/init`, proves it can read its own `/only` but cannot open a
+/// `/host_secret` that exists at the shared mount root. Run by
+/// `test_container_confinement`.
+#[cfg_attr(not(feature = "test"), allow(dead_code))]
+pub static CONFINE_SMOKE: &[u8] = include_bytes!("../../../target/servers/confine-smoke.elf");
