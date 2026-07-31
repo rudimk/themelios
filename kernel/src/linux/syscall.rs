@@ -175,12 +175,13 @@ fn sys_kill(current: crate::process::ProcessId, target: u64, sig: u64, rax: &mut
     super::thread::exit_group(128 + sig);
 }
 
-/// Write bytes to the console (serial). Container fd 1/2 route here; per-container
-/// capture arrives with the runtime in 5.5.
+/// Write a container's stdout/stderr (fd 1/2). Routes to the calling container's
+/// per-container capture buffer (Phase 6.2, keyed by container id so the log
+/// survives the process) and mirrors to the serial console. A non-container Linux
+/// process just reaches serial.
 fn console_write(bytes: &[u8]) {
-    for &b in bytes {
-        crate::print!("{}", b as char);
-    }
+    let pid = crate::sched::current_process_id();
+    crate::container::registry::write_stdout(pid, bytes);
 }
 
 /// `writev(fd, iov, iovcnt)` — gathered write of the `iovec[]` to fd 1/2.

@@ -82,6 +82,41 @@ pub struct ContainerMeta {
 /// The global container table.
 static CONTAINERS: InterruptMutex<Vec<ContainerMeta>> = InterruptMutex::new(Vec::new());
 
+/// Per-container captured stdout/stderr (Phase 6.2), keyed by `ContainerId` and
+/// **owned separately from the metadata row** so it isn't cloned on every `ps`.
+/// A row's log is created with the container and dropped only on [`remove`], so it
+/// **survives the process** — `docker logs` must work on an exited container.
+static CONTAINER_LOGS: InterruptMutex<Vec<(String, LogRing)>> = InterruptMutex::new(Vec::new());
+
+/// Cap on a single container's captured output. Bounded RAM (no persistent log
+/// storage on-node): the oldest bytes are dropped once the cap is reached.
+const LOG_CAP: usize = 16 * 1024;
+
+/// A bounded, RAM-backed capture buffer for one container's stdout/stderr. Newest
+/// bytes are kept; once [`LOG_CAP`] is exceeded the oldest are dropped.
+pub struct LogRing {
+    buf: Vec<u8>,
+}
+
+impl LogRing {
+    const fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+    /// Append `bytes`, dropping the oldest data if over the cap.
+    fn append(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() > LOG_CAP {
+            let excess = self.buf.len() - LOG_CAP;
+            self.buf.drain(0..excess);
+        }
+    }
+    /// The last `n` captured bytes (or all of them if `n` exceeds what's buffered).
+    fn tail(&self, n: usize) -> Vec<u8> {
+        let start = self.buf.len().saturating_sub(n);
+        self.buf[start..].to_vec()
+    }
+}
+
 /// A monotonic counter mixed into generated ids so two containers created in the
 /// same tick still get distinct ids.
 static ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -146,6 +181,8 @@ pub fn create_on_mount(image: &str, name: &str, mount: u64) -> Result<String, Ru
         pid,
         rootfs_mount: mount,
     });
+    // Allocate this container's (empty) stdout/stderr capture buffer (Phase 6.2).
+    CONTAINER_LOGS.lock().push((id.clone(), LogRing::new()));
     Ok(id)
 }
 
@@ -199,11 +236,53 @@ pub fn list() -> Vec<ContainerMeta> {
     CONTAINERS.lock().clone()
 }
 
-/// Remove a container's metadata row by exact id (`docker rm`). Returns whether a
-/// row was removed. (Freeing the backing process/rootfs is the caller's job.)
+/// Remove a container's metadata row **and its captured log** by exact id
+/// (`docker rm`). Returns whether a row was removed. (Freeing the backing
+/// process/rootfs is the caller's job.)
 pub fn remove(id: &str) -> bool {
     let mut table = CONTAINERS.lock();
     let before = table.len();
     table.retain(|c| c.id != id);
-    table.len() != before
+    let removed = table.len() != before;
+    drop(table);
+    // The log outlives the process but not the metadata row (Phase 6.2).
+    CONTAINER_LOGS.lock().retain(|(k, _)| k != id);
+    removed
+}
+
+/// Route a container's stdout/stderr write (Phase 6.2): if `pid` backs a container,
+/// append `bytes` to that container's capture buffer (keyed by its id, so the log
+/// survives the process); always mirror to the serial console as a dev aid.
+///
+/// Called from the Linux `write`/`writev` fd 1/2 paths. A non-container Linux
+/// process (no row for its pid) allocates no buffer — it just reaches serial.
+pub fn write_stdout(pid: ProcessId, bytes: &[u8]) {
+    // Look up the container id for this pid (short critical section), then append
+    // under the logs lock. Two small locks per write; the metadata lock is not held
+    // across the append.
+    let id = CONTAINERS
+        .lock()
+        .iter()
+        .find(|c| c.pid == pid)
+        .map(|c| c.id.clone());
+    if let Some(id) = id {
+        if let Some(entry) = CONTAINER_LOGS.lock().iter_mut().find(|(k, _)| *k == id) {
+            entry.1.append(bytes);
+        }
+    }
+    // Serial mirror (unconditional): keeps the interactive console useful.
+    for &b in bytes {
+        crate::print!("{}", b as char);
+    }
+}
+
+/// Read back a container's captured stdout/stderr (`docker logs`). `id_or_name` is
+/// resolved like [`lookup`] (id / id-prefix / name); `tail` bounds the number of
+/// most-recent bytes returned (`None` = all buffered). Returns `None` if no such
+/// container.
+pub fn logs(id_or_name: &str, tail: Option<usize>) -> Option<Vec<u8>> {
+    let id = lookup(id_or_name)?.id;
+    let logs = CONTAINER_LOGS.lock();
+    let ring = &logs.iter().find(|(k, _)| *k == id)?.1;
+    Some(ring.tail(tail.unwrap_or(usize::MAX)))
 }

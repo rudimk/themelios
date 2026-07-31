@@ -225,22 +225,27 @@ hardening pass.
 - [x] `run`/`ps`/`stop` shell cmds record/list/update rows.
 - [ ] (→ 6.1b) two running containers are rootfs-isolated from each other.
 
-### 6.2 — Per-container stdout/stderr capture (`docker logs` backing)
+### 6.2 — Per-container stdout/stderr capture (`docker logs` backing) — ✅ DONE
 
-**Goal**: Capture container output per-container, surviving exit.
-
-**What to build**:
-- A per-container log ring buffer **owned by the `ContainerId` row** (audit ring
-  buffer as the template). `console_write`/`sys_writev` map `current pid →
-  ContainerId → buffer` (serial kept as a dev mirror). Non-container Linux
-  processes allocate no buffer. Buffer freed on container removal, **not** on exit.
-- Read-back API (`container::logs(id, tail) -> bytes`) + a `logs <id>` shell cmd.
+**Built**:
+- A per-container `LogRing` (bounded, 16 KiB, oldest-dropped) held in a
+  `CONTAINER_LOGS` table **keyed by `ContainerId`** — stored *separately* from the
+  metadata row so it isn't cloned on every `ps`. Created with the container,
+  dropped only on `remove` (so it **outlives the process** — `docker logs` works on
+  an exited container).
+- `registry::write_stdout(pid, bytes)`: both Linux stdout paths — `console_write`
+  (writev, fd 1/2) and `sys_write` (write, fd 1/2) — route here. It maps `pid →
+  ContainerId → buffer` and appends; a non-container Linux process (no row for its
+  pid) allocates no buffer. Always mirrors to serial (dev aid).
+- `registry::logs(id_or_name, tail) -> Option<Vec<u8>>` (id/prefix/name resolution)
+  + a `logs <id>` shell cmd.
 
 **Acceptance**:
-- [ ] Run a container that writes known bytes; read its buffer back and byte-match;
-      a second container's buffer is independent; the buffer is **still readable
-      after the container exits**.
-- [ ] Bounded (oldest dropped); no unbounded growth; no buffer for non-containers.
+- [x] `test_container_logs`: the demo container's `linux-smoke ok` is captured;
+      readable **after** the process is destroyed (buffer keyed by id, not pid); a
+      second container's buffer is independent; `remove` drops one log but not the
+      other; an unknown id yields `None`.
+- [x] Bounded (oldest dropped); no buffer for non-container processes.
 
 ### 6.3 — Management ABI + `CapType::Management` + connection-accept shim
 

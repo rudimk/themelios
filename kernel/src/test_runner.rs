@@ -83,6 +83,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_http_request",      func: test_http_request },
     TestCase { name: "test_json_serialize",    func: test_json_serialize },
     TestCase { name: "test_container_registry", func: test_container_registry },
+    TestCase { name: "test_container_logs",    func: test_container_logs },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -4769,6 +4770,102 @@ fn test_container_registry() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_container_registry() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Per-container stdout/stderr capture (Phase 6.2). Runs the demo container (whose
+/// `/init`, linux-smoke, writes `"linux-smoke ok\n"` to fd 1), then reads the
+/// capture buffer back — proving output is captured per-container, **survives the
+/// process** (the pid is destroyed before the read), is **independent** across two
+/// containers, and is dropped on removal.
+#[cfg(target_arch = "x86_64")]
+fn test_container_logs() -> Result<(), &'static str> {
+    use crate::container::registry;
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self};
+    use crate::sched;
+
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0x5A11_D0C5_10AD_ED11;
+    const MARKER: &[u8] = b"linux-smoke ok";
+
+    // Run a demo container to completion, returning its id. The result page must be
+    // mapped (linux-smoke writes to it before exiting).
+    fn run_demo(mount: u64, name: &str) -> Result<alloc::string::String, &'static str> {
+        let id = registry::create_on_mount("demo", name, mount).map_err(|_| "create failed")?;
+        let pid = registry::lookup(&id).ok_or("row missing")?.pid;
+        let region = SharedRegion::alloc(4096).ok_or("region alloc failed")?;
+        process::with_address_space(pid, |a| {
+            region.map_into(a, VirtAddr::new(RESULT_VADDR));
+        })
+        .ok_or("map region failed")?;
+        registry::set_state(&id, registry::ContainerState::Running);
+        crate::container::start(pid);
+        let mut ran = false;
+        for _ in 0..400_000 {
+            // SAFETY: kernel-owned region; the container writes the same memory.
+            let s = unsafe { region.as_slice_mut() };
+            if u64::from_le_bytes(s[0..8].try_into().unwrap()) == RESULT_MAGIC {
+                ran = true;
+                break;
+            }
+            sched::yield_now();
+        }
+        if !ran {
+            process::destroy_process(pid);
+            return Err("demo container did not run");
+        }
+        if let Some(code) = process::exit_status(pid) {
+            registry::note_exit(pid, code);
+        }
+        // Destroy the process — the log must remain readable afterwards.
+        process::destroy_process(pid);
+        Ok(id)
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    let mount = bring_up_ext2_mount("ext2-disk-logs", "ext2-logs")?;
+
+    let id1 = run_demo(mount, "logA")?;
+    // Captured, and readable AFTER the process is gone (buffer keyed by id, not pid).
+    let log1 = registry::logs(&id1, None).ok_or("logs(id1) returned None")?;
+    if !contains(&log1, MARKER) {
+        return Err("container stdout was not captured");
+    }
+
+    // A second container's buffer is independent.
+    let id2 = run_demo(mount, "logB")?;
+    let log2 = registry::logs(&id2, None).ok_or("logs(id2) returned None")?;
+    if !contains(&log2, MARKER) {
+        return Err("second container's stdout not captured");
+    }
+
+    // Removing one drops its log but not the other's (independent storage).
+    if !registry::remove(&id1) {
+        return Err("remove(id1) returned false");
+    }
+    if registry::logs(&id1, None).is_some() {
+        return Err("removed container's log still present");
+    }
+    if registry::logs(&id2, None).is_none() {
+        return Err("removing one container dropped another's log");
+    }
+
+    // A non-container / unknown id yields None (no buffer allocated for it).
+    if registry::logs("no-such-container", None).is_some() {
+        return Err("logs() returned a buffer for an unknown container");
+    }
+
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_container_logs() -> Result<(), &'static str> {
     Ok(())
 }
 

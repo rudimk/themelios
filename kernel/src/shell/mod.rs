@@ -90,6 +90,7 @@ fn shell_entry() {
             "tcpconnect" => commands::cmd_tcpconnect(args),
             "run" => commands::cmd_run(args),
             "ps" => commands::cmd_ps(args),
+            "logs" => commands::cmd_logs(args),
             "stop" => commands::cmd_stop(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
