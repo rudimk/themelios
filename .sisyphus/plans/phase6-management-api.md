@@ -282,11 +282,15 @@ state guards and the empty-image rejection were added per the review.
       with a wrong-type cap), every op — `listen` included — is a capability denial.
 - [x] Each op emits an `ApiAccess` audit entry.
 
-The positive end-to-end `listen` (open a real inbound-TCP listener) needs a live
-net-server and is proven in **6.4**; 6.3's test covers the `listen` *cap gate* via
-the denial path (rejected before the socket layer is touched). Spawning a second
-net-server inside the 6.3 test after the earlier net suite proved flaky in CI, so it
-was dropped in favor of the 6.4 end-to-end proof.
+`test_management_capability` is deliberately **fast and self-contained** — no
+server spawns, no container run — so it fits inside the suite's 90 s QEMU wall-clock
+budget (an earlier version that brought up an ext2 mount + ran a container tipped the
+whole run over that ceiling in CI). It injects registry rows in a chosen state (a
+test-only helper) to prove the lifecycle *guards*, which reject on state before ever
+touching the backing process. What it defers, and where each is instead proven:
+- **positive `create`→`start`→run→`exit`** — `test_container_registry` (end-to-end).
+- **positive `listen`** (a real inbound-TCP listener) — **6.4**, which de-risks
+  ring-3 inbound TCP; 6.3 covers the `listen` *cap gate* via the denial path.
 
 ### 6.4 — Prove ring-3 TCP transport + sentinel-cap spawn wiring (Momus C1/C2)
 

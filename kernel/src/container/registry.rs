@@ -236,6 +236,29 @@ pub fn list() -> Vec<ContainerMeta> {
     CONTAINERS.lock().clone()
 }
 
+/// Test-only: inject a metadata row (with an empty log buffer) in a chosen state,
+/// **without** unpacking an image or assembling a rootfs. Lets the management-ABI
+/// test exercise the capability gate and the lifecycle *guards* (which reject on
+/// state before ever touching the backing process) deterministically — no ext2
+/// mount, no ring-3 task, so it fits well inside the suite's wall-clock budget. The
+/// `pid` is a placeholder; only the guard-negative paths (which never dereference
+/// it) use these rows. Returns the id for convenience.
+#[cfg(feature = "test")]
+pub fn insert_test_meta(id: &str, name: &str, image: &str, state: ContainerState) -> String {
+    CONTAINERS.lock().push(ContainerMeta {
+        id: String::from(id),
+        name: String::from(name),
+        image: String::from(image),
+        created_ms: now_ms(),
+        command: alloc::vec![String::from("/init")],
+        state,
+        pid: ProcessId::KERNEL,
+        rootfs_mount: 0,
+    });
+    CONTAINER_LOGS.lock().push((String::from(id), LogRing::new()));
+    String::from(id)
+}
+
 /// Remove a container's metadata row **and its captured log** by exact id
 /// (`docker rm`). Returns whether a row was removed. (Freeing the backing
 /// process/rootfs is the caller's job.)

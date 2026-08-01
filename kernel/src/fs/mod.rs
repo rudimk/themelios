@@ -401,15 +401,6 @@ pub fn data_mount() -> Option<u64> {
     }
 }
 
-/// Test-only: register `id` as the `/data` mount. The test harness brings up its
-/// own ext2 mount instead of running [`boot_storage`], so `data_mount()` is unset;
-/// tests that exercise the default-mount path (e.g. the management ABI's
-/// `create_from_image`) call this to point it at their mount.
-#[cfg(feature = "test")]
-pub fn set_data_mount_for_test(id: u64) {
-    DATA_MOUNT.store(id, Ordering::SeqCst);
-}
-
 /// Bring up the full storage stack and register the root and data mounts.
 ///
 /// Discovers the attached VirtIO disks (classifying each by its on-disk magic),
