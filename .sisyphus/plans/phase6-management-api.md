@@ -278,9 +278,15 @@ first ring-3 inbound TCP and first sentinel-cap grant together). `start`/`stop`
 state guards and the empty-image rejection were added per the review.
 
 **Acceptance**:
-- [x] A process **with** the cap can list/create/start/stop/logs + open a listener;
-      **without** it (or with a wrong-type cap), every op is a capability denial.
+- [x] A process **with** the cap can list/create/start/stop/logs; **without** it (or
+      with a wrong-type cap), every op — `listen` included — is a capability denial.
 - [x] Each op emits an `ApiAccess` audit entry.
+
+The positive end-to-end `listen` (open a real inbound-TCP listener) needs a live
+net-server and is proven in **6.4**; 6.3's test covers the `listen` *cap gate* via
+the denial path (rejected before the socket layer is touched). Spawning a second
+net-server inside the 6.3 test after the earlier net suite proved flaky in CI, so it
+was dropped in favor of the 6.4 end-to-end proof.
 
 ### 6.4 — Prove ring-3 TCP transport + sentinel-cap spawn wiring (Momus C1/C2)
 

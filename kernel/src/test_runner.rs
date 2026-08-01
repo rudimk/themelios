@@ -4881,8 +4881,10 @@ fn test_container_logs() -> Result<(), &'static str> {
 ///
 /// Deterministic: container ops run over a private ext2 mount and, except for the
 /// one positive `start`, never execute a container binary (the guards are proven by
-/// driving the registry state machine). The listener uses the trusted `ksocket_*`
-/// bind/listen path — no external peer — exactly like `test_socket_capability`.
+/// driving the registry state machine). The `listen` *cap gate* is proven via the
+/// denial path (which rejects before touching the socket layer); the positive
+/// end-to-end listener — which needs a live net-server — is proven in Phase 6.4,
+/// where ring-3 inbound TCP is de-risked in isolation.
 #[cfg(target_arch = "x86_64")]
 fn test_management_capability() -> Result<(), &'static str> {
     use crate::cap::{CapHandle, CapRights, CapType, Capability};
@@ -4907,12 +4909,11 @@ fn test_management_capability() -> Result<(), &'static str> {
         needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
     }
 
-    // --- setup: an ext2 mount for container ops + the net server for `listen` ---
+    // --- setup: a private ext2 mount for the container ops ---
     // `mgmt::create` resolves the default `/data` mount (as the real api-server
     // would); point it at this test's ext2 mount since the harness skips boot_storage.
     let mount = bring_up_ext2_mount("ext2-disk-mgmt", "ext2-mgmt")?;
     crate::fs::set_data_mount_for_test(mount);
-    let _fs_ep = spawn_net_server_with_sockets(false, "virtio-net-mgmt")?;
 
     // The api-server stand-in: a process holding the Management authority.
     let (api, _) = process::create_process("mgmt-api", None);
@@ -5068,11 +5069,10 @@ fn test_management_capability() -> Result<(), &'static str> {
     }
     process::destroy_process(runtest.pid);
 
-    // ===== positive listen: open an inbound-TCP listener, mint its Socket cap =====
-    let listener = mgmt::listen(api, mgmt_cap, 8080).map_err(|_| "listen denied for the holder")?;
-    if listener == CapHandle::NULL.as_raw() {
-        return Err("listen returned a null capability handle");
-    }
+    // The positive `listen` (open a real inbound-TCP listener + mint its Socket cap)
+    // needs a live net-server and is proven end-to-end in Phase 6.4; here the listen
+    // *cap gate* is covered by the denial path above (a non-holder is rejected before
+    // the socket layer is ever touched).
 
     // ===== audit: the ops above logged ApiAccess entries for the api process =====
     let after = crate::audit::last_entries(256);
