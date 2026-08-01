@@ -45,6 +45,7 @@ pub fn cmd_help(_args: &str) {
     println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
     println!("  run [image]      — create + launch a container (default: demo)");
     println!("  ps               — list containers and their state");
+    println!("  logs <id>        — print a container's captured stdout/stderr");
     println!("  stop <pid>       — force-terminate a running container");
 }
 
@@ -127,6 +128,27 @@ pub fn cmd_kill(args: &str) {
         Err(_) => {
             println!("Invalid task ID: '{}'", args);
         }
+    }
+}
+
+/// Print a container's captured stdout/stderr (`docker logs`, Phase 6.2). Works on
+/// exited containers too (the log outlives the process, until the row is removed).
+pub fn cmd_logs(args: &str) {
+    let id = args.trim();
+    if id.is_empty() {
+        println!("Usage: logs <container-id-or-name>");
+        return;
+    }
+    match crate::container::registry::logs(id, None) {
+        Some(bytes) => {
+            for &b in &bytes {
+                crate::print!("{}", b as char);
+            }
+            if bytes.last().is_some_and(|&b| b != b'\n') {
+                println!();
+            }
+        }
+        None => println!("No such container: {}", id),
     }
 }
 

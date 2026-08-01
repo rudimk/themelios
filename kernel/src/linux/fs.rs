@@ -243,9 +243,8 @@ fn sys_write(pid: process::ProcessId, fd: i32, buf: u64, len: u64) -> u64 {
         }
         return match copy_from_user(buf, n) {
             Some(data) => {
-                for &b in &data {
-                    crate::print!("{}", b as char);
-                }
+                // Route to the container's capture buffer + serial (Phase 6.2).
+                crate::container::registry::write_stdout(pid, &data);
                 n as u64
             }
             None => err(EFAULT),
