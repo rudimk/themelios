@@ -1,0 +1,16 @@
+[package]
+name = "tcp-echo-smoke"
+version = "0.1.0"
+edition = "2021"
+
+# Phase 6.4 throwaway proof: the FIRST ring-3 inbound-TCP server. It holds a
+# spawn-granted Management capability, opens a listener through the management ABI
+# (SYS_MGMT/listen), accepts one connection, and echoes a line back — proving the
+# ring-3 accept/recv/send path end to end. Also used as the fail-closed control:
+# spawned WITHOUT the grant, its listen is denied before any NIC access.
+[[bin]]
+name = "tcp-echo-smoke"
+path = "src/main.rs"
+
+[dependencies]
+libthemelios = { path = "../libthemelios" }

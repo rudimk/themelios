@@ -463,6 +463,7 @@ pub fn boot_storage() {
                 arg0: 0,
                 arg1: 0,
                 filesystem_mount: None,
+                grant_management: false,
             });
             // Overlay over the SquashFS lower layer.
             if let Some(ovl_client) = SharedRegion::alloc(128 * 1024) {
@@ -478,6 +479,7 @@ pub fn boot_storage() {
                     arg0: sqfs_ep,
                     arg1: 0,
                     filesystem_mount: None,
+                    grant_management: false,
                 });
                 let root_id = register_mount(ovl_ep, ovl_client);
                 ROOT_MOUNT.store(root_id, Ordering::SeqCst);
@@ -501,6 +503,7 @@ pub fn boot_storage() {
                 arg0: 0,
                 arg1: 0,
                 filesystem_mount: None,
+                grant_management: false,
             });
             let data_id = register_mount(ext2_ep, ext2_client);
             DATA_MOUNT.store(data_id, Ordering::SeqCst);

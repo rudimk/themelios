@@ -227,6 +227,21 @@ pub const SYS_TCP_SEND: u64 = 24;
 /// high-bit error (`WouldBlock` if connected but no data yet).
 pub const SYS_TCP_RECV: u64 = 25;
 
+/// SYS_MGMT: the container **management ABI** (Phase 6.4), the ring-3 seam onto the
+/// kernel `mgmt` module that the `api-server` (6.5) drives. It is **op-multiplexed**
+/// — RDI selects the verb ([`MGMT_OP_LISTEN`] and, in 6.5, list/inspect/create/
+/// start/stop/logs/node_info) — so the whole growing ABI costs one syscall number
+/// instead of one per verb. Op-specific args ride RSI/RDX/R10/R8; the return is the
+/// verb's success value (a capability handle, a byte count) with bit 63 clear, or a
+/// high-bit-set [`MgmtError`](crate::mgmt::MgmtError) code. Every verb is capability-
+/// checked inside `mgmt` against the caller's `Management` cap and audited there.
+pub const SYS_MGMT: u64 = 26;
+
+/// `SYS_MGMT` verb selector (RDI): open an inbound-TCP listener. RSI = the caller's
+/// `Management` cap handle, RDX = TCP port. Returns a freshly minted listener
+/// `Socket` cap handle (accept it with `SYS_ACCEPT`), or a high-bit `MgmtError`.
+pub const MGMT_OP_LISTEN: u64 = 1;
+
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
 /// RDI = the SYS_NULL return value. The handler stores the result and
@@ -624,6 +639,14 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
             cpu::sti();
             dispatch_socket_syscall(frame);
         }
+        SYS_MGMT => {
+            // Management ABI (Phase 6.4). The `listen` verb blocks on the net
+            // server (ksocket_open_tcp → IPC), so enable interrupts like the socket
+            // path. Only a native process reaches here — Linux-personality tasks
+            // short-circuit above, so a container can never invoke the mgmt ABI.
+            cpu::sti();
+            dispatch_mgmt_syscall(frame);
+        }
         SYS_TEST_COMPLETE => {
             // Internal test syscall: store the test result and kill the task.
             // RDI contains the SYS_NULL return value from the test shellcode.
@@ -981,6 +1004,33 @@ fn dispatch_socket_syscall(frame: &mut SyscallFrame) {
             }
         }
         _ => frame.rax = bad_arg,
+    }
+}
+
+/// Dispatch a `SYS_MGMT` invocation (Phase 6.4) to the kernel `mgmt` module.
+///
+/// Op-multiplexed on RDI. Each verb is capability-checked and audited inside
+/// `mgmt` against the caller's `Management` cap; a caller without it gets
+/// `MgmtError::PermissionDenied` **before** any backing service is touched (the
+/// fail-closed property). Only `MGMT_OP_LISTEN` is wired in 6.4; the remaining
+/// verbs (list/inspect/create/…) land with the ring-3 api-server in 6.5.
+fn dispatch_mgmt_syscall(frame: &mut SyscallFrame) {
+    use crate::cap::CapHandle;
+    let pid = crate::sched::current_process_id();
+    let bad_op = crate::mgmt::MgmtError::InvalidArgument.as_syscall_ret();
+    match frame.rdi {
+        MGMT_OP_LISTEN => {
+            // RSI = Management cap handle, RDX = TCP port.
+            let mgmt_handle = CapHandle::from_raw(frame.rsi as u32);
+            let port = frame.rdx as u16;
+            match crate::mgmt::listen(pid, mgmt_handle, port) {
+                // Success: the freshly minted listener Socket cap handle (bit 63
+                // clear). The caller accepts on it via SYS_ACCEPT.
+                Ok(listener) => frame.rax = listener as u64,
+                Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        _ => frame.rax = bad_op,
     }
 }
 

@@ -292,23 +292,53 @@ touching the backing process. What it defers, and where each is instead proven:
 - **positive `listen`** (a real inbound-TCP listener) — **6.4**, which de-risks
   ring-3 inbound TCP; 6.3 covers the `listen` *cap gate* via the denial path.
 
-### 6.4 — Prove ring-3 TCP transport + sentinel-cap spawn wiring (Momus C1/C2)
+### 6.4 — Prove ring-3 TCP transport + sentinel-cap spawn wiring — ✅ DONE (Momus-reviewed)
 
 **Goal**: De-risk the OS's **first ring-3 inbound-TCP + first sentinel-cap grant**
 in isolation, before the api-server depends on them.
 
-**What to build**:
-- Extend `ServerConfig`/`spawn_server` to **grant sentinel caps** (Management +,
-  if needed, network authority) — today it grants only `filesystem_mount`.
-- A throwaway ring-3 crate (`servers/tcp-echo-smoke`, `libthemelios` wrappers) that
-  holds the caps and, via the 6.3 accept shim, `listen`s → `accept`s → `recv`/
-  `send` echoes a line — the `test_tcp_server` round-trip but **from ring 3**.
+**What was built**:
+- **`SYS_MGMT`** (syscall #26, `arch/x86_64/syscall.rs`): the op-multiplexed ring-3
+  seam onto the kernel `mgmt` module. RDI selects the verb — only `MGMT_OP_LISTEN`
+  (RSI = Management cap, RDX = port) is wired in 6.4; the rest (list/inspect/create/…)
+  land in 6.5 under the same number. Returns the minted listener `Socket` cap
+  handle, or a high-bit-set `MgmtError` code. `MgmtError` got explicit discriminants
+  + `as_syscall_ret` so ring 3 can decode `PermissionDenied` specifically.
+- **`ServerConfig.grant_management`** (`process/server.rs`): `spawn_server` grants a
+  `Management` sentinel cap and passes its handle via a new `mgmt_cap_handle`
+  boot-info field (appended in lockstep to `ServerBootInfo` **and** libthemelios
+  `BootInfo`; a `const _` size assert on both sides locks the 104-byte layout).
+- **`servers/tcp-echo-smoke`** — the first ring-3 inbound-TCP server: `mgmt_listen`
+  (libthemelios wrapper) → `accept` → `tcp_recv` → `tcp_send` echo → `close`,
+  reporting to a shared result page. Built/embedded like the FS/net servers.
+- **`test_ring3_tcp_echo`** (supersedes `test_tcp_server`): Phase 1 spawns the server
+  **without** the grant → its listen is `PermissionDenied` before any NIC access →
+  reports `DENIED` (fail-closed, no net-server needed); Phase 2 brings up DHCP,
+  spawns it **with** the grant, and the host peer (hostfwd 15007→7) drives the echo.
+
+**Chosen design** (Momus DECISION 1 = **Option B**): the server holds a `Management`
+cap and lists via the **kernel-listener path** (`mgmt::listen` → `ksocket_*`), so
+`sys_socket`'s UDP-only TCP gate is **not** relaxed (honoring 6.3's C1) and the exact
+6.5 api-server path is de-risked. DECISION 2 = **supersede** `test_tcp_server`
+(reuse port 7 + the host peer) — budget-neutral under the 90 s QEMU ceiling.
+
+**Momus must-fixes applied**: fault-freedom is load-bearing (a ring-3 fault halts the
+kernel), so the smoke server is tiny/defensive with all-bounded loops; mandatory
+`yield` on every `WouldBlock`; `cpu::sti()` on the `SYS_MGMT` arm; commit-word-last
+volatile result writes with a bounded kernel poll; `MgmtError` syscall encoding.
+Should-fixes: fail-closed done as a cheap ring-3 spawn (instant denial, no net); docs
+reconciled to admit trusted kernel-spawned servers holding `Management`.
+
+**Coverage note**: superseding `test_tcp_server` drops the last caller of kernel-side
+`ksocket_accept` (kept, `allow(dead_code)`); `mgmt::listen` still exercises
+`ksocket_open_tcp`/`bind_port`/`listen`, and the ring-3 path now covers
+`sys_accept`/`sys_recv`/`sys_send` — net coverage gain.
 
 **Acceptance**:
-- [ ] Over `hostfwd`, the host connects, sends a line, the ring-3 guest echoes it —
-      proving ring-3 accept/recv/send end to end.
-- [ ] `spawn_server` grants the sentinel cap; a control run without the grant fails
-      closed.
+- [x] Over `hostfwd`, the host connects, sends a line, the ring-3 guest echoes it —
+      proving ring-3 accept/recv/send end to end (echoed 18 bytes).
+- [x] `spawn_server` grants the sentinel cap; a control run without the grant fails
+      closed (`DENIED`).
 
 ### 6.5 — Ring-3 `api-server` skeleton + Docker Engine API routing
 
