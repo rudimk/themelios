@@ -17,6 +17,7 @@ resolver = "2"
 members = [
     "libthemelios",
     "echo-server",
+    "tcp-echo-smoke",
     "squashfs-server",
     "overlay-server",
     "ext2-server",

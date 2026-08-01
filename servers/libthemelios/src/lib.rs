@@ -94,7 +94,17 @@ pub struct BootInfo {
     /// Capability handle of a `Filesystem` capability granted to this process
     /// (0 if none). Used with the filesystem syscalls (`open`, `stat`, …).
     pub fs_cap_handle: u64,
+    /// Capability handle of a `Management` capability granted to this process
+    /// (0 if none — an unambiguous null handle). Used with `SYS_MGMT`
+    /// (`syscall::mgmt_listen`, …) by trusted control-plane servers (Phase 6.4).
+    pub mgmt_cap_handle: u64,
 }
+
+/// Lock the kernel↔userspace boot-info layout: the two `#[repr(C)]` structs
+/// (`ServerBootInfo` in the kernel and this `BootInfo`) must stay byte-identical.
+/// 13 `u64` fields × 8 bytes = 104. If either side adds/removes a field without the
+/// other, this fails to compile — catching the drift at build time.
+const _: () = assert!(core::mem::size_of::<BootInfo>() == 104);
 
 /// Read the boot-info page the kernel populated for this server.
 ///
@@ -578,6 +588,12 @@ pub mod syscall {
     const SYS_TCP_SEND: u64 = 24;
     const SYS_TCP_RECV: u64 = 25;
 
+    /// `SYS_MGMT` (the op-multiplexed container management ABI) and its verb
+    /// selectors. Only `listen` is wired in Phase 6.4; the rest arrive with the
+    /// ring-3 api-server (6.5).
+    const SYS_MGMT: u64 = 26;
+    const MGMT_OP_LISTEN: u64 = 1;
+
     /// Listen for inbound TCP connections on the bound socket `sock`. Returns 0,
     /// or a high-bit error.
     pub fn listen(sock: u64, backlog: u64) -> u64 {
@@ -668,6 +684,29 @@ pub mod syscall {
                 in("rdi") sock,
                 in("rsi") buf as u64,
                 in("rdx") len as u64,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Open an inbound-TCP listener on `port` via the management ABI (Phase 6.4).
+    /// `mgmt_cap` is this server's `Management` capability handle (from
+    /// `boot_info().mgmt_cap_handle`). Returns a fresh listener socket capability
+    /// handle (accept connections on it with [`accept`]), or a high-bit-set
+    /// `MgmtError` (bit 63 set; low bits = the discriminant, e.g. 2 =
+    /// `PermissionDenied` when the caller lacks the Management cap).
+    pub fn mgmt_listen(mgmt_cap: u64, port: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_MGMT register ABI — RDI = verb, RSI = mgmt cap, RDX = port.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_MGMT => ret,
+                in("rdi") MGMT_OP_LISTEN,
+                in("rsi") mgmt_cap,
+                in("rdx") port,
                 out("rcx") _, out("r11") _,
                 options(nostack),
             );

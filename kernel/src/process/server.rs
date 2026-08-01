@@ -93,7 +93,16 @@ struct ServerBootInfo {
     arg0: u64,
     arg1: u64,
     fs_cap_handle: u64,
+    /// Capability handle of a `Management` capability granted to this process
+    /// (0 = none, i.e. an unambiguous null handle — CSpace slot 0 is the reserved
+    /// Null slot, so `insert` never returns it). Used with `SYS_MGMT` (Phase 6.4).
+    mgmt_cap_handle: u64,
 }
+
+/// Lock the layout against libthemelios `BootInfo` (which asserts the same size):
+/// 13 `u64` fields × 8 bytes = 104. Adding a field on one side without the other
+/// fails to compile here — catching boot-info drift at build time.
+const _: () = assert!(core::mem::size_of::<ServerBootInfo>() == 104);
 
 /// Configuration for spawning a server.
 pub struct ServerConfig {
@@ -120,6 +129,12 @@ pub struct ServerConfig {
     /// If set, grant the server a `Filesystem` capability for this mount id and
     /// pass its handle to the server via `BootInfo.fs_cap_handle`.
     pub filesystem_mount: Option<u64>,
+    /// If true, grant the server a `Management` sentinel capability (the authority
+    /// to drive the container management ABI via `SYS_MGMT`) and pass its handle to
+    /// the server via `BootInfo.mgmt_cap_handle` (Phase 6.4). Only trusted,
+    /// kernel-spawned servers (the api-server; the `tcp-echo-smoke` test server)
+    /// ever set this — never a container.
+    pub grant_management: bool,
 }
 
 /// Spawn a userspace server from an embedded flat binary.
@@ -232,6 +247,27 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
         0
     };
 
+    // --- Optionally grant a Management capability (sentinel authority for the
+    //     container management ABI). Only trusted, kernel-spawned servers request
+    //     it; a container is spawned with an empty CSpace and never this. ---
+    let mgmt_cap_handle = if config.grant_management {
+        process::with_cspace_mut(pid, |cspace| {
+            cspace
+                .insert(Capability {
+                    // resolve_management checks presence only, but grant full rights
+                    // so future per-verb rights refinements have room.
+                    cap_type: CapType::Management,
+                    rights: CapRights::READ | CapRights::WRITE,
+                    parent: None,
+                })
+                .map(|h| h.as_raw() as u64)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+    } else {
+        0
+    };
+
     // --- Map and fill the boot-info page ---
     let bootinfo_phys = mm::frame::allocate_frame().expect("spawn_server: no frame for bootinfo");
     let boot_info = ServerBootInfo {
@@ -247,6 +283,7 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
         arg0: config.arg0,
         arg1: config.arg1,
         fs_cap_handle,
+        mgmt_cap_handle,
     };
     // SAFETY: bootinfo_phys is a fresh HHDM-mapped frame; ServerBootInfo fits in
     // one page.

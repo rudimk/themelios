@@ -122,6 +122,7 @@ pub fn boot_net() {
             // the low 48 bits; NET_ARG_DHCP (bit 48) requests DHCP.
             arg1: pack_mac(mac) | NET_ARG_DHCP,
             filesystem_mount: None,
+            grant_management: false,
         });
 
         // Set up the capability-checked socket API (Phase 4.5): allocate the

@@ -17,12 +17,14 @@
 //! the network authority ([`SOCKET_FACTORY`](crate::cap::SOCKET_FACTORY)): holding
 //! it grants *all* management operations; not holding it denies *every* one.
 //!
-//! **Invariant.** The `Management` cap is minted only to the `api-server`, never
-//! into a container's CSpace (a container is created with an empty CSpace, so it
-//! can never reach this ABI). This is the confused-deputy guard: management ops
-//! take a **container id** (resolved through [`registry::lookup`]), never an
-//! arbitrary pid, so even the api-server cannot be tricked into acting on a
-//! kernel service — kernel services have no registry row, and pids never recycle.
+//! **Invariant.** The `Management` cap is minted only to **trusted, kernel-spawned
+//! servers** — the `api-server` in production, plus the Phase 6.4 `tcp-echo-smoke`
+//! test server — and **never** into a container's CSpace (a container is created
+//! with an empty CSpace, so it can never reach this ABI). This is the
+//! confused-deputy guard: management ops take a **container id** (resolved through
+//! [`registry::lookup`]), never an arbitrary pid, so even a cap holder cannot be
+//! tricked into acting on a kernel service — kernel services have no registry row,
+//! and pids never recycle.
 //!
 //! ## Shape
 //!
@@ -76,26 +78,45 @@ const OP_LISTEN: u64 = 8;
 
 /// Errors from a management operation.
 ///
-/// Distinct from the raw socket/container error types so the (future, 6.4)
-/// syscall layer can map each to a stable errno without leaking kernel internals.
+/// Distinct from the raw socket/container error types so the syscall layer
+/// ([`SYS_MGMT`](crate::arch::x86_64::syscall::SYS_MGMT), Phase 6.4) can map each to
+/// a stable code without leaking kernel internals. The explicit discriminants are
+/// part of that ABI: they are the low bits of a high-bit-set syscall return
+/// ([`as_syscall_ret`](MgmtError::as_syscall_ret)), so a ring-3 caller can decode
+/// which error occurred (e.g. distinguish `PermissionDenied` for a fail-closed
+/// probe). The `SYS_MGMT` syscall owns this error space exclusively — it does not
+/// collide with `SockError` (which numbers its own space on the socket syscalls).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MgmtError {
     /// The caller does not hold the `Management` capability. Every op begins with
     /// this check, so a process without the cap can do *nothing* here.
-    PermissionDenied,
+    PermissionDenied = 1,
     /// No container matched the given id / id-prefix / name.
-    NotFound,
+    NotFound = 2,
     /// The operation is invalid for the container's current state (e.g. `start`
     /// on a container that is not `Created`, or `stop` on one already `Exited`).
-    InvalidState,
+    InvalidState = 3,
     /// A required argument was empty or malformed (e.g. `create` with no image).
-    InvalidArgument,
+    InvalidArgument = 4,
     /// The container could not be created from the image (unpack/rootfs failure).
-    CreateFailed,
+    CreateFailed = 5,
     /// A backing kernel service (the net server, for `listen`) was unavailable.
-    ServerUnavailable,
+    ServerUnavailable = 6,
     /// The caller's CSpace is full — a minted capability could not be inserted.
-    NoResources,
+    NoResources = 7,
+}
+
+/// Sentinel bit marking a syscall return value as an encoded error rather than a
+/// success value (matches the socket/FS convention: `net::socket::STATUS_ERROR_FLAG`).
+const STATUS_ERROR_FLAG: u64 = 1 << 63;
+
+impl MgmtError {
+    /// Encode as a high-bit-set syscall return, low bits = the discriminant. A
+    /// success value (a capability handle, a byte count) always has the high bit
+    /// clear, so a ring-3 caller tests bit 63 to branch error-vs-ok.
+    pub fn as_syscall_ret(self) -> u64 {
+        STATUS_ERROR_FLAG | self as u64
+    }
 }
 
 // --- Capability resolution ---

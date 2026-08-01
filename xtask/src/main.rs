@@ -196,6 +196,7 @@ fn ensure_limine(root: &Path) -> PathBuf {
 /// `include_bytes!`.
 const SERVER_BINARIES: &[&str] = &[
     "echo-server",
+    "tcp-echo-smoke",
     "squashfs-server",
     "overlay-server",
     "ext2-server",

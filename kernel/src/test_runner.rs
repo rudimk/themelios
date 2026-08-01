@@ -62,7 +62,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_net_icmp_echo",    func: test_net_icmp_echo },
     // Runs before the other persistent net-server tests so it is the sole NIC
     // drainer (no inbound-frame competition) for the host-driven TCP handshake.
-    TestCase { name: "test_tcp_server",       func: test_tcp_server },
+    TestCase { name: "test_ring3_tcp_echo",   func: test_ring3_tcp_echo },
     TestCase { name: "test_dhcp",             func: test_dhcp },
     TestCase { name: "test_socket_capability", func: test_socket_capability },
     TestCase { name: "test_socket_list",      func: test_socket_list },
@@ -1591,6 +1591,7 @@ fn test_server_spawn() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     // Let the ring-3 server reach its receive loop. It must be scheduled, run
@@ -1694,6 +1695,7 @@ fn test_squashfs_server() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     // Let the server boot and parse the superblock.
@@ -1919,6 +1921,7 @@ fn test_overlay_server() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     // Overlay server: lower = SquashFS (arg0 = sqfs_ep, block-slot region =
@@ -1936,6 +1939,7 @@ fn test_overlay_server() -> Result<(), &'static str> {
         arg0: sqfs_ep,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     // Let both servers boot (SquashFS parses its superblock; overlay is ready).
@@ -2133,6 +2137,7 @@ fn test_ext2_read() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     for _ in 0..1000 {
@@ -2320,6 +2325,7 @@ fn test_ext2_write() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
     for _ in 0..1000 {
         sched::yield_now();
@@ -2503,6 +2509,7 @@ fn test_vfs_capability() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
     for _ in 0..1000 {
         sched::yield_now();
@@ -2625,6 +2632,7 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
     for _ in 0..1000 {
         sched::yield_now();
@@ -2645,6 +2653,7 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: Some(mount_id),
+        grant_management: false,
     });
 
     // The client reports its result code on result_ep. 0 = all syscalls passed.
@@ -2917,6 +2926,7 @@ fn test_net_server_stack() -> Result<(), &'static str> {
         arg0: svc_ep,
         arg1: packed_mac,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     // An ARP request from the gateway asking for the net server's IP.
@@ -3065,6 +3075,7 @@ fn test_net_icmp_echo() -> Result<(), &'static str> {
         arg0: svc_ep,
         arg1: packed_mac,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     // Frame 1: ARP request "who has 10.0.2.15?" from the gateway (seeds cache).
@@ -3229,6 +3240,7 @@ fn test_dhcp() -> Result<(), &'static str> {
         arg0: handle.endpoint,
         arg1: packed_mac | net::NET_ARG_DHCP,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     // Drive the scheduler until the DHCP client acquires a lease. slirp answers
@@ -3319,6 +3331,7 @@ fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u
         arg0: handle.endpoint,
         arg1: packed,
         filesystem_mount: None,
+        grant_management: false,
     });
 
     // Map the socket payload region and register the router (as boot_net does).
@@ -3412,7 +3425,7 @@ fn test_socket_capability() -> Result<(), &'static str> {
 ///
 /// Deterministic: it only opens sockets, binds, lists, and *emits* one ICMP echo
 /// request — none of which needs an external peer or an inbound frame (so it does
-/// not compete with `test_tcp_server` for the NIC). Whether an echo *reply* comes
+/// not compete with `test_ring3_tcp_echo` for the NIC). Whether an echo *reply* comes
 /// back is left to the best-effort `ping` shell command (slirp's ICMP proxy may
 /// lack host privileges); here we assert the send is accepted, which exercises the
 /// whole ICMP socket build/bind/emit path in the ring-3 stack.
@@ -3709,6 +3722,7 @@ fn test_linux_fs() -> Result<(), &'static str> {
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
     for _ in 0..1000 {
         sched::yield_now();
@@ -4007,6 +4021,7 @@ fn bring_up_ext2_mount(block_name: &'static str, ep_name: &'static str) -> Resul
         arg0: 0,
         arg1: 0,
         filesystem_mount: None,
+        grant_management: false,
     });
     for _ in 0..1000 {
         sched::yield_now();
@@ -5270,30 +5285,108 @@ fn test_tcp_client() -> Result<(), &'static str> {
 }
 
 // ============================================================
-//  test_tcp_server — inbound TCP listen/accept + echo (Phase 4.6)
+//  test_ring3_tcp_echo — ring-3 inbound TCP + sentinel grant (Phase 6.4)
 // ============================================================
 
-/// Test the TCP server path with a real inbound connection driven by the host.
+/// Prove the OS's **first ring-3 inbound-TCP server** and **first sentinel-cap
+/// spawn grant**, end to end. Supersedes the old kernel-side `test_tcp_server`: the
+/// listener is now the ring-3 `tcp-echo-smoke` server rather than in-kernel
+/// `ksocket_*` calls (which are still exercised underneath, via `mgmt::listen`).
 ///
-/// Brings the stack up with DHCP, listens on port 7, and accepts a connection
-/// that the xtask harness's host-side peer makes through a QEMU `hostfwd` rule
-/// (host 127.0.0.1:15007 → guest :7). The guest receives the peer's payload,
-/// verifies it, and echoes it back — a deterministic, bidirectional TCP round
-/// trip against an external endpoint, exercising `bind`/`listen`/`accept` and the
-/// per-connection socket, `recv`, and `send`.
+/// Two phases:
+/// 1. **Fail-closed control (cheap; no net-server).** Spawn `tcp-echo-smoke`
+///    *without* the Management grant. Its `SYS_MGMT`/listen is denied
+///    (`PermissionDenied`) *before* any NIC access, so it reports `DENIED`. This
+///    proves `spawn_server`'s grant gate: no grant → no listener.
+/// 2. **Granted round-trip.** Bring the stack up with DHCP, spawn `tcp-echo-smoke`
+///    *with* the grant; it opens a listener on port 7 via the management ABI,
+///    accepts the host peer's connection (hostfwd `127.0.0.1:15007 → guest:7`),
+///    and echoes the payload. The kernel reads the server's result page and
+///    asserts `OK` + the echoed byte count.
 ///
 /// Registered before the other persistent net-server tests so it is the only
-/// interface draining the NIC when it runs — otherwise accumulated net servers
-/// would compete for the inbound frames.
+/// interface draining the NIC when it runs (the host-driven handshake needs no
+/// inbound-frame competition).
 #[cfg(target_arch = "x86_64")]
-fn test_tcp_server() -> Result<(), &'static str> {
-    use crate::net::socket::SockError;
-    use crate::net::{net_service, socket};
+fn test_ring3_tcp_echo() -> Result<(), &'static str> {
+    use crate::ipc;
+    use crate::mm::shared::SharedRegion;
+    use crate::net::net_service;
+    use crate::process::embedded;
+    use crate::process::server::{spawn_server, ServerConfig};
+    use crate::process::{self, ProcessId};
     use crate::sched;
 
-    let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-tcpsrv")?;
+    // Result-page contract shared with servers/tcp-echo-smoke (commit word last).
+    const RESULT_MAGIC: u64 = 0x_5243_4845_5F4F_4B00;
+    const STATUS_OK: u64 = 1;
+    const STATUS_DENIED: u64 = 2;
+    // The host peer (xtask::spawn_tcp_test_peer) sends this exact payload.
+    const PAYLOAD_LEN: u64 = 18; // b"THEMELIOS_TCP_PING".len()
 
-    // Wait for DHCP: the host's hostfwd targets the guest's DHCP address.
+    // Read the ring-3 server's result page: Some((status, count)) once committed
+    // (magic observed), else None. `read_volatile` + magic-first-read mirrors the
+    // server's magic-last-write ordering, so status/count are never torn.
+    fn read_result(region: &SharedRegion) -> Option<(u64, u64)> {
+        // SAFETY: kernel-owned region, HHDM-aliased; three in-bounds u64 slots.
+        let base = unsafe { region.as_slice_mut() }.as_ptr() as *const u64;
+        let magic = unsafe { core::ptr::read_volatile(base) };
+        if magic != RESULT_MAGIC {
+            return None;
+        }
+        let status = unsafe { core::ptr::read_volatile(base.add(1)) };
+        let count = unsafe { core::ptr::read_volatile(base.add(2)) };
+        Some((status, count))
+    }
+
+    // Spawn tcp-echo-smoke with a fresh result region (mapped as its `shared`
+    // region at SERVER_SHARED_VIRT). `grant` selects the Management-cap grant.
+    fn spawn_echo(
+        grant: bool,
+        name: &'static str,
+        ep_name: &'static str,
+    ) -> Result<(ProcessId, SharedRegion), &'static str> {
+        let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+        let ep = ipc::create_endpoint(ep_name);
+        let pid = spawn_server(ServerConfig {
+            name,
+            binary: embedded::TCP_ECHO_SMOKE,
+            fs_endpoint: ep,
+            block_endpoint: 0,
+            shared: Some(region),
+            client_shared: None,
+            heap_bytes: 64 * 1024,
+            arg0: 0,
+            arg1: 0,
+            filesystem_mount: None,
+            grant_management: grant,
+        });
+        Ok((pid, region))
+    }
+
+    // Poll a server's result page up to `max` yields; None if it never committed.
+    fn await_result(region: &SharedRegion, max: u32) -> Option<(u64, u64)> {
+        for _ in 0..max {
+            if let Some(res) = read_result(region) {
+                return Some(res);
+            }
+            crate::sched::yield_now();
+        }
+        None
+    }
+
+    // --- Phase 1: fail-closed control (no net-server needed) ---
+    let (noperm_pid, noperm_region) = spawn_echo(false, "tcp-echo-noperm", "tcp-echo-ep-noperm")?;
+    let ctrl = await_result(&noperm_region, 400_000);
+    process::destroy_process(noperm_pid);
+    match ctrl {
+        Some((STATUS_DENIED, _)) => {}
+        Some((_, _)) => return Err("fail-closed control did not report DENIED"),
+        None => return Err("fail-closed control never reported (server hung?)"),
+    }
+
+    // --- Phase 2: granted ring-3 inbound-TCP round-trip ---
+    let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-r3echo")?;
     let mut configured = false;
     for _ in 0..300_000 {
         if net_service::status().config.configured {
@@ -5303,83 +5396,30 @@ fn test_tcp_server() -> Result<(), &'static str> {
         sched::yield_now();
     }
     if !configured {
-        return Err("DHCP did not configure before the TCP server test");
+        return Err("DHCP did not configure before the ring-3 TCP echo test");
     }
 
-    // Listen on port 7 (the hostfwd target).
-    let listener = socket::ksocket_open_tcp().map_err(|_| "ksocket_open_tcp failed")?;
-    socket::ksocket_bind_port(listener, 7).map_err(|_| "ksocket_bind_port failed")?;
-    socket::ksocket_listen(listener).map_err(|_| "ksocket_listen failed")?;
-
-    // Accept the host peer's inbound connection. Each poll cycles the net server,
-    // so the handshake completes within a bounded number of attempts.
-    let mut conn: Option<u64> = None;
-    for _ in 0..40_000 {
-        match socket::ksocket_accept(listener) {
-            Ok((cid, _ip, _port)) => {
-                conn = Some(cid);
-                break;
-            }
-            Err(SockError::WouldBlock) => sched::yield_now(),
-            Err(_) => {
-                let _ = socket::ksocket_close(listener);
-                return Err("TCP accept returned an unexpected error");
-            }
+    let (grant_pid, grant_region) = spawn_echo(true, "tcp-echo-grant", "tcp-echo-ep-grant")?;
+    // The server listens on 7 and echoes; the host peer connects and drives it.
+    let res = await_result(&grant_region, 2_000_000);
+    process::destroy_process(grant_pid);
+    match res {
+        Some((STATUS_OK, n)) if n == PAYLOAD_LEN => {
+            crate::println!("  [test_ring3_tcp_echo] ring-3 server echoed {} bytes", n);
+            Ok(())
         }
-    }
-    let conn = match conn {
-        Some(c) => c,
-        None => {
-            let _ = socket::ksocket_close(listener);
-            return Err("no inbound TCP connection accepted (host peer did not connect)");
+        Some((STATUS_OK, n)) => {
+            crate::println!("  [test_ring3_tcp_echo] echoed {} bytes (expected {})", n, PAYLOAD_LEN);
+            Err("ring-3 echo byte count mismatch")
         }
-    };
-
-    // Receive the host peer's payload.
-    let expect: &[u8] = b"THEMELIOS_TCP_PING";
-    let mut buf = [0u8; 64];
-    let mut got = 0usize;
-    for _ in 0..40_000 {
-        match socket::ksocket_recv(conn, &mut buf) {
-            Ok(n) if n > 0 => {
-                got = n;
-                break;
-            }
-            Ok(_) => sched::yield_now(),
-            Err(SockError::WouldBlock) => sched::yield_now(),
-            Err(_) => break,
-        }
+        Some((_, _)) => Err("granted ring-3 server reported an error"),
+        None => Err("granted ring-3 server never reported (no inbound connection?)"),
     }
-    if got != expect.len() || &buf[..got] != expect {
-        let _ = socket::ksocket_close(conn);
-        let _ = socket::ksocket_close(listener);
-        return Err("TCP server received an unexpected payload");
-    }
-
-    // Echo it back to the host.
-    let mut sent = 0usize;
-    for _ in 0..20_000 {
-        match socket::ksocket_send(conn, &buf[sent..got]) {
-            Ok(n) => {
-                sent += n;
-                if sent >= got {
-                    break;
-                }
-            }
-            Err(SockError::WouldBlock) => sched::yield_now(),
-            Err(_) => break,
-        }
-    }
-
-    let _ = socket::ksocket_close(conn);
-    let _ = socket::ksocket_close(listener);
-    crate::println!("  [test_tcp_server] accepted inbound TCP, echoed {} bytes", got);
-    Ok(())
 }
 
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
-fn test_tcp_server() -> Result<(), &'static str> {
+fn test_ring3_tcp_echo() -> Result<(), &'static str> {
     Ok(())
 }
 
