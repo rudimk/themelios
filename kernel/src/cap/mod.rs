@@ -236,6 +236,18 @@ pub enum CapType {
         /// create-sockets authority.
         socket_id: u64,
     },
+
+    /// The **management authority** (Phase 6.3): the single, global right to drive
+    /// the container management ABI — list/inspect/create/start/stop/logs and open
+    /// a listener via the connection-accept shim. It is a coarse sentinel, exactly
+    /// like [`SOCKET_FACTORY`] is for sockets: holding it grants *all* management
+    /// operations (per-verb / per-container sub-capabilities are a future
+    /// refinement). **Invariant:** this cap is minted only to the ring-3
+    /// `api-server` (the node's control plane) and **never** enters a container's
+    /// capability space — a container is created with an empty CSpace, so it can
+    /// never manage anything. `resolve_management` checks only the presence of this
+    /// variant (rights are not consulted, mirroring `resolve_factory`).
+    Management,
 }
 
 /// Sentinel `socket_id` marking a [`CapType::Socket`] as the **network

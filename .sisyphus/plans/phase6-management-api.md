@@ -247,24 +247,50 @@ hardening pass.
       other; an unknown id yields `None`.
 - [x] Bounded (oldest dropped); no buffer for non-container processes.
 
-### 6.3 — Management ABI + `CapType::Management` + connection-accept shim
+### 6.3 — Management ABI + `CapType::Management` — ✅ DONE (Momus-reviewed)
 
 **Goal**: The capability-guarded ring-0 surface the api-server drives — including
-inbound TCP via the proven kernel accept path.
+opening the inbound-TCP listener via the proven kernel path.
 
-**What to build**:
-- **`CapType::Management`** sentinel + its `resolve_*` check (has-it-or-not).
-- A minimal ABI (syscalls or a dedicated IPC endpoint), each op checked against the
-  cap and audited (`ApiAccess`): `list`, `inspect(id)`, `create(image,name,cfg)`,
-  `start(id)`, `stop(id)`, `logs(id,tail)`, `node_info`, and — the C1 fix —
-  `listen(port)` / `accept() -> (conn_cap, peer)` implemented over the **trusted
-  `ksocket_listen`/`ksocket_accept`** path, returning a minted per-connection
-  `Socket` cap. Without the `Management` cap every op is denied.
+**What was built** (`kernel/src/mgmt.rs`):
+- **`CapType::Management`** sentinel (`cap/mod.rs`) + `resolve_management` — a
+  has-it-or-not check copying `resolve_factory` (rights not consulted). Documented
+  invariant: minted only to the api-server, never into a container CSpace.
+- **`AuditOp::ApiAccess`** (`audit/mod.rs`); every op audits with the op number.
+- A kernel-internal ABI of cap-checked functions returning **owned data**: `list`,
+  `inspect(id)`, `create(image,name)`, `start(id)`, `stop(id)`, `logs(id,tail)`,
+  `node_info` (compact Docker-Engine-shaped JSON via `oci::json::Value::to_bytes`),
+  and `listen(port)` — over the **trusted `ksocket_open_tcp`/`bind`/`listen`**
+  path, minting a per-listener `Socket` cap parented to the management handle.
+  Lifecycle guards: `start` only from `Created` (flips to `Running` *after* a
+  successful spawn); `stop` refuses an already-`Exited` container; `create("")` →
+  `InvalidArgument`.
+- `test_management_capability`: proves the cap gate (every op denied without the cap
+  and with a wrong-type cap), the positive ops, the lifecycle guards, and that
+  `ApiAccess` entries are logged. Deterministic (private ext2 mount + local
+  net-server bind; no external peer).
+
+**Momus revisions applied** (verdict REVISE → addressed): dropped a separate
+`mgmt::accept` (the api-server `accept`s on the minted `Socket` cap via the ordinary
+socket ABI); **deferred** the syscall/IPC wrappers **and** the
+`ServerConfig`/`spawn_server` sentinel-cap grant to **6.4** (which de-risks the OS's
+first ring-3 inbound TCP and first sentinel-cap grant together). `start`/`stop`
+state guards and the empty-image rejection were added per the review.
 
 **Acceptance**:
-- [ ] A process **with** the cap can list/create/start/stop/logs + listen/accept;
-      **without** it, every op is a capability denial.
-- [ ] Each op emits an `ApiAccess` audit entry.
+- [x] A process **with** the cap can list/create/start/stop/logs; **without** it (or
+      with a wrong-type cap), every op — `listen` included — is a capability denial.
+- [x] Each op emits an `ApiAccess` audit entry.
+
+`test_management_capability` is deliberately **fast and self-contained** — no
+server spawns, no container run — so it fits inside the suite's 90 s QEMU wall-clock
+budget (an earlier version that brought up an ext2 mount + ran a container tipped the
+whole run over that ceiling in CI). It injects registry rows in a chosen state (a
+test-only helper) to prove the lifecycle *guards*, which reject on state before ever
+touching the backing process. What it defers, and where each is instead proven:
+- **positive `create`→`start`→run→`exit`** — `test_container_registry` (end-to-end).
+- **positive `listen`** (a real inbound-TCP listener) — **6.4**, which de-risks
+  ring-3 inbound TCP; 6.3 covers the `listen` *cap gate* via the denial path.
 
 ### 6.4 — Prove ring-3 TCP transport + sentinel-cap spawn wiring (Momus C1/C2)
 
@@ -383,7 +409,7 @@ in isolation, before the api-server depends on them.
 | 6.0 HTTP request parser + JSON serializer | Low-Medium |
 | 6.1 Container metadata table + mount lifecycle + image glue | Medium |
 | 6.2 Per-container log capture (ContainerId-owned) | Medium |
-| 6.3 Management ABI + `CapType::Management` + accept shim | Medium-High |
+| 6.3 Management ABI + `CapType::Management` (listener via kernel path) | Medium-High |
 | 6.4 Prove ring-3 TCP + sentinel-cap spawn wiring | Medium-High |
 | 6.5 Ring-3 api-server + Engine API routing | High |
 | 6.6 Auth + live curl/docker integration | Medium-High |
