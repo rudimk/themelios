@@ -225,3 +225,55 @@ pub fn parse_request(bytes: &[u8]) -> Option<Request> {
         body,
     })
 }
+
+/// Build a complete HTTP/1.1 response as raw bytes (Phase 6.5, used by the ring-3
+/// `api-server`).
+///
+/// Always frames the body with an explicit `Content-Length` (a 204 or empty body
+/// gets `Content-Length: 0`) and closes the connection with `Connection: close` —
+/// the api-server serves one request per accepted socket, so a keep-alive client
+/// must not wait for a second response that never comes. The status reason phrase
+/// is caller-supplied; `content_type` is emitted verbatim (e.g.
+/// `application/json` or `text/plain`).
+pub fn build_response(status: u16, reason: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Status line.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(u16_dec(status).as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    // Headers.
+    out.extend_from_slice(b"Content-Type: ");
+    out.extend_from_slice(content_type.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(b"Content-Length: ");
+    out.extend_from_slice(usize_dec(body.len()).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    // Body.
+    out.extend_from_slice(body);
+    out
+}
+
+/// Decimal-format a `u16` without `alloc::format!` (keeps the response builder
+/// panic-free and dependency-light).
+fn u16_dec(n: u16) -> String {
+    usize_dec(n as usize)
+}
+
+/// Decimal-format a `usize` into a `String`.
+fn usize_dec(mut n: usize) -> String {
+    if n == 0 {
+        return String::from("0");
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    // SAFETY: buf[i..] is all ASCII digits.
+    String::from(core::str::from_utf8(&buf[i..]).unwrap_or("0"))
+}

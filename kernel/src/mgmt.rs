@@ -18,8 +18,8 @@
 //! it grants *all* management operations; not holding it denies *every* one.
 //!
 //! **Invariant.** The `Management` cap is minted only to **trusted, kernel-spawned
-//! servers** — the `api-server` in production, plus the Phase 6.4 `tcp-echo-smoke`
-//! test server — and **never** into a container's CSpace (a container is created
+//! servers** — the `api-server` (in production and in its test) — and **never**
+//! into a container's CSpace (a container is created
 //! with an empty CSpace, so it can never reach this ABI). This is the
 //! confused-deputy guard: management ops take a **container id** (resolved through
 //! [`registry::lookup`]), never an arbitrary pid, so even a cap holder cannot be
@@ -104,6 +104,10 @@ pub enum MgmtError {
     ServerUnavailable = 6,
     /// The caller's CSpace is full — a minted capability could not be inserted.
     NoResources = 7,
+    /// The caller's output buffer is too small for a read verb's JSON response
+    /// (Phase 6.5). Fail-closed: the caller retries with a larger buffer rather
+    /// than receiving a truncated document.
+    BufferTooSmall = 8,
 }
 
 /// Sentinel bit marking a syscall return value as an encoded error rather than a

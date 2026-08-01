@@ -17,12 +17,10 @@
 /// (sub-phase 3.4). Replaced/joined by the real filesystem servers in 3.5+.
 pub static ECHO_SERVER: &[u8] = include_bytes!("../../../target/servers/echo-server.bin");
 
-/// The tcp-echo-smoke server (Phase 6.4): the first ring-3 inbound-TCP server.
-/// Holds a spawn-granted `Management` cap, opens a listener via `SYS_MGMT`/listen,
-/// accepts one connection and echoes a line — the ring-3 counterpart of the old
-/// kernel-side `test_tcp_server`. Also the fail-closed control when spawned without
-/// the grant. Driven by `test_ring3_tcp_echo`.
-pub static TCP_ECHO_SMOKE: &[u8] = include_bytes!("../../../target/servers/tcp-echo-smoke.bin");
+/// The api-server (Phase 6.5): the ring-3 Docker Engine API control plane. Holds a
+/// spawn-granted Management cap, listens via the management ABI, and serves the read
+/// (GET) endpoint pipeline. Spawned in `kmain` normal mode and by `test_api_server`.
+pub static API_SERVER: &[u8] = include_bytes!("../../../target/servers/api-server.bin");
 
 /// The SquashFS server: reads the read-only SquashFS root image (sub-phase 3.5).
 pub static SQUASHFS_SERVER: &[u8] = include_bytes!("../../../target/servers/squashfs-server.bin");

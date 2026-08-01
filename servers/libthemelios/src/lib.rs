@@ -36,6 +36,10 @@
 //! ```
 
 #![no_std]
+// A custom allocation-error handler (below) so an out-of-memory condition in a
+// server exits cleanly instead of aborting — an abort is a ring-3 fault, which the
+// kernel treats as fatal. Still unstable, hence the feature gate.
+#![feature(alloc_error_handler)]
 // Servers have no Rust runtime; libthemelios provides `_start` as the entry.
 
 extern crate alloc;
@@ -47,6 +51,15 @@ use linked_list_allocator::LockedHeap;
 pub mod block_proto;
 pub mod fs_proto;
 pub mod net_proto;
+
+/// The HTTP/1.1 request parser + response builder, **single-sourced** from the
+/// kernel's `http` module (Phase 6.5). Both are `no_std`/`alloc`-only with zero
+/// kernel coupling, so the ring-3 `api-server` compiles the exact same source the
+/// kernel does — one implementation, no drift (unlike the hand-duplicated proto
+/// tables, this is untrusted-input parser logic where a divergent security fix
+/// would be silent).
+#[path = "../../../kernel/src/http/mod.rs"]
+pub mod http;
 
 // ----- Boot info -----
 
@@ -162,6 +175,17 @@ pub extern "C" fn _start() -> ! {
 /// A server panic is contained — it terminates only this ring-3 process, never
 /// the kernel. That isolation is the whole point of running filesystem code in
 /// userspace.
+/// Allocation-error handler: fired when the heap window is exhausted. Without it,
+/// `alloc` aborts (a ring-3 fault → the kernel halts the whole machine to its
+/// watchdog). Instead we report over serial and `exit` cleanly, so a server that
+/// runs out of memory (e.g. the api-server on a hostile request) terminates only
+/// itself — a bounded caller/test observes the exit, never a hang.
+#[alloc_error_handler]
+fn on_oom(_layout: core::alloc::Layout) -> ! {
+    debug_print("\n[server oom]\n");
+    syscall::exit(2)
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     debug_print("\n[server panic] ");
@@ -593,6 +617,9 @@ pub mod syscall {
     /// ring-3 api-server (6.5).
     const SYS_MGMT: u64 = 26;
     const MGMT_OP_LISTEN: u64 = 1;
+    const MGMT_OP_LIST: u64 = 2;
+    const MGMT_OP_INSPECT: u64 = 3;
+    const MGMT_OP_NODE_INFO: u64 = 4;
 
     /// Listen for inbound TCP connections on the bound socket `sock`. Returns 0,
     /// or a high-bit error.
@@ -707,6 +734,65 @@ pub mod syscall {
                 in("rdi") MGMT_OP_LISTEN,
                 in("rsi") mgmt_cap,
                 in("rdx") port,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// A `SYS_MGMT` read verb (Phase 6.5) with no input: copy a JSON document into
+    /// `out[..out_len]`. Returns bytes written, or a high-bit `MgmtError`
+    /// (`BufferTooSmall` = bit 63 | 8 if the document exceeds `out_len`). Used for
+    /// `MGMT_OP_LIST` and `MGMT_OP_NODE_INFO`.
+    fn mgmt_read0(op: u64, mgmt_cap: u64, out: *mut u8, out_len: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_MGMT register ABI; the kernel validates out[..out_len].
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_MGMT => ret,
+                in("rdi") op,
+                in("rsi") mgmt_cap,
+                in("rdx") 0u64,          // no input ptr
+                in("r10") 0u64,          // no input len
+                in("r8") out as u64,
+                in("r9") out_len,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// List all containers as a JSON array into `out` (`docker ps -a`). See
+    /// [`mgmt_read0`] for the return convention.
+    pub fn mgmt_list(mgmt_cap: u64, out: *mut u8, out_len: u64) -> u64 {
+        mgmt_read0(MGMT_OP_LIST, mgmt_cap, out, out_len)
+    }
+
+    /// Node-info JSON object into `out` (`docker info` subset).
+    pub fn mgmt_node_info(mgmt_cap: u64, out: *mut u8, out_len: u64) -> u64 {
+        mgmt_read0(MGMT_OP_NODE_INFO, mgmt_cap, out, out_len)
+    }
+
+    /// Inspect one container by id/name (`id[..id_len]`), writing its JSON detail
+    /// object into `out[..out_len]`. Returns bytes written, or a high-bit
+    /// `MgmtError` (`NotFound` = bit 63 | 2, `BufferTooSmall` = bit 63 | 8).
+    pub fn mgmt_inspect(mgmt_cap: u64, id: *const u8, id_len: u64, out: *mut u8, out_len: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_MGMT register ABI; the kernel validates id[..id_len] and
+        // out[..out_len].
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_MGMT => ret,
+                in("rdi") MGMT_OP_INSPECT,
+                in("rsi") mgmt_cap,
+                in("rdx") id as u64,
+                in("r10") id_len,
+                in("r8") out as u64,
+                in("r9") out_len,
                 out("rcx") _, out("r11") _,
                 options(nostack),
             );

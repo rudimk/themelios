@@ -131,9 +131,8 @@ pub struct ServerConfig {
     pub filesystem_mount: Option<u64>,
     /// If true, grant the server a `Management` sentinel capability (the authority
     /// to drive the container management ABI via `SYS_MGMT`) and pass its handle to
-    /// the server via `BootInfo.mgmt_cap_handle` (Phase 6.4). Only trusted,
-    /// kernel-spawned servers (the api-server; the `tcp-echo-smoke` test server)
-    /// ever set this — never a container.
+    /// the server via `BootInfo.mgmt_cap_handle` (Phase 6.4). Only the trusted,
+    /// kernel-spawned `api-server` sets this — never a container.
     pub grant_management: bool,
 }
 

@@ -1,0 +1,17 @@
+[package]
+name = "api-server"
+version = "0.1.0"
+edition = "2021"
+
+# The ThemeliOS control-plane server (Phase 6.5): a ring-3 program that serves a
+# subset of the Docker Engine API. It holds a spawn-granted Management capability,
+# opens a listener via the management ABI, and for each inbound connection parses
+# an HTTP request, routes it, calls the kernel management ABI (SYS_MGMT), and
+# returns a framed JSON response. Phase 6.5 lands the read (GET) pipeline; the
+# write verbs (create/start/stop/logs) follow in 6.5b.
+[[bin]]
+name = "api-server"
+path = "src/main.rs"
+
+[dependencies]
+libthemelios = { path = "../libthemelios" }
