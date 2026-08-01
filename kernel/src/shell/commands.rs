@@ -404,6 +404,7 @@ pub fn cmd_caps(args: &str) {
             CapType::Filesystem { .. } => "FS",
             CapType::FileDescriptor { .. } => "FD",
             CapType::Socket { .. } => "Socket",
+            CapType::Management => "Mgmt",
         };
         let details = match cap_type {
             CapType::Null => alloc::string::String::from("-"),
@@ -425,6 +426,7 @@ pub fn cmd_caps(args: &str) {
                 alloc::string::String::from("factory"),
             CapType::Socket { socket_id } =>
                 alloc::format!("sock={}", socket_id),
+            CapType::Management => alloc::string::String::from("authority"),
         };
         println!("  {:>12}  {:>16}  {:>8}  {}",
             handle, type_str, rights, details);
@@ -476,6 +478,7 @@ pub fn cmd_audit(args: &str) {
             CapType::Filesystem { .. } => "FS",
             CapType::FileDescriptor { .. } => "FD",
             CapType::Socket { .. } => "Socket",
+            CapType::Management => "Mgmt",
         };
 
         println!("  {:>6}  {:>8}  {:>6}  {:>14}  {:>10}  {:#012x}",

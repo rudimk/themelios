@@ -84,6 +84,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_json_serialize",    func: test_json_serialize },
     TestCase { name: "test_container_registry", func: test_container_registry },
     TestCase { name: "test_container_logs",    func: test_container_logs },
+    TestCase { name: "test_management_capability", func: test_management_capability },
 ];
 
 /// Run all tests and exit QEMU with the appropriate code.
@@ -4866,6 +4867,232 @@ fn test_container_logs() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_container_logs() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Management ABI capability gate (Phase 6.3). Proves the security property the
+/// sub-phase adds: the container control surface is *ambient-authority-free*. A
+/// process holding the [`CapType::Management`] sentinel can drive every management
+/// op (list/inspect/create/start/stop/logs/node_info + open a listener); a process
+/// **without** it — or holding a wrong-type capability — is denied at *every* op,
+/// before any work happens. Also checks the lifecycle guards (`start` only from
+/// `Created`; `stop` refuses an already-`Exited` container) and that each op emits
+/// an `ApiAccess` audit entry.
+///
+/// Deterministic: container ops run over a private ext2 mount and, except for the
+/// one positive `start`, never execute a container binary (the guards are proven by
+/// driving the registry state machine). The listener uses the trusted `ksocket_*`
+/// bind/listen path — no external peer — exactly like `test_socket_capability`.
+#[cfg(target_arch = "x86_64")]
+fn test_management_capability() -> Result<(), &'static str> {
+    use crate::cap::{CapHandle, CapRights, CapType, Capability};
+    use crate::container::registry::{self, ContainerState};
+    use crate::mgmt::{self, MgmtError};
+    use crate::mm::addr::VirtAddr;
+    use crate::mm::shared::SharedRegion;
+    use crate::process::{self};
+    use crate::sched;
+
+    // linux-smoke (the demo /init) reports to this page and exits 0.
+    const RESULT_VADDR: u64 = 0x0600_0000;
+    const RESULT_MAGIC: u64 = 0x5A11_D0C5_10AD_ED11;
+
+    fn is_array(b: &[u8]) -> bool {
+        b.first() == Some(&b'[')
+    }
+    fn is_object(b: &[u8]) -> bool {
+        b.first() == Some(&b'{')
+    }
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // --- setup: an ext2 mount for container ops + the net server for `listen` ---
+    // `mgmt::create` resolves the default `/data` mount (as the real api-server
+    // would); point it at this test's ext2 mount since the harness skips boot_storage.
+    let mount = bring_up_ext2_mount("ext2-disk-mgmt", "ext2-mgmt")?;
+    crate::fs::set_data_mount_for_test(mount);
+    let _fs_ep = spawn_net_server_with_sockets(false, "virtio-net-mgmt")?;
+
+    // The api-server stand-in: a process holding the Management authority.
+    let (api, _) = process::create_process("mgmt-api", None);
+    let mgmt_cap = process::with_cspace_mut(api, |cs| {
+        cs.insert(Capability {
+            cap_type: CapType::Management,
+            rights: CapRights::READ | CapRights::WRITE,
+            parent: None,
+        })
+    })
+    .ok_or("no cspace")?
+    .map_err(|_| "insert management cap failed")?;
+
+    // Snapshot the audit sequence so we can prove ApiAccess entries were logged.
+    let seq_before = crate::audit::current_seq();
+
+    // ===== CAP GATE (the heart): without the cap, EVERY op is denied =====
+    // resolve_management runs first, so these deny before touching fs/net/registry.
+    // A process with no capability at all (NULL handle) and one holding a
+    // wrong-type cap must both be rejected uniformly.
+    let (noperm, _) = process::create_process("mgmt-noperm", None);
+    let bogus = process::with_cspace_mut(noperm, |cs| {
+        cs.insert(Capability {
+            cap_type: CapType::Endpoint { endpoint_id: 1, badge: 0 },
+            rights: CapRights::READ | CapRights::WRITE,
+            parent: None,
+        })
+    })
+    .ok_or("no cspace")?
+    .map_err(|_| "insert bogus cap failed")?;
+
+    for &h in &[CapHandle::NULL, bogus] {
+        let denied = matches!(mgmt::list(noperm, h), Err(MgmtError::PermissionDenied))
+            && matches!(mgmt::inspect(noperm, h, "x"), Err(MgmtError::PermissionDenied))
+            && matches!(mgmt::create(noperm, h, "demo", "x"), Err(MgmtError::PermissionDenied))
+            && matches!(mgmt::start(noperm, h, "x"), Err(MgmtError::PermissionDenied))
+            && matches!(mgmt::stop(noperm, h, "x"), Err(MgmtError::PermissionDenied))
+            && matches!(mgmt::logs(noperm, h, "x", None), Err(MgmtError::PermissionDenied))
+            && matches!(mgmt::node_info(noperm, h), Err(MgmtError::PermissionDenied))
+            && matches!(mgmt::listen(noperm, h, 9000), Err(MgmtError::PermissionDenied));
+        if !denied {
+            return Err("a management op was permitted without the Management cap");
+        }
+    }
+
+    // ===== WITH the cap: read-only + create ops succeed =====
+    let list_json = mgmt::list(api, mgmt_cap).map_err(|_| "list denied for the cap holder")?;
+    if !is_array(&list_json) {
+        return Err("list did not return a JSON array");
+    }
+    let info_json = mgmt::node_info(api, mgmt_cap).map_err(|_| "node_info denied")?;
+    if !is_object(&info_json) || !contains(&info_json, b"\"Containers\"") {
+        return Err("node_info did not return the expected object");
+    }
+
+    // create: an empty image is rejected; a real image yields a Created container.
+    match mgmt::create(api, mgmt_cap, "", "") {
+        Err(MgmtError::InvalidArgument) => {}
+        _ => return Err("create with an empty image should be InvalidArgument"),
+    }
+    let create_json =
+        mgmt::create(api, mgmt_cap, "demo", "apitest").map_err(|_| "create denied for the holder")?;
+    if !contains(&create_json, b"\"Id\"") {
+        return Err("create response missing Id");
+    }
+    let apitest = registry::lookup("apitest").ok_or("created container not in the registry")?;
+    if apitest.state != ContainerState::Created {
+        return Err("newly created container not in the Created state");
+    }
+
+    // inspect: a hit resolves and carries the /name; a miss is NotFound.
+    let inspect_json = mgmt::inspect(api, mgmt_cap, "apitest").map_err(|_| "inspect denied")?;
+    if !contains(&inspect_json, b"/apitest") {
+        return Err("inspect response missing the container name");
+    }
+    match mgmt::inspect(api, mgmt_cap, "no-such-container") {
+        Err(MgmtError::NotFound) => {}
+        _ => return Err("inspect of a missing container should be NotFound"),
+    }
+
+    // logs: readable (empty, not yet run) for a real container; NotFound for a miss.
+    mgmt::logs(api, mgmt_cap, "apitest", None).map_err(|_| "logs denied for a real container")?;
+    match mgmt::logs(api, mgmt_cap, "no-such-container", None) {
+        Err(MgmtError::NotFound) => {}
+        _ => return Err("logs of a missing container should be NotFound"),
+    }
+
+    // ===== lifecycle guards (driven via the registry state machine, no run) =====
+    // start rejects a missing container...
+    match mgmt::start(api, mgmt_cap, "no-such-container") {
+        Err(MgmtError::NotFound) => {}
+        _ => return Err("start of a missing container should be NotFound"),
+    }
+    // ...and rejects a non-Created one. Flip apitest to Running, then Exited, and
+    // confirm start refuses both (double-start / restart-after-exit are unsupported).
+    registry::set_state(&apitest.id, ContainerState::Running);
+    match mgmt::start(api, mgmt_cap, "apitest") {
+        Err(MgmtError::InvalidState) => {}
+        _ => return Err("start of a Running container should be InvalidState"),
+    }
+    registry::set_state(&apitest.id, ContainerState::Exited(0));
+    match mgmt::start(api, mgmt_cap, "apitest") {
+        Err(MgmtError::InvalidState) => {}
+        _ => return Err("start of an Exited container should be InvalidState"),
+    }
+    // stop refuses an already-Exited container.
+    match mgmt::stop(api, mgmt_cap, "apitest") {
+        Err(MgmtError::InvalidState) => {}
+        _ => return Err("stop of an Exited container should be InvalidState"),
+    }
+    process::destroy_process(apitest.pid); // apitest was never started; free it.
+
+    // ===== positive stop: tear down a Created container that was never run =====
+    mgmt::create(api, mgmt_cap, "demo", "stoptest").map_err(|_| "create stoptest failed")?;
+    let stoptest = registry::lookup("stoptest").ok_or("stoptest missing")?;
+    mgmt::stop(api, mgmt_cap, "stoptest").map_err(|_| "stop of a Created container denied")?;
+    if !matches!(registry::lookup("stoptest").unwrap().state, ContainerState::Exited(_)) {
+        return Err("stop did not mark the container Exited");
+    }
+    // A second stop is now invalid.
+    match mgmt::stop(api, mgmt_cap, "stoptest") {
+        Err(MgmtError::InvalidState) => {}
+        _ => return Err("a second stop should be InvalidState"),
+    }
+    let _ = stoptest; // its process was destroyed by terminate().
+
+    // ===== positive start: a Created container actually runs to completion =====
+    mgmt::create(api, mgmt_cap, "demo", "runtest").map_err(|_| "create runtest failed")?;
+    let runtest = registry::lookup("runtest").ok_or("runtest missing")?;
+    // Map the result page so linux-smoke exits cleanly rather than faulting.
+    let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
+    process::with_address_space(runtest.pid, |a| {
+        region.map_into(a, VirtAddr::new(RESULT_VADDR));
+    })
+    .ok_or("mapping the result region failed")?;
+    mgmt::start(api, mgmt_cap, "runtest").map_err(|_| "start of a Created container denied")?;
+    if registry::lookup("runtest").unwrap().state != ContainerState::Running {
+        return Err("start did not flip the row to Running");
+    }
+    let mut ran = false;
+    for _ in 0..400_000 {
+        // SAFETY: kernel-owned region; the container writes the same memory.
+        let s = unsafe { region.as_slice_mut() };
+        if u64::from_le_bytes(s[0..8].try_into().unwrap()) == RESULT_MAGIC {
+            ran = true;
+            break;
+        }
+        sched::yield_now();
+    }
+    if !ran {
+        process::destroy_process(runtest.pid);
+        return Err("started container did not run");
+    }
+    process::destroy_process(runtest.pid);
+
+    // ===== positive listen: open an inbound-TCP listener, mint its Socket cap =====
+    let listener = mgmt::listen(api, mgmt_cap, 8080).map_err(|_| "listen denied for the holder")?;
+    if listener == CapHandle::NULL.as_raw() {
+        return Err("listen returned a null capability handle");
+    }
+
+    // ===== audit: the ops above logged ApiAccess entries for the api process =====
+    let after = crate::audit::last_entries(256);
+    let api_events = after
+        .iter()
+        .filter(|e| e.seq >= seq_before)
+        .filter(|e| e.operation == crate::audit::AuditOp::ApiAccess && e.source_pid == api)
+        .count();
+    if api_events == 0 {
+        return Err("no ApiAccess audit entries were recorded for management ops");
+    }
+
+    process::destroy_process(api);
+    process::destroy_process(noperm);
+    Ok(())
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_management_capability() -> Result<(), &'static str> {
     Ok(())
 }
 

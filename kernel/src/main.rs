@@ -190,6 +190,14 @@ mod container;
 #[allow(dead_code)] // request parser + helpers; the api-server (6.5) uses the full surface
 mod http;
 
+/// Container management ABI (Phase 6.3): the capability-guarded ring-0 surface the
+/// ring-3 `api-server` drives to serve the Docker Engine API — list/inspect/create/
+/// start/stop/logs/node_info + an inbound-TCP listener, each gated on the
+/// `CapType::Management` sentinel and audited. The syscall/IPC wrappers and the
+/// sentinel-cap grant land in Phase 6.4.
+#[allow(dead_code)] // driven by the api-server (6.4/6.5); tested directly in 6.3
+mod mgmt;
+
 // ----- Kernel entry point -----
 
 /// The kernel entry point. Limine bootloader jumps here after loading the

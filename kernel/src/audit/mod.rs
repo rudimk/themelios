@@ -97,6 +97,11 @@ pub enum AuditOp {
     /// A socket operation was dispatched through the kernel socket router
     /// (Phase 4.5). Detail: the socket syscall number (SYS_SOCKET .. SYS_SOCKET_CLOSE).
     NetAccess,
+
+    /// A management-ABI operation was invoked by a holder of the `Management`
+    /// capability (Phase 6.3): container list/inspect/create/start/stop/logs or a
+    /// listener open. Detail: the management op number.
+    ApiAccess,
 }
 
 impl core::fmt::Display for AuditOp {
@@ -113,6 +118,7 @@ impl core::fmt::Display for AuditOp {
             AuditOp::Syscall     => write!(f, "syscall"),
             AuditOp::FsAccess    => write!(f, "fs_access"),
             AuditOp::NetAccess   => write!(f, "net_access"),
+            AuditOp::ApiAccess   => write!(f, "api_access"),
         }
     }
 }
