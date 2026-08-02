@@ -5322,6 +5322,12 @@ fn test_api_server() -> Result<(), &'static str> {
     const STATUS_DENIED: u64 = 2;
     // The api-server test listens on port 7 (reuses the existing hostfwd rule).
     const API_PORT: u64 = 7;
+    // The host peer (xtask) opens exactly this many connections. We wait for the
+    // server to serve them ALL before tearing it down — this proves no per-request
+    // socket leak AND lets the peer finish so it stops reconnecting to a listener
+    // we're about to destroy (a lingering half-open connect would churn the leftover
+    // net server and starve the next test's DHCP).
+    const EXPECTED_SERVED: u64 = 2;
 
     // Read the api-server's result page: Some((status, served)) once committed.
     fn read_result(region: &SharedRegion) -> Option<(u64, u64)> {
@@ -5396,12 +5402,13 @@ fn test_api_server() -> Result<(), &'static str> {
     }
 
     let (api_pid, api_region) = spawn_api(true, "api-server", "api-ep")?;
-    // The host peer sends GET /_ping on separate connections; the server serves and
-    // closes each. Wait until it has served at least one request.
+    // The host peer sends GET /_ping on `EXPECTED_SERVED` separate connections; the
+    // server parses/routes/replies and closes each. Wait until all are served (so
+    // the peer finishes and stops reconnecting) before tearing the server down.
     let mut res = None;
     for _ in 0..2_000_000 {
         if let Some((status, served)) = read_result(&api_region) {
-            if status == STATUS_SERVING && served >= 1 {
+            if status == STATUS_SERVING && served >= EXPECTED_SERVED {
                 res = Some((status, served));
                 break;
             }
@@ -5414,7 +5421,7 @@ fn test_api_server() -> Result<(), &'static str> {
             crate::println!("  [test_api_server] ring-3 api-server served {} request(s)", served);
             Ok(())
         }
-        None => Err("api-server never served a request (no inbound connection?)"),
+        None => Err("api-server did not serve all expected requests (inbound path?)"),
     }
 }
 
