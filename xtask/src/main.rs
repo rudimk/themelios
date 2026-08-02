@@ -377,16 +377,18 @@ const TCP_TEST_GUEST_PORT: u16 = 7;
 
 /// The HTTP request(s) the host peer sends to the ring-3 `api-server`, each on its
 /// own connection. This is the **live inbound smoke** (phase 3 of `test_api_server`):
-/// a single `GET /_ping` proving the real accept → HTTP-parse → route → reply path
-/// over TCP. A single connection is used deliberately — the immature net server can
-/// deliver stale RX data across *sequential* connections on one listener (a
-/// pre-existing bug; see the plan's 6.5b note), so multi-connection content
-/// assertions are flaky. The *content* of the routing + JSON-parsing logic (POST
-/// create, `Image` extraction, the write verbs) is proven separately and
-/// deterministically by the api-server's in-process self-test (phase 2), which needs
-/// no network, so the wire smoke only has to prove a request round-trips.
+/// a single authenticated `GET /containers/json` proving the real accept → HTTP-parse
+/// → authenticate → route → reply path over TCP, including that the
+/// `Authorization: Bearer` header round-trips intact. The token literal must match the
+/// kernel's `API_TOKEN` const in `kernel/src/process/server.rs`. A single connection
+/// is used deliberately — the immature net server can deliver stale RX data across
+/// *sequential* connections on one listener (a pre-existing bug; see the plan's 6.5b
+/// note), so multi-connection content assertions are flaky. The *content* of the
+/// routing + auth + JSON-parsing logic is proven separately and deterministically by
+/// the api-server's in-process self-test (phase 2), which needs no network, so this
+/// wire smoke only has to prove an authenticated request round-trips.
 const API_TEST_REQUESTS: &[&[u8]] = &[
-    b"GET /_ping HTTP/1.1\r\nHost: themelios\r\n\r\n",
+    b"GET /containers/json HTTP/1.1\r\nHost: themelios\r\nAuthorization: Bearer themelios-dev-secret-token\r\n\r\n",
 ];
 
 /// Spawn a detached host thread that drives the ring-3 `api-server` over the

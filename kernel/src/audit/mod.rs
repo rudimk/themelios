@@ -102,6 +102,13 @@ pub enum AuditOp {
     /// capability (Phase 6.3): container list/inspect/create/start/stop/logs or a
     /// listener open. Detail: the management op number.
     ApiAccess,
+
+    /// The api-server rejected a request for failing bearer-token authentication
+    /// (Phase 6.6). Recorded on the audited ABI (via `SYS_MGMT` `AUDIT_DENY`) so a
+    /// failed auth attempt is as visible as a successful op. A distinct variant —
+    /// not `ApiAccess` with a magic detail — so audit consumers filter it cleanly.
+    /// Detail: reserved (0).
+    ApiAuthReject,
 }
 
 impl core::fmt::Display for AuditOp {
@@ -119,6 +126,7 @@ impl core::fmt::Display for AuditOp {
             AuditOp::FsAccess    => write!(f, "fs_access"),
             AuditOp::NetAccess   => write!(f, "net_access"),
             AuditOp::ApiAccess   => write!(f, "api_access"),
+            AuditOp::ApiAuthReject => write!(f, "api_auth_reject"),
         }
     }
 }

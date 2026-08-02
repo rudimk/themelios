@@ -97,12 +97,34 @@ struct ServerBootInfo {
     /// (0 = none, i.e. an unambiguous null handle — CSpace slot 0 is the reserved
     /// Null slot, so `insert` never returns it). Used with `SYS_MGMT` (Phase 6.4).
     mgmt_cap_handle: u64,
+    /// Bearer token provisioned to the api-server (Phase 6.6), NUL-unpadded in the
+    /// first `api_token_len` bytes. Populated only for the trusted control plane (a
+    /// server spawned with `grant_management`); zeroed with `api_token_len == 0`
+    /// otherwise. The api-server compares the `Authorization: Bearer …` header
+    /// against these bytes. Kept in the boot-info page (not baked into the flat
+    /// binary) to model a per-node secret handed over at spawn.
+    api_token: [u8; 32],
+    /// Length of the provisioned token in `api_token` (0 = none).
+    api_token_len: u64,
 }
 
-/// Lock the layout against libthemelios `BootInfo` (which asserts the same size):
-/// 13 `u64` fields × 8 bytes = 104. Adding a field on one side without the other
-/// fails to compile here — catching boot-info drift at build time.
-const _: () = assert!(core::mem::size_of::<ServerBootInfo>() == 104);
+/// Lock the layout against libthemelios `BootInfo` (which asserts the same size and
+/// offsets): 13 `u64` fields (104) + `[u8;32]` token (→ 136) + a `u64` len (→ 144).
+/// The size assert catches a field added on one side but not the other; the
+/// `offset_of!` asserts additionally pin the two *heterogeneous* trailing fields to
+/// fixed offsets, so a cross-struct field reorder (which the size check alone would
+/// pass, silently corrupting the token) fails to compile. Keep both structs
+/// byte-identical.
+const _: () = assert!(core::mem::size_of::<ServerBootInfo>() == 144);
+const _: () = assert!(core::mem::offset_of!(ServerBootInfo, api_token) == 104);
+const _: () = assert!(core::mem::offset_of!(ServerBootInfo, api_token_len) == 136);
+
+/// The bearer token provisioned to the api-server (Phase 6.6). A fixed dev secret for
+/// now — a real deployment injects a per-node secret; provenance (fixed vs random per
+/// boot) is out of scope here. Must be ≤ 32 bytes (the boot-info field width) and
+/// kept in sync with the xtask test peer's `Authorization` header literal.
+pub const API_TOKEN: &[u8] = b"themelios-dev-secret-token";
+const _: () = assert!(API_TOKEN.len() <= 32);
 
 /// Configuration for spawning a server.
 pub struct ServerConfig {
@@ -269,6 +291,17 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
 
     // --- Map and fill the boot-info page ---
     let bootinfo_phys = mm::frame::allocate_frame().expect("spawn_server: no frame for bootinfo");
+    // Provision the bearer token to the trusted control plane only (Phase 6.6): the
+    // api-server (the sole `grant_management` server) authenticates clients, so only
+    // it should hold the node secret in its address space. Every other server gets a
+    // zeroed token / len 0.
+    let mut api_token = [0u8; 32];
+    let api_token_len = if config.grant_management {
+        api_token[..API_TOKEN.len()].copy_from_slice(API_TOKEN);
+        API_TOKEN.len() as u64
+    } else {
+        0
+    };
     let boot_info = ServerBootInfo {
         magic: BOOTINFO_MAGIC,
         fs_endpoint: config.fs_endpoint,
@@ -283,6 +316,8 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
         arg1: config.arg1,
         fs_cap_handle,
         mgmt_cap_handle,
+        api_token,
+        api_token_len,
     };
     // SAFETY: bootinfo_phys is a fresh HHDM-mapped frame; ServerBootInfo fits in
     // one page.

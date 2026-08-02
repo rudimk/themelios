@@ -266,6 +266,14 @@ pub const MGMT_OP_START: u64 = 6;
 pub const MGMT_OP_STOP: u64 = 7;
 pub const MGMT_OP_LOGS: u64 = 8;
 
+/// `SYS_MGMT` verb selector (RDI): record a bearer-token **auth rejection** (Phase
+/// 6.6). RSI = the caller's `Management` cap handle; no other args. The api-server
+/// calls this when it turns away an unauthenticated / wrong-token request, so a
+/// failed auth attempt is audited on the same ABI as a successful op. Returns 0 on
+/// success (bit 63 clear) or a high-bit `MgmtError` (`PermissionDenied` if the caller
+/// lacks the cap).
+pub const MGMT_OP_AUDIT_DENY: u64 = 9;
+
 /// Hard cap on the bytes `MGMT_OP_LOGS` returns, regardless of the caller's output
 /// capacity — bounds the `logs` allocation so a huge captured log can't be forced
 /// into one copy. The effective tail is `min(out_capacity, MGMT_LOGS_MAX)`.
@@ -1160,6 +1168,13 @@ fn dispatch_mgmt_syscall(frame: &mut SyscallFrame) {
                 Ok(id) => emit(frame, crate::mgmt::logs(pid, mgmt_handle, id, Some(tail))),
                 Err(_) => frame.rax = bad_op,
             }
+        }
+        MGMT_OP_AUDIT_DENY => {
+            // No input; records an auth-rejection audit entry. Success writes 0.
+            frame.rax = match crate::mgmt::audit_deny(pid, mgmt_handle) {
+                Ok(()) => 0,
+                Err(e) => e.as_syscall_ret(),
+            };
         }
         _ => frame.rax = bad_op,
     }
