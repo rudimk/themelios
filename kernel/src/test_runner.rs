@@ -62,7 +62,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_net_icmp_echo",    func: test_net_icmp_echo },
     // Runs before the other persistent net-server tests so it is the sole NIC
     // drainer (no inbound-frame competition) for the host-driven TCP handshake.
-    TestCase { name: "test_ring3_tcp_echo",   func: test_ring3_tcp_echo },
+    TestCase { name: "test_api_server",       func: test_api_server },
     TestCase { name: "test_dhcp",             func: test_dhcp },
     TestCase { name: "test_socket_capability", func: test_socket_capability },
     TestCase { name: "test_socket_list",      func: test_socket_list },
@@ -3425,7 +3425,7 @@ fn test_socket_capability() -> Result<(), &'static str> {
 ///
 /// Deterministic: it only opens sockets, binds, lists, and *emits* one ICMP echo
 /// request — none of which needs an external peer or an inbound frame (so it does
-/// not compete with `test_ring3_tcp_echo` for the NIC). Whether an echo *reply* comes
+/// not compete with `test_api_server` for the NIC). Whether an echo *reply* comes
 /// back is left to the best-effort `ping` shell command (slirp's ICMP proxy may
 /// lack host privileges); here we assert the send is accepted, which exercises the
 /// whole ICMP socket build/bind/emit path in the ring-3 stack.
@@ -5285,30 +5285,29 @@ fn test_tcp_client() -> Result<(), &'static str> {
 }
 
 // ============================================================
-//  test_ring3_tcp_echo — ring-3 inbound TCP + sentinel grant (Phase 6.4)
+//  test_api_server — ring-3 Docker Engine API over TCP (Phase 6.5)
 // ============================================================
 
-/// Prove the OS's **first ring-3 inbound-TCP server** and **first sentinel-cap
-/// spawn grant**, end to end. Supersedes the old kernel-side `test_tcp_server`: the
-/// listener is now the ring-3 `tcp-echo-smoke` server rather than in-kernel
-/// `ksocket_*` calls (which are still exercised underneath, via `mgmt::listen`).
+/// Prove the ring-3 `api-server` end to end: accept → HTTP parse → route → mgmt
+/// ABI → JSON → reply. Supersedes `test_ring3_tcp_echo` — the api-server is now the
+/// ring-3 inbound-TCP proof (it opens its listener via the same `mgmt::listen`
+/// path), and this test folds in the fail-closed grant control.
 ///
 /// Two phases:
-/// 1. **Fail-closed control (cheap; no net-server).** Spawn `tcp-echo-smoke`
-///    *without* the Management grant. Its `SYS_MGMT`/listen is denied
-///    (`PermissionDenied`) *before* any NIC access, so it reports `DENIED`. This
-///    proves `spawn_server`'s grant gate: no grant → no listener.
-/// 2. **Granted round-trip.** Bring the stack up with DHCP, spawn `tcp-echo-smoke`
-///    *with* the grant; it opens a listener on port 7 via the management ABI,
-///    accepts the host peer's connection (hostfwd `127.0.0.1:15007 → guest:7`),
-///    and echoes the payload. The kernel reads the server's result page and
-///    asserts `OK` + the echoed byte count.
+/// 1. **Fail-closed control (cheap; no net-server).** Spawn the api-server *without*
+///    the Management grant. Its `mgmt_listen` is denied (`PermissionDenied`) before
+///    any NIC access, so it reports `DENIED`.
+/// 2. **Served HTTP round-trip.** Bring the stack up with DHCP, spawn the api-server
+///    *with* the grant on port 7; the host peer (hostfwd `127.0.0.1:15007 →
+///    guest:7`) sends `GET /_ping HTTP/1.1` on separate connections. The server
+///    parses, routes, replies `200 OK` (framed with Content-Length), and closes
+///    each socket; the kernel asserts via the server's result page that it served
+///    at least one request without wedging.
 ///
 /// Registered before the other persistent net-server tests so it is the only
-/// interface draining the NIC when it runs (the host-driven handshake needs no
-/// inbound-frame competition).
+/// interface draining the NIC when it runs.
 #[cfg(target_arch = "x86_64")]
-fn test_ring3_tcp_echo() -> Result<(), &'static str> {
+fn test_api_server() -> Result<(), &'static str> {
     use crate::ipc;
     use crate::mm::shared::SharedRegion;
     use crate::net::net_service;
@@ -5317,16 +5316,20 @@ fn test_ring3_tcp_echo() -> Result<(), &'static str> {
     use crate::process::{self, ProcessId};
     use crate::sched;
 
-    // Result-page contract shared with servers/tcp-echo-smoke (commit word last).
-    const RESULT_MAGIC: u64 = 0x_5243_4845_5F4F_4B00;
-    const STATUS_OK: u64 = 1;
+    // Result-page contract shared with servers/api-server (commit word last).
+    const RESULT_MAGIC: u64 = 0x_4150_4953_5256_0000;
+    const STATUS_SERVING: u64 = 1;
     const STATUS_DENIED: u64 = 2;
-    // The host peer (xtask::spawn_tcp_test_peer) sends this exact payload.
-    const PAYLOAD_LEN: u64 = 18; // b"THEMELIOS_TCP_PING".len()
+    // The api-server test listens on port 7 (reuses the existing hostfwd rule).
+    const API_PORT: u64 = 7;
+    // The host peer (xtask) opens exactly this many connections. We wait for the
+    // server to serve them ALL before tearing it down — this proves no per-request
+    // socket leak AND lets the peer finish so it stops reconnecting to a listener
+    // we're about to destroy (a lingering half-open connect would churn the leftover
+    // net server and starve the next test's DHCP).
+    const EXPECTED_SERVED: u64 = 2;
 
-    // Read the ring-3 server's result page: Some((status, count)) once committed
-    // (magic observed), else None. `read_volatile` + magic-first-read mirrors the
-    // server's magic-last-write ordering, so status/count are never torn.
+    // Read the api-server's result page: Some((status, served)) once committed.
     fn read_result(region: &SharedRegion) -> Option<(u64, u64)> {
         // SAFETY: kernel-owned region, HHDM-aliased; three in-bounds u64 slots.
         let base = unsafe { region.as_slice_mut() }.as_ptr() as *const u64;
@@ -5335,13 +5338,13 @@ fn test_ring3_tcp_echo() -> Result<(), &'static str> {
             return None;
         }
         let status = unsafe { core::ptr::read_volatile(base.add(1)) };
-        let count = unsafe { core::ptr::read_volatile(base.add(2)) };
-        Some((status, count))
+        let served = unsafe { core::ptr::read_volatile(base.add(2)) };
+        Some((status, served))
     }
 
-    // Spawn tcp-echo-smoke with a fresh result region (mapped as its `shared`
-    // region at SERVER_SHARED_VIRT). `grant` selects the Management-cap grant.
-    fn spawn_echo(
+    // Spawn the api-server with a fresh result region mapped as its `shared` region.
+    // `grant` selects the Management-cap grant; arg0 pins the listen port.
+    fn spawn_api(
         grant: bool,
         name: &'static str,
         ep_name: &'static str,
@@ -5350,21 +5353,23 @@ fn test_ring3_tcp_echo() -> Result<(), &'static str> {
         let ep = ipc::create_endpoint(ep_name);
         let pid = spawn_server(ServerConfig {
             name,
-            binary: embedded::TCP_ECHO_SMOKE,
+            binary: embedded::API_SERVER,
             fs_endpoint: ep,
             block_endpoint: 0,
             shared: Some(region),
             client_shared: None,
-            heap_bytes: 64 * 1024,
-            arg0: 0,
-            arg1: 0,
+            heap_bytes: 256 * 1024,
+            arg0: API_PORT,
+            // Serve-then-exit after the peer's requests, so the server closes its
+            // listener and exits cleanly instead of being destroyed mid-loop with an
+            // orphaned listen socket (which starves the next test's NIC).
+            arg1: EXPECTED_SERVED,
             filesystem_mount: None,
             grant_management: grant,
         });
         Ok((pid, region))
     }
 
-    // Poll a server's result page up to `max` yields; None if it never committed.
     fn await_result(region: &SharedRegion, max: u32) -> Option<(u64, u64)> {
         for _ in 0..max {
             if let Some(res) = read_result(region) {
@@ -5376,7 +5381,7 @@ fn test_ring3_tcp_echo() -> Result<(), &'static str> {
     }
 
     // --- Phase 1: fail-closed control (no net-server needed) ---
-    let (noperm_pid, noperm_region) = spawn_echo(false, "tcp-echo-noperm", "tcp-echo-ep-noperm")?;
+    let (noperm_pid, noperm_region) = spawn_api(false, "api-noperm", "api-ep-noperm")?;
     let ctrl = await_result(&noperm_region, 400_000);
     process::destroy_process(noperm_pid);
     match ctrl {
@@ -5385,8 +5390,8 @@ fn test_ring3_tcp_echo() -> Result<(), &'static str> {
         None => return Err("fail-closed control never reported (server hung?)"),
     }
 
-    // --- Phase 2: granted ring-3 inbound-TCP round-trip ---
-    let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-r3echo")?;
+    // --- Phase 2: served HTTP round-trip ---
+    let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-api")?;
     let mut configured = false;
     for _ in 0..300_000 {
         if net_service::status().config.configured {
@@ -5396,30 +5401,36 @@ fn test_ring3_tcp_echo() -> Result<(), &'static str> {
         sched::yield_now();
     }
     if !configured {
-        return Err("DHCP did not configure before the ring-3 TCP echo test");
+        return Err("DHCP did not configure before the api-server test");
     }
 
-    let (grant_pid, grant_region) = spawn_echo(true, "tcp-echo-grant", "tcp-echo-ep-grant")?;
-    // The server listens on 7 and echoes; the host peer connects and drives it.
-    let res = await_result(&grant_region, 2_000_000);
-    process::destroy_process(grant_pid);
+    let (api_pid, api_region) = spawn_api(true, "api-server", "api-ep")?;
+    // The host peer sends GET /_ping on `EXPECTED_SERVED` separate connections; the
+    // server parses/routes/replies and closes each. Wait until all are served (so
+    // the peer finishes and stops reconnecting) before tearing the server down.
+    let mut res = None;
+    for _ in 0..2_000_000 {
+        if let Some((status, served)) = read_result(&api_region) {
+            if status == STATUS_SERVING && served >= EXPECTED_SERVED {
+                res = Some((status, served));
+                break;
+            }
+        }
+        sched::yield_now();
+    }
+    process::destroy_process(api_pid);
     match res {
-        Some((STATUS_OK, n)) if n == PAYLOAD_LEN => {
-            crate::println!("  [test_ring3_tcp_echo] ring-3 server echoed {} bytes", n);
+        Some((_, served)) => {
+            crate::println!("  [test_api_server] ring-3 api-server served {} request(s)", served);
             Ok(())
         }
-        Some((STATUS_OK, n)) => {
-            crate::println!("  [test_ring3_tcp_echo] echoed {} bytes (expected {})", n, PAYLOAD_LEN);
-            Err("ring-3 echo byte count mismatch")
-        }
-        Some((_, _)) => Err("granted ring-3 server reported an error"),
-        None => Err("granted ring-3 server never reported (no inbound connection?)"),
+        None => Err("api-server did not serve all expected requests (inbound path?)"),
     }
 }
 
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
-fn test_ring3_tcp_echo() -> Result<(), &'static str> {
+fn test_api_server() -> Result<(), &'static str> {
     Ok(())
 }
 

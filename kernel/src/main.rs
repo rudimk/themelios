@@ -501,6 +501,31 @@ extern "C" fn kmain() -> ! {
         // net service, and spawn the ring-3 net server (smoltcp).
         net::boot_net();
 
+        // Bring up the container management API (Phase 6.5): a ring-3 server
+        // holding the Management sentinel cap, serving the Docker Engine API on the
+        // default port. It listens via the management ABI once the net server is up
+        // (it retries while that comes up). Only reachable when a route/hostfwd is
+        // configured — unauthenticated for now (auth lands in 6.6), so it must not
+        // be exposed on a real NIC until then. This spawn is not exercised by CI
+        // (the test path runs `test_api_server` instead); the binary, grant, listen,
+        // and serve are all covered there.
+        {
+            let api_ep = ipc::create_endpoint("api-server");
+            process::server::spawn_server(process::server::ServerConfig {
+                name: "api-server",
+                binary: process::embedded::API_SERVER,
+                fs_endpoint: api_ep,
+                block_endpoint: 0,
+                shared: None,
+                client_shared: None,
+                heap_bytes: 256 * 1024,
+                arg0: 0, // 0 → the api-server's default Docker port (2375)
+                arg1: 0,
+                filesystem_mount: None,
+                grant_management: true,
+            });
+        }
+
         println!();
         println!("Interrupts enabled — scheduler is running.");
         println!("Type 'help' for available commands.");

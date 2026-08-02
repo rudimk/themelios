@@ -243,12 +243,11 @@ pub enum CapType {
     /// like [`SOCKET_FACTORY`] is for sockets: holding it grants *all* management
     /// operations (per-verb / per-container sub-capabilities are a future
     /// refinement). **Invariant:** this cap is minted only to **trusted,
-    /// kernel-spawned servers** — the ring-3 `api-server` (the node's control plane)
-    /// in production, and the Phase 6.4 `tcp-echo-smoke` test server — and **never**
-    /// enters a container's capability space (a container is created with an empty
-    /// CSpace, so it can never manage anything). `resolve_management` checks only the
-    /// presence of this variant (rights are not consulted, mirroring
-    /// `resolve_factory`).
+    /// kernel-spawned servers** — the ring-3 `api-server` (the node's control plane),
+    /// in production and in its test — and **never** enters a container's capability
+    /// space (a container is created with an empty CSpace, so it can never manage
+    /// anything). `resolve_management` checks only the presence of this variant
+    /// (rights are not consulted, mirroring `resolve_factory`).
     Management,
 }
 

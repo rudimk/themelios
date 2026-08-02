@@ -196,7 +196,7 @@ fn ensure_limine(root: &Path) -> PathBuf {
 /// `include_bytes!`.
 const SERVER_BINARIES: &[&str] = &[
     "echo-server",
-    "tcp-echo-smoke",
+    "api-server",
     "squashfs-server",
     "overlay-server",
     "ext2-server",
@@ -370,41 +370,70 @@ fn virtio_net_args(id: &str) -> Vec<String> {
 }
 
 /// Host TCP port forwarded to the guest's TCP listener (guest port 7) during
-/// `cargo xtask test`, for the Phase 4.6 `test_tcp_server` round-trip.
+/// `cargo xtask test`, for the Phase 6.5 `test_api_server` HTTP round-trip.
 const TCP_TEST_HOST_PORT: u16 = 15007;
-/// Guest TCP port the server test listens on.
+/// Guest TCP port the api-server test listens on (reuses the existing hostfwd).
 const TCP_TEST_GUEST_PORT: u16 = 7;
 
-/// The payload the host peer sends and `test_tcp_server` echoes back.
-const TCP_TEST_PAYLOAD: &[u8] = b"THEMELIOS_TCP_PING";
+/// The number of HTTP requests the host peer makes on separate connections —
+/// enough (>1) to prove the api-server closes each accepted socket and does not
+/// leak capability slots across requests.
+const API_TEST_REQUESTS: usize = 2;
 
-/// Spawn a detached host thread that connects to the guest TCP listener (via the
-/// `hostfwd` rule), sends [`TCP_TEST_PAYLOAD`], and reads the echo. It retries
-/// until the guest is listening (early connects are refused), then stops after a
-/// successful exchange. Failures are silent: the guest side asserts the
-/// round-trip; this thread only drives the connection.
+/// Spawn a detached host thread that drives the ring-3 `api-server` over the
+/// `hostfwd` rule: it opens [`API_TEST_REQUESTS`] separate connections, each
+/// sending `GET /_ping HTTP/1.1` and reading the complete framed response (looping
+/// until `Content-Length` is satisfied or the peer closes). It retries the first
+/// connect until the guest is listening. Failures are silent — the guest side
+/// asserts success via the api-server's result page; this thread only drives the
+/// connections.
 fn spawn_tcp_test_peer() {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::time::{Duration, Instant};
+
+    // Read a full HTTP/1.1 response: headers, then `Content-Length` body bytes.
+    // Returns true if a complete response was read.
+    fn read_response(stream: &mut TcpStream) -> bool {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            // Once headers are in, read exactly Content-Length more bytes.
+            if let Some(hdr_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..hdr_end]).to_ascii_lowercase();
+                let need = head
+                    .split("\r\n")
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= hdr_end + 4 + need {
+                    return true;
+                }
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => return !buf.is_empty(), // peer closed
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return false,
+            }
+        }
+    }
 
     std::thread::spawn(|| {
         let sa: SocketAddr = match format!("127.0.0.1:{TCP_TEST_HOST_PORT}").parse() {
             Ok(a) => a,
             Err(_) => return,
         };
+        let request = b"GET /_ping HTTP/1.1\r\nHost: themelios\r\n\r\n";
         let deadline = Instant::now() + Duration::from_secs(85);
-        while Instant::now() < deadline {
+        let mut done = 0usize;
+        while done < API_TEST_REQUESTS && Instant::now() < deadline {
             match TcpStream::connect_timeout(&sa, Duration::from_millis(500)) {
                 Ok(mut stream) => {
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-                    if stream.write_all(TCP_TEST_PAYLOAD).is_ok() {
-                        // Read the echo back (keeps the connection open long enough
-                        // for the guest to recv + echo), then we're done.
-                        let mut buf = [0u8; 64];
-                        let _ = stream.read(&mut buf);
-                        return;
+                    if stream.write_all(request).is_ok() && read_response(&mut stream) {
+                        done += 1;
+                        continue;
                     }
                     std::thread::sleep(Duration::from_millis(150));
                 }

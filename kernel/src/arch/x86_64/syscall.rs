@@ -242,6 +242,17 @@ pub const SYS_MGMT: u64 = 26;
 /// `Socket` cap handle (accept it with `SYS_ACCEPT`), or a high-bit `MgmtError`.
 pub const MGMT_OP_LISTEN: u64 = 1;
 
+/// `SYS_MGMT` **read verbs** (Phase 6.5): each returns an owned JSON document copied
+/// into a caller-provided output buffer. Shared register ABI: RSI = `Management` cap
+/// handle, RDX = input ptr, R10 = input len (the container id/name for `INSPECT`;
+/// unused for `LIST`/`NODE_INFO`), R8 = output ptr, R9 = output capacity. The return
+/// is the number of JSON bytes written (bit 63 clear), or a high-bit-set `MgmtError`
+/// — `BufferTooSmall` if the document exceeds R9. The write verbs (create/start/stop/
+/// logs) land in 6.5b.
+pub const MGMT_OP_LIST: u64 = 2;
+pub const MGMT_OP_INSPECT: u64 = 3;
+pub const MGMT_OP_NODE_INFO: u64 = 4;
+
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
 /// RDI = the SYS_NULL return value. The handler stores the result and
@@ -1016,18 +1027,63 @@ fn dispatch_socket_syscall(frame: &mut SyscallFrame) {
 /// verbs (list/inspect/create/…) land with the ring-3 api-server in 6.5.
 fn dispatch_mgmt_syscall(frame: &mut SyscallFrame) {
     use crate::cap::CapHandle;
+    use crate::mgmt::MgmtError;
     let pid = crate::sched::current_process_id();
-    let bad_op = crate::mgmt::MgmtError::InvalidArgument.as_syscall_ret();
+    let bad_op = MgmtError::InvalidArgument.as_syscall_ret();
+    let mgmt_handle = CapHandle::from_raw(frame.rsi as u32);
+
+    // Copy a read verb's JSON result into the caller's output buffer (R8 = ptr,
+    // R9 = capacity), returning the byte count or a high-bit `MgmtError`. The
+    // length is checked against the capacity BEFORE `copy_to_user`, so an
+    // over-length response fails closed as `BufferTooSmall` (never truncates).
+    fn emit(frame: &mut SyscallFrame, result: Result<alloc::vec::Vec<u8>, MgmtError>) {
+        frame.rax = match result {
+            Ok(json) => {
+                let out_ptr = frame.r8;
+                let out_cap = frame.r9 as usize;
+                if json.len() > out_cap {
+                    MgmtError::BufferTooSmall.as_syscall_ret()
+                } else if copy_to_user(out_ptr, &json) {
+                    json.len() as u64
+                } else {
+                    MgmtError::InvalidArgument.as_syscall_ret()
+                }
+            }
+            Err(e) => e.as_syscall_ret(),
+        };
+    }
+
     match frame.rdi {
         MGMT_OP_LISTEN => {
             // RSI = Management cap handle, RDX = TCP port.
-            let mgmt_handle = CapHandle::from_raw(frame.rsi as u32);
             let port = frame.rdx as u16;
             match crate::mgmt::listen(pid, mgmt_handle, port) {
                 // Success: the freshly minted listener Socket cap handle (bit 63
                 // clear). The caller accepts on it via SYS_ACCEPT.
                 Ok(listener) => frame.rax = listener as u64,
                 Err(e) => frame.rax = e.as_syscall_ret(),
+            }
+        }
+        MGMT_OP_LIST => {
+            // No input; JSON array of container summaries into R8[..R9].
+            emit(frame, crate::mgmt::list(pid, mgmt_handle));
+        }
+        MGMT_OP_NODE_INFO => {
+            // No input; node-info JSON object into R8[..R9].
+            emit(frame, crate::mgmt::node_info(pid, mgmt_handle));
+        }
+        MGMT_OP_INSPECT => {
+            // RDX = id/name ptr, R10 = id/name len; JSON detail object into R8[..R9].
+            let id = match copy_from_user(frame.rdx, frame.r10 as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    frame.rax = bad_op;
+                    return;
+                }
+            };
+            match core::str::from_utf8(&id) {
+                Ok(id) => emit(frame, crate::mgmt::inspect(pid, mgmt_handle, id)),
+                Err(_) => frame.rax = bad_op,
             }
         }
         _ => frame.rax = bad_op,

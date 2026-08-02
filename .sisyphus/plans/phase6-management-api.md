@@ -340,26 +340,57 @@ reconciled to admit trusted kernel-spawned servers holding `Management`.
 - [x] `spawn_server` grants the sentinel cap; a control run without the grant fails
       closed (`DENIED`).
 
-### 6.5 — Ring-3 `api-server` skeleton + Docker Engine API routing
+### 6.5 — Ring-3 `api-server` skeleton + Docker Engine API routing (GET pipeline) — Momus-reviewed
 
-**Goal**: The server: accept (6.4) → parse (6.0) → route → ABI (6.3) → JSON → reply.
+**Goal**: The server: accept (6.4) → HTTP parse (6.0) → route → mgmt ABI (6.3) →
+JSON → reply. **Scope narrowed to the read (GET) pipeline** (Momus §10): the first
+untrusted-input ring-3 parser lands with the smallest blast radius; POST
+create/start/stop + logs (and all of `json` request-body parsing) move to **6.5b**.
 
 **What to build**:
-- `servers/api-server` — **strictly sequential** accept/serve loop; per-request
-  HTTP parse → route (tolerating `/v1.NN/`) → management ABI → JSON → response.
-- Endpoint subset: `GET /_ping`, `GET /version`, `GET /info`;
-  `GET /containers/json`, `GET /containers/{id}/json`, `POST /containers/create`,
-  `POST /containers/{id}/start`, `POST /containers/{id}/stop`,
-  `GET /containers/{id}/logs`, `GET /images/json`. Correct status codes + Engine
-  API JSON shapes.
-- Boot wiring: spawn with the Management cap + listen port via `ServerBootInfo`.
+- **SYS_MGMT read verbs** — `MGMT_OP_LIST`/`INSPECT`/`NODE_INFO`, each copying the
+  mgmt `Vec<u8>` JSON into a user out-buffer (ABI: RDI=op, RSI=mgmt cap, RDX=in_ptr,
+  R10=in_len, R8=out_ptr, R9=out_len; return = bytes written, bit-63 = `MgmtError`).
+  New `MgmtError::BufferTooSmall` (8), checked **before** `copy_to_user`. Matching
+  libthemelios wrappers.
+- **`http` single-source into ring 3** — libthemelios `#[path]`s the kernel
+  `http/mod.rs` (zero kernel deps; no copy-paste, no drift — Momus #6). Add a
+  `http::build_response` there (status line + `Content-Type` + always
+  `Content-Length` + `Connection: close`, HTTP/1.1). No `json` in ring 3 yet
+  (GET-only; responses are pre-built by the kernel mgmt ops).
+- **`servers/api-server`** — strictly sequential accept/serve loop, **fault-free**
+  (a ring-3 fault halts the kernel): recv-accumulate bounded to `MAX_REQUEST`
+  *before* growing; frame via `find_sub(\r\n\r\n)` + `content_length` *before*
+  `parse_request` (which conflates incomplete/malformed); route (tolerating
+  `/v1.NN/`); call the mgmt wrapper into a fixed out-buffer; build the response;
+  **close the connection socket per request** (or the CSpace fills — Momus #4).
+  Endpoints: `GET /_ping`→`200 "OK"`; `GET /version`→static; `GET /info`→node_info;
+  `GET /containers/json`→list; `GET /containers/{id}/json`→inspect; else `404`.
+- **libthemelios `alloc_error_handler`** — convert an uncatchable OOM abort (→ ring-3
+  fault → kernel halt) into a clean marker + `exit` (Momus #1).
+- **Boot wiring** — spawn the api-server in `kmain` normal mode after
+  `net::boot_net()` with `grant_management: true` (documented as not CI-exercised;
+  the *binary/grant/listen/serve* are all covered by the test below).
+
+**Momus decisions**: DECISION 1 = `#[path]` single-source (not copy-paste);
+DECISION 3 = **T1**, supersede `test_ring3_tcp_echo` — the api-server is now the
+ring-3 inbound-TCP proof, folding in the fail-closed grant control; the throwaway
+`tcp-echo-smoke` is removed.
 
 **Acceptance**:
-- [ ] **Primary (MockConn-style, no NIC):** feed canned HTTP requests to the
-      router; assert JSON for `_ping`/`version`/`info`/`containers/json`/
-      `create`+`start`+`logs`. This proves the HTTP core even if the socket path
-      slips.
-- [ ] The api-server boots, listens, and answers one endpoint over the 6.4 path.
+- [x] Fail-closed control: an api-server spawned **without** the grant is denied at
+      `listen` before any NIC access (`DENIED`, no net-server).
+- [x] Over `hostfwd`, the host sends `GET /_ping` (and a second GET, proving no
+      per-connection socket leak), the ring-3 api-server replies `200 OK` framed
+      with `Content-Length`; the kernel asserts via the server's result marker
+      (`test_api_server` — "served 1 request(s)").
+
+**Status: DONE (Momus-reviewed).** `SYS_MGMT` read verbs (list/inspect/node_info) +
+`MgmtError::BufferTooSmall`; `http` single-sourced into libthemelios via `#[path]` +
+`build_response`; libthemelios `alloc_error_handler`; `servers/api-server` (GET
+pipeline, fault-free framing, per-request close); `test_api_server` supersedes the
+echo test (`tcp-echo-smoke` removed); boot spawn in `kmain`. **Deferred to 6.5b**:
+POST create/start/stop + logs write verbs and request-body `json` parsing.
 
 ### 6.6 — Auth + live curl/`docker` integration
 
