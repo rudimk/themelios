@@ -392,6 +392,61 @@ pipeline, fault-free framing, per-request close); `test_api_server` supersedes t
 echo test (`tcp-echo-smoke` removed); boot spawn in `kmain`. **Deferred to 6.5b**:
 POST create/start/stop + logs write verbs and request-body `json` parsing.
 
+### 6.5b — api-server write verbs (POST create/start/stop, logs) — Momus-reviewed
+
+**Goal**: complete the mutating half of the Engine API subset + request-body JSON.
+
+**What was built**:
+- **`SYS_MGMT` write verbs** — `CREATE=5`/`START=6`/`STOP=7`/`LOGS=8`. `CREATE` takes
+  `"image\0name"` (NUL-separated); `START`/`STOP` take the id and return 0 bytes
+  (Docker 204); `LOGS` returns raw bytes with the tail capped at
+  `min(out_cap, MGMT_LOGS_MAX=16 KiB)` so `BufferTooSmall` is structurally impossible
+  and the copy is bounded (Momus). Kernel arms `from_utf8().ok()`-reject bad input.
+- **`json` single-sourced into libthemelios** via `#[path]` (same as `http`), for the
+  POST-create request body only.
+- **api-server POST routing** — `POST /containers/create` (parse body → extract a
+  non-empty, **NUL-free** `Image` → NUL-join → create → `201`/`400`/`500`);
+  `POST /containers/{id}/start|stop` → `204`/`404`/`409`; `GET /containers/{id}/logs`.
+  A write-verb-specific error mapper (Momus): `NotFound`→404, `InvalidState`→409,
+  `InvalidArgument`→400, else→500. Still fault-free (body ≤ `MAX_BODY`; `json::parse`
+  depth-guarded; fixed out-buffers).
+- **`test_api_server`** now asserts response **status** (Momus #1/#2 — the prior
+  count-only test was vacuous), split into three phases:
+  1. *fail-closed control* — no grant → `mgmt_listen` denied → `DENIED` (no net).
+  2. *routing/JSON self-test* — the api-server runs a fixed request set through
+     `route` **in-process** (no TCP; enabled by a `SELF_TEST_FLAG` bit in `arg1`) and
+     records `[200, 400, 500, 409]`: `GET /_ping`=200, `POST create {}`=400 (empty
+     `Image`), `POST create {"Image":"demo"}`=500 (Image extracted → create verb →
+     `CreateFailed`, no `/data` mount), `POST /containers/<running>/start`=409 (a
+     pre-injected `Running` container → the start verb's `InvalidState` guard). Each
+     status ≠ the catch-all 404, so this deterministically proves the real GET/POST
+     routing, untrusted request-body JSON parse, `Image` extraction, and the
+     create/start write verbs — with no network in the loop.
+  3. *live inbound smoke* — over `hostfwd`, one `GET /_ping` round-trips end to end
+     (count-based), proving the accept → HTTP-parse → route → reply wire path still
+     works. The write-path *content* is proven in phase 2, so this stays a smoke.
+
+**Why the self-test (noted, not a defect here)**: the ring-3 net server can deliver
+**stale RX data across sequential connections** on one listener — invisible to 6.4/6.5
+(identical payloads, count-only assertion) but it makes a multi-connection, content-
+asserting wire test flaky. Rather than depend on the timing-sensitive inbound path for
+correctness assertions, the routing/JSON *content* is proven by the in-process
+self-test and the wire path keeps a single-connection count-based smoke. Fixing the
+net-server socket recycling is a Phase-4/net follow-up, out of 6.5b scope.
+
+**Security note (for 6.6)**: the write verbs spawn/tear down **real** ring-3
+processes on an **unauthenticated** port. Contained for now — the test `hostfwd` is
+`127.0.0.1`-only and `run` mode is slirp-isolated — but lifecycle mutation MUST NOT be
+exposed on a real NIC until 6.6 lands auth. `POST create` also needs a `/data` mount
+(none configured at boot yet) and 500s gracefully without one.
+
+**Acceptance**:
+- [x] `test_api_server` proves POST routing + request-body JSON parse + `Image`
+      extraction + the create/start write verbs via the deterministic self-test
+      (`[200, 400, 500, 409]`, each ≠ catch-all), and the wire path via a live
+      `GET /_ping` smoke. Passes locally (34 tests green before the sandbox's
+      live-network wall); CI runs the full suite.
+
 ### 6.6 — Auth + live curl/`docker` integration
 
 **Goal**: The app-layer token policy and a real client over the wire.

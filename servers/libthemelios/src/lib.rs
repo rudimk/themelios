@@ -61,6 +61,14 @@ pub mod net_proto;
 #[path = "../../../kernel/src/http/mod.rs"]
 pub mod http;
 
+/// The minimal JSON parser/serializer, **single-sourced** from the kernel's
+/// `oci::json` module (Phase 6.5b). Like `http` it is `alloc`-only with zero kernel
+/// coupling, so the api-server parses request bodies (`POST /containers/create`)
+/// with the exact same `parse` the kernel uses — one implementation, no drift. Its
+/// `MAX_DEPTH` guard bounds the recursion on hostile input.
+#[path = "../../../kernel/src/oci/json.rs"]
+pub mod json;
+
 // ----- Boot info -----
 
 /// Fixed virtual address where the kernel maps the server's boot-info page.
@@ -620,6 +628,12 @@ pub mod syscall {
     const MGMT_OP_LIST: u64 = 2;
     const MGMT_OP_INSPECT: u64 = 3;
     const MGMT_OP_NODE_INFO: u64 = 4;
+    // Write verbs (Phase 6.5b). These must match the kernel's MGMT_OP_* selectors
+    // in arch/x86_64/syscall.rs (kept in sync by hand, like the other proto tables).
+    const MGMT_OP_CREATE: u64 = 5;
+    const MGMT_OP_START: u64 = 6;
+    const MGMT_OP_STOP: u64 = 7;
+    const MGMT_OP_LOGS: u64 = 8;
 
     /// Listen for inbound TCP connections on the bound socket `sock`. Returns 0,
     /// or a high-bit error.
@@ -798,6 +812,57 @@ pub mod syscall {
             );
         }
         ret
+    }
+
+    /// Generic `SYS_MGMT` call (Phase 6.5b): input `in[..in_len]` → verb `op` →
+    /// output `out[..out_len]`. Returns bytes written (bit 63 clear), or a high-bit
+    /// `MgmtError`. The kernel validates both buffers.
+    fn mgmt_call(op: u64, mgmt_cap: u64, in_ptr: *const u8, in_len: u64, out: *mut u8, out_len: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_MGMT register ABI.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_MGMT => ret,
+                in("rdi") op,
+                in("rsi") mgmt_cap,
+                in("rdx") in_ptr as u64,
+                in("r10") in_len,
+                in("r8") out as u64,
+                in("r9") out_len,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Create a container (`docker create`). `spec[..spec_len]` is `"image\0name"`
+    /// (NUL-separated; no NUL → empty name = auto-generate). Writes `{"Id":…}` JSON
+    /// into `out`. Returns bytes written or a high-bit `MgmtError` (e.g.
+    /// `InvalidArgument` = bit 63 | 4 for an empty image).
+    pub fn mgmt_create(mgmt_cap: u64, spec: *const u8, spec_len: u64, out: *mut u8, out_len: u64) -> u64 {
+        mgmt_call(MGMT_OP_CREATE, mgmt_cap, spec, spec_len, out, out_len)
+    }
+
+    /// Start a created container (`docker start`). `id[..id_len]` = id/name. Returns
+    /// 0 on success (Docker 204), or a high-bit `MgmtError` (`NotFound` = 2,
+    /// `InvalidState` = 3).
+    pub fn mgmt_start(mgmt_cap: u64, id: *const u8, id_len: u64) -> u64 {
+        mgmt_call(MGMT_OP_START, mgmt_cap, id, id_len, core::ptr::null_mut(), 0)
+    }
+
+    /// Stop a container (`docker stop`). Returns 0 on success (204) or a high-bit
+    /// `MgmtError`.
+    pub fn mgmt_stop(mgmt_cap: u64, id: *const u8, id_len: u64) -> u64 {
+        mgmt_call(MGMT_OP_STOP, mgmt_cap, id, id_len, core::ptr::null_mut(), 0)
+    }
+
+    /// Read a container's captured logs (`docker logs`). `id[..id_len]` = id/name;
+    /// raw bytes into `out` (bounded by the kernel). Returns bytes written or a
+    /// high-bit `MgmtError`.
+    pub fn mgmt_logs(mgmt_cap: u64, id: *const u8, id_len: u64, out: *mut u8, out_len: u64) -> u64 {
+        mgmt_call(MGMT_OP_LOGS, mgmt_cap, id, id_len, out, out_len)
     }
 
     /// Print a single byte to the kernel serial console (debugging only).

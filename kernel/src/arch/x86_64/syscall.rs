@@ -248,10 +248,28 @@ pub const MGMT_OP_LISTEN: u64 = 1;
 /// unused for `LIST`/`NODE_INFO`), R8 = output ptr, R9 = output capacity. The return
 /// is the number of JSON bytes written (bit 63 clear), or a high-bit-set `MgmtError`
 /// — `BufferTooSmall` if the document exceeds R9. The write verbs (create/start/stop/
-/// logs) land in 6.5b.
+/// logs) share this ABI and are defined just below.
 pub const MGMT_OP_LIST: u64 = 2;
 pub const MGMT_OP_INSPECT: u64 = 3;
 pub const MGMT_OP_NODE_INFO: u64 = 4;
+
+/// `SYS_MGMT` **write verbs** (Phase 6.5b): the mutating container lifecycle ops.
+/// Same register ABI as the read verbs. Inputs (RDX/R10): `CREATE` takes
+/// `"image\0name"` (NUL-separated; empty name → auto-generate); `START`/`STOP`/`LOGS`
+/// take the container id/name. Outputs (R8/R9): `CREATE` writes `{"Id":…}` JSON,
+/// `LOGS` writes raw log bytes (bounded), `START`/`STOP` write nothing (0 bytes = the
+/// Docker 204 success). Return = bytes written (bit 63 clear) or a high-bit
+/// `MgmtError`. **These selectors are a distinct namespace from the audit `OP_*` in
+/// `mgmt.rs`** — do not conflate them.
+pub const MGMT_OP_CREATE: u64 = 5;
+pub const MGMT_OP_START: u64 = 6;
+pub const MGMT_OP_STOP: u64 = 7;
+pub const MGMT_OP_LOGS: u64 = 8;
+
+/// Hard cap on the bytes `MGMT_OP_LOGS` returns, regardless of the caller's output
+/// capacity — bounds the `logs` allocation so a huge captured log can't be forced
+/// into one copy. The effective tail is `min(out_capacity, MGMT_LOGS_MAX)`.
+pub const MGMT_LOGS_MAX: usize = 16 * 1024;
 
 /// SYS_TEST_COMPLETE: internal test syscall. The test shellcode calls this
 /// after SYS_NULL to report the result back to the kernel test runner.
@@ -1023,8 +1041,9 @@ fn dispatch_socket_syscall(frame: &mut SyscallFrame) {
 /// Op-multiplexed on RDI. Each verb is capability-checked and audited inside
 /// `mgmt` against the caller's `Management` cap; a caller without it gets
 /// `MgmtError::PermissionDenied` **before** any backing service is touched (the
-/// fail-closed property). Only `MGMT_OP_LISTEN` is wired in 6.4; the remaining
-/// verbs (list/inspect/create/…) land with the ring-3 api-server in 6.5.
+/// fail-closed property). `MGMT_OP_LISTEN` landed in 6.4; the read verbs
+/// (list/inspect/node_info) in 6.5; and the write verbs (create/start/stop/logs)
+/// in 6.5b — the full set the ring-3 api-server drives.
 fn dispatch_mgmt_syscall(frame: &mut SyscallFrame) {
     use crate::cap::CapHandle;
     use crate::mgmt::MgmtError;
@@ -1083,6 +1102,62 @@ fn dispatch_mgmt_syscall(frame: &mut SyscallFrame) {
             };
             match core::str::from_utf8(&id) {
                 Ok(id) => emit(frame, crate::mgmt::inspect(pid, mgmt_handle, id)),
+                Err(_) => frame.rax = bad_op,
+            }
+        }
+        MGMT_OP_CREATE => {
+            // RDX/R10 = "image\0name" (NUL-separated). Splits on the first NUL; no NUL
+            // → empty name (auto-generated); leading NUL → empty image → the mgmt
+            // layer rejects it (InvalidArgument). Output: {"Id":…} JSON.
+            let input = match copy_from_user(frame.rdx, frame.r10 as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    frame.rax = bad_op;
+                    return;
+                }
+            };
+            let (image_b, name_b) = match input.iter().position(|&b| b == 0) {
+                Some(nul) => (&input[..nul], &input[nul + 1..]),
+                None => (&input[..], &input[..0]),
+            };
+            match (core::str::from_utf8(image_b), core::str::from_utf8(name_b)) {
+                (Ok(image), Ok(name)) => {
+                    emit(frame, crate::mgmt::create(pid, mgmt_handle, image, name))
+                }
+                _ => frame.rax = bad_op,
+            }
+        }
+        MGMT_OP_START | MGMT_OP_STOP => {
+            // RDX/R10 = id/name. Success writes 0 bytes (Docker 204).
+            let id = match copy_from_user(frame.rdx, frame.r10 as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    frame.rax = bad_op;
+                    return;
+                }
+            };
+            match core::str::from_utf8(&id) {
+                Ok(id) if frame.rdi == MGMT_OP_START => {
+                    emit(frame, crate::mgmt::start(pid, mgmt_handle, id))
+                }
+                Ok(id) => emit(frame, crate::mgmt::stop(pid, mgmt_handle, id)),
+                Err(_) => frame.rax = bad_op,
+            }
+        }
+        MGMT_OP_LOGS => {
+            // RDX/R10 = id/name; raw log bytes into R8[..R9]. The tail is capped at
+            // min(out_capacity, MGMT_LOGS_MAX) so the result always fits the buffer
+            // (BufferTooSmall is structurally impossible) and the copy is bounded.
+            let id = match copy_from_user(frame.rdx, frame.r10 as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    frame.rax = bad_op;
+                    return;
+                }
+            };
+            let tail = (frame.r9 as usize).min(MGMT_LOGS_MAX);
+            match core::str::from_utf8(&id) {
+                Ok(id) => emit(frame, crate::mgmt::logs(pid, mgmt_handle, id, Some(tail))),
                 Err(_) => frame.rax = bad_op,
             }
         }

@@ -5293,21 +5293,31 @@ fn test_tcp_client() -> Result<(), &'static str> {
 /// ring-3 inbound-TCP proof (it opens its listener via the same `mgmt::listen`
 /// path), and this test folds in the fail-closed grant control.
 ///
-/// Two phases:
+/// Three phases:
 /// 1. **Fail-closed control (cheap; no net-server).** Spawn the api-server *without*
 ///    the Management grant. Its `mgmt_listen` is denied (`PermissionDenied`) before
 ///    any NIC access, so it reports `DENIED`.
-/// 2. **Served HTTP round-trip.** Bring the stack up with DHCP, spawn the api-server
-///    *with* the grant on port 7; the host peer (hostfwd `127.0.0.1:15007 →
-///    guest:7`) sends `GET /_ping HTTP/1.1` on separate connections. The server
-///    parses, routes, replies `200 OK` (framed with Content-Length), and closes
-///    each socket; the kernel asserts via the server's result page that it served
-///    at least one request without wedging.
+/// 2. **Routing/JSON self-test (deterministic; no net-server).** Spawn the api-server
+///    *with* the grant and the `SELF_TEST_FLAG` bit set in `arg1`. It runs a fixed
+///    set of requests through `route` in-process (no TCP), records each HTTP status,
+///    and exits. The kernel asserts the statuses are `[200, 400, 500, 409]` — each
+///    ≠ the catch-all 404, so this proves the real GET/POST routing, the untrusted
+///    request-body JSON parse, `Image` extraction, and the create/start write verbs
+///    without depending on the timing-sensitive inbound-TCP path. A `Running`
+///    container is injected first so the `start` request hits the state guard (409).
+/// 3. **Live inbound smoke.** Bring the stack up with DHCP, spawn the api-server
+///    *with* the grant on port 7 in serve-then-exit mode; the host peer (hostfwd
+///    `127.0.0.1:15007 → guest:7`) sends a single `GET /_ping HTTP/1.1`. The server
+///    parses, routes, replies `200 OK`, and closes the socket; the kernel asserts
+///    via the result page that it served the request (count-based — the *content*
+///    path is already proven deterministically in phase 2).
 ///
 /// Registered before the other persistent net-server tests so it is the only
 /// interface draining the NIC when it runs.
 #[cfg(target_arch = "x86_64")]
 fn test_api_server() -> Result<(), &'static str> {
+    use crate::container::registry;
+    use crate::container::registry::ContainerState;
     use crate::ipc;
     use crate::mm::shared::SharedRegion;
     use crate::net::net_service;
@@ -5317,37 +5327,53 @@ fn test_api_server() -> Result<(), &'static str> {
     use crate::sched;
 
     // Result-page contract shared with servers/api-server (commit word last).
+    // Words: [0]=magic [1]=state [2]=served [3+i]=HTTP status of request i.
     const RESULT_MAGIC: u64 = 0x_4150_4953_5256_0000;
     const STATUS_SERVING: u64 = 1;
     const STATUS_DENIED: u64 = 2;
+    const STATUS_ARRAY_OFF: usize = 3;
     // The api-server test listens on port 7 (reuses the existing hostfwd rule).
     const API_PORT: u64 = 7;
-    // The host peer (xtask) opens exactly this many connections. We wait for the
-    // server to serve them ALL before tearing it down — this proves no per-request
-    // socket leak AND lets the peer finish so it stops reconnecting to a listener
-    // we're about to destroy (a lingering half-open connect would churn the leftover
-    // net server and starve the next test's DHCP).
-    const EXPECTED_SERVED: u64 = 2;
+    // `arg1` top bit → the api-server runs its in-process self-test and exits (matches
+    // `SELF_TEST_FLAG` in servers/api-server).
+    const SELF_TEST_FLAG: u64 = 1 << 63;
+    // Container id the self-test's `start` request targets; injected `Running` so the
+    // start verb returns InvalidState → 409 (matches `SELF_TEST_CONTAINER`).
+    const SELFTEST_ID: &str = "selftest-run";
+    // The statuses the self-test's canned requests must elicit, in order:
+    // GET /_ping=200, POST create {}=400, POST create {"Image":..}=500, start=409.
+    const SELFTEST_STATUS: [u64; 4] = [200, 400, 500, 409];
+    // Phase 3 live smoke: the host peer sends exactly one GET /_ping on one
+    // connection; the server serves it then exits. Count-based (no content assert).
+    const INBOUND_SERVED: u64 = 1;
 
-    // Read the api-server's result page: Some((status, served)) once committed.
+    // Read the api-server's result page: Some((state, served)) once committed.
     fn read_result(region: &SharedRegion) -> Option<(u64, u64)> {
-        // SAFETY: kernel-owned region, HHDM-aliased; three in-bounds u64 slots.
+        // SAFETY: kernel-owned region, HHDM-aliased; in-bounds u64 slots.
         let base = unsafe { region.as_slice_mut() }.as_ptr() as *const u64;
         let magic = unsafe { core::ptr::read_volatile(base) };
         if magic != RESULT_MAGIC {
             return None;
         }
-        let status = unsafe { core::ptr::read_volatile(base.add(1)) };
+        let state = unsafe { core::ptr::read_volatile(base.add(1)) };
         let served = unsafe { core::ptr::read_volatile(base.add(2)) };
-        Some((status, served))
+        Some((state, served))
+    }
+
+    // Read the recorded HTTP status of request `i` from the result page.
+    fn read_status(region: &SharedRegion, i: usize) -> u64 {
+        let base = unsafe { region.as_slice_mut() }.as_ptr() as *const u64;
+        unsafe { core::ptr::read_volatile(base.add(STATUS_ARRAY_OFF + i)) }
     }
 
     // Spawn the api-server with a fresh result region mapped as its `shared` region.
-    // `grant` selects the Management-cap grant; arg0 pins the listen port.
+    // `grant` selects the Management-cap grant; arg0 pins the listen port; `arg1`
+    // carries either the serve-then-exit count or the SELF_TEST_FLAG bit.
     fn spawn_api(
         grant: bool,
         name: &'static str,
         ep_name: &'static str,
+        arg1: u64,
     ) -> Result<(ProcessId, SharedRegion), &'static str> {
         let region = SharedRegion::alloc(4096).ok_or("result region alloc failed")?;
         let ep = ipc::create_endpoint(ep_name);
@@ -5360,10 +5386,7 @@ fn test_api_server() -> Result<(), &'static str> {
             client_shared: None,
             heap_bytes: 256 * 1024,
             arg0: API_PORT,
-            // Serve-then-exit after the peer's requests, so the server closes its
-            // listener and exits cleanly instead of being destroyed mid-loop with an
-            // orphaned listen socket (which starves the next test's NIC).
-            arg1: EXPECTED_SERVED,
+            arg1,
             filesystem_mount: None,
             grant_management: grant,
         });
@@ -5381,7 +5404,7 @@ fn test_api_server() -> Result<(), &'static str> {
     }
 
     // --- Phase 1: fail-closed control (no net-server needed) ---
-    let (noperm_pid, noperm_region) = spawn_api(false, "api-noperm", "api-ep-noperm")?;
+    let (noperm_pid, noperm_region) = spawn_api(false, "api-noperm", "api-ep-noperm", 0)?;
     let ctrl = await_result(&noperm_region, 400_000);
     process::destroy_process(noperm_pid);
     match ctrl {
@@ -5390,7 +5413,46 @@ fn test_api_server() -> Result<(), &'static str> {
         None => return Err("fail-closed control never reported (server hung?)"),
     }
 
-    // --- Phase 2: served HTTP round-trip ---
+    // --- Phase 2: routing/JSON self-test (deterministic; no net-server) ---
+    // Inject a Running container so the self-test's `start` request hits the state
+    // guard (InvalidState → 409). The row's pid is a placeholder never dereferenced
+    // on this guard-negative path. Removed after the assertion so it doesn't leak
+    // into later list-based tests.
+    registry::insert_test_meta(SELFTEST_ID, "selftest-box", "demo", ContainerState::Running);
+    let (st_pid, st_region) = spawn_api(true, "api-selftest", "api-ep-selftest", SELF_TEST_FLAG)?;
+    let st_result = await_result(&st_region, 2_000_000);
+    let mut st_got = [0u64; SELFTEST_STATUS.len()];
+    for (i, slot) in st_got.iter_mut().enumerate() {
+        *slot = read_status(&st_region, i);
+    }
+    process::destroy_process(st_pid);
+    registry::remove(SELFTEST_ID);
+    match st_result {
+        Some((STATUS_SERVING, served)) if served == SELFTEST_STATUS.len() as u64 => {}
+        Some((_, served)) => {
+            crate::println!(
+                "  [test_api_server] self-test served {} (want {})",
+                served,
+                SELFTEST_STATUS.len()
+            );
+            return Err("api-server self-test did not run all canned requests");
+        }
+        None => return Err("api-server self-test never reported (server hung?)"),
+    }
+    if st_got != SELFTEST_STATUS {
+        crate::println!(
+            "  [test_api_server] self-test status mismatch: got {:?}, expected {:?}",
+            st_got,
+            SELFTEST_STATUS
+        );
+        return Err("api-server self-test returned unexpected response statuses");
+    }
+    crate::println!(
+        "  [test_api_server] routing/JSON self-test passed: statuses {:?}",
+        st_got
+    );
+
+    // --- Phase 3: live inbound smoke ---
     let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-api")?;
     let mut configured = false;
     for _ in 0..300_000 {
@@ -5404,28 +5466,30 @@ fn test_api_server() -> Result<(), &'static str> {
         return Err("DHCP did not configure before the api-server test");
     }
 
-    let (api_pid, api_region) = spawn_api(true, "api-server", "api-ep")?;
-    // The host peer sends GET /_ping on `EXPECTED_SERVED` separate connections; the
-    // server parses/routes/replies and closes each. Wait until all are served (so
-    // the peer finishes and stops reconnecting) before tearing the server down.
-    let mut res = None;
+    let (api_pid, api_region) = spawn_api(true, "api-server", "api-ep", INBOUND_SERVED)?;
+    // The host peer sends one GET /_ping; the server serves it, closes its listener,
+    // and exits. Wait until it is served (count-based; the response *content* is
+    // already proven in phase 2) before tearing the server down.
+    let mut served_ok = false;
     for _ in 0..2_000_000 {
-        if let Some((status, served)) = read_result(&api_region) {
-            if status == STATUS_SERVING && served >= EXPECTED_SERVED {
-                res = Some((status, served));
+        if let Some((state, served)) = read_result(&api_region) {
+            if state == STATUS_SERVING && served >= INBOUND_SERVED {
+                served_ok = true;
                 break;
             }
         }
         sched::yield_now();
     }
-    process::destroy_process(api_pid);
-    match res {
-        Some((_, served)) => {
-            crate::println!("  [test_api_server] ring-3 api-server served {} request(s)", served);
-            Ok(())
-        }
-        None => Err("api-server did not serve all expected requests (inbound path?)"),
+    if !served_ok {
+        process::destroy_process(api_pid);
+        return Err("api-server did not serve the inbound request (inbound path?)");
     }
+    process::destroy_process(api_pid);
+    crate::println!(
+        "  [test_api_server] live inbound smoke served {} request(s)",
+        INBOUND_SERVED
+    );
+    Ok(())
 }
 
 /// Stub for non-x86_64 targets.
