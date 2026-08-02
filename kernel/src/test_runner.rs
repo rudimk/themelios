@@ -5360,7 +5360,10 @@ fn test_api_server() -> Result<(), &'static str> {
             client_shared: None,
             heap_bytes: 256 * 1024,
             arg0: API_PORT,
-            arg1: 0,
+            // Serve-then-exit after the peer's requests, so the server closes its
+            // listener and exits cleanly instead of being destroyed mid-loop with an
+            // orphaned listen socket (which starves the next test's NIC).
+            arg1: EXPECTED_SERVED,
             filesystem_mount: None,
             grant_management: grant,
         });

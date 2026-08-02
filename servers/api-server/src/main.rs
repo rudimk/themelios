@@ -66,6 +66,11 @@ fn err_code(r: u64) -> u64 {
 pub extern "C" fn server_main() -> ! {
     let info = boot_info();
     let port = if info.arg0 == 0 { DEFAULT_PORT } else { info.arg0 };
+    // `arg1` = serve-then-exit count for the test harness (0 = unlimited, the
+    // production default). Exiting cleanly after N requests — closing the listener
+    // first — lets the test tear us down without leaving an orphaned listen socket
+    // in the net server (which would starve the next test's NIC).
+    let max_requests = info.arg1;
     // Optional result page (the test maps one as our `shared` region; production
     // spawns don't). `0` = absent → we simply don't report.
     let result = if info.shared_vaddr != 0 {
@@ -105,7 +110,19 @@ pub extern "C" fn server_main() -> ! {
         serve_connection(conn);
         let _ = syscall::socket_close(conn); // per-request close (CSpace hygiene)
         served = served.wrapping_add(1);
+        // Test harness: after serving the requested number, close the listener
+        // BEFORE the committing report and exit cleanly. Closing first means the
+        // moment the test observes the marker, the listen socket is already gone —
+        // no orphaned listener even if it tears us down immediately (production runs
+        // with max_requests == 0 and never exits).
+        let done = max_requests != 0 && served >= max_requests;
+        if done {
+            let _ = syscall::socket_close(listener);
+        }
         report(result, STATUS_SERVING, served);
+        if done {
+            syscall::exit(0);
+        }
     }
 }
 
