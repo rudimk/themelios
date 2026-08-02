@@ -335,6 +335,14 @@ fn authenticate(req: &http::Request, token: &[u8]) -> bool {
 /// compare (not constant-time): the token travels in cleartext over an unencrypted
 /// port, so a timing oracle would reveal nothing the transport doesn't already.
 fn bearer_matches(header: &str, token: &[u8]) -> bool {
+    // Fail closed on an empty provisioned token: otherwise `Authorization: Bearer `
+    // (scheme + only whitespace) would match an empty token and pass auth with no
+    // secret. Today the api-server is always provisioned a non-empty token (it is the
+    // sole `grant_management` server), so this only guards against a future change
+    // ever running auth with `api_token_len == 0` — cheap defense in depth.
+    if token.is_empty() {
+        return false;
+    }
     let bytes = header.as_bytes();
     const PREFIX: &[u8] = b"bearer ";
     if bytes.len() < PREFIX.len() || !bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {

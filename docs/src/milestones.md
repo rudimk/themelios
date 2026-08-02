@@ -10,7 +10,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **3** | VirtIO block driver, read-only filesystem | Complete |
 | **4** | VirtIO net driver, TCP/IP stack | Complete |
 | **5** | OCI container support | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
-| **6** | Management API (Docker-compatible) | Not started |
+| **6** | Management API (Docker-compatible) | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port | Not started |
 | **8** | Hyperscaler support (AWS, GCP, Azure) | Not started |
 | **9** | Testing and benchmarks | Not started |
@@ -133,19 +133,35 @@ real static-musl image over a live registry transport; container `exec`; real
 `oci-server`; PTYs; per-container resource limits; registry auth/TLS + cloud
 credential helpers.
 
-## Phase 6 — Management (Not started)
+## Phase 6 — Management (Complete — core)
 
 **Goal**: Docker-compatible management API for the node.
 
-**Deliverables**:
-- Docker Engine API compatible subset (containers, exec, images, logs, networks)
-- Bidirectional streaming for interactive exec sessions (websocket)
-- Capability-based authorization (API clients mapped to capability sets)
-- TLS client certificate and API token authentication
-- Node status and health reporting
-- Configuration injection at boot time
-- No SSH — API is the only interface
-- Standard Docker tooling works out of the box (`docker exec`, `docker ps`, `docker logs`, etc.)
+A ring-3 `api-server` holds a `Management` sentinel capability, opens an inbound-TCP
+listener through the kernel-accept shim, and serves a subset of the Docker Engine API
+behind two layers of authorization: the kernel capability (which *process* may drive
+the ABI) and an app-layer bearer token (which *client* may call the API). Untrusted
+HTTP/JSON parsing stays in ring 3, fail-closed against a node-halting fault; every
+container mutation crosses into the kernel through the capability-checked, audited
+`SYS_MGMT` ABI. See the [Management API](./management-api.md) chapter for the design.
+
+**Delivered**:
+- Docker Engine API subset — `_ping`, `version`, `info`, container `list`/`inspect`/
+  `create`/`start`/`stop`/`logs` (with `/v1.NN` version-prefix stripping)
+- Capability-gated management ABI (`SYS_MGMT`) driven only by the trusted control plane
+- App-layer bearer-token authentication (401 fail-closed; auth outcomes audited)
+- Per-container RAM-ring log capture (`docker logs`)
+- No SSH — the API is the only management interface
+- Momus-audited untrusted-input surface (no reachable kernel panic, no auth bypass)
+
+**Deferred** (documented):
+- TLS client-certificate + transport security (mTLS/HTTPS) — the API is a plaintext,
+  token-gated interface until it lands
+- Interactive `exec` and bidirectional streaming for sessions (websocket)
+- A live `docker` CLI / multi-request `curl` mutation sequence end to end (blocked on
+  net-server RX recycling + a `/data` mount at boot)
+- Broader Engine API surface (networks, volumes, images, events, stats)
+- Configuration injection at boot time beyond `ServerBootInfo`
 
 ## Phase 7 — aarch64 port (Not started)
 

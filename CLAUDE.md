@@ -143,7 +143,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **3** | VirtIO block driver, read-only FS, ephemeral layers | Complete |
 | **4** | VirtIO net driver, TCP/IP stack | Complete |
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
-| **6** | Docker-compatible management API | Not started |
+| **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Not started |
 | **8** | Hyperscaler support (AWS, GCP, Azure), secure boot | Not started |
 | **9** | Testing and benchmarks | Not started |
@@ -158,63 +158,53 @@ line when finishing a sub-phase. Detailed per-sub-phase checklists live in
 `.sisyphus/plans/` (local, gitignored); the git commit history has the full
 narrative per commit._
 
-**Phase 5 — Containers: COMPLETE (core).** A container is an ordinary process
-made to believe it's on Linux, in its own rootfs, holding no capabilities:
-(1) a **Linux syscall personality** (a per-process Linux-ABI table, routed by a
-personality flag so it doesn't collide with the native ABI); (2) a **single
-rootfs mount** with a `..`-clamping path resolver; (3) an **empty capability
-space** — so every privileged op is denied by construction. The pipeline is
-`image → unpack (oci) → assemble rootfs (VFS) → load entrypoint ELF → ring-3
-Linux process`. Isolation is the **capability system**, not namespaces — it
-falls out of the microkernel model. `main` is green (46 tests, 3× soak clean);
-`cargo xtask test` before pushing. Full design in mdbook `containers.md`.
-**Next up: Phase 6 (Docker-compatible management API).**
+**Phase 6 — Management API: COMPLETE (core).** The node is driven entirely
+through an external HTTP API (no SSH, no shell). A ring-3 **`api-server`** holds a
+`Management` **sentinel capability**, opens an inbound-TCP listener via a
+**kernel-accept shim**, and serves a Docker Engine API subset behind **two
+authorization layers**: the kernel cap (which *process* may drive the ABI) + an
+app-layer **bearer token** (which *client* may call the API). Untrusted HTTP/JSON
+parsing stays in ring 3, **fail-closed against a node-halting fault**; every
+container mutation crosses into the kernel through the capability-checked, audited
+**`SYS_MGMT`** ABI. Full design in mdbook `management-api.md`. `cargo xtask test`
+before pushing. **Next up: Phase 7 (aarch64 port).**
 
-- ✅ **5.0** ELF64 loader + `exec` — parse ET_EXEC, map PT_LOAD (`W^X`), build the
-  SysV initial stack (argc/argv/envp/auxv), enter ring 3 at `e_entry`. `elf-smoke`
-  (native ABI) + `test_elf_exec`.
-- ✅ **5.1** Linux syscall personality — `Personality::{Native,Linux}` routes
-  dispatch to a Linux table (write/writev/brk/mmap/arch_prctl/ioctl/clock_gettime/
-  getrandom/exit_group/…). Per-task `%fs` base restored on context switch (TLS).
-  `linux-smoke` + `test_linux_exec`.
-- ✅ **5.2** Linux filesystem syscalls over the VFS (openat/read/write/close/lseek/
-  fstat/newfstatat/getdents64/getcwd/chdir/readlinkat), rooted at one mount; the
-  path resolver **clamps `..` at rootfs** (container-escape prevention). `fs-smoke`
-  + `test_path_resolve` + `test_linux_fs`.
-- ✅ **5.3** Linux threads — `clone(CLONE_THREAD)` (sibling task, child resumes at
-  parent RIP with rax=0), `futex` WAIT/WAKE (address-keyed wait queue),
-  `set_tid_address`, `exit` vs `exit_group`. `threads-smoke` + `test_linux_threads`.
-- ✅ **5.4** OCI image unpacking — `docker save` bundles (outer tar → manifest +
-  config + uncompressed layer tars), layers applied in order with whiteouts
-  resolved, into a flat rootfs + runtime config. Hand-rolled tar + JSON readers
-  (`alloc`-only). `test_oci_unpack`.
-- ✅ **5.5** Container runtime — unpack → assemble rootfs on the ext2 mount → load
-  the entrypoint **from that rootfs** (`VfsByteSource`) → run as a Linux process;
-  `exit_group` captures the exit status. `run` shell cmd; `test_container_run`
-  (linux-smoke as `/init`, end-to-end).
-- ✅ **5.6** Registry pull — Docker Registry HTTP API v2 over a `Connection` trait:
-  manifest v2 → config + **gzip** layer blobs by `sha256:` digest, each
-  **digest-verified before use**; `oci/{sha256,gzip,registry}.rs` (+ `miniz_oxide`).
-  Fail-closed parsers: bounded gzip inflate (bomb cap), bounded JSON depth,
-  `checked_add` lengths (Momus-hardened). `test_sha256`, `test_registry_pull`,
-  `test_registry_hardening`. Live TCP transport (slirp `guestfwd` + host
-  `registry:2`) deferred; the pull pipeline is fully tested offline.
-- ✅ **5.7** Enforced isolation + teardown + finalize — Linux `socket()` (nr 41) →
-  **`-EPERM`** (no `SOCKET_FACTORY` cap; checked errno, not `-ENOSYS`); `kill`
-  (self-only, else `-EPERM`) / `wait4` (`-ECHILD`); `container::terminate` +
-  `stop <pid>` (container-type-guarded), plus a **`destroy_process` UAF fix**
-  (tasks marked Dead *before* the address space is freed). `isolation-smoke` +
-  `test_container_isolation` prove the boundary on the live syscall path:
-  positive read OK, `../../../../only` **succeeds and byte-matches** `/only`
-  (live `..` clamp), absent path misses, `socket()` → `-EPERM`. mdbook
-  `containers.md` written; milestone trackers reconciled. **46 tests, 3× soak.**
-  Deferred (documented): real static-musl busybox over a live registry, container
-  `exec`, real `wait4`/signal-handler delivery, ring-3 `oci-server` relocation.
+- ✅ **6.0** HTTP/1.1 request parser + minimal JSON serializer (`http`, `oci::json`),
+  `alloc`-only, fail-closed (bounded sizes, `checked_add`, `None`-on-malformed), lifted
+  unchanged into ring 3. `test_http_*`.
+- ✅ **6.1b** Container **rootfs confinement** — each container confined to a `/c/<id>`
+  subtree via a single `host_path` choke point; `create_confined`. Isolation probe +
+  `test_container_confinement`.
+- ✅ **6.3** Kernel **management ABI** (`mgmt`) + `CapType::Management` sentinel cap —
+  cap-checked, audited (`ApiAccess`) list/inspect/create/start/stop/logs/node_info/
+  listen ops returning owned JSON. `test_management_capability`.
+- ✅ **6.4** Ring-3 **inbound TCP** + sentinel-cap grant — `ServerConfig::grant_management`
+  mints the cap into a kernel-spawned server; the kernel-accept shim (`mgmt::listen`
+  mints a listener `Socket` cap) + fail-closed control. Host-coordinated echo test.
+- ✅ **6.5** api-server **read pipeline** — `SYS_MGMT` JSON read verbs + wrappers;
+  `http`+`json` single-sourced into ring 3 via `#[path]`; GET routing (`_ping`/`version`/
+  `info`/`containers/json`/`{id}/json`).
+- ✅ **6.5b** **Write verbs** — `SYS_MGMT` create/start/stop/logs; `POST /containers/create`
+  (untrusted body JSON → `Image` extraction → NUL-join), start/stop → 204/404/409.
+  Deterministic in-process **self-test** (routing + JSON content, no flaky wire path) +
+  a single live inbound smoke.
+- ✅ **6.6** **Bearer-token auth** — token provisioned via boot-info to the api-server
+  only; all routes except `/_ping`/`/version` require `Authorization: Bearer`; missing/
+  wrong → **401 before any op** (incl. unknown paths); auth outcomes audited
+  (`ApiAccess` / `ApiAuthReject`). Self-test asserts `[200,401,401,200,400,500,409]`.
+- ✅ **6.7** Finalize — mdbook `management-api.md`; trackers reconciled; **Momus
+  hardening audit** of the untrusted-input surface: **no reachable kernel panic, no
+  auth bypass** (fail-closed confirmed end-to-end); landed the F1 empty-token guard;
+  F2 (dev secret→Phase 8), F3 (bounded slowloris), F4 (container-count cap), F5 (json
+  permissiveness — NUL guard load-bearing) tracked.
 
-Per-milestone branches: each Phase 5 sub-phase was a fresh branch + PR off the
-latest `main` (5.0 #4 … 5.6 #10); 5.7 lives on `claude/phase-5.7-finalize`.
-**Phase 4 (Networking) is complete** — design + sub-phase detail in mdbook
-`networking.md`.
+Per-milestone branches: each Phase 6 sub-phase was a fresh branch + PR off the
+latest `main` (6.3 #17 … 6.6 #21); 6.7 lives on `claude/phase-6.7-finalize`.
+**Deferred (documented):** TLS/mTLS, interactive `exec`/websocket streaming, a live
+`docker` CLI / multi-request `curl` mutation sequence (net-server RX recycling +
+`/data`-at-boot), and broader Engine API breadth (networks, volumes, images).
+**Phases 4 (Networking) and 5 (Containers) are complete** — design + sub-phase detail
+in mdbook `networking.md` / `containers.md`.
 
 Notable — three long-standing concurrency bugs in the syscall/IPC core were
 root-caused and fixed during Phase 4.5 (they grew from rare to majority-of-runs
