@@ -119,13 +119,25 @@ pub struct BootInfo {
     /// (0 if none — an unambiguous null handle). Used with `SYS_MGMT`
     /// (`syscall::mgmt_listen`, …) by trusted control-plane servers (Phase 6.4).
     pub mgmt_cap_handle: u64,
+    /// Bearer token provisioned to the api-server (Phase 6.6), in the first
+    /// `api_token_len` bytes. Populated only for the control plane (spawned with
+    /// `grant_management`); zeroed with `api_token_len == 0` otherwise. The api-server
+    /// compares the `Authorization: Bearer …` header against these bytes.
+    pub api_token: [u8; 32],
+    /// Length of the provisioned token in `api_token` (0 = none).
+    pub api_token_len: u64,
 }
 
 /// Lock the kernel↔userspace boot-info layout: the two `#[repr(C)]` structs
 /// (`ServerBootInfo` in the kernel and this `BootInfo`) must stay byte-identical.
-/// 13 `u64` fields × 8 bytes = 104. If either side adds/removes a field without the
-/// other, this fails to compile — catching the drift at build time.
-const _: () = assert!(core::mem::size_of::<BootInfo>() == 104);
+/// 13 `u64` fields (104) + `[u8;32]` token (→ 136) + a `u64` len (→ 144). The size
+/// assert catches a field added on one side but not the other; the `offset_of!`
+/// asserts pin the two *heterogeneous* trailing fields so a cross-struct reorder
+/// (which the size check alone would pass, silently corrupting the token) also fails
+/// to compile.
+const _: () = assert!(core::mem::size_of::<BootInfo>() == 144);
+const _: () = assert!(core::mem::offset_of!(BootInfo, api_token) == 104);
+const _: () = assert!(core::mem::offset_of!(BootInfo, api_token_len) == 136);
 
 /// Read the boot-info page the kernel populated for this server.
 ///
@@ -634,6 +646,8 @@ pub mod syscall {
     const MGMT_OP_START: u64 = 6;
     const MGMT_OP_STOP: u64 = 7;
     const MGMT_OP_LOGS: u64 = 8;
+    // Auth-rejection audit verb (Phase 6.6).
+    const MGMT_OP_AUDIT_DENY: u64 = 9;
 
     /// Listen for inbound TCP connections on the bound socket `sock`. Returns 0,
     /// or a high-bit error.
@@ -863,6 +877,26 @@ pub mod syscall {
     /// high-bit `MgmtError`.
     pub fn mgmt_logs(mgmt_cap: u64, id: *const u8, id_len: u64, out: *mut u8, out_len: u64) -> u64 {
         mgmt_call(MGMT_OP_LOGS, mgmt_cap, id, id_len, out, out_len)
+    }
+
+    /// Record a bearer-token auth rejection (Phase 6.6): the api-server calls this
+    /// when it turns away an unauthenticated / wrong-token request, so a failed auth
+    /// attempt is audited on the same ABI as a successful op. Returns 0 on success or
+    /// a high-bit `MgmtError`.
+    pub fn mgmt_audit_deny(mgmt_cap: u64) -> u64 {
+        let ret: u64;
+        // SAFETY: SYS_MGMT register ABI — RDI = verb, RSI = mgmt cap; no other args.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_MGMT => ret,
+                in("rdi") MGMT_OP_AUDIT_DENY,
+                in("rsi") mgmt_cap,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
     }
 
     /// Print a single byte to the kernel serial console (debugging only).

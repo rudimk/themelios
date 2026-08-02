@@ -146,6 +146,21 @@ fn audit(pid: ProcessId, op: u64) {
     audit::log_event(pid, AuditOp::ApiAccess, CapType::Management, op);
 }
 
+/// Record a bearer-token authentication rejection (Phase 6.6).
+///
+/// The api-server calls this — through `SYS_MGMT` `AUDIT_DENY` — when it turns away
+/// an unauthenticated or wrong-token request, so failed auth attempts land on the
+/// same audited ABI as successful ops (the plan's "both audited"). Cap-checked like
+/// every other verb: only a `Management`-cap holder (the trusted control plane) can
+/// record these, so a capless container cannot forge audit noise. Emits a distinct
+/// [`AuditOp::ApiAuthReject`] — not `ApiAccess` — so consumers filter it without
+/// overloading the op-number detail field.
+pub fn audit_deny(pid: ProcessId, handle: CapHandle) -> Result<(), MgmtError> {
+    resolve_management(pid, handle)?;
+    audit::log_event(pid, AuditOp::ApiAuthReject, CapType::Management, 0);
+    Ok(())
+}
+
 // --- JSON shaping (Docker Engine API subset) ---
 
 /// Join a container's argv into a single command string (Docker `Command` field).

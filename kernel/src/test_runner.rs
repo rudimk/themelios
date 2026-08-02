@@ -5297,20 +5297,24 @@ fn test_tcp_client() -> Result<(), &'static str> {
 /// 1. **Fail-closed control (cheap; no net-server).** Spawn the api-server *without*
 ///    the Management grant. Its `mgmt_listen` is denied (`PermissionDenied`) before
 ///    any NIC access, so it reports `DENIED`.
-/// 2. **Routing/JSON self-test (deterministic; no net-server).** Spawn the api-server
-///    *with* the grant and the `SELF_TEST_FLAG` bit set in `arg1`. It runs a fixed
-///    set of requests through `route` in-process (no TCP), records each HTTP status,
-///    and exits. The kernel asserts the statuses are `[200, 400, 500, 409]` — each
-///    ≠ the catch-all 404, so this proves the real GET/POST routing, the untrusted
-///    request-body JSON parse, `Image` extraction, and the create/start write verbs
-///    without depending on the timing-sensitive inbound-TCP path. A `Running`
-///    container is injected first so the `start` request hits the state guard (409).
+/// 2. **Routing/auth/JSON self-test (deterministic; no net-server).** Spawn the
+///    api-server *with* the grant and the `SELF_TEST_FLAG` bit set in `arg1`. It runs
+///    a fixed set of requests through `route` in-process (no TCP), records each HTTP
+///    status, and exits. The kernel asserts the statuses are
+///    `[200, 401, 401, 200, 400, 500, 409]` — each ≠ the catch-all 404, so this
+///    proves the real GET/POST routing, bearer-token auth (no-token/wrong-token → 401,
+///    correct-token → 200 on the same route), the untrusted request-body JSON parse,
+///    `Image` extraction, and the create/start write verbs, without depending on the
+///    timing-sensitive inbound-TCP path. A `Running` container is injected first so
+///    the authed `start` request hits the state guard (409).
 /// 3. **Live inbound smoke.** Bring the stack up with DHCP, spawn the api-server
 ///    *with* the grant on port 7 in serve-then-exit mode; the host peer (hostfwd
-///    `127.0.0.1:15007 → guest:7`) sends a single `GET /_ping HTTP/1.1`. The server
-///    parses, routes, replies `200 OK`, and closes the socket; the kernel asserts
-///    via the result page that it served the request (count-based — the *content*
-///    path is already proven deterministically in phase 2).
+///    `127.0.0.1:15007 → guest:7`) sends a single authenticated `GET /containers/json`
+///    (correct `Authorization: Bearer` header). The server parses, authenticates,
+///    routes, replies, and closes the socket; the kernel asserts via the result page
+///    that it served the request (count-based — this is a *transport* check that the
+///    header round-trips over TCP; the auth *logic* is proven deterministically in
+///    phase 2).
 ///
 /// Registered before the other persistent net-server tests so it is the only
 /// interface draining the NIC when it runs.
@@ -5341,8 +5345,11 @@ fn test_api_server() -> Result<(), &'static str> {
     // start verb returns InvalidState → 409 (matches `SELF_TEST_CONTAINER`).
     const SELFTEST_ID: &str = "selftest-run";
     // The statuses the self-test's canned requests must elicit, in order:
-    // GET /_ping=200, POST create {}=400, POST create {"Image":..}=500, start=409.
-    const SELFTEST_STATUS: [u64; 4] = [200, 400, 500, 409];
+    // GET /_ping=200 (auth-exempt); GET /containers/json no-token=401, wrong-token=401,
+    // correct-token=200 (bearer auth, 6.6); POST create {}=400, {"Image":..}=500,
+    // start=409 (all authed). Each ≠ the catch-all 404; the 401/200 contrast on the
+    // same /containers/json route proves auth is enforced and a valid token passes.
+    const SELFTEST_STATUS: [u64; 7] = [200, 401, 401, 200, 400, 500, 409];
     // Phase 3 live smoke: the host peer sends exactly one GET /_ping on one
     // connection; the server serves it then exits. Count-based (no content assert).
     const INBOUND_SERVED: u64 = 1;
@@ -5448,7 +5455,7 @@ fn test_api_server() -> Result<(), &'static str> {
         return Err("api-server self-test returned unexpected response statuses");
     }
     crate::println!(
-        "  [test_api_server] routing/JSON self-test passed: statuses {:?}",
+        "  [test_api_server] routing/auth/JSON self-test passed: statuses {:?}",
         st_got
     );
 

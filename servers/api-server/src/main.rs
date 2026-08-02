@@ -1,22 +1,36 @@
-//! # api-server — ThemeliOS Docker Engine API (Phase 6.5b, read + write)
+//! # api-server — ThemeliOS Docker Engine API (Phase 6.6, read + write + auth)
 //!
 //! The node's ring-3 control plane. It holds a spawn-granted `Management`
 //! capability, opens an inbound-TCP listener through the management ABI
 //! (`SYS_MGMT`/listen), and serves a subset of the Docker Engine API:
-//! **accept → HTTP parse (6.0) → route → management ABI (6.3) → JSON → reply.**
+//! **accept → HTTP parse (6.0) → authenticate (6.6) → route → management ABI (6.3)
+//! → JSON → reply.**
 //!
-//! Phase 6.5 landed the **read (GET) pipeline**; 6.5b adds the **write verbs**
+//! Phase 6.5 landed the **read (GET) pipeline**; 6.5b added the **write verbs**
 //! (`POST /containers/create`, `.../start`, `.../stop`, `GET .../logs`) and the
 //! untrusted request-body JSON parsing that `create` needs.
+//!
+//! ## Bearer-token authentication (Phase 6.6)
+//!
+//! The kernel authority is a single coarse `Management` cap; per-request policy is
+//! **app-level** and lives here. Every route except the `GET /_ping` /
+//! `GET /version` health probes requires an `Authorization: Bearer <token>` header
+//! matching the token the kernel provisioned via boot-info. A missing or wrong token
+//! is turned away with **401** *before* any management op runs — including on unknown
+//! paths, so an unauthenticated client cannot even enumerate routes. Rejections are
+//! recorded on the audited ABI (`SYS_MGMT` `AUDIT_DENY`), so a failed auth attempt is
+//! as visible as a successful op. The token rides in plaintext over an unencrypted
+//! port — this is a pre-TLS app-layer gate, not transport security (TLS is deferred).
 //!
 //! ## Deterministic self-test
 //!
 //! The inbound-TCP path is timing-sensitive under a shared single core, so the
-//! *content* of the routing + JSON-parsing logic is proven by an in-process
+//! *content* of the routing + auth + JSON-parsing logic is proven by an in-process
 //! self-test (no network): with the [`SELF_TEST_FLAG`] bit set in `arg1`, the
-//! server runs a fixed set of requests through [`route`], records each HTTP status
-//! to the result page, and exits — the kernel asserts those statuses directly. The
-//! live inbound path keeps a separate, count-based smoke (a single `GET /_ping`).
+//! server runs a fixed set of requests through [`route`] (unauthenticated, wrong-
+//! token, and correctly-authenticated), records each HTTP status to the result page,
+//! and exits — the kernel asserts those statuses directly. The live inbound path
+//! keeps a separate, count-based smoke that proves the header round-trips over TCP.
 //!
 //! ## Fault-freedom is mandatory
 //!
@@ -86,6 +100,11 @@ const SELF_TEST_FLAG: u64 = 1 << 63;
 /// `InvalidState` → HTTP 409 (a status the catch-all 404 can never produce). Keep in
 /// sync with `SELFTEST_ID` in `test_api_server`.
 const SELF_TEST_CONTAINER: &str = "selftest-run";
+
+/// Routes exempt from bearer-token auth (Phase 6.6): the health and version probes.
+/// Exact `(method, path)` matches — never a prefix — so nothing under `/containers`
+/// can be reached unauthenticated by path confusion.
+const AUTH_EXEMPT: &[(&str, &str)] = &[("GET", "/_ping"), ("GET", "/version")];
 
 fn is_err(r: u64) -> bool {
     r & ERR_FLAG != 0
@@ -247,15 +266,34 @@ fn read_request(conn: u64) -> Option<Vec<u8>> {
 }
 
 /// Route a fully-buffered request to `(status, framed response)`. GET read pipeline
-/// (6.5) + POST write verbs (6.5b).
+/// (6.5) + POST write verbs (6.5b), gated by bearer-token auth (6.6).
 fn route(request: &[u8]) -> (u16, Vec<u8>) {
     let req = match http::parse_request(request) {
         Some(r) => r,
         None => return resp(400, "Bad Request", "text/plain", b"bad request"),
     };
-    let cap = boot_info().mgmt_cap_handle;
+    let info = boot_info();
+    let cap = info.mgmt_cap_handle;
     let method = req.method.as_str();
     let path = req.path.as_str();
+
+    // Authenticate every non-exempt route — including unknown paths, which reach here
+    // and would otherwise 404 — *before* any management op. A missing/wrong token is
+    // 401 (RFC 9110: a correct token would work, so it is "unauthorized", never 403),
+    // and the rejection is recorded on the audited ABI.
+    if !AUTH_EXEMPT.iter().any(|&(m, p)| m == method && p == path) {
+        let token_len = (info.api_token_len as usize).min(info.api_token.len());
+        let token = &info.api_token[..token_len];
+        if !authenticate(&req, token) {
+            let _ = syscall::mgmt_audit_deny(cap); // best-effort audit
+            return resp(
+                401,
+                "Unauthorized",
+                "application/json",
+                br#"{"message":"unauthorized: valid bearer token required"}"#,
+            );
+        }
+    }
 
     match (method, path) {
         ("GET", "/_ping") => resp(200, "OK", "text/plain", b"OK"),
@@ -280,6 +318,31 @@ fn route(request: &[u8]) -> (u16, Vec<u8>) {
             _ => resp(404, "Not Found", "text/plain", b"not found"),
         },
     }
+}
+
+/// Whether `req` carries an `Authorization: Bearer <token>` header matching the
+/// provisioned `token`. Absent header, non-`Bearer` scheme, or mismatch → `false`
+/// (the caller maps that to 401).
+fn authenticate(req: &http::Request, token: &[u8]) -> bool {
+    match req.header("Authorization") {
+        Some(v) => bearer_matches(v, token),
+        None => false,
+    }
+}
+
+/// Match an `Authorization` header value against `token`. The scheme (`Bearer`) is
+/// case-insensitive per RFC 7235; the token itself is compared exactly. A plain byte
+/// compare (not constant-time): the token travels in cleartext over an unencrypted
+/// port, so a timing oracle would reveal nothing the transport doesn't already.
+fn bearer_matches(header: &str, token: &[u8]) -> bool {
+    let bytes = header.as_bytes();
+    const PREFIX: &[u8] = b"bearer ";
+    if bytes.len() < PREFIX.len() || !bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        return false;
+    }
+    // Trim surrounding ASCII whitespace from the presented token (defensive; the
+    // header parser already trims the value), then compare exactly.
+    bytes[PREFIX.len()..].trim_ascii() == token
 }
 
 /// `(status, build_response(...))` — the common route return shape.
@@ -405,34 +468,65 @@ fn send_all(conn: u64, data: &[u8]) {
 ///
 /// Each request is chosen so its status is **impossible for the catch-all 404** — so
 /// observing it proves the specific arm ran, not that the request merely fell
-/// through. This exercises the real routing, the untrusted request-body JSON parse,
-/// `Image` extraction, and the write verbs without depending on the timing-sensitive
-/// inbound-TCP path:
-///   - `GET /_ping` → **200** (GET routing).
-///   - `POST /containers/create {}` → **400** (create arm; empty `Image` rejected).
-///   - `POST /containers/create {"Image":"demo"}` → **500** (`Image` extracted →
-///     `SYS_MGMT` create → `CreateFailed` with no `/data` mount in the harness).
-///   - `POST /containers/<id>/start` → **409** (`container_action` + start verb; the
-///     injected container is `Running`, so the state guard returns `InvalidState`).
+/// through. Together they exercise the real routing, bearer-token auth, the untrusted
+/// request-body JSON parse, `Image` extraction, and the write verbs without depending
+/// on the timing-sensitive inbound-TCP path. Statuses `[200, 401, 401, 200, 400, 500,
+/// 409]`:
+///   - `GET /_ping` (no token) → **200** (auth-exempt health probe).
+///   - `GET /containers/json` **no** Authorization → **401** (auth enforced).
+///   - `GET /containers/json` **wrong** token → **401** (a bad token is still 401,
+///     never 403 — a correct token *would* work).
+///   - `GET /containers/json` **correct** token → **200** (auth passes; the 401/200
+///     contrast on the same route proves the header is the only variable).
+///   - `POST /containers/create {}` (authed) → **400** (create arm; empty `Image`).
+///   - `POST /containers/create {"Image":"demo"}` (authed) → **500** (`Image`
+///     extracted → `SYS_MGMT` create → `CreateFailed`, no `/data` mount here).
+///   - `POST /containers/<id>/start` (authed) → **409** (`container_action` + start
+///     verb; the injected container is `Running`, so the state guard trips).
 fn run_self_test(result: *mut u64) {
-    // Three static requests; the fourth (start) is built from SELF_TEST_CONTAINER so
-    // the id stays in sync with the container the kernel test injects.
-    let mut start_req: Vec<u8> = Vec::new();
-    start_req.extend_from_slice(b"POST /containers/");
-    start_req.extend_from_slice(SELF_TEST_CONTAINER.as_bytes());
-    start_req.extend_from_slice(b"/start HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
-    let requests: [&[u8]; 4] = [
-        b"GET /_ping HTTP/1.1\r\nHost: t\r\n\r\n",
-        b"POST /containers/create HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}",
-        b"POST /containers/create HTTP/1.1\r\nHost: t\r\nContent-Length: 16\r\n\r\n{\"Image\":\"demo\"}",
-        &start_req,
+    // The provisioned bearer token (from boot-info) is the single source of truth for
+    // the authed requests — no hardcoded copy to drift.
+    let info = boot_info();
+    let tlen = (info.api_token_len as usize).min(info.api_token.len());
+    let token = &info.api_token[..tlen];
+
+    // Assemble an HTTP/1.1 request: start line + optional bearer + Content-Length/body.
+    let build = |start: &[u8], auth: Option<&[u8]>, clen: &[u8], body: &[u8]| -> Vec<u8> {
+        let mut r = Vec::new();
+        r.extend_from_slice(start);
+        r.extend_from_slice(b" HTTP/1.1\r\nHost: t\r\n");
+        if let Some(tok) = auth {
+            r.extend_from_slice(b"Authorization: Bearer ");
+            r.extend_from_slice(tok);
+            r.extend_from_slice(b"\r\n");
+        }
+        r.extend_from_slice(b"Content-Length: ");
+        r.extend_from_slice(clen);
+        r.extend_from_slice(b"\r\n\r\n");
+        r.extend_from_slice(body);
+        r
+    };
+    // The `start` route id stays in sync with the injected container via the const.
+    let mut start_line: Vec<u8> = Vec::new();
+    start_line.extend_from_slice(b"POST /containers/");
+    start_line.extend_from_slice(SELF_TEST_CONTAINER.as_bytes());
+    start_line.extend_from_slice(b"/start");
+
+    let requests: [Vec<u8>; 7] = [
+        build(b"GET /_ping", None, b"0", b""),
+        build(b"GET /containers/json", None, b"0", b""),
+        build(b"GET /containers/json", Some(b"wrong-token".as_slice()), b"0", b""),
+        build(b"GET /containers/json", Some(token), b"0", b""),
+        build(b"POST /containers/create", Some(token), b"2", b"{}"),
+        build(b"POST /containers/create", Some(token), b"16", b"{\"Image\":\"demo\"}"),
+        build(start_line.as_slice(), Some(token), b"0", b""),
     ];
 
     let mut count: u64 = 0;
     for (i, req) in requests.iter().enumerate() {
         let (status, _response) = route(req);
         if !result.is_null() && (i as u64) < MAX_RECORDED {
-            // SAFETY: kernel-mapped shared page (checked non-null); i < 4 ≤
+            // SAFETY: kernel-mapped shared page (checked non-null); i < 7 ≤
             // MAX_RECORDED, so the slot is in-bounds within the 4 KiB frame.
             unsafe {
                 core::ptr::write_volatile(result.add(STATUS_ARRAY_OFF + i), status as u64);

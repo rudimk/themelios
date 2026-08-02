@@ -447,23 +447,58 @@ exposed on a real NIC until 6.6 lands auth. `POST create` also needs a `/data` m
       `GET /_ping` smoke. Passes locally (34 tests green before the sandbox's
       live-network wall); CI runs the full suite.
 
-### 6.6 — Auth + live curl/`docker` integration
+### 6.6 — Bearer-token auth — Momus-reviewed
 
-**Goal**: The app-layer token policy and a real client over the wire.
+**Goal**: App-layer bearer-token authentication enforced inside the api-server.
 
-**What to build**:
-- Bearer-token auth **inside the api-server** (token via `ServerBootInfo`) mapping a
-  request to an allowed-operation set; unauth/wrong → `401`/`403`, audited via the
-  ABI. (Kernel side is just the one `Management` cap; ops-policy is app-level — H1.)
-- A `hostfwd` integration test (the `spawn_tcp_test_peer` pattern): host issues real
-  HTTP via `curl` → asserts `containers/json` + a create+start+logs sequence;
-  **stretch:** the real `docker -H tcp://…` CLI.
+**What was built**:
+- **Token provisioning via boot-info** — `ServerBootInfo`/`BootInfo` gain
+  `api_token: [u8;32]` + `api_token_len: u64` (size assert 104 → 144, plus `offset_of!`
+  asserts pinning the two heterogeneous trailing fields so a cross-struct reorder can't
+  silently corrupt the token — Momus). `spawn_server` fills the token from a kernel
+  `API_TOKEN` const **only for `grant_management` servers** (the api-server), so only
+  the control plane holds the node secret. No `ServerConfig` churn (boot-info has one
+  constructor). Provenance (fixed vs random-per-boot) is scoped out.
+- **Enforcement (api-server)** — every route except the `GET /_ping` / `GET /version`
+  health probes requires `Authorization: Bearer <token>` matching the provisioned
+  bytes. Missing/wrong → **401** *before* any management op, **including unknown paths**
+  (so an unauthenticated client can't enumerate routes). **Wrong token is 401, not 403**
+  (RFC 9110: a correct token would work → "unauthorized", never "forbidden"; 403 is
+  reserved for an authenticated-but-unauthorized principal, which doesn't exist with one
+  all-or-nothing token — Momus must-fix). Scheme is case-insensitive; plain byte compare
+  (a constant-time compare guards nothing while the token is plaintext over an
+  unencrypted port — Momus).
+- **Audit** — success already audits kernel-side (`ApiAccess` on the op). Failures go
+  through a new `SYS_MGMT` `AUDIT_DENY=9` verb → a **distinct `AuditOp::ApiAuthReject`**
+  (not `ApiAccess` with a magic detail — Momus), cap-checked like every verb.
+- **Test** — the deterministic self-test (phase 2) gains auth arms, asserting
+  `[200, 401, 401, 200, 400, 500, 409]`: `GET /_ping`=200 (exempt); `GET /containers/json`
+  no-token=401, wrong-token=401, correct-token=200 (the 401/200 contrast on the *same*
+  route proves auth is the only variable and a valid token passes); then the authed
+  write-verb cases. The authed requests are built from `boot_info().api_token` (one fewer
+  sync point — Momus). The live smoke (phase 3) is now an authed `GET /containers/json`
+  over `hostfwd` — a **transport** check that the header round-trips.
+
+**Security note**: bearer auth over plaintext HTTP is an app-layer gate, **not**
+transport security. It gates who can drive the API but does nothing against a wire
+sniffer; that waits on TLS (deferred phase-wide). Token is a fixed dev secret kept in
+sync between the kernel `API_TOKEN` const and the xtask test peer.
 
 **Acceptance**:
-- [ ] Wrong/absent token → `401`/`403`; correct → success; both audited.
-- [ ] Host `curl http://127.0.0.1:<fwd>/containers/json` returns valid Engine API
-      JSON; create+start+logs works end to end.
-- [ ] (Stretch) the real `docker` CLI lists/runs/logs against the node.
+- [x] Absent token → 401, wrong token → 401, correct token → 200 — proven by the
+      deterministic self-test (each ≠ the catch-all 404); success audited via
+      `ApiAccess`, failure via `ApiAuthReject`.
+- [x] One authenticated `GET /containers/json` round-trips over `hostfwd` (transport
+      check that the `Authorization` header survives the wire).
+- [ ] **Deferred** (renegotiated from the original "create+start+logs end to end" +
+      "live curl/`docker` CLI" — Momus must-fix, recorded not dropped): a live,
+      multi-request `curl`/`docker` mutation sequence. **Blocked on** (a) the net-server
+      stale-RX-across-connections bug (multi-connection wire sequences are flaky —
+      documented in 6.5b) and (b) `POST create` needing a `/data` mount + real image not
+      configured at boot (standing one up blew the 90s CI budget in 6.3). The mutation
+      **success** path remains covered in-kernel by `test_container_registry` /
+      `test_container_run`; 6.6 delivers the auth layer specifically. Unblock is a
+      net-server RX-recycling fix + `/data`-at-boot (a later net/boot sub-phase).
 
 ### 6.7 — Finalize: docs + trackers + hardening pass
 
