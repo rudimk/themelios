@@ -1,143 +1,199 @@
-# Phase 7 — aarch64 port (plan)
+# Phase 7 — aarch64 port (plan, Momus-reviewed)
 
-**Roadmap goal**: aarch64 port — **boot, memory, scheduler, shell**. Bring the kernel
-up on ARM64 (QEMU `virt`) to an interactive in-kernel serial shell with preemptive
-multitasking, and run the portable test suite on aarch64 in CI. Ring-3/EL0 userspace,
-storage, and networking on ARM are **explicitly out of Phase 7 scope** (see Deferred).
+**Deliverable (renamed for honesty — Momus):** a **ring-0 kernel-core port to aarch64
+with a reduced in-kernel serial shell**. Bring the kernel up on QEMU `virt` (ARM64) to
+an interactive in-kernel shell with preemptive multitasking, and run the portable,
+alloc-only test suite on aarch64 in CI. This is **not** "Docker on ARM": ring-3/EL0
+userspace, storage, networking, and containers on aarch64 are a separate, deferred ABI
+surface. The milestone label must not imply userspace/containers.
 
-## Grounding (from the porting-surface map)
+## Grounding (from the porting-surface map + Momus verification)
 
-- **No x86-only third-party crates.** The kernel takes `limine`, `spin`,
-  `linked_list_allocator`, `miniz_oxide` — all arch-neutral. Every hardware primitive
-  (UART, PIC, PIT, GDT/IDT, MSRs, PTE format, `PhysAddr`/`VirtAddr`) is hand-rolled
-  in-tree. **The port is writing aarch64 implementations, not replacing dependencies.**
-- **Two ABI surfaces, sequenced.** Booting the *kernel* on aarch64 is independent of
-  running *ring-3 servers*: `servers/libthemelios` wraps the syscall ABI in ~30 inline
-  `syscall` blocks and every server binary is x86. The in-kernel shell needs neither,
-  so Phase 7 reaches "boot → shell" without touching the userspace ABI.
-- **Facade win.** ~35 of 66 `arch::x86_64::*` sites are CLASS B (interrupt
-  enable/disable/halt + monotonic tick) — pure critical-section/counter primitives that
-  collapse behind a thin `arch::{irq,time}` facade with the x86 impls **unchanged**.
-  The rest are CLASS A (page tables, context switch, syscall entry, interrupt
-  controller, timer, UART, exception vectors, per-CPU) — they need a *second
-  implementation*, and the seam just makes `main.rs`/`sched` call `arch::foo::init()`
-  unconditionally instead of the current `#[cfg]` ladder.
-- **Already portable as-is**: frame allocator, heap, capability system, IPC *logic*,
-  audit ring, VFS, containers/OCI, HTTP/JSON, and the `smoltcp` stack (already
-  CI-proven for `aarch64-unknown-none`). `mm::PAGE_SIZE = 4096` matches the 4 KiB
-  granule; `PhysAddr`/`VirtAddr` are hand-rolled but their canonical-address math
-  assumes x86 sign-extension and must be re-audited for the aarch64 TTBR0/1 split.
+- **No x86-only third-party crates.** `limine`, `spin`, `linked_list_allocator`,
+  `miniz_oxide` are all arch-neutral; every HW primitive (UART, PIC, PIT, GDT/IDT,
+  MSRs, PTE format, `PhysAddr`/`VirtAddr`) is hand-rolled in-tree. **The port is
+  writing aarch64 implementations, not replacing dependencies.**
+- **Two ABI surfaces, sequenced.** The *kernel* boot is independent of *ring-3
+  servers*: `libthemelios` wraps the syscall ABI in ~30 inline `syscall` blocks and
+  every server binary is x86. The in-kernel shell is a **ring-0 `sched::spawn` task**
+  (`shell/mod.rs:41`, confirmed) draining the serial-RX ring buffer — it needs no EL0.
+- **Limine hands off "warm," not bare-metal (Momus MUST-FIX 4).** limine 0.5 supports
+  aarch64 (`lib.rs:126-129`). The kernel is entered at **EL1 with the MMU already
+  enabled, caches on, stack set, BSS zeroed** — the exact analog of the x86 handoff
+  where `kmain` prints its banner on Limine's tables *before* `mm::page_table::init()`
+  (`main.rs:230-386`). We do **not** reset `SCTLR_EL1`/stack/BSS in early boot; we
+  inherit Limine's state and only *verify* it.
+- **The kernel does not compile for aarch64 today, and the seam is bigger than
+  "main.rs + CLASS-B" (Momus MUST-FIX 1).** `arch/mod.rs:26-31` declares `pub mod
+  x86_64` only under `cfg(target_arch="x86_64")`, so `crate::arch::x86_64` **does not
+  exist** on aarch64 — yet these unconditionally-compiled modules reference it at
+  module scope with no cfg gate:
+  - *Tick reads (facade-able):* `net/net_service.rs:46`, `container/registry.rs:25`,
+    `audit/mod.rs:226`, `shell/commands.rs:1038` → `arch::x86_64::idt::tick_count()`.
+  - *Ring-3/Linux (must be cfg-partitioned out of aarch64):* `linux/fs.rs:13`,
+    `linux/thread.rs:24,184,204`, `linux/syscall.rs:24,113,140,320,343` —
+    `copy_from_user`/`SyscallFrame`/`swapgs`/`sti`.
+- **kmain's boot tail stays cfg-gated (Momus MUST-FIX 2).** `main.rs:486-527` calls
+  `shell::init()`, `process::init::start()` (which **drops to ring 3** —
+  `process/init.rs:73`), `fs::boot_storage()`, `net::boot_net()`, and the api-server
+  spawn — none arch-gated today. On aarch64 the boot ladder must *stay* `#[cfg]`'d for
+  every deferred subsystem; "convert the cfg ladder to unconditional facade calls"
+  applies only to the arch-core primitives (serial/idt/gdt/cpu/pic/pit/syscall init),
+  not the deferred subsystems.
 
-## Cross-cutting invariant (non-negotiable)
+## Cross-cutting invariants (non-negotiable)
 
-**Every sub-phase PR keeps amd64 fully green.** The facade re-exports the x86 impls
-unchanged; all aarch64 code is additive behind `cfg(target_arch = "aarch64")`. The
-amd64 QEMU suite remains the regression gate throughout; a port must never regress the
-working architecture. Each sub-phase is a fresh branch + PR off latest `main`,
-Momus-reviewed, CI-green before merge — the established workflow.
+1. **amd64 stays fully green** every sub-phase. The facade re-exports x86 impls
+   unchanged; aarch64 code is additive behind `cfg(target_arch="aarch64")`. The amd64
+   QEMU suite is the regression gate.
+2. **aarch64 compile gate per PR from 7.0b on (Momus SHOULD-FIX 5).** Extend the CI
+   `arm64-gate` job (`build.yml:52`) to `cargo build --target aarch64-unknown-none`
+   the kernel — "amd64 green" is insufficient once the seam touches shared files.
+3. Each sub-phase is a fresh branch + PR off latest `main`, Momus-reviewed, CI-green
+   before merge.
 
-## Key up-front decisions (pin these; Momus to challenge)
+## Pinned decisions (Momus-adjusted)
 
 1. **Arch seam = module facade, not a trait object.** `arch::{irq,time,cpu,paging,
-   context,serial,intc,timer,syscall,exceptions}` are plain modules that
-   `pub use` the active arch's impl. No `dyn`, no vtables in the kernel hot path —
-   monomorphized, zero-cost, matches the existing `cfg`-module style.
-2. **GIC version = GICv2**, pinned via QEMU `-machine virt,gic-version=2`. GICv2 is the
-   simpler bring-up (MMIO distributor + CPU interface; no per-CPU redistributor, no
-   `ICC_*_EL1` sysreg interface). Real cloud ARM (Graviton) is GICv3 — noted as a
-   follow-up when Phase 8 hyperscaler work needs it, not a Phase 7 blocker.
-3. **Timer = physical generic timer** (`CNTP_TVAL_EL0`/`CNTP_CTL_EL0`, GIC **PPI 30**).
-   Limine hands off in EL1 where CNTP is accessible; no EL2 trap handling needed.
-4. **QEMU exit = ARM semihosting** (`-semihosting`, `SYS_EXIT` via `HLT #0xF000`) to
-   preserve the CI pass/fail **exit-code** contract that `isa-debug-exit` gives on
-   x86 (`virt` has no `isa-debug-exit`). This replaces `cpu::exit_qemu`'s port write.
-5. **Firmware = UEFI (AAVMF/edk2-aarch64).** `virt` has no BIOS; boot is UEFI-only via
-   `-bios AAVMF_CODE.fd` (apt `qemu-efi-aarch64`). The ISO carries `BOOTAA64.EFI`, not
-   the BIOS El-Torito bits.
-6. **Scheduler proven with kernel tasks.** Context-switch/preemption is exercised with
-   in-kernel tasks (ring-0), independent of EL0/ring-3 — so 7.3 needs no userspace ABI.
+   context,serial,intc,timer,syscall,exceptions}` `pub use` the active arch's impl.
+   Monomorphized, zero-cost, matches the existing `cfg`-module style. *(Confirmed
+   correct — Momus.)*
+2. **GICv2**, via `-machine virt,gic-version=2`. Simpler bring-up (MMIO GICD+GICC; no
+   redistributors, no `ICC_*_EL1`/`ICC_SRE_EL1` sysreg interface). GICv3 is **real
+   Phase-8 work** for Graviton, not a drop-in. *(Confirmed correct — Momus.)*
+3. **Timer = virtual generic timer `CNTV`** (`CNTV_TVAL_EL0`/`CNTV_CTL_EL0`, GIC
+   **PPI 27**) — the trap-free guest choice (Momus SHOULD-FIX 2). `CNTP` (PPI 30) can
+   trap via `CNTHCTL_EL2.EL1PCEN` when EL2 is present (Graviton). The 7.spike confirms
+   whichever we pick actually fires at EL1 before we commit.
+4. **CI pass/fail = serial-sentinel parsing (Momus MUST-FIX 3), arch-uniform.**
+   Semihosting `SYS_EXIT` returns host exit **0/1**, never the **3** that
+   `xtask:1118-1130` hardcodes for isa-debug-exit "pass" — so semihosting does *not*
+   preserve the contract. The test harness prints a unique end sentinel to serial;
+   `cmd_test` greps for pass/fail in captured serial (works identically on both
+   arches). Machine stop via PSCI `SYSTEM_OFF` (QEMU `virt` implements PSCI) or
+   semihosting `SYS_EXIT` — used only to halt, not to signal pass/fail. (Optionally
+   migrate x86 to the same sentinel scheme so the harness is one path.)
+5. **Firmware = UEFI (AAVMF/edk2-aarch64) via the `pflash` CODE+VARS pair**, not
+   `-bios CODE.fd` alone (more reliable across edk2 versions — Momus CONSIDER). The
+   firmware path is discovered at runtime (like `find_mkfs_ext2`, `xtask:515`), not
+   hardcoded. `virt` is UEFI-only (no BIOS); the ISO carries `BOOTAA64.EFI`.
+6. **FP/SIMD trap must be enabled in early boot (Momus MUST-FIX 5).**
+   `aarch64-unknown-none` is **hardfloat** (fp+neon on), unlike soft-float
+   `x86_64-unknown-none` — the compiler can lower `memcpy`/`memset`/struct-moves/
+   formatting to SIMD, and any FP/SIMD access at EL1 **traps** unless
+   `CPACR_EL1.FPEN = 0b11`, which Limine does not guarantee. Set `CPACR_EL1.FPEN`
+   before any non-trivial Rust runs, **or** build the kernel with `+soft-float`/`-neon`.
+   Decide in the 7.spike (measure which the codegen actually needs).
+7. **Scheduler proven with kernel (ring-0) tasks**, independent of EL0. *(Confirmed —
+   Momus: shell + scheduler are ring-0.)*
 
 ## Sub-phases
 
-### 7.0 — Arch seam + boot-to-UART
-Split for reviewability:
-- **7.0a — Seam refactor (amd64-only, pure refactor, no behavior change).** Introduce
-  the `arch::{irq,time,cpu,serial,paging,context,intc,timer,syscall,exceptions}`
-  facade; re-export the x86 impls unchanged; convert `main.rs`'s ~15 `#[cfg]` call
-  sites + the CLASS-B interrupt/tick sites (`ipc`, `sched`, `sync.rs`,
-  `audit`/`registry`/`shell`/`linux` tick reads) to unconditional facade calls. Big
-  but mechanical diff; **amd64 suite must stay green** (this is the whole acceptance).
+### 7.spike — throwaway boot+GIC+timer spike (retire the top unknowns FIRST)
+Momus SHOULD-FIX 1: the two highest-uncertainty items (Limine-UEFI-on-ARM handoff,
+GIC/timer) are otherwise scheduled behind a large merged refactor — a dead-end there
+strands merged work. On a **throwaway branch** (not merged): minimal aarch64 entry that
+(a) prints a banner over PL011, (b) dumps `CurrentEL`/`SCTLR_EL1`/`TCR_EL1`/`TTBR*_EL1`
+to *verify* the Limine warm-handoff assumptions, (c) confirms FP-trap behavior (does a
+struct-move fault?), and (d) takes one GICv2 + `CNTV` timer IRQ. **Exit criteria:** all
+four observed working, decisions 3 & 6 confirmed. Only then invest in 7.0a. Findings
+fold back into this plan; the spike code is discarded.
+
+### 7.0 — Arch seam + boot-to-UART (split — Momus)
+- **7.0a-i — `irq`/`time` facade (amd64-only, mechanical).** Add `arch::irq::{disable,
+  enable,are_enabled,halt}` + `arch::time::tick_count()`; re-export x86 impls unchanged;
+  route the CLASS-B interrupt sites (`ipc`, `sched`, `sync.rs` `InterruptMutex`) and
+  **all** tick reads (`audit`, `shell`, `net/net_service`, `container/registry`,
+  `linux` — the portable ones) through the facade. **Must not disturb the three known
+  GS/per-CPU race fixes** (CLAUDE.md): `sync.rs:154-166` and the sched critical sections
+  keep identical ordering. amd64 suite green = the whole acceptance.
+- **7.0a-ii — cfg-partition the ring-3/Linux subtree (amd64-only).** `#[cfg]`-gate the
+  EL0-dependent module tree out of the aarch64 build: `linux/*` (`SyscallFrame`,
+  `copy_*_user`, `swapgs`), ring-3 `process::init::start`, and the deferred
+  boot-tail calls in `kmain` (`main.rs:486-527`). amd64 unchanged; goal is that a
+  hypothetical aarch64 build has no dangling `arch::x86_64` refs outside `arch/`.
 - **7.0b — aarch64 boot-to-UART.** `kernel/linker-aarch64.ld`, `.cargo/config.toml`
-  `[target.aarch64-unknown-none]`, xtask UEFI-ISO + `qemu-system-aarch64 -M virt
-  -cpu cortex-a72 -bios AAVMF` path (replace the `run --arch aarch64` stub), EL1 setup
-  (`SCTLR_EL1`, stack, BSS zero), PL011 UART driver, arch-neutral boot banner.
-  **Acceptance**: `cargo xtask run --arch aarch64` prints the banner over PL011.
-  **Riskiest unknown**: Limine UEFI-on-ARM handoff + AAVMF wiring + higher-half linker
-  layout / `.requests` sections.
+  `[target.aarch64-unknown-none]`, xtask UEFI-ISO (`BOOTAA64.EFI`) + `qemu-system-aarch64
+  -M virt,gic-version=2 -cpu cortex-a72 -pflash AAVMF_CODE/VARS` path (replace the
+  `run --arch aarch64` stub at `main.rs:971`). Early aarch64 entry: **verify** EL1 via
+  `CurrentEL` (don't reset `SCTLR`/stack/BSS — inherit Limine), enable `CPACR_EL1.FPEN`,
+  PL011 driver, arch-neutral banner printed **on Limine's tables**. **Acceptance:**
+  `cargo xtask run --arch aarch64` prints the banner; kernel `cargo build
+  --target aarch64-unknown-none` is added to CI. **Riskiest unknown (pre-retired by
+  7.spike):** Limine UEFI handoff + AAVMF wiring + higher-half linker layout /
+  `.requests` sections.
 
 ### 7.1 — MMU / paging
 ARM descriptor `PageFlags` (valid/table/AP/AttrIndx/AF/UXN/PXN), `TCR_EL1`
-(T0SZ/T1SZ=16, 4 KiB TG0/TG1), `MAIR_EL1` attributes, 4-level walk reusing the
-HHDM-based `AddressSpace`, `write_cr3` → `TTBR0_EL1` + `TLBI VMALLE1IS`/`DSB`/`ISB`.
-Re-audit `mm/addr.rs` canonical math for the TTBR0/1 split (aarch64 top-VA is all-ones,
-not sign-extended).
-**Acceptance**: paging enabled, kernel runs on its own tables, a map/unmap/translate
-self-test passes on aarch64; **amd64 unchanged**.
-**Riskiest unknown**: MAIR/AttrIndx cacheability (wrong attrs = silent corruption or
-DMA-only faults later).
+(T0SZ/T1SZ=16, 4 KiB TG0/TG1), `MAIR_EL1`, 4-level walk reusing the HHDM-based
+`AddressSpace`, `write_cr3` → `TTBR0_EL1` write. **Barrier discipline as the map/unmap
+contract (Momus SHOULD-FIX 3):** `DSB ISHST` before `TLBI`, `TLBI VMALLE1IS`, then
+`DSB ISH` + `ISB` after — at every map/unmap, not just the TTBR load. **`mm/addr.rs`
+needs NO Phase-7 change (Momus correction):** its index extraction (bits 39/30/21/12)
+and HHDM `to_virt`/`to_phys` are arch-neutral for 48-bit/4-level/4KiB; the only
+x86-canonical assumptions (`USER_ADDR_LIMIT`, the `sysret` non-canonical-RCX check) are
+in the **deferred ring-3 path** (`syscall.rs:466-486,723`) — audit those when EL0 is
+picked up, not now.
+**Acceptance**: paging on our own tables; map/unmap/translate self-test passes on
+aarch64; amd64 unchanged.
+**Riskiest unknown**: `MAIR`/`AttrIndx` cacheability (wrong attrs = silent corruption
+or DMA-only faults later).
 
-### 7.2 — Exceptions + GIC + timer
-`VBAR_EL1` 16-entry vector table; sync handler decodes `ESR_EL1.EC` (SVC vs data/
-instruction abort vs `BRK`); GICv2 distributor + CPU-interface init; physical generic
-timer → `arch::time` tick + preemptive `schedule()`. `brk #0` self-test (the `int3`
-analog).
-**Acceptance**: a timer IRQ fires at a fixed rate and increments the tick; a
-synchronous exception (`brk`) is caught and handled; **amd64 unchanged**.
-**Riskiest unknown** (highest in the port): GIC EOI mode + PPI routing; getting
-distributor/CPU-interface enable + priority-mask right.
+### 7.2 — Exceptions + GIC + timer (tick only)
+`VBAR_EL1` 16-entry vector table; sync handler decodes `ESR_EL1.EC` (SVC / data+instr
+abort / `BRK`); GICv2 GICD+GICC init; `CNTV` timer → `arch::time` tick. **Tick only —
+`schedule()` is wired into the timer handler in 7.3 (Momus CONSIDER: matches the x86
+`idt.rs:442` split).** `brk #0` self-test (the `int3` analog).
+**Acceptance**: timer IRQ fires at a fixed rate and increments the tick; a `brk`
+synchronous exception is caught; amd64 unchanged.
+**Riskiest unknown (highest in the port, pre-spiked in 7.spike)**: GICv2 EOI discipline
++ PPI routing + distributor/CPU-interface enable + priority mask.
 
 ### 7.3 — Scheduler context switch
 aarch64 `switch_context` (save/restore x19–x30 + SP) and `task_bootstrap`
 (`msr daifclr`; `blr`); `TPIDR_EL1` as the PerCpu pointer written **on every switch**
-(the `gs`-base analog). Explicitly replay the three known GS/per-CPU race classes
-(CLAUDE.md) in `TPIDR` form: per-switch `TPIDR_EL1` write, atomic exception-return
-tail.
-**Acceptance**: ≥2 in-kernel tasks preempt and round-robin on aarch64 under the timer;
-a soak run is clean; **amd64 unchanged**.
-**Riskiest unknown**: per-CPU/`TPIDR` races (the exact bug class that bit x86 in 4.5).
+(the `gs`-base analog); wire `schedule()` into the 7.2 timer handler. Explicitly replay
+the three known GS/per-CPU race classes (CLAUDE.md) in `TPIDR` form: per-switch
+`TPIDR_EL1` write, atomic exception-return tail.
+**Acceptance**: ≥2 in-kernel tasks preempt and round-robin under the timer; a soak run
+is clean; amd64 unchanged.
+**Riskiest unknown**: per-CPU/`TPIDR` races (the exact class that bit x86 in 4.5).
 
 ### 7.4 — Shell + tests + CI + finalize
-PL011 RX-interrupt-driven in-kernel serial shell (the roadmap's "shell"); semihosting
-`exit_qemu`; un-gate the portable `test_runner` tests for aarch64 + add aarch64-specific
-smoke tests (paging, timer, context switch); add a `cargo xtask test --arch aarch64` CI
-job (runner installs `qemu-system-arm` + `qemu-efi-aarch64`); mdbook aarch64 chapter;
-reconcile the three trackers to Phase 7 = Complete (core; ring-3/storage/net deferred).
-**Acceptance**: `cargo xtask run --arch aarch64` gives an interactive shell; aarch64
-CI job green; amd64 suite still green; mdbook builds.
-**Riskiest unknown**: the QEMU `virt` exit-code contract (semihosting) for `cmd_test`.
+PL011 RX-IRQ-driven in-kernel serial shell — **reduced command set on aarch64 (Momus
+CONSIDER):** the ~18/30 commands that depend on deferred fs/net/container (`ls`/`cat`/
+`ping`/`run`/`ps`/`stop`/`mount`/`ifconfig`/`sockets`/…) are `#[cfg]`'d out; aarch64
+ships the arch/mem/sched/help commands. Serial-sentinel `cmd_test` exit contract
+(decision 4); **un-gate the genuinely portable, alloc-only tests for aarch64 (Momus
+SHOULD-FIX 4):** frame allocator, heap, capability system, IPC *logic*, VFS logic,
+http/json parsers — so aarch64 CI proves real assertions, not just "it boots." Add
+aarch64-specific smokes (paging, timer, context switch). aarch64 `cargo xtask test` CI
+job (runner installs `qemu-system-arm` + `qemu-efi-aarch64`). mdbook aarch64 chapter;
+reconcile the three trackers to Phase 7 = Complete (ring-0 core; ring-3/storage/net
+deferred).
+**Acceptance**: `cargo xtask run --arch aarch64` gives an interactive (reduced) shell;
+aarch64 CI job green on real tests; amd64 suite still green; mdbook builds.
+**Riskiest unknown**: the serial-sentinel exit contract wiring for `cmd_test`.
 
 ## Deferred (documented — out of Phase 7 scope)
 
-- **Ring-3 / EL0 userspace on aarch64** — the SVC syscall entry + aarch64 register ABI,
-  `copy_*_user`/`SyscallFrame` aarch64 impls, EL0 drop (`SPSR_EL1`/`ELR_EL1`), and
-  porting `servers/libthemelios` (~30 `syscall` sites) + an aarch64 server linker script
-  + aarch64 server builds in xtask. This is the "two binary sets" milestone; it gates
+- **Ring-3 / EL0 userspace on aarch64** — SVC syscall entry + aarch64 register ABI,
+  `copy_*_user`/`SyscallFrame` aarch64 impls, EL0 drop (`SPSR_EL1`/`ELR_EL1`), porting
+  `servers/libthemelios` (~30 `syscall` sites) + an aarch64 server linker script +
+  aarch64 server builds. **This is where the x86-canonical assumptions
+  (`USER_ADDR_LIMIT`, `sysret` RCX check) get their aarch64 audit.** Gates
   containers/`api-server` on ARM. Revisit when Phase 8 (hyperscaler ARM) needs it.
 - **Storage + networking on aarch64** — `drivers::pci` is port-I/O based; `virt`
-  exposes VirtIO as **virtio-mmio** (device-tree) or PCIe **ECAM**. The smoltcp stack
-  is already portable but has no device to bind to until a virtio-mmio/ECAM transport
-  is written. Post-Phase-7.
-- **GICv3** — for real cloud ARM; GICv2 suffices in QEMU `virt`.
+  exposes VirtIO as **virtio-mmio** (device-tree) or PCIe **ECAM**. smoltcp is already
+  portable but has no device to bind to until a virtio-mmio/ECAM transport exists.
+- **GICv3** — for Graviton; GICv2 suffices in QEMU `virt`.
+- **SMP / secondary CPUs** (PSCI `CPU_ON`) — the kernel is UP for bring-up.
 - **Secure boot / real firmware** — Phase 8.
 
-## Open questions for review
+## Notes (Momus CONSIDER, carried forward)
 
-- Is scoping Phase 7 to kernel-boot-to-shell (no ring-3) the right cut, or should the
-  EL0/userspace ABI (7.x) be pulled into Phase 7 to match "Docker on ARM" expectations?
-- 7.0a seam refactor as a standalone amd64-only PR: acceptable big-but-mechanical diff,
-  or split further?
-- GICv2 vs GICv3 for the first bring-up — is deferring GICv3 acceptable given Graviton
-  is GICv3?
-- Semihosting vs PSCI `SYSTEM_OFF`+serial-parse for the CI exit contract.
-- Anything in `mm/addr.rs` canonical-address handling that will silently break under
-  the TTBR0/1 split rather than fail loudly.
+- **No IST/TSS analog.** Same-EL aarch64 exceptions reuse `SP_EL1`, so a kernel-stack
+  overflow re-faults on the same stack (x86 caught double-faults on an IST stack).
+  Acceptable for bring-up; note it, don't solve it in Phase 7.
+- **7.spike is throwaway** — its purpose is to retire unknowns and confirm decisions
+  3 (CNTV) and 6 (FP trap), not to produce merged code.
