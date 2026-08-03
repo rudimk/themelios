@@ -89,15 +89,42 @@ surface. The milestone label must not imply userspace/containers.
 
 ## Sub-phases
 
-### 7.spike — throwaway boot+GIC+timer spike (retire the top unknowns FIRST)
+### 7.spike — throwaway boot+GIC+timer spike — DONE ✅
+Ran locally (QEMU 8.2.2 `virt`, AAVMF firmware, Limine v8 `BOOTAA64.EFI`), throwaway
+code in scratchpad (not committed). All four goals retired; findings below.
+
+**Results:**
+- **(a) PL011 + (c) FP-trap + (d) GICv2/CNTV** — validated via a `-kernel` direct boot
+  (MMU off, EL1):
+  - PL011 TX at `0x0900_0000` works; boots at **EL1**.
+  - **FP-trap CONFIRMED (Momus MUST-FIX 5 is real):** ordinary `f64` math traps at EL1
+    with `ESR_EL1.EC=0x07`; `CPACR_EL1` is `0` on entry. Setting `CPACR_EL1.FPEN=0b11`
+    (→ `0x30_0000`) and retrying makes it succeed. **The kernel must enable FP in early
+    boot.**
+  - **`VBAR_EL1` exception vectors work:** `brk #0` → sync `EC=0x3C`, handler resumes.
+  - **GICv2 + CNTV CONFIRMED (decisions 2 & 3):** GICD+GICC init + `CNTV_CTL/TVAL_EL0`
+    deliver **INTID 27** IRQs through the full vector→`GICC_IAR`→`GICC_EOIR` path;
+    `CNTFRQ_EL0 = 62.5 MHz`. Re-arm + mask work.
+- **(b) Limine UEFI warm-handoff** — validated via the real chain (AAVMF `pflash` →
+  `BOOTAA64.EFI` → higher-half kernel):
+  - **Chain works:** UEFI finds `BOOTAA64.EFI`, Limine loads the higher-half ELF and
+    **hands off at EL1 in the higher half** (kernel ran at `0xffffffff8000_01f0`, MMU
+    ON). Limine warm-handoff confirmed — do NOT reset `SCTLR`/stack/BSS.
+  - **HHDM present**, offset `= 0xffff_0000_0000_0000`.
+  - **⚠️ KEY FINDING — Limine's HHDM maps RAM, NOT device MMIO.** Both raw-phys
+    `0x0900_0000` **and** HHDM+`0x0900_0000` data-abort (translation fault, `FAR` =
+    `0xffff_0000_0900_0018`). Unlike x86 (port-I/O serial works instantly), **on
+    aarch64 the kernel must establish a mapping for the PL011 MMIO before it can print**
+    — early serial is entangled with a minimal page-table edit. This reshapes 7.0b (see
+    below).
+
+**Pinned-decision confirmations:** decision 3 (CNTV) ✓, decision 6 (FP trap real) ✓,
+GICv2 (decision 2) ✓, Limine warm handoff ✓.
+
+### 7.spike — throwaway boot+GIC+timer spike (original scope, now retired)
 Momus SHOULD-FIX 1: the two highest-uncertainty items (Limine-UEFI-on-ARM handoff,
-GIC/timer) are otherwise scheduled behind a large merged refactor — a dead-end there
-strands merged work. On a **throwaway branch** (not merged): minimal aarch64 entry that
-(a) prints a banner over PL011, (b) dumps `CurrentEL`/`SCTLR_EL1`/`TCR_EL1`/`TTBR*_EL1`
-to *verify* the Limine warm-handoff assumptions, (c) confirms FP-trap behavior (does a
-struct-move fault?), and (d) takes one GICv2 + `CNTV` timer IRQ. **Exit criteria:** all
-four observed working, decisions 3 & 6 confirmed. Only then invest in 7.0a. Findings
-fold back into this plan; the spike code is discarded.
+GIC/timer) were spiked FIRST on a throwaway branch so a dead-end couldn't strand merged
+work. Done — see results above.
 
 ### 7.0 — Arch seam + boot-to-UART (split — Momus)
 - **7.0a-i — `irq`/`time` facade (amd64-only, mechanical).** Add `arch::irq::{disable,
@@ -112,16 +139,23 @@ fold back into this plan; the spike code is discarded.
   `copy_*_user`, `swapgs`), ring-3 `process::init::start`, and the deferred
   boot-tail calls in `kmain` (`main.rs:486-527`). amd64 unchanged; goal is that a
   hypothetical aarch64 build has no dangling `arch::x86_64` refs outside `arch/`.
-- **7.0b — aarch64 boot-to-UART.** `kernel/linker-aarch64.ld`, `.cargo/config.toml`
-  `[target.aarch64-unknown-none]`, xtask UEFI-ISO (`BOOTAA64.EFI`) + `qemu-system-aarch64
-  -M virt,gic-version=2 -cpu cortex-a72 -pflash AAVMF_CODE/VARS` path (replace the
+- **7.0b — aarch64 boot-to-UART.** `kernel/linker-aarch64.ld` (higher-half
+  `0xffffffff80000000`, `elf64-littleaarch64`, `.requests*` markers KEEP'd — validated
+  in the spike), `.cargo/config.toml` `[target.aarch64-unknown-none]`, xtask UEFI-boot
+  (`BOOTAA64.EFI` from `target/limine`; `-M virt,gic-version=2 -cpu cortex-a72` +
+  `-pflash AAVMF_CODE/VARS` discovered at runtime; **no BIOS El-Torito** — replace the
   `run --arch aarch64` stub at `main.rs:971`). Early aarch64 entry: **verify** EL1 via
-  `CurrentEL` (don't reset `SCTLR`/stack/BSS — inherit Limine), enable `CPACR_EL1.FPEN`,
-  PL011 driver, arch-neutral banner printed **on Limine's tables**. **Acceptance:**
-  `cargo xtask run --arch aarch64` prints the banner; kernel `cargo build
-  --target aarch64-unknown-none` is added to CI. **Riskiest unknown (pre-retired by
-  7.spike):** Limine UEFI handoff + AAVMF wiring + higher-half linker layout /
-  `.requests` sections.
+  `CurrentEL` (do NOT reset `SCTLR`/stack/BSS — inherit Limine's warm handoff), **enable
+  `CPACR_EL1.FPEN`** (spike-confirmed mandatory), then the PL011 banner.
+  **⚠️ Early-serial requires a UART mapping (spike finding):** Limine's HHDM does not
+  map device MMIO, so before the first `println!` the kernel must map the PL011
+  (`0x0900_0000`) — the pragmatic path is to edit Limine's live page tables via the HHDM
+  (page-table frames are RAM, hence HHDM-reachable) to add one Device-`nGnRnE` entry for
+  the UART. This pulls a *minimal* page-table-edit primitive into 7.0b (a precursor to
+  the full 7.1 MMU work); keep it to "map one device page," not the whole allocator.
+  **Acceptance:** `cargo xtask run --arch aarch64` prints the banner; kernel
+  `cargo build --target aarch64-unknown-none` added to CI. **Riskiest unknown — RETIRED
+  by 7.spike** (Limine handoff, AAVMF wiring, higher-half layout all confirmed working).
 
 ### 7.1 — MMU / paging
 ARM descriptor `PageFlags` (valid/table/AP/AttrIndx/AF/UXN/PXN), `TCR_EL1`
