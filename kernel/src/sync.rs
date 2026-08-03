@@ -142,25 +142,21 @@ impl<T> Drop for InterruptMutexGuard<'_, T> {
     }
 }
 
-// --- Architecture-specific interrupt control ---
+// --- Interrupt control ---
 //
-// These thin wrappers dispatch to the appropriate arch module.
-// When aarch64 support is added (Phase 7), equivalent implementations
-// using DAIF masking will be added here.
+// Thin wrappers over the architecture-neutral `arch::irq` facade (x86: `cli`/`sti`;
+// aarch64: `DAIF` masking). Arch-neutral now, so they compile on every target.
 
-#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn arch_disable_interrupts() {
     crate::arch::irq::disable();
 }
 
-#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn arch_enable_interrupts() {
     crate::arch::irq::enable();
 }
 
-#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn arch_interrupts_enabled() -> bool {
     crate::arch::irq::are_enabled()

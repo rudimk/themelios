@@ -734,6 +734,88 @@ fn cmd_image(_args: &[String]) {
 /// /boot/themelios                  — The kernel ELF binary
 /// /EFI/BOOT/BOOTX64.EFI          — UEFI fallback bootloader
 /// ```
+/// Boot the aarch64 kernel on QEMU `virt` via Limine/UEFI (Phase 7).
+///
+/// `virt` has no BIOS, so this is UEFI-only: assemble an EFI System Partition (ESP)
+/// tree containing Limine's `BOOTAA64.EFI`, the kernel, and `limine.conf`, hand it to
+/// QEMU as a virtual-FAT disk, and boot it behind AAVMF/edk2 UEFI firmware. GICv2 is
+/// pinned (`gic-version=2`) to match the Phase 7 bring-up.
+fn run_aarch64(root: &Path, kernel: &Path, limine_dir: &Path, display: bool) {
+    let esp = root.join("target/aarch64-esp");
+    let _ = fs::remove_dir_all(&esp);
+    fs::create_dir_all(esp.join("EFI/BOOT")).expect("create ESP/EFI/BOOT");
+    fs::create_dir_all(esp.join("boot/limine")).expect("create ESP/boot/limine");
+
+    let bootaa64 = limine_dir.join("BOOTAA64.EFI");
+    if !bootaa64.exists() {
+        eprintln!(
+            "Limine's BOOTAA64.EFI not found at {} — is the Limine binary branch complete?",
+            bootaa64.display()
+        );
+        process::exit(1);
+    }
+    fs::copy(&bootaa64, esp.join("EFI/BOOT/BOOTAA64.EFI")).expect("copy BOOTAA64.EFI");
+    fs::copy(kernel, esp.join("boot/themelios")).expect("copy kernel to ESP");
+    fs::copy(root.join("limine.conf"), esp.join("boot/limine/limine.conf"))
+        .expect("copy limine.conf to ESP");
+
+    // UEFI firmware: read-only CODE flash + a writable copy of the VARS flash.
+    let (code, vars_src) = match find_aavmf() {
+        Some(pair) => pair,
+        None => {
+            eprintln!(
+                "aarch64 UEFI firmware (AAVMF/edk2) not found. Install it — e.g.\n  \
+                 Debian/Ubuntu: apt-get install qemu-efi-aarch64\n  \
+                 macOS (brew):  brew install qemu (bundles edk2 firmware)"
+            );
+            process::exit(1);
+        }
+    };
+    let vars = root.join("target/aarch64-vars.fd");
+    fs::copy(&vars_src, &vars).expect("copy AAVMF VARS flash");
+
+    let mode = if display { "with display" } else { "headless" };
+    println!("Launching QEMU (aarch64 virt, {mode})...");
+    println!("Press Ctrl+A, X to exit QEMU.\n");
+
+    let mut cmd = Command::new("qemu-system-aarch64");
+    cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-serial", "stdio", "-no-reboot"]);
+    cmd.arg("-drive").arg(format!("if=pflash,format=raw,readonly=on,file={}", code.display()));
+    cmd.arg("-drive").arg(format!("if=pflash,format=raw,file={}", vars.display()));
+    cmd.arg("-drive").arg(format!("file=fat:rw:{},format=raw,if=virtio", esp.display()));
+    if !display {
+        cmd.args(["-display", "none"]);
+    }
+
+    match cmd.status() {
+        Ok(s) if s.success() => println!("\nQEMU exited cleanly."),
+        Ok(_) => println!("\nQEMU exited."),
+        Err(e) => {
+            eprintln!("Failed to launch qemu-system-aarch64: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Locate the aarch64 UEFI firmware pair (CODE, VARS) across common distro/macOS
+/// paths. Returns `None` if not found (resolved at runtime like the `mkfs.ext2`
+/// lookup, rather than hardcoded).
+fn find_aavmf() -> Option<(PathBuf, PathBuf)> {
+    let pairs = [
+        ("/usr/share/AAVMF/AAVMF_CODE.fd", "/usr/share/AAVMF/AAVMF_VARS.fd"),
+        ("/usr/share/qemu-efi-aarch64/QEMU_EFI.fd", "/usr/share/qemu-efi-aarch64/QEMU_VARS.fd"),
+        ("/usr/share/edk2/aarch64/QEMU_EFI.fd", "/usr/share/edk2/aarch64/QEMU_VARS.fd"),
+        ("/opt/homebrew/share/qemu/edk2-aarch64-code.fd", "/opt/homebrew/share/qemu/edk2-arm-vars.fd"),
+        ("/usr/local/share/qemu/edk2-aarch64-code.fd", "/usr/local/share/qemu/edk2-arm-vars.fd"),
+    ];
+    for (code, vars) in pairs {
+        if Path::new(code).exists() && Path::new(vars).exists() {
+            return Some((PathBuf::from(code), PathBuf::from(vars)));
+        }
+    }
+    None
+}
+
 fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path) -> PathBuf {
     let iso_root = root.join("target/iso_root");
     let iso_path = root.join("target/themelios.iso");
@@ -919,8 +1001,15 @@ fn cmd_run(args: &[String]) {
 
     let kernel_binary = root.join(format!("target/{target}/debug/themelios"));
 
-    // Step 2: Download Limine if needed and create bootable ISO
+    // Step 2: Download Limine if needed. Both architectures boot via Limine; aarch64
+    // is UEFI-only (no BIOS), so it takes a separate ESP path.
     let limine_dir = ensure_limine(&root);
+
+    if matches!(opts.arch.as_str(), "aarch64" | "arm64") {
+        run_aarch64(&root, &kernel_binary, &limine_dir, opts.display);
+        return;
+    }
+
     let iso_path = create_iso(&root, &kernel_binary, &limine_dir);
 
     // Step 3: Launch QEMU
@@ -968,10 +1057,8 @@ fn cmd_run(args: &[String]) {
 
             cmd.status()
         }
-        "aarch64" | "arm64" => {
-            eprintln!("aarch64 boot is not yet implemented (Phase 0 is x86_64 only).");
-            process::exit(1);
-        }
+        // aarch64 is handled earlier (UEFI path) and returns before this match.
+        "aarch64" | "arm64" => unreachable!("aarch64 handled by run_aarch64"),
         _ => unreachable!(),
     };
 
@@ -1210,12 +1297,35 @@ fn cmd_arm64_gate(_args: &[String]) {
         .status()
         .expect("Failed to execute cargo build for the arm64 gate");
 
-    if status.success() {
-        println!("arm64 gate passed: smoltcp builds for aarch64-unknown-none.");
-    } else {
+    if !status.success() {
         eprintln!("arm64 gate FAILED: smoltcp did not build for aarch64-unknown-none.");
         process::exit(1);
     }
+    println!("  smoltcp: OK");
+
+    // Phase 7: also build the kernel itself for aarch64. From 7.0b the kernel boots on
+    // aarch64 (QEMU virt), so this gate must catch any change that breaks the aarch64
+    // build — "amd64 stays green" alone is insufficient once the arch seam is shared.
+    // The kernel embeds no userspace servers on aarch64 (they are cfg-gated out), so a
+    // direct `cargo build` needs no prior server staging.
+    println!("Compiling the kernel for aarch64-unknown-none (arm64 kernel gate)...");
+    let kstatus = Command::new("cargo")
+        .current_dir(&root)
+        .args([
+            "build",
+            "--package", "themelios",
+            "--target", "aarch64-unknown-none",
+            BUILD_STD,
+            BUILD_STD_FEATURES,
+        ])
+        .status()
+        .expect("Failed to execute cargo build for the aarch64 kernel");
+    if !kstatus.success() {
+        eprintln!("arm64 gate FAILED: the kernel did not build for aarch64-unknown-none.");
+        process::exit(1);
+    }
+    println!("  kernel: OK");
+    println!("arm64 gate passed: smoltcp + kernel build for aarch64-unknown-none.");
 }
 
 /// Print usage information.

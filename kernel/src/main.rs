@@ -34,6 +34,25 @@
 // and `-Zbuild-std=core,alloc` in the build flags (see xtask).
 extern crate alloc;
 
+// On x86_64 the global allocator lives in `mm::heap`. On aarch64 the memory subsystem
+// is not yet ported (Phase 7.1), so provide a placeholder allocator that keeps the
+// crate linkable. The Phase 7.0b boot-to-banner path performs **no** heap allocation;
+// any allocation before 7.1 is a bug and panics loudly here rather than corrupting.
+#[cfg(target_arch = "aarch64")]
+mod aarch64_alloc_placeholder {
+    use core::alloc::{GlobalAlloc, Layout};
+    struct NullAlloc;
+    // SAFETY: never hands out memory; alloc always diverges, dealloc is a no-op.
+    unsafe impl GlobalAlloc for NullAlloc {
+        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+            panic!("aarch64: heap allocation attempted before the Phase 7.1 allocator");
+        }
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+    }
+    #[global_allocator]
+    static ALLOCATOR: NullAlloc = NullAlloc;
+}
+
 // --- Limine boot protocol setup ---
 //
 // The Limine bootloader communicates with the kernel through "requests":
@@ -114,73 +133,87 @@ mod sync;
 /// Memory management subsystem.
 /// Handles physical frame allocation, virtual address spaces (page tables),
 /// and the kernel heap allocator.
+#[cfg(target_arch = "x86_64")]
 mod mm;
 
 /// Process scheduler.
 /// Manages kernel and userspace tasks, implements scheduling policies,
 /// and handles context switching.
+#[cfg(target_arch = "x86_64")]
 mod sched;
 
 /// Interactive debug shell.
 /// Runs as a scheduler task, provides commands for inspecting memory,
 /// tasks, and kernel state at runtime via the serial console.
+#[cfg(target_arch = "x86_64")]
 mod shell;
 
 /// Automated test harness.
 /// When built with `--features test`, the kernel runs self-tests instead of
 /// the interactive shell and exits QEMU with a pass/fail exit code.
 #[cfg(feature = "test")]
+#[cfg(target_arch = "x86_64")]
 mod test_runner;
 
 /// Capability system.
 /// The core security primitive of ThemeliOS. All resource access is mediated
 /// by unforgeable capability tokens — processes can only use resources they've
 /// been explicitly granted access to.
+#[cfg(target_arch = "x86_64")]
 mod cap;
 
 /// Process abstraction.
 /// Bundles an address space, capability space, and task list into a single
 /// unit of isolation. The kernel process (PID 0) owns all boot-time tasks.
+#[cfg(target_arch = "x86_64")]
 mod process;
 
 /// Inter-process communication.
 /// Message passing between processes. Since ThemeliOS is a microkernel,
 /// IPC is the backbone — drivers, filesystems, and services all communicate
 /// through IPC channels.
+#[cfg(target_arch = "x86_64")]
 mod ipc;
 
 /// Audit logging.
 /// A tamper-evident ring buffer recording all security-relevant kernel
 /// operations: capability create/grant/revoke, IPC send/receive, and
 /// syscall invocations. Kernel-internal only in Phase 2.
+#[cfg(target_arch = "x86_64")]
 mod audit;
 
 /// Device drivers.
 /// VirtIO drivers for block devices, network interfaces, and console.
 /// Platform-specific drivers for timers, interrupt controllers, etc.
+#[cfg(target_arch = "x86_64")]
 mod drivers;
 
 /// Filesystem layer.
 /// Read-only root filesystem for the immutable OS image, plus ephemeral
 /// writable layers for container runtime state.
+#[cfg(target_arch = "x86_64")]
 mod fs;
 
 /// Network stack.
 /// TCP/IP implementation for container networking and the management API.
+#[cfg(target_arch = "x86_64")]
 mod net;
 
 /// Linux compatibility layer (Phase 5): ELF loader and, later, the Linux syscall
 /// personality that lets ThemeliOS run unmodified OCI container binaries.
+#[cfg(target_arch = "x86_64")]
 mod linux;
 
 /// OCI / docker-save image unpacking (Phase 5.4): tar + JSON + layer assembly.
 /// Dependency-light (alloc-only) so it can lift into a ring-3 `oci-server`. Used
 /// by the Phase 5.5 container runtime.
 #[allow(dead_code)] // a complete tar/JSON reader; callers use a subset
+#[cfg(target_arch = "x86_64")]
 mod oci;
 
 /// Container runtime (Phase 5.5): unpack an image, assemble its rootfs, and launch
 /// its entrypoint as a capability-isolated Linux process.
+#[cfg(target_arch = "x86_64")]
 mod container;
 
 /// Minimal HTTP/1.1 primitives (Phase 6.0): shared byte-scanning helpers plus an
@@ -188,6 +221,7 @@ mod container;
 /// so it lifts into the ring-3 `api-server`; the registry client reuses the shared
 /// helpers for its response parsing.
 #[allow(dead_code)] // request parser + helpers; the api-server (6.5) uses the full surface
+#[cfg(target_arch = "x86_64")]
 mod http;
 
 /// Container management ABI (Phase 6.3): the capability-guarded ring-0 surface the
@@ -196,6 +230,7 @@ mod http;
 /// `CapType::Management` sentinel and audited. The syscall/IPC wrappers and the
 /// sentinel-cap grant land in Phase 6.4.
 #[allow(dead_code)] // driven by the api-server (6.4/6.5); tested directly in 6.3
+#[cfg(target_arch = "x86_64")]
 mod mgmt;
 
 // ----- Kernel entry point -----
@@ -213,8 +248,35 @@ mod mgmt;
 /// - Allocated and set up a stack
 /// - Entered 64-bit long mode
 /// - Filled in our boot protocol request structures
+/// Kernel entry point (linker `ENTRY(kmain)`). Dispatches to the per-architecture
+/// bring-up path. Both branches diverge, so exactly one architecture's boot code is
+/// compiled into any given build.
 #[no_mangle]
 extern "C" fn kmain() -> ! {
+    // aarch64 (Phase 7.0b): minimal boot-to-banner. Limine hands off at EL1 with the
+    // MMU on; the aarch64 path enables FP, maps the PL011, and prints a banner. The
+    // full bring-up (mm/sched/etc.) lands in 7.1+.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let hhdm = HHDM_REQUEST.get_response().map(|r| r.offset()).unwrap_or(0);
+        let (phys_base, virt_base) = EXECUTABLE_ADDRESS_REQUEST
+            .get_response()
+            .map(|r| (r.physical_base(), r.virtual_base()))
+            .unwrap_or((0, 0));
+        crate::arch::aarch64::boot::kmain_aarch64(
+            hhdm,
+            crate::arch::aarch64::boot::KernelAddr { phys_base, virt_base },
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    kmain_x86_64()
+}
+
+/// x86_64 kernel bring-up: serial, GDT/IDT, memory, scheduler, drivers, servers, and
+/// the interactive shell. (The original `kmain` body, unchanged.)
+#[cfg(target_arch = "x86_64")]
+fn kmain_x86_64() -> ! {
     // Verify that the bootloader supports our protocol revision.
     // The base revision request was placed in the .requests section above;
     // Limine fills it in at boot time. If the bootloader doesn't support

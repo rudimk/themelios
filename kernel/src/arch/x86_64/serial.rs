@@ -293,27 +293,5 @@ pub fn receive_byte() -> Option<u8> {
     }
 }
 
-/// Print formatted text to the serial console.
-///
-/// Works exactly like `std::print!` but outputs to the UART serial port.
-/// The global serial writer must be initialized via `serial::init()` first,
-/// otherwise output is silently dropped.
-///
-/// Uses `InterruptMutex` internally, so it's safe to call from interrupt
-/// handlers — interrupts are disabled while the serial lock is held.
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => {{
-        $crate::arch::x86_64::serial::_print(format_args!($($arg)*));
-    }};
-}
-
-/// Print formatted text to the serial console, followed by a newline.
-///
-/// Works exactly like `std::println!` but outputs to the UART serial port.
-/// See `print!` for details on initialization and interrupt safety.
-#[macro_export]
-macro_rules! println {
-    () => ($crate::print!("\n"));
-    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
-}
+// The `print!`/`println!` macros live in the architecture-neutral `arch::serial`
+// facade (they dispatch to the active arch's `_print`), so they exist on aarch64 too.

@@ -144,7 +144,21 @@ work. Done — see results above.
   verifiable way), rather than blind in an amd64-only PR where its aarch64-correctness
   can't be checked. 7.0a therefore ships the **facade alone** (7.0a-i): a clean,
   amd64-green, independently-reviewable refactor.
-- **7.0b — aarch64 boot-to-UART.** `kernel/linker-aarch64.ld` (higher-half
+- **7.0b — aarch64 boot-to-UART — DONE ✅** (boots on QEMU `virt`; banner over PL011).
+  Delivered: `kernel/linker-aarch64.ld` + `.cargo` target; the aarch64 arch module
+  (`boot`/`serial`/`irq`/`time`) + an `arch::serial` facade that moved the
+  `print!`/`println!` macros arch-neutral; a per-arch `kmain` dispatcher (`kmain_x86_64`
+  unchanged); the not-yet-ported modules cfg-gated to x86_64 (mm/sched/process/linux/
+  net/drivers/fs/… — un-gated as each later sub-phase lands) + a panic-on-alloc
+  placeholder allocator; early boot enables `CPACR_EL1.FPEN` and **maps the PL011 by
+  editing Limine's live TTBR1 tables via the HHDM** (the spike finding — allocates
+  intermediate tables from a static `.bss` pool, Device-`nGnRnE` via a MAIR scan, then
+  `TLBI`); xtask `run --arch aarch64` (UEFI ESP + `qemu-system-aarch64 -M
+  virt,gic-version=2` + runtime AAVMF discovery); CI arm64 gate extended to build the
+  aarch64 kernel. Verified locally: `cargo xtask run --arch aarch64` prints the banner;
+  amd64 builds + suite stay green. **Original detail below.**
+
+  `kernel/linker-aarch64.ld` (higher-half
   `0xffffffff80000000`, `elf64-littleaarch64`, `.requests*` markers KEEP'd — validated
   in the spike), `.cargo/config.toml` `[target.aarch64-unknown-none]`, xtask UEFI-boot
   (`BOOTAA64.EFI` from `target/limine`; `-M virt,gic-version=2 -cpu cortex-a72` +
