@@ -24,6 +24,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+use std::thread;
+use std::time::Duration;
 
 // ============================================================================
 // Build constants
@@ -741,6 +743,33 @@ fn cmd_image(_args: &[String]) {
 /// QEMU as a virtual-FAT disk, and boot it behind AAVMF/edk2 UEFI firmware. GICv2 is
 /// pinned (`gic-version=2`) to match the Phase 7 bring-up.
 fn run_aarch64(root: &Path, kernel: &Path, limine_dir: &Path, display: bool) {
+    let (esp, code, vars) = prepare_aarch64_boot(root, kernel, limine_dir);
+
+    let mode = if display { "with display" } else { "headless" };
+    println!("Launching QEMU (aarch64 virt, {mode})...");
+    println!("Press Ctrl+A, X to exit QEMU.\n");
+
+    let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
+    cmd.args(["-serial", "stdio"]);
+    if !display {
+        cmd.args(["-display", "none"]);
+    }
+
+    match cmd.status() {
+        Ok(s) if s.success() => println!("\nQEMU exited cleanly."),
+        Ok(_) => println!("\nQEMU exited."),
+        Err(e) => {
+            eprintln!("Failed to launch qemu-system-aarch64: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Assemble the aarch64 UEFI boot inputs shared by `run --arch aarch64` and the CI
+/// boot smoke: an ESP tree (`BOOTAA64.EFI` + kernel + `limine.conf`), the read-only
+/// firmware CODE flash, and a fresh writable copy of the VARS flash. Returns
+/// `(esp_dir, code_fd, vars_fd)`.
+fn prepare_aarch64_boot(root: &Path, kernel: &Path, limine_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let esp = root.join("target/aarch64-esp");
     let _ = fs::remove_dir_all(&esp);
     fs::create_dir_all(esp.join("EFI/BOOT")).expect("create ESP/EFI/BOOT");
@@ -759,7 +788,6 @@ fn run_aarch64(root: &Path, kernel: &Path, limine_dir: &Path, display: bool) {
     fs::copy(root.join("limine.conf"), esp.join("boot/limine/limine.conf"))
         .expect("copy limine.conf to ESP");
 
-    // UEFI firmware: read-only CODE flash + a writable copy of the VARS flash.
     let (code, vars_src) = match find_aavmf() {
         Some(pair) => pair,
         None => {
@@ -773,27 +801,83 @@ fn run_aarch64(root: &Path, kernel: &Path, limine_dir: &Path, display: bool) {
     };
     let vars = root.join("target/aarch64-vars.fd");
     fs::copy(&vars_src, &vars).expect("copy AAVMF VARS flash");
+    (esp, code, vars)
+}
 
-    let mode = if display { "with display" } else { "headless" };
-    println!("Launching QEMU (aarch64 virt, {mode})...");
-    println!("Press Ctrl+A, X to exit QEMU.\n");
-
+/// A `qemu-system-aarch64 -M virt` command with the firmware pflash pair and the ESP
+/// virtual-FAT disk attached (no serial/display — the caller adds those).
+fn qemu_aarch64_base(esp: &Path, code: &Path, vars: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-aarch64");
-    cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-serial", "stdio", "-no-reboot"]);
+    cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-no-reboot"]);
     cmd.arg("-drive").arg(format!("if=pflash,format=raw,readonly=on,file={}", code.display()));
     cmd.arg("-drive").arg(format!("if=pflash,format=raw,file={}", vars.display()));
     cmd.arg("-drive").arg(format!("file=fat:rw:{},format=raw,if=virtio", esp.display()));
-    if !display {
-        cmd.args(["-display", "none"]);
+    cmd
+}
+
+/// `cargo xtask arm64-smoke` — build the aarch64 kernel, boot it headless on QEMU
+/// `virt`, and assert it reaches the boot banner. This is the CI proof that the
+/// Limine → EL1 → PL011 path works on aarch64, not just that the kernel compiles.
+///
+/// The 7.0b kernel idles after the banner (no self-shutdown until the timer/exit
+/// mechanism lands), so we capture serial to a file, poll for the banner marker, then
+/// terminate QEMU. Absence of the marker within the window is a failure.
+fn cmd_arm64_smoke(_args: &[String]) {
+    let root = workspace_root();
+
+    println!("Building the aarch64 kernel for the boot smoke...");
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args([
+            "build", "--package", "themelios", "--target", "aarch64-unknown-none",
+            BUILD_STD, BUILD_STD_FEATURES,
+        ])
+        .status()
+        .expect("Failed to build the aarch64 kernel");
+    if !status.success() {
+        eprintln!("arm64 boot smoke FAILED: kernel did not build for aarch64.");
+        process::exit(1);
     }
 
-    match cmd.status() {
-        Ok(s) if s.success() => println!("\nQEMU exited cleanly."),
-        Ok(_) => println!("\nQEMU exited."),
-        Err(e) => {
-            eprintln!("Failed to launch qemu-system-aarch64: {e}");
-            process::exit(1);
+    let kernel = root.join("target/aarch64-unknown-none/debug/themelios");
+    let limine_dir = ensure_limine(&root);
+    let (esp, code, vars) = prepare_aarch64_boot(&root, &kernel, &limine_dir);
+
+    let serial_log = root.join("target/aarch64-smoke-serial.log");
+    let _ = fs::remove_file(&serial_log);
+
+    println!("Booting aarch64 kernel on QEMU virt (headless)...");
+    let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
+    cmd.args(["-display", "none"]);
+    cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+    let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
+
+    // The banner's last line — proves the full Limine→EL1→FP→UART-map→print path ran.
+    const MARKER: &str = "Phase 7.0b boot-to-banner reached";
+    let mut found = false;
+    for _ in 0..50 {
+        // ~25 s budget
+        thread::sleep(Duration::from_millis(500));
+        if let Ok(s) = fs::read_to_string(&serial_log) {
+            if s.contains(MARKER) {
+                found = true;
+                break;
+            }
         }
+        if let Ok(Some(_)) = child.try_wait() {
+            break; // QEMU exited early (unexpected for the idling 7.0b kernel)
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let serial = fs::read_to_string(&serial_log).unwrap_or_default();
+    println!("--- aarch64 serial output ---\n{serial}\n-----------------------------");
+    if found {
+        println!("arm64 boot smoke passed: kernel booted to the banner on QEMU virt.");
+    } else {
+        eprintln!("arm64 boot smoke FAILED: banner marker '{MARKER}' not seen within the window.");
+        process::exit(1);
     }
 }
 
@@ -1374,6 +1458,7 @@ fn main() {
         "image" => cmd_image(rest),
         "docs" => cmd_docs(rest),
         "arm64-gate" => cmd_arm64_gate(rest),
+        "arm64-smoke" => cmd_arm64_smoke(rest),
         "help" | "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("Unknown command: {unknown}\n");
