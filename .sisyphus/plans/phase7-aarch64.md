@@ -134,11 +134,16 @@ work. Done — see results above.
   `linux` — the portable ones) through the facade. **Must not disturb the three known
   GS/per-CPU race fixes** (CLAUDE.md): `sync.rs:154-166` and the sched critical sections
   keep identical ordering. amd64 suite green = the whole acceptance.
-- **7.0a-ii — cfg-partition the ring-3/Linux subtree (amd64-only).** `#[cfg]`-gate the
-  EL0-dependent module tree out of the aarch64 build: `linux/*` (`SyscallFrame`,
-  `copy_*_user`, `swapgs`), ring-3 `process::init::start`, and the deferred
-  boot-tail calls in `kmain` (`main.rs:486-527`). amd64 unchanged; goal is that a
-  hypothetical aarch64 build has no dangling `arch::x86_64` refs outside `arch/`.
+- **7.0a-ii — cfg-partition the ring-3/Linux subtree.** *(Sequencing refinement: this
+  MOVES INTO 7.0b.)* `#[cfg]`-gate the EL0-dependent module tree out of the aarch64
+  build: `linux/*` (`SyscallFrame`, `copy_*_user`, `swapgs`), ring-3
+  `process::init::start`, and the deferred boot-tail calls in `kmain`
+  (`main.rs:486-527`). **Rationale for moving it:** a dangling `arch::x86_64` ref is a
+  *compile error* that only surfaces when compiling aarch64, which first happens in
+  7.0b — so the partition is done there, driven by real build errors (the honest,
+  verifiable way), rather than blind in an amd64-only PR where its aarch64-correctness
+  can't be checked. 7.0a therefore ships the **facade alone** (7.0a-i): a clean,
+  amd64-green, independently-reviewable refactor.
 - **7.0b — aarch64 boot-to-UART.** `kernel/linker-aarch64.ld` (higher-half
   `0xffffffff80000000`, `elf64-littleaarch64`, `.requests*` markers KEEP'd — validated
   in the spike), `.cargo/config.toml` `[target.aarch64-unknown-none]`, xtask UEFI-boot

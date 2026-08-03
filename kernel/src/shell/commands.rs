@@ -1035,7 +1035,7 @@ pub fn cmd_ping(args: &str) {
 /// Monotonic milliseconds since boot (the same source as `SYS_UPTIME_MS`), for
 /// the `ping` round-trip timer. The 100 Hz tick gives ~10 ms resolution.
 fn now_ms() -> u64 {
-    crate::arch::x86_64::idt::tick_count().wrapping_mul(10)
+    crate::arch::time::tick_count().wrapping_mul(10)
 }
 
 /// `run [image]` — create + launch a container and record its metadata (5.5/6.1).

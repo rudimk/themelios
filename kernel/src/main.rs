@@ -463,7 +463,7 @@ extern "C" fn kmain() -> ! {
     // - PIT timer (IRQ0) fires at ~100 Hz for preemptive scheduling
     // - COM1 serial (IRQ4) fires when the user types in the QEMU terminal
     #[cfg(target_arch = "x86_64")]
-    arch::x86_64::cpu::sti();
+    crate::arch::irq::enable();
 
     // --- Test mode vs interactive mode ---
     //
@@ -534,7 +534,7 @@ extern "C" fn kmain() -> ! {
         // preempt it and schedule other tasks. The shell task handles input.
         loop {
             #[cfg(target_arch = "x86_64")]
-            arch::x86_64::cpu::halt();
+            crate::arch::irq::halt();
 
             #[cfg(not(target_arch = "x86_64"))]
             core::hint::spin_loop();
@@ -558,7 +558,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // handlers running after a panic. This must happen BEFORE printing,
     // in case a timer or other interrupt tries to use panicked state.
     #[cfg(target_arch = "x86_64")]
-    arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 
     // Print the panic info to the global serial writer. If the serial port
     // hasn't been initialized yet (panic very early in boot), the output
@@ -581,11 +581,11 @@ fn hcf() -> ! {
     // pending interrupt would wake the CPU from `hlt` and we'd resume
     // execution, which we don't want after a panic or clean shutdown.
     #[cfg(target_arch = "x86_64")]
-    arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 
     loop {
         #[cfg(target_arch = "x86_64")]
-        arch::x86_64::cpu::halt();
+        crate::arch::irq::halt();
 
         #[cfg(not(target_arch = "x86_64"))]
         core::hint::spin_loop();

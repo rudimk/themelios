@@ -29,3 +29,16 @@ pub mod x86_64;
 /// aarch64 (ARM 64-bit) architecture support.
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
+
+// --- Architecture-neutral facades (Phase 7) ---
+//
+// These small modules present a common vocabulary for the primitives that
+// arch-neutral kernel code needs, each `pub use`-re-exporting the active
+// architecture's implementation (no runtime dispatch). They are what let `sched`,
+// `ipc`, `sync`, `audit`, etc. compile unchanged across architectures.
+
+/// Local-interrupt control (`disable`/`enable`/`are_enabled`/`halt`).
+pub mod irq;
+
+/// Monotonic tick source (`tick_count`).
+pub mod time;

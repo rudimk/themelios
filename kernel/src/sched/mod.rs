@@ -426,14 +426,14 @@ pub fn yield_now() {
     // Disable interrupts for the scheduling critical section.
     // schedule() expects interrupts to be disabled on entry.
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 
     schedule();
 
     // Re-enable interrupts after returning from schedule.
     // (When the task resumes, we're back here with interrupts still disabled.)
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::cpu::sti();
+    crate::arch::irq::enable();
 }
 
 /// Mark the current task as Dead and switch to the next task.
@@ -443,7 +443,7 @@ pub fn yield_now() {
 /// scheduled again.
 pub fn exit_current_task() -> ! {
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 
     {
         let mut guard = SCHEDULER.lock();
@@ -575,7 +575,7 @@ pub fn kill_task(id: TaskId) -> bool {
 /// Must NOT be called from an interrupt handler — only from task context.
 pub fn block_current_task() {
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 
     {
         let mut guard = SCHEDULER.lock();
@@ -588,7 +588,7 @@ pub fn block_current_task() {
 
     // When we return here, the task has been woken up.
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::cpu::sti();
+    crate::arch::irq::enable();
 }
 
 /// Wake a blocked task, moving it back to the Ready state.
@@ -787,7 +787,7 @@ fn cleanup_dead_tasks(sched: &mut Scheduler, current_id: TaskId) {
 fn idle_entry() {
     loop {
         #[cfg(target_arch = "x86_64")]
-        crate::arch::x86_64::cpu::halt();
+        crate::arch::irq::halt();
 
         #[cfg(not(target_arch = "x86_64"))]
         core::hint::spin_loop();

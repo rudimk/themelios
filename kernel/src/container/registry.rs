@@ -22,7 +22,7 @@
 //! confinement is deferred to its own sub-phase; this registry stores the mount id
 //! each container was assembled onto so it lifts cleanly when confinement lands.
 
-use crate::arch::x86_64::idt;
+use crate::arch::time as idt;
 use crate::oci::sha256;
 use crate::process::ProcessId;
 use crate::sync::InterruptMutex;
