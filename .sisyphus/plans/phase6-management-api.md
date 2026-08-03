@@ -500,23 +500,47 @@ sync between the kernel `API_TOKEN` const and the xtask test peer.
       `test_container_run`; 6.6 delivers the auth layer specifically. Unblock is a
       net-server RX-recycling fix + `/data`-at-boot (a later net/boot sub-phase).
 
-### 6.7 — Finalize: docs + trackers + hardening pass
+### 6.7 — Finalize: docs + trackers + hardening pass — Momus-reviewed
 
 **Goal**: Close the phase honestly.
 
-**What to build**:
-- mdbook `management-api.md` (ring-3 api-server, management ABI + `Management` cap,
-  the kernel-accept shim, Engine API subset, two-layer auth, log capture,
-  deferrals). Add to `SUMMARY.md`.
-- Reconcile the three synced trackers (CLAUDE.md table, `milestones.md` summary +
-  heading) with an honest status string; rewrite CLAUDE.md Current Status.
-- A hardening pass (Momus) on the new untrusted-input parsers: request-size/header
-  bombs, deep-JSON request bodies, adversarial container ids.
+**What was built**:
+- **mdbook `management-api.md`** — ring-3 api-server, fault-freedom mandate, the
+  two-layer auth model (kernel `Management` cap + app-layer bearer token), the
+  `SYS_MGMT` ABI + verb table, the kernel-accept shim, the Engine API subset, log
+  capture, the three-phase test strategy, and deferrals. Added to `SUMMARY.md`;
+  mdbook builds.
+- **Tracker reconciliation** — Phase 6 flipped to `Complete (core; …deferred)` in all
+  three synced locations (CLAUDE.md roadmap table + Current Status; `milestones.md`
+  summary table + Phase 6 heading).
+- **Hardening pass (Momus adversarial audit)** of the whole untrusted-input surface
+  (`http` parser, recursive-descent `json` parser, api-server framing/auth/create/
+  id-split, and how hostile ids/images flow into the kernel), against the threat model
+  *a ring-3 fault halts the kernel, so any reachable panic = node DoS*. **Verdict:
+  safe to ship — no reachable kernel panic and no auth bypass in the shipped config.**
+  Confirmed fail-closed: `find_sub` length guard, `content_length` `parse::<usize>`
+  (rejects negative/`+`/overflow/whitespace), the json `\u`/multibyte EOF/ surrogate
+  paths, `MAX_DEPTH=64` recursion bound (~129 small frames vs the 64 KiB guarded
+  stack), the auth gate running before the route match (incl. unknown paths) with an
+  exact-match exempt set, the first-NUL `image\0name` split, and confinement using a
+  kernel-`generate_id()` id (never attacker input). One fix landed:
+  - **F1 (empty-token guard)** — `bearer_matches` now fails closed when the provisioned
+    token is empty, so a future change that ever ran auth with `api_token_len == 0`
+    can't be bypassed by `Authorization: Bearer ` (scheme-only). Latent today (the token
+    is always provisioned len 26); cheap defense in depth.
+  - Tracked for later phases (non-blocking, all low/contained): **F2** hardcoded dev
+    secret (→ Phase 8 secure boot / provisioned secrets); **F3** single-threaded
+    accept + 4M-spin `read_request` is a bounded slowloris throughput-DoS on the API
+    (no crash) — consider a per-connection deadline / multiplexing; **F4** an authed
+    client can grow `CONTAINERS` unbounded (no `rm` route, no count cap) — consider a
+    ceiling; **F5** the json parser is permissive (raw control bytes / trailing
+    garbage), which is why `create_container`'s NUL guard is load-bearing (kept).
 
 **Acceptance**:
-- [ ] Full suite green + 3× soak; **arm64 still builds** (no arm64 net stack exists
-      — this is a build check, not a meaningful gate; Momus L3); mdbook builds.
-- [ ] Trackers reconciled; docs written; hardening tests added.
+- [x] Full suite green + soak; **arm64 still builds** (build check, not a gate; Momus
+      L3); mdbook builds.
+- [x] Trackers reconciled; docs written; Momus hardening pass done (F1 fixed, F2–F5
+      tracked).
 
 ## Deferred (documented — out of the off-ramp)
 

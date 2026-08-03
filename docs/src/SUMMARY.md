@@ -17,6 +17,7 @@
 - [Storage Architecture](./storage.md)
 - [Network Architecture](./networking.md)
 - [Container Runtime](./containers.md)
+- [Management API](./management-api.md)
 
 # Roadmap
 
