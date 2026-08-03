@@ -151,17 +151,17 @@ impl<T> Drop for InterruptMutexGuard<'_, T> {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn arch_disable_interrupts() {
-    crate::arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn arch_enable_interrupts() {
-    crate::arch::x86_64::cpu::sti();
+    crate::arch::irq::enable();
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn arch_interrupts_enabled() -> bool {
-    crate::arch::x86_64::cpu::interrupts_enabled()
+    crate::arch::irq::are_enabled()
 }

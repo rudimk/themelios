@@ -110,7 +110,7 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         SYS_CLONE => frame.rax = super::thread::sys_clone(frame),
         SYS_FUTEX => {
             // FUTEX_WAIT may block, so enable interrupts first (like SYS_YIELD).
-            crate::arch::x86_64::cpu::sti();
+            crate::arch::irq::enable();
             frame.rax = super::thread::sys_futex(frame);
         }
         SYS_SET_TID_ADDRESS => frame.rax = super::thread::sys_set_tid_address(frame.rdi),
@@ -137,7 +137,7 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         SYS_CLOCK_GETTIME => frame.rax = sys_clock_gettime(frame.rsi),
         SYS_GETRANDOM => frame.rax = sys_getrandom(frame.rdi, frame.rsi),
         SYS_SCHED_YIELD => {
-            crate::arch::x86_64::cpu::sti();
+            crate::arch::irq::enable();
             crate::sched::yield_now();
             frame.rax = 0;
         }
@@ -317,7 +317,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
 /// `clock_gettime(_, timespec*)` — fills a `struct timespec { i64 sec; i64 nsec }`
 /// from the kernel's millisecond uptime.
 fn sys_clock_gettime(ts_ptr: u64) -> u64 {
-    let ms = crate::arch::x86_64::idt::tick_count().wrapping_mul(10);
+    let ms = crate::arch::time::tick_count().wrapping_mul(10);
     let sec = (ms / 1000) as i64;
     let nsec = ((ms % 1000) * 1_000_000) as i64;
     let mut buf = [0u8; 16];
@@ -340,7 +340,7 @@ fn sys_getrandom(buf: u64, len: u64) -> u64 {
     if !user_range_ok(buf, n) {
         return err(EFAULT);
     }
-    let mut state = crate::arch::x86_64::idt::tick_count().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ buf;
+    let mut state = crate::arch::time::tick_count().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ buf;
     let mut out = alloc::vec![0u8; n];
     for chunk in out.chunks_mut(8) {
         // splitmix64

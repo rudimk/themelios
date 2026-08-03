@@ -223,7 +223,7 @@ impl AuditRingBuffer {
 
         #[cfg(target_arch = "x86_64")]
         {
-            entry.timestamp = crate::arch::x86_64::idt::tick_count();
+            entry.timestamp = crate::arch::time::tick_count();
         }
 
         // Write at the current position, wrapping around if necessary

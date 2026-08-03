@@ -249,7 +249,7 @@ pub fn ipc_send(endpoint_id: u64, mut message: IpcMessage, badge: u64) -> Result
     // its drop sees were_enabled=false and keeps them disabled through
     // to block_current_task().
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 
     let should_block = {
         let mut registry = ENDPOINT_REGISTRY.lock();
@@ -257,7 +257,7 @@ pub fn ipc_send(endpoint_id: u64, mut message: IpcMessage, badge: u64) -> Result
             .ok_or_else(|| {
                 // Re-enable interrupts on error return — we won't block.
                 #[cfg(target_arch = "x86_64")]
-                crate::arch::x86_64::cpu::sti();
+                crate::arch::irq::enable();
                 IpcError::InvalidEndpoint
             })?;
 
@@ -283,7 +283,7 @@ pub fn ipc_send(endpoint_id: u64, mut message: IpcMessage, badge: u64) -> Result
     } else {
         // Non-blocking path: re-enable interrupts ourselves.
         #[cfg(target_arch = "x86_64")]
-        crate::arch::x86_64::cpu::sti();
+        crate::arch::irq::enable();
     }
 
     Ok(())
@@ -313,14 +313,14 @@ pub fn ipc_receive(endpoint_id: u64) -> Result<IpcMessage, IpcError> {
 
     // Disable interrupts to prevent lost-wakeup race (see ipc_send comment).
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 
     let immediate_msg = {
         let mut registry = ENDPOINT_REGISTRY.lock();
         let ep = find_endpoint_mut(&mut registry, endpoint_id)
             .ok_or_else(|| {
                 #[cfg(target_arch = "x86_64")]
-                crate::arch::x86_64::cpu::sti();
+                crate::arch::irq::enable();
                 IpcError::InvalidEndpoint
             })?;
 
@@ -351,7 +351,7 @@ pub fn ipc_receive(endpoint_id: u64) -> Result<IpcMessage, IpcError> {
     if let Some(msg) = immediate_msg {
         // Non-blocking path: re-enable interrupts.
         #[cfg(target_arch = "x86_64")]
-        crate::arch::x86_64::cpu::sti();
+        crate::arch::irq::enable();
         return Ok(msg);
     }
 
@@ -426,14 +426,14 @@ pub fn ipc_call(endpoint_id: u64, mut message: IpcMessage, badge: u64) -> Result
     // For call(), the caller ALWAYS blocks (waiting for reply), so we never
     // take a non-blocking early return — sti() happens inside block_current_task().
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::cpu::cli();
+    crate::arch::irq::disable();
 
     {
         let mut registry = ENDPOINT_REGISTRY.lock();
         let ep = find_endpoint_mut(&mut registry, endpoint_id)
             .ok_or_else(|| {
                 #[cfg(target_arch = "x86_64")]
-                crate::arch::x86_64::cpu::sti();
+                crate::arch::irq::enable();
                 IpcError::InvalidEndpoint
             })?;
 

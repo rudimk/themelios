@@ -43,7 +43,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use crate::arch::x86_64::idt;
+use crate::arch::time as idt;
 use crate::ipc::{self, IpcMessage};
 use crate::mm::shared::SharedRegion;
 use crate::net::device;

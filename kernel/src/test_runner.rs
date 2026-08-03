@@ -312,8 +312,7 @@ fn test_scheduler() -> Result<(), &'static str> {
 fn test_interrupts() -> Result<(), &'static str> {
     #[cfg(target_arch = "x86_64")]
     {
-        use crate::arch::x86_64::idt::tick_count;
-        use crate::arch::x86_64::cpu;
+        use crate::arch::time::tick_count;
 
         let before = tick_count();
 
@@ -321,7 +320,7 @@ fn test_interrupts() -> Result<(), &'static str> {
         // each halt wakes after ~10ms when the timer fires. Five halts
         // gives the timer plenty of chances to advance the tick counter.
         for _ in 0..5 {
-            cpu::halt();
+            crate::arch::irq::halt();
         }
 
         let after = tick_count();
@@ -2782,7 +2781,7 @@ fn test_virtio_net() -> Result<(), &'static str> {
 #[cfg(target_arch = "x86_64")]
 fn test_net_service() -> Result<(), &'static str> {
     use alloc::boxed::Box;
-    use crate::arch::x86_64::idt;
+    use crate::arch::time as idt;
     use crate::drivers::pci;
     use crate::drivers::virtio::net::VirtioNet;
     use crate::ipc::{self, IpcMessage};
@@ -2890,7 +2889,7 @@ fn test_net_service() -> Result<(), &'static str> {
 /// and out (MSG_TX_FRAME) with smoltcp processing in between.
 #[cfg(target_arch = "x86_64")]
 fn test_net_server_stack() -> Result<(), &'static str> {
-    use crate::arch::x86_64::idt;
+    use crate::arch::time as idt;
     use crate::ipc::{self, IpcMessage};
     use crate::mm::shared::SharedRegion;
     use crate::net::net_service::{MSG_POLL, MSG_TX_FRAME, STATUS_OK};
@@ -3041,7 +3040,7 @@ fn test_net_icmp_echo() -> Result<(), &'static str> {
     use alloc::collections::VecDeque;
     use alloc::vec;
     use alloc::vec::Vec;
-    use crate::arch::x86_64::idt;
+    use crate::arch::time as idt;
     use crate::ipc::{self, IpcMessage};
     use crate::mm::shared::SharedRegion;
     use crate::net::net_service::{MSG_POLL, MSG_TX_FRAME, STATUS_OK};
