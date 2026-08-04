@@ -49,17 +49,25 @@ jobs:
       - name: Run kernel tests
         run: cargo xtask test
         
-  arm64-gate:
-    name: aarch64 smoltcp compile gate
+  arm64:
+    name: aarch64 build + boot (QEMU virt)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
-    # Phase 4 runs and tests only on amd64, but the TCP/IP stack (smoltcp) is
-    # meant to be architecture-independent so the Phase 7 arm64 port inherits it
-    # unchanged. This job compiles smoltcp alone — with the net server's exact
-    # feature set — for aarch64-unknown-none (see servers/smoltcp-gate). It goes
-    # red the moment the stack takes an amd64-only or std dependency, long before
-    # the arm64 port would trip over it. Compile-only: no QEMU needed.
+    # Two levels of aarch64 coverage, cheapest first:
+    #
+    #  1. The compile gate (`arm64-gate`) builds smoltcp alone — with the net
+    #     server's exact feature set — for aarch64-unknown-none. It goes red the
+    #     moment the TCP/IP stack takes an amd64-only or std dependency, long
+    #     before the port would trip over it.
+    #  2. The boot smoke (`arm64-smoke`) builds the kernel itself for aarch64 and
+    #     boots it headless on QEMU `virt` under UEFI, asserting it reaches the
+    #     boot banner on the PL011 UART. That proves the whole
+    #     Limine → EL1 → UART path runs, not merely that the kernel compiles.
+    #
+    # The smoke needs qemu-system-aarch64 plus the AAVMF firmware pair; on Ubuntu
+    # the qemu-efi-aarch64 package ships them under /usr/share/AAVMF, which is the
+    # first path xtask's find_aavmf() probes.
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -69,18 +77,27 @@ jobs:
         with:
           toolchain: nightly
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry and Limine
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-arm64gate-${{ hashFiles('servers/smoltcp-gate/Cargo.toml', 'rust-toolchain.toml') }}
+            target/limine
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-arm64gate-
+            ${{ runner.os }}-cargo-arm64-
 
-      - name: Compile smoltcp for aarch64-unknown-none
+      - name: Install aarch64 QEMU + UEFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64
+
+      - name: Compile-gate smoltcp + kernel for aarch64
         run: cargo xtask arm64-gate
+
+      - name: Boot the aarch64 kernel on QEMU virt (banner smoke)
+        run: cargo xtask arm64-smoke
 
   release:
     name: Release ISO (amd64)
