@@ -1063,6 +1063,27 @@ fn cmd_iso(args: &[String]) {
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
+    // `create_iso` below emits an x86-only boot structure: `BOOTX64.EFI`, the BIOS
+    // El Torito images, and a `limine bios-install` pass. It has no `BOOTAA64.EFI`
+    // path. Because `cmd_build` *does* honour `--arch`, an unguarded
+    // `xtask iso --arch aarch64` would happily compile an aarch64 kernel, wrap it in
+    // x86 scaffolding, and emit a themelios.iso that simply never boots on arm64 —
+    // silently wrong output, which is worse than a hard failure. Refuse instead.
+    //
+    // A real arm64 image is Phase 8 work: `virt` is UEFI-only (no BIOS/El Torito),
+    // so it wants a FAT ESP or GPT disk image rather than a hybrid ISO.
+    if target == "aarch64-unknown-none" {
+        eprintln!("Error: `xtask iso` cannot build an aarch64 image yet.");
+        eprintln!(
+            "create_iso() emits x86-only boot scaffolding (BOOTX64.EFI + BIOS El Torito);\n\
+             an aarch64 ISO built from it would not boot. A UEFI-only arm64 image is\n\
+             Phase 8 work."
+        );
+        eprintln!("To boot aarch64 today:  cargo xtask run --arch aarch64");
+        eprintln!("To smoke-test aarch64:  cargo xtask arm64-smoke");
+        process::exit(1);
+    }
+
     cmd_build(args);
 
     let kernel_binary = root.join(format!("target/{target}/debug/themelios"));
@@ -1216,10 +1237,14 @@ fn cmd_test(args: &[String]) {
     let qemu = qemu_binary(&opts.arch);
     println!("Running tests in QEMU...\n");
 
-    // 90s: the suite now boots several userspace filesystem servers, each doing
-    // IPC + block I/O, so give QEMU comfortable headroom over the ~few seconds a
-    // healthy run takes (a real hang still trips well before this).
-    let timeout_secs = 90;
+    // The suite boots several userspace filesystem and network servers, each doing
+    // IPC + block I/O, and a healthy run is now tens of seconds — not the "~few
+    // seconds" this budget was originally sized against. At 90s a slow or loaded CI
+    // runner could exhaust the budget mid-suite and report a *timeout* for what was
+    // only slowness, which is indistinguishable from a real kernel hang (this
+    // happened on the Phase 7.0b PR). 180s keeps a genuine hang bounded while
+    // leaving room for the aarch64 suite the port adds in 7.4.
+    let timeout_secs = 180;
 
     let mut cmd = Command::new(qemu);
     cmd.current_dir(&root)
