@@ -19,3 +19,8 @@ xt = "run --package xtask --"
 # as required by the Limine boot protocol.
 [target.x86_64-unknown-none]
 rustflags = ["-Crelocation-model=static", "-Clink-arg=-Tkernel/linker-x86_64.ld"]
+
+# Linker script for the aarch64 bare-metal kernel (Phase 7). Same higher-half base
+# as x86_64; the Limine protocol is architecture-neutral.
+[target.aarch64-unknown-none]
+rustflags = ["-Crelocation-model=static", "-Clink-arg=-Tkernel/linker-aarch64.ld"]

@@ -42,3 +42,6 @@ pub mod irq;
 
 /// Monotonic tick source (`tick_count`).
 pub mod time;
+
+/// Serial console (`_print`) — backs the `print!`/`println!` macros.
+pub mod serial;

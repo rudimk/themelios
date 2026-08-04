@@ -23,8 +23,15 @@
 //! in `arch/mod.rs` ensures the rest of the kernel doesn't need to know
 //! which architecture it's running on.
 
-// Sub-modules will be added after x86_64 implementation is stable:
-// pub mod boot;    — entry point, EL1 setup
-// pub mod gic;     — Generic Interrupt Controller
-// pub mod uart;    — PL011 UART driver
-// pub mod mmu;     — translation table management
+// Phase 7.0b: minimal boot-to-banner support.
+//
+// - `boot`   — early EL1 init: enable FP, map the PL011, print the banner (7.0b).
+// - `serial` — PL011 UART driver + `_print` (backs the `println!` facade).
+// - `irq`    — `DAIF`/`wfi` local-interrupt control (backs `arch::irq`).
+// - `time`   — monotonic tick (backs `arch::time`; timer ISR lands in 7.2).
+//
+// Still to come: `mmu` (7.1), `exceptions`+`gic`+`timer` (7.2), `context` (7.3).
+pub mod boot;
+pub mod irq;
+pub mod serial;
+pub mod time;
