@@ -166,7 +166,22 @@ pub enum VirtioError {
     OutOfMemory,
     /// The device signalled an error during initialisation.
     DeviceError,
+    /// The device did not complete a submitted descriptor chain within the bounded
+    /// poll window (see [`MAX_COMPLETION_SPINS`]). Usually means the device was
+    /// reset or re-initialised underneath an in-flight request, so the used ring
+    /// will never advance for that chain.
+    DeviceTimeout,
 }
+
+/// Upper bound on how many times [`Virtqueue::submit_and_wait`] spins waiting for
+/// the device to return a chain before giving up.
+///
+/// Sized generously: a healthy QEMU VirtIO device completes in microseconds, so at
+/// roughly tens of cycles per `pause` this is still a sub-second worst case, while
+/// being far beyond any legitimate completion latency. It exists to convert a
+/// permanent kernel-wide freeze (the caller holds the device lock with interrupts
+/// disabled) into a recoverable per-request error.
+const MAX_COMPLETION_SPINS: u32 = 20_000_000;
 
 /// A single split-virtqueue descriptor (16 bytes, matches the VirtIO spec).
 ///
@@ -273,7 +288,12 @@ impl Virtqueue {
     /// (e.g. request header → data buffer → status byte for a block request),
     /// places `head` in the available ring, increments the available index,
     /// rings the doorbell, and spins on the used ring.
-    fn submit_and_wait(&mut self, head: u16) {
+    ///
+    /// Returns [`VirtioError::DeviceTimeout`] if the device does not return the
+    /// chain within [`MAX_COMPLETION_SPINS`]. Callers must treat that as a failed
+    /// request rather than retrying indefinitely — see the comment on the poll loop
+    /// for why the wait is bounded at all.
+    fn submit_and_wait(&mut self, head: u16) -> Result<(), VirtioError> {
         // 1. Publish `head` into the available ring at the current avail index.
         // SAFETY: avail ring is HHDM-mapped RAM of the correct size.
         let avail_idx = unsafe { mmio_read_u16(self.avail, RING_IDX) };
@@ -301,16 +321,32 @@ impl Virtqueue {
         }
 
         // 5. Poll the used ring until its index advances past what we last saw,
-        // signalling the device has returned our chain.
-        loop {
+        // signalling the device has returned our chain — but never forever.
+        //
+        // Both callers (the block driver and the NIC's TX path) hold the device's
+        // `InterruptMutex` across this call, so **interrupts are disabled while we
+        // spin**. An unbounded spin here therefore does not merely stall the calling
+        // task: it stops the timer, so nothing preempts us and the whole kernel is
+        // dead with no output. That is a real failure mode, not a theoretical one —
+        // it is what wedged the test suite when one net-service was mid-transmit
+        // while another bring-up reset the same shared VirtIO device out from under
+        // it, leaving a used ring that would never advance.
+        //
+        // Note the bound must be a **spin count, not a deadline**: with interrupts
+        // off the monotonic tick does not advance, so a time-based timeout would
+        // never expire. On a healthy QEMU device the used ring advances in
+        // microseconds; this cap is orders of magnitude beyond that, so it fires only
+        // when the device genuinely will never complete the chain.
+        for _ in 0..MAX_COMPLETION_SPINS {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             let used_idx = unsafe { mmio_read_u16(self.used, RING_IDX) };
             if used_idx != self.last_used_idx {
                 self.last_used_idx = used_idx;
-                break;
+                return Ok(());
             }
             core::hint::spin_loop();
         }
+        Err(VirtioError::DeviceTimeout)
     }
 
     // ----- Asynchronous (non-blocking) primitives for networking -----

@@ -199,8 +199,14 @@ impl Inner {
                 next: 0,
             },
         );
-        // Submit and poll until the device has consumed the frame.
-        self.tx_queue.submit_and_wait(0);
+        // Submit and poll until the device has consumed the frame. If the device
+        // never returns the chain — which happens when the shared NIC is reset or
+        // re-initialised while this transmit is in flight — report a device error
+        // and let the caller drop the frame. Spinning here would freeze the kernel:
+        // we hold the device lock, so interrupts are disabled.
+        self.tx_queue
+            .submit_and_wait(0)
+            .map_err(|_| NetError::DeviceError)?;
         Ok(())
     }
 

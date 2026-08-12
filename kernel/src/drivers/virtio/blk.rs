@@ -221,8 +221,13 @@ impl Inner {
             },
         );
 
-        // Submit the chain (head = header) and poll until the device returns it.
-        self.queue.submit_and_wait(DESC_HEADER);
+        // Submit the chain (head = header) and poll until the device returns it. A
+        // timeout means the device will never complete this request (e.g. it was
+        // reset underneath us), so surface it as a device error rather than reading
+        // a status byte the device never wrote.
+        self.queue
+            .submit_and_wait(DESC_HEADER)
+            .map_err(|_| BlockError::DeviceError)?;
 
         // Check the device's status byte.
         // SAFETY: the device has completed the request and written the status.
