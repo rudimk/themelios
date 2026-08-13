@@ -175,6 +175,13 @@ impl Inner {
         if frame.len() > MAX_FRAME || VIRTIO_NET_HDR_LEN + frame.len() > RX_BUF_SIZE {
             return Err(NetError::TooLarge);
         }
+        // Bail out BEFORE staging anything. The TX path is single-buffered
+        // (`tx_buf_phys`, descriptor 0), so if a previous chain was abandoned the
+        // device may still be reading that buffer and that descriptor. The staging
+        // writes below would race it; checking at submit time would be too late.
+        if self.tx_queue.is_failed() {
+            return Err(NetError::DeviceError);
+        }
         // Stage: zeroed 12-byte header, then the frame.
         // SAFETY: tx_buf_phys backs one HHDM-mapped frame we own; the total
         // length is bounded by the check above and access is serialised by the
@@ -199,8 +206,24 @@ impl Inner {
                 next: 0,
             },
         );
-        // Submit and poll until the device has consumed the frame.
-        self.tx_queue.submit_and_wait(0);
+        // Submit and poll until the device has consumed the frame. If the device
+        // never returns the chain — which happens when the shared NIC is reset or
+        // re-initialised while this transmit is in flight — the queue disables
+        // itself and we report a device error so the caller drops the frame.
+        // Spinning here would freeze the kernel: we hold the device lock, so
+        // interrupts are disabled.
+        //
+        // The staging buffer and descriptor are protected by the `is_failed` check at
+        // the top of this function, which runs before either is written.
+        if let Err(e) = self.tx_queue.submit_and_wait(0) {
+            // Log the first failure per queue only; `Virtqueue::fail` already
+            // reports the underlying cause, and a chatty TX path under a wedged
+            // device would bury it.
+            if !matches!(e, VirtioError::QueueDesynchronised) {
+                crate::println!("[virtio-net] transmit failed: {e:?}; frame dropped");
+            }
+            return Err(NetError::DeviceError);
+        }
         Ok(())
     }
 

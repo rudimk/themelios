@@ -154,6 +154,15 @@ impl Inner {
         data_sectors: usize,
         dev_writes_data: bool,
     ) -> Result<(), BlockError> {
+        // Bail out BEFORE staging anything. The header, status byte, bounce buffer
+        // and all three descriptors are fixed, single-instance DMA memory; if a
+        // previous chain was abandoned the device may still be reading or writing
+        // them, so the staging writes below would race it. Checking at submit time
+        // would be too late — they have already happened by then.
+        if self.queue.is_failed() {
+            return Err(BlockError::DeviceError);
+        }
+
         // --- Build the 16-byte request header in the header DMA buffer ---
         // Layout: type:u32, reserved:u32, sector:u64 (all little-endian).
         // SAFETY: header_phys points to a 16-byte-aligned DMA buffer we own.
@@ -222,7 +231,18 @@ impl Inner {
         );
 
         // Submit the chain (head = header) and poll until the device returns it.
-        self.queue.submit_and_wait(DESC_HEADER);
+        //
+        // On failure we must NOT fall through to the status read below: the device
+        // never wrote the status byte for this request, and its descriptors and
+        // bounce buffer are still device-owned. `submit_and_wait` disables the queue
+        // in that case, so every later request fails too rather than picking up this
+        // one's late completion and returning its data as their own.
+        if let Err(e) = self.queue.submit_and_wait(DESC_HEADER) {
+            if !matches!(e, VirtioError::QueueDesynchronised) {
+                crate::println!("[virtio-blk] request failed: {e:?}");
+            }
+            return Err(BlockError::DeviceError);
+        }
 
         // Check the device's status byte.
         // SAFETY: the device has completed the request and written the status.

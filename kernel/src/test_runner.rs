@@ -46,6 +46,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
     TestCase { name: "test_pci_scan",        func: test_pci_scan },
     TestCase { name: "test_virtio_transport", func: test_virtio_transport },
+    TestCase { name: "test_virtio_queue_failure", func: test_virtio_queue_failure },
     TestCase { name: "test_virtio_blk",       func: test_virtio_blk },
     TestCase { name: "test_shared_memory",    func: test_shared_memory },
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
@@ -1292,6 +1293,24 @@ fn test_virtio_transport() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_virtio_transport() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Fault-injection for the VirtIO queue-failure paths.
+///
+/// A healthy QEMU device always completes, so the timeout and desynchronisation
+/// handling is otherwise dead code in the suite — which is how an earlier version of
+/// it shipped a silent data-corruption path that every green run missed. The
+/// assertions live next to the code under test (`virtio::test_queue_failure_paths`);
+/// this drives them from the suite.
+#[cfg(target_arch = "x86_64")]
+fn test_virtio_queue_failure() -> Result<(), &'static str> {
+    crate::drivers::virtio::test_queue_failure_paths()
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_virtio_queue_failure() -> Result<(), &'static str> {
     Ok(())
 }
 
@@ -3280,6 +3299,60 @@ fn test_dhcp() -> Result<(), &'static str> {
 //  Socket API tests (Phase 4.5)
 // ============================================================
 
+/// Wait until `ready()` reports true, giving up after `timeout_ticks` have elapsed
+/// on the 100 Hz monotonic tick (one tick ≈ 10 ms). Returns whether it succeeded.
+///
+/// **Why a tick deadline and not an iteration count.** The obvious way to write a
+/// bounded wait in this suite is `for _ in 0..300_000 { … sched::yield_now() }`, but
+/// that is not a *time* bound at all: how long 300k yields take depends entirely on
+/// how fast the host is and how many other tasks are runnable. On a fast dev box such
+/// a loop expires in under a second; on a loaded CI runner, with a net server also
+/// competing for the CPU, the same loop can run for the better part of a minute. That
+/// is long enough to consume the harness's whole-suite budget, at which point a merely
+/// slow wait is reported as a QEMU timeout and reads exactly like a wedged kernel.
+/// (This is precisely how the amd64 suite flaked on the Phase 7.0b PR.)
+///
+/// Bounding by the tick makes "wait up to N seconds" mean the same thing on every
+/// host, so a wait that really does fail returns a clean, fast test failure instead of
+/// silently eating the budget.
+#[cfg(target_arch = "x86_64")]
+fn wait_ticks(timeout_ticks: u64, mut ready: impl FnMut() -> bool) -> bool {
+    use crate::arch::time::tick_count;
+    use crate::sched;
+
+    // Backstop against the tick source itself stalling (timer masked, ISR wedged):
+    // without this the deadline below could never expire and we would spin forever,
+    // reintroducing the hang we are trying to remove.
+    //
+    // Sized so it can actually fire *inside* the harness's QEMU budget, using a
+    // measured cost rather than an assumed one: `sched::yield_now()` is a full pass
+    // through the scheduler and was benchmarked at **174 µs idle and 279 µs under 4×
+    // host CPU load** in this suite — not the ~10 µs one might assume. At that rate
+    // 100,000 iterations is roughly 17–28 s, which fits inside the 180 s budget with
+    // most of the suite already spent. Earlier values of 50M and 1M needed ~500 s and
+    // ~175–280 s respectively, i.e. the harness would kill QEMU first and the
+    // backstop could never fire — indistinguishable from having no backstop at all,
+    // which is exactly the outcome it exists to prevent.
+    const MAX_SPINS: u64 = 100_000;
+
+    let start = tick_count();
+    let mut spins: u64 = 0;
+    loop {
+        if ready() {
+            return true;
+        }
+        // wrapping_sub so a (theoretical) tick wrap still yields a sane elapsed count.
+        if tick_count().wrapping_sub(start) >= timeout_ticks {
+            return false;
+        }
+        spins += 1;
+        if spins >= MAX_SPINS {
+            return false;
+        }
+        sched::yield_now();
+    }
+}
+
 /// Bring up a NIC + kernel net service + ring-3 net server, map the socket
 /// payload region, and register the kernel socket router — the same wiring
 /// `boot_net` does. Returns the net server's request endpoint. `dhcp` selects
@@ -5087,20 +5160,16 @@ fn build_dns_query() -> [u8; 29] {
 #[cfg(target_arch = "x86_64")]
 fn test_udp_echo() -> Result<(), &'static str> {
     use crate::net::{net_service, socket};
-    use crate::sched;
 
     let _fs_ep = spawn_net_server_with_sockets(true, "virtio-net-udp")?;
 
-    // Wait for DHCP so the interface has an address and default route.
-    let mut configured = false;
-    for _ in 0..300_000 {
-        if net_service::status().config.configured {
-            configured = true;
-            break;
-        }
-        sched::yield_now();
-    }
-    if !configured {
+    // Wait for DHCP so the interface has an address and default route. 10 s is far
+    // more than a healthy lease exchange needs (test_dhcp, which ran earlier, does
+    // the same handshake) while still bounding a stuck stack in wall-clock terms.
+    const DHCP_TIMEOUT_TICKS: u64 = 1_000; // 100 Hz → 10 s
+    if !wait_ticks(DHCP_TIMEOUT_TICKS, || {
+        net_service::status().config.configured
+    }) {
         return Err("DHCP did not configure before the UDP test");
     }
 
@@ -5116,26 +5185,28 @@ fn test_udp_echo() -> Result<(), &'static str> {
         return Err("sendto did not accept the whole datagram");
     }
 
-    // Best-effort: try to receive the DNS response (see the doc comment).
+    // Best-effort: try to receive the DNS response (see the doc comment). This one is
+    // explicitly allowed to come back empty — a sandboxed CI may block slirp's DNS
+    // proxy entirely — so keep the window short rather than spending suite budget
+    // waiting for a reply that is not required to arrive.
+    const DNS_REPLY_TIMEOUT_TICKS: u64 = 200; // 100 Hz → 2 s
     let mut buf = [0u8; 512];
     let mut got = false;
-    for _ in 0..200_000 {
-        if let Ok((n, ip, port)) = socket::ksocket_recvfrom(id, &mut buf) {
-            if n > 0 {
-                if ip == [10, 0, 2, 3]
+    wait_ticks(DNS_REPLY_TIMEOUT_TICKS, || {
+        match socket::ksocket_recvfrom(id, &mut buf) {
+            Ok((n, ip, port)) if n > 0 => {
+                // First datagram decides it, matching the original single-shot check.
+                got = ip == [10, 0, 2, 3]
                     && port == 53
                     && n >= 12
                     && buf[0] == query[0]
                     && buf[1] == query[1]
-                    && (buf[2] & 0x80) != 0
-                {
-                    got = true;
-                }
-                break;
+                    && (buf[2] & 0x80) != 0;
+                true
             }
+            _ => false,
         }
-        sched::yield_now();
-    }
+    });
     let _ = socket::ksocket_close(id);
 
     if got {
