@@ -46,6 +46,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
     TestCase { name: "test_pci_scan",        func: test_pci_scan },
     TestCase { name: "test_virtio_transport", func: test_virtio_transport },
+    TestCase { name: "test_virtio_queue_failure", func: test_virtio_queue_failure },
     TestCase { name: "test_virtio_blk",       func: test_virtio_blk },
     TestCase { name: "test_shared_memory",    func: test_shared_memory },
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
@@ -1292,6 +1293,24 @@ fn test_virtio_transport() -> Result<(), &'static str> {
 /// Stub for non-x86_64 targets.
 #[cfg(not(target_arch = "x86_64"))]
 fn test_virtio_transport() -> Result<(), &'static str> {
+    Ok(())
+}
+
+/// Fault-injection for the VirtIO queue-failure paths.
+///
+/// A healthy QEMU device always completes, so the timeout and desynchronisation
+/// handling is otherwise dead code in the suite — which is how an earlier version of
+/// it shipped a silent data-corruption path that every green run missed. The
+/// assertions live next to the code under test (`virtio::test_queue_failure_paths`);
+/// this drives them from the suite.
+#[cfg(target_arch = "x86_64")]
+fn test_virtio_queue_failure() -> Result<(), &'static str> {
+    crate::drivers::virtio::test_queue_failure_paths()
+}
+
+/// Stub for non-x86_64 targets.
+#[cfg(not(target_arch = "x86_64"))]
+fn test_virtio_queue_failure() -> Result<(), &'static str> {
     Ok(())
 }
 
@@ -3303,9 +3322,14 @@ fn wait_ticks(timeout_ticks: u64, mut ready: impl FnMut() -> bool) -> bool {
 
     // Backstop against the tick source itself stalling (timer masked, ISR wedged):
     // without this the deadline below could never expire and we would spin forever,
-    // reintroducing the hang we are trying to remove. Sized far above any legitimate
-    // wait, so it only ever fires when the clock is broken.
-    const MAX_SPINS: u64 = 50_000_000;
+    // reintroducing the hang we are trying to remove.
+    //
+    // Sized so it can actually fire *inside* the harness's QEMU budget. Each
+    // iteration is a `yield_now`, i.e. a full pass through the scheduler, so at a
+    // rough ten microseconds apiece this is on the order of ten seconds. A much
+    // larger cap would need minutes to trip and the suite would be killed first —
+    // which would look exactly like the wedged kernel this is meant to prevent.
+    const MAX_SPINS: u64 = 1_000_000;
 
     let start = tick_count();
     let mut spins: u64 = 0;

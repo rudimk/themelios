@@ -201,12 +201,24 @@ impl Inner {
         );
         // Submit and poll until the device has consumed the frame. If the device
         // never returns the chain — which happens when the shared NIC is reset or
-        // re-initialised while this transmit is in flight — report a device error
-        // and let the caller drop the frame. Spinning here would freeze the kernel:
-        // we hold the device lock, so interrupts are disabled.
-        self.tx_queue
-            .submit_and_wait(0)
-            .map_err(|_| NetError::DeviceError)?;
+        // re-initialised while this transmit is in flight — the queue disables
+        // itself and we report a device error so the caller drops the frame.
+        // Spinning here would freeze the kernel: we hold the device lock, so
+        // interrupts are disabled.
+        //
+        // Note the TX queue is single-buffered (`tx_buf_phys`, descriptor 0), so
+        // once a chain has been abandoned the staging buffer is still device-owned.
+        // `submit_and_wait` refusing every later call is what stops the next frame
+        // from overwriting a buffer the device may still be reading.
+        if let Err(e) = self.tx_queue.submit_and_wait(0) {
+            // Log the first failure per queue only; `Virtqueue::fail` already
+            // reports the underlying cause, and a chatty TX path under a wedged
+            // device would bury it.
+            if !matches!(e, VirtioError::QueueDesynchronised) {
+                crate::println!("[virtio-net] transmit failed: {e:?}; frame dropped");
+            }
+            return Err(NetError::DeviceError);
+        }
         Ok(())
     }
 

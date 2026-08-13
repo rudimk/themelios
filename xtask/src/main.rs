@@ -349,6 +349,33 @@ fn ensure_scratch_disk(root: &Path) -> PathBuf {
 ///
 /// Devices are assigned PCI slots in command-line order, so callers control
 /// discovery order by the order they emit these arg groups.
+/// Refuse any subcommand that would route an aarch64 kernel through [`create_iso`].
+///
+/// `create_iso` emits an x86-only boot structure: `BOOTX64.EFI`, the BIOS El Torito
+/// images, and a `limine bios-install` pass. It has no `BOOTAA64.EFI` path. But
+/// `cmd_build` *does* honour `--arch`, so without this check `iso --arch aarch64`
+/// and `test --arch aarch64` both compile an aarch64 kernel, wrap it in x86
+/// scaffolding, and produce something that simply never boots on arm64 — silently
+/// wrong output, which is worse than a hard failure. (`run --arch aarch64` is fine:
+/// it diverts to `run_aarch64` and never reaches `create_iso`.)
+///
+/// A real arm64 image is Phase 8 work: `virt` is UEFI-only (no BIOS/El Torito), so
+/// it wants a FAT ESP or GPT disk image rather than a hybrid ISO.
+fn reject_aarch64_iso(target: &str, subcommand: &str) {
+    if target != "aarch64-unknown-none" {
+        return;
+    }
+    eprintln!("Error: `xtask {subcommand}` cannot build an aarch64 image yet.");
+    eprintln!(
+        "create_iso() emits x86-only boot scaffolding (BOOTX64.EFI + BIOS El Torito);\n\
+         an aarch64 image built from it would not boot. A UEFI-only arm64 image is\n\
+         Phase 8 work."
+    );
+    eprintln!("To boot aarch64 today:  cargo xtask run --arch aarch64");
+    eprintln!("To smoke-test aarch64:  cargo xtask arm64-smoke");
+    process::exit(1);
+}
+
 fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
     let ro = if readonly { ",readonly=on" } else { "" };
     vec![
@@ -1063,26 +1090,7 @@ fn cmd_iso(args: &[String]) {
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
-    // `create_iso` below emits an x86-only boot structure: `BOOTX64.EFI`, the BIOS
-    // El Torito images, and a `limine bios-install` pass. It has no `BOOTAA64.EFI`
-    // path. Because `cmd_build` *does* honour `--arch`, an unguarded
-    // `xtask iso --arch aarch64` would happily compile an aarch64 kernel, wrap it in
-    // x86 scaffolding, and emit a themelios.iso that simply never boots on arm64 —
-    // silently wrong output, which is worse than a hard failure. Refuse instead.
-    //
-    // A real arm64 image is Phase 8 work: `virt` is UEFI-only (no BIOS/El Torito),
-    // so it wants a FAT ESP or GPT disk image rather than a hybrid ISO.
-    if target == "aarch64-unknown-none" {
-        eprintln!("Error: `xtask iso` cannot build an aarch64 image yet.");
-        eprintln!(
-            "create_iso() emits x86-only boot scaffolding (BOOTX64.EFI + BIOS El Torito);\n\
-             an aarch64 ISO built from it would not boot. A UEFI-only arm64 image is\n\
-             Phase 8 work."
-        );
-        eprintln!("To boot aarch64 today:  cargo xtask run --arch aarch64");
-        eprintln!("To smoke-test aarch64:  cargo xtask arm64-smoke");
-        process::exit(1);
-    }
+    reject_aarch64_iso(target, "iso");
 
     cmd_build(args);
 
@@ -1189,13 +1197,18 @@ fn cmd_run(args: &[String]) {
 ///
 /// - QEMU exit code `3` (kernel wrote `0x01`) → all tests passed
 /// - QEMU exit code `1` (kernel wrote `0x00`) → some test failed
-/// - Timeout (30 seconds) → kernel hung or panicked
+/// - Timeout (see `timeout_secs` below) → kernel hung or panicked
 ///
 /// Serial output is captured and printed on failure or timeout.
 fn cmd_test(args: &[String]) {
     let opts = parse_options(args);
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
+
+    // Same trap as `cmd_iso`: this path builds for `--arch` but then goes through
+    // `create_iso` and launches `-M q35` with x86 disk/NIC args. Refuse before doing
+    // any work rather than emitting an unbootable image and a nonsense QEMU command.
+    reject_aarch64_iso(target, "test");
 
     println!("Building ThemeliOS kernel (test mode) for {target}...");
 

@@ -221,13 +221,19 @@ impl Inner {
             },
         );
 
-        // Submit the chain (head = header) and poll until the device returns it. A
-        // timeout means the device will never complete this request (e.g. it was
-        // reset underneath us), so surface it as a device error rather than reading
-        // a status byte the device never wrote.
-        self.queue
-            .submit_and_wait(DESC_HEADER)
-            .map_err(|_| BlockError::DeviceError)?;
+        // Submit the chain (head = header) and poll until the device returns it.
+        //
+        // On failure we must NOT fall through to the status read below: the device
+        // never wrote the status byte for this request, and its descriptors and
+        // bounce buffer are still device-owned. `submit_and_wait` disables the queue
+        // in that case, so every later request fails too rather than picking up this
+        // one's late completion and returning its data as their own.
+        if let Err(e) = self.queue.submit_and_wait(DESC_HEADER) {
+            if !matches!(e, VirtioError::QueueDesynchronised) {
+                crate::println!("[virtio-blk] request failed: {e:?}");
+            }
+            return Err(BlockError::DeviceError);
+        }
 
         // Check the device's status byte.
         // SAFETY: the device has completed the request and written the status.

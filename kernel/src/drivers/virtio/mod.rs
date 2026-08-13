@@ -41,6 +41,13 @@
 //! used ring's index until our buffer comes back. This keeps the block path
 //! simple and deterministic. Interrupt-driven completion (MSI-X) is a later
 //! optimisation; the VirtIO spec explicitly permits polling.
+//!
+//! That spin is **bounded**, and giving up is not recoverable. Callers hold the
+//! device lock with interrupts disabled for the whole poll, so an unbounded wait
+//! freezes the entire kernel rather than just the calling task. When the bound is
+//! reached the chain is still device-owned, so the queue disables itself
+//! permanently instead of reusing descriptors the device may still touch — see
+//! [`Virtqueue::fail`] and [`MAX_COMPLETION_SPINS`].
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -171,17 +178,34 @@ pub enum VirtioError {
     /// reset or re-initialised underneath an in-flight request, so the used ring
     /// will never advance for that chain.
     DeviceTimeout,
+    /// The queue's view of the rings no longer matches the device's, so completions
+    /// can no longer be attributed to the requests that produced them. Permanent
+    /// until the device is re-initialised; see [`Virtqueue::fail`].
+    QueueDesynchronised,
 }
 
-/// Upper bound on how many times [`Virtqueue::submit_and_wait`] spins waiting for
-/// the device to return a chain before giving up.
+/// Upper bound on how many times [`Virtqueue::submit_and_wait`] polls the used ring
+/// before declaring the device stuck.
 ///
-/// Sized generously: a healthy QEMU VirtIO device completes in microseconds, so at
-/// roughly tens of cycles per `pause` this is still a sub-second worst case, while
-/// being far beyond any legitimate completion latency. It exists to convert a
-/// permanent kernel-wide freeze (the caller holds the device lock with interrupts
-/// disabled) into a recoverable per-request error.
-const MAX_COMPLETION_SPINS: u32 = 20_000_000;
+/// This window is time during which the **entire kernel is frozen** — the caller
+/// holds the device lock, so interrupts are disabled for its whole duration — which
+/// is why it is sized from a measurement rather than a guess. 20,000,000 iterations
+/// of this loop (SeqCst fence + volatile `u16` read + `spin_loop`) were measured at
+/// ~13.7 s under QEMU TCG in a debug build, the exact configuration CI runs: about
+/// 0.68 µs per iteration. 200,000 iterations is therefore a worst case of roughly
+/// 140 ms there. On real hardware an iteration is far cheaper (~180 cycles including
+/// the fence), so the same count is on the order of 12 ms at 3 GHz.
+///
+/// A healthy QEMU device completes in microseconds, leaving three orders of
+/// magnitude of headroom before this can fire. A spurious timeout is safe but not
+/// free: it permanently disables the queue (see [`Virtqueue::fail`]), turning into a
+/// loud I/O failure rather than silent corruption.
+///
+/// A calibrated deadline would be better than a raw count — `rdtsc` does keep
+/// advancing with interrupts disabled, contrary to the monotonic tick, which stalls.
+/// The kernel has no TSC calibration yet, so a cycle count would carry no wall-clock
+/// meaning either; adding one is a separate change.
+const MAX_COMPLETION_SPINS: u32 = 200_000;
 
 /// A single split-virtqueue descriptor (16 bytes, matches the VirtIO spec).
 ///
@@ -229,6 +253,11 @@ pub struct Virtqueue {
     notify_addr: VirtAddr,
     /// Last used-ring index we have observed (for polling completions).
     last_used_idx: u16,
+    /// Set once this queue has desynchronised from the device — a submitted chain
+    /// was abandoned on timeout, or the device returned a completion for a chain we
+    /// did not submit. See [`Virtqueue::fail`] for why the queue must then be
+    /// refused rather than reused.
+    failed: bool,
 }
 
 // --- Available / used ring field offsets (within their respective regions) ---
@@ -268,6 +297,7 @@ impl Virtqueue {
             used_phys,
             notify_addr,
             last_used_idx: 0,
+            failed: false,
         })
     }
 
@@ -294,6 +324,11 @@ impl Virtqueue {
     /// request rather than retrying indefinitely — see the comment on the poll loop
     /// for why the wait is bounded at all.
     fn submit_and_wait(&mut self, head: u16) -> Result<(), VirtioError> {
+        // Refuse work on a queue that has already desynchronised (see `fail`).
+        if self.failed {
+            return Err(VirtioError::QueueDesynchronised);
+        }
+
         // 1. Publish `head` into the available ring at the current avail index.
         // SAFETY: avail ring is HHDM-mapped RAM of the correct size.
         let avail_idx = unsafe { mmio_read_u16(self.avail, RING_IDX) };
@@ -331,22 +366,62 @@ impl Virtqueue {
         // it is what wedged the test suite when one net-service was mid-transmit
         // while another bring-up reset the same shared VirtIO device out from under
         // it, leaving a used ring that would never advance.
-        //
-        // Note the bound must be a **spin count, not a deadline**: with interrupts
-        // off the monotonic tick does not advance, so a time-based timeout would
-        // never expire. On a healthy QEMU device the used ring advances in
-        // microseconds; this cap is orders of magnitude beyond that, so it fires only
-        // when the device genuinely will never complete the chain.
         for _ in 0..MAX_COMPLETION_SPINS {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             let used_idx = unsafe { mmio_read_u16(self.used, RING_IDX) };
-            if used_idx != self.last_used_idx {
-                self.last_used_idx = used_idx;
-                return Ok(());
+            if used_idx == self.last_used_idx {
+                core::hint::spin_loop();
+                continue;
             }
-            core::hint::spin_loop();
+
+            // Consume exactly ONE entry — the one at our cursor — rather than
+            // jumping the cursor to the device's index. Jumping would silently
+            // swallow any extra entry, and (worse) after an abandoned request it
+            // would let this call adopt the *previous* request's late completion as
+            // its own. Reading the element also lets us assert the device returned
+            // the chain we actually submitted, which the index alone cannot tell us.
+            let slot = (self.last_used_idx % self.size) as u64;
+            // SAFETY: used ring is HHDM-mapped RAM; entries start at RING_ENTRIES
+            // and are 8 bytes each ({ id: u32, len: u32 }), slot < size.
+            let id = unsafe { read_volatile((self.used.as_u64() + RING_ENTRIES + slot * 8) as *const u32) };
+            self.last_used_idx = self.last_used_idx.wrapping_add(1);
+
+            if id as u16 != head {
+                // The device completed a chain we did not just submit. Our view of
+                // the ring no longer matches the device's, so every later completion
+                // would be attributed to the wrong request.
+                self.fail("completion id mismatch");
+                return Err(VirtioError::QueueDesynchronised);
+            }
+            return Ok(());
         }
+
+        // Timed out. The chain is STILL published and device-owned: the descriptors
+        // and their buffers may be read or written by the device at any later point.
+        // Reusing them would race the device, and a late completion would be picked
+        // up by whichever request polls next. Poison the queue instead.
+        self.fail("completion timeout");
         Err(VirtioError::DeviceTimeout)
+    }
+
+    /// Mark this queue permanently unusable and say so once.
+    ///
+    /// Called when the queue and the device disagree about ring state. Recovery is
+    /// not possible from here: the abandoned descriptors are still device-owned, so
+    /// we can neither reclaim them nor safely resynchronise the cursor — only a full
+    /// device re-initialisation (which reprograms the rings) can clear this. Failing
+    /// every later request is deliberate: a queue that keeps accepting work after
+    /// desynchronising returns other requests' data as if it were yours, which is far
+    /// worse than a loud, permanent I/O error.
+    fn fail(&mut self, reason: &str) {
+        if !self.failed {
+            self.failed = true;
+            crate::println!(
+                "[virtio] queue {} failed: {reason} (last_used_idx={}); queue disabled",
+                self.index,
+                self.last_used_idx
+            );
+        }
     }
 
     // ----- Asynchronous (non-blocking) primitives for networking -----
@@ -360,6 +435,10 @@ impl Virtqueue {
     /// kicking the device or waiting. Used to (re)post RX buffers and to queue a
     /// TX frame before a single `kick`.
     fn publish(&self, head: u16) {
+        // A desynchronised queue must not be handed more buffers — see `fail`.
+        if self.failed {
+            return;
+        }
         // SAFETY: avail ring is HHDM-mapped RAM of the correct size.
         let avail_idx = unsafe { mmio_read_u16(self.avail, RING_IDX) };
         let slot = avail_idx % self.size;
@@ -388,6 +467,12 @@ impl Virtqueue {
     /// last observation, returns `(descriptor head id, bytes written by device)`
     /// and advances our used cursor by one; otherwise returns `None`.
     fn poll_used(&mut self) -> Option<(u16, u32)> {
+        // Completions on a desynchronised queue cannot be attributed to the right
+        // request, so report "nothing waiting" forever rather than hand back a
+        // buffer id we can no longer trust.
+        if self.failed {
+            return None;
+        }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         // SAFETY: used ring is HHDM-mapped RAM of the correct size.
         let used_idx = unsafe { mmio_read_u16(self.used, RING_IDX) };
@@ -406,6 +491,85 @@ impl Virtqueue {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         Some((id as u16, len))
     }
+}
+
+/// Fault-injection coverage for the queue-failure paths (test builds only).
+///
+/// These paths are unreachable from the normal suite — a healthy QEMU device always
+/// completes — so without injection the timeout and desynchronisation handling would
+/// ship untested. That matters here because the *previous* version of this code
+/// looked correct and silently returned one request's data as another's; the
+/// assertions below are exactly what pins that behaviour down.
+///
+/// Drives a queue with no device behind it: the used ring is plain RAM that nobody
+/// ever advances, and the doorbell is a scratch page rather than real MMIO.
+#[cfg(feature = "test")]
+pub fn test_queue_failure_paths() -> Result<(), &'static str> {
+    const SIZE: u16 = 8;
+
+    /// Build a standalone queue backed by RAM, with no device attached.
+    fn fresh() -> Option<Virtqueue> {
+        let desc = alloc_zeroed(SIZE as usize * 16)?;
+        let avail = alloc_zeroed(6 + SIZE as usize * 2)?;
+        let used = alloc_zeroed(6 + SIZE as usize * 8)?;
+        // No device is listening, so the kick must land on harmless RAM.
+        let doorbell = alloc_zeroed(PAGE_SIZE as usize)?;
+        Some(Virtqueue {
+            size: SIZE,
+            index: 0xFF,
+            desc: desc.to_virt(),
+            avail: avail.to_virt(),
+            used: used.to_virt(),
+            desc_phys: desc,
+            avail_phys: avail,
+            used_phys: used,
+            notify_addr: doorbell.to_virt(),
+            last_used_idx: 0,
+            failed: false,
+        })
+    }
+
+    // --- 1. A device that never completes must time out, not spin forever ---
+    let mut q = fresh().ok_or("queue alloc failed")?;
+    match q.submit_and_wait(0) {
+        Err(VirtioError::DeviceTimeout) => {}
+        _ => return Err("submit_and_wait should time out when the used ring never advances"),
+    }
+    if !q.failed {
+        return Err("a timeout must disable the queue");
+    }
+
+    // --- 2. A disabled queue must refuse everything afterwards ---
+    // This is the assertion that matters most: the abandoned chain is still
+    // device-owned, so accepting more work is what would let a late completion be
+    // handed to the wrong request.
+    match q.submit_and_wait(0) {
+        Err(VirtioError::QueueDesynchronised) => {}
+        _ => return Err("a disabled queue must refuse further submissions"),
+    }
+    if q.poll_used().is_some() {
+        return Err("a disabled queue must report no completions");
+    }
+
+    // --- 3. A completion for a chain we did not submit must disable the queue ---
+    // Simulate the device returning descriptor 5 while we wait on head 0, which is
+    // what a late completion from an abandoned request looks like.
+    let mut q2 = fresh().ok_or("queue alloc failed")?;
+    unsafe {
+        let base = q2.used.as_u64() + RING_ENTRIES;
+        write_volatile(base as *mut u32, 5u32); // id
+        write_volatile((base + 4) as *mut u32, 0u32); // len
+        mmio_write_u16(q2.used, RING_IDX, 1);
+    }
+    match q2.submit_and_wait(0) {
+        Err(VirtioError::QueueDesynchronised) => {}
+        _ => return Err("a mismatched completion id must desynchronise the queue"),
+    }
+    if !q2.failed {
+        return Err("an id mismatch must disable the queue");
+    }
+
+    Ok(())
 }
 
 /// Allocate `bytes` of physically-contiguous, zeroed memory.
