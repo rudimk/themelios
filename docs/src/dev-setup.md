@@ -182,10 +182,27 @@ cargo xtask run --arch arm64
 ### Build ISO only (without launching QEMU)
 
 ```bash
-cargo xtask iso
+cargo xtask iso                  # target/themelios-amd64.iso
+cargo xtask iso --arch aarch64   # target/themelios-arm64.iso
 ```
 
-This builds the kernel and creates a bootable ISO at `target/themelios.iso` without launching QEMU. Useful when you want to run QEMU manually with custom flags.
+This builds the kernel and creates a bootable ISO without launching QEMU. Useful when
+you want to run QEMU manually with custom flags.
+
+The two images are **not** interchangeable, and differ by more than the kernel inside
+them:
+
+| Image | Platform | Firmware | Boot structure |
+|-------|----------|----------|----------------|
+| `themelios-amd64.iso` | x86_64 | BIOS or UEFI | Hybrid: BIOS El Torito + `limine-bios.sys` + a `limine bios-install` pass, plus an EFI El Torito image with `BOOTX64.EFI` |
+| `themelios-arm64.iso` | aarch64 | UEFI only | EFI El Torito only, with `BOOTAA64.EFI` — QEMU `virt` and arm64 platforms generally have no BIOS |
+
+To check that the arm64 image boots (needs `qemu-system-aarch64` and the AAVMF
+firmware):
+
+```bash
+cargo xtask arm64-iso-smoke
+```
 
 ### Run with QEMU display window
 

@@ -1,7 +1,7 @@
 # Single CI workflow for ThemeliOS:
 # - On pull requests: run kernel tests only.
-# - On push to main: run kernel tests, build the release ISO, and publish
-#   it as a GitHub Release tagged with the build ULID.
+# - On push to main: run kernel tests, build the release ISOs, and publish
+#   them as a GitHub Release tagged with the build ULID.
 #
 # The ULID (Universally Unique Lexicographically Sortable Identifier) is
 # produced by kernel/build.rs and written to target/build-ulid so the
@@ -17,9 +17,13 @@ on:
 
 jobs:
   test:
-    name: Build & Test (amd64)
+    name: amd64 — build + test suite (QEMU q35)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The in-QEMU suite budget is 180s (raised from 90s). The job cap has to sit
+    # above it with room for the build, or a slow-but-passing run gets killed by
+    # GitHub before the harness can time out and dump the serial log — turning a
+    # diagnosable failure into a bare "job cancelled".
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -48,13 +52,13 @@ jobs:
 
       - name: Run kernel tests
         run: cargo xtask test
-        
+
   arm64:
-    name: aarch64 build + boot (QEMU virt)
+    name: aarch64 — build + boot (QEMU virt)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
-    # Two levels of aarch64 coverage, cheapest first:
+    # Three levels of aarch64 coverage, cheapest first:
     #
     #  1. The compile gate (`arm64-gate`) builds smoltcp alone — with the net
     #     server's exact feature set — for aarch64-unknown-none. It goes red the
@@ -64,10 +68,16 @@ jobs:
     #     boots it headless on QEMU `virt` under UEFI, asserting it reaches the
     #     boot banner on the PL011 UART. That proves the whole
     #     Limine → EL1 → UART path runs, not merely that the kernel compiles.
+    #  3. The ISO smoke (`arm64-iso-smoke`) boots the *shipped artifact* —
+    #     target/themelios-arm64.iso — rather than the directory-backed UEFI ESP
+    #     that step 2 uses. Step 2 proves the kernel boots; only this proves the
+    #     UEFI-only El Torito layout we publish is itself bootable. Without it the
+    #     release job would ship an arm64 ISO nothing has ever booted.
     #
-    # The smoke needs qemu-system-aarch64 plus the AAVMF firmware pair; on Ubuntu
+    # The smokes need qemu-system-aarch64 plus the AAVMF firmware pair; on Ubuntu
     # the qemu-efi-aarch64 package ships them under /usr/share/AAVMF, which is the
-    # first path xtask's find_aavmf() probes.
+    # first path xtask's find_aavmf() probes. xorriso is needed because step 3
+    # builds an ISO.
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -91,7 +101,7 @@ jobs:
       - name: Install aarch64 QEMU + UEFI firmware
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 xorriso
 
       - name: Compile-gate smoltcp + kernel for aarch64
         run: cargo xtask arm64-gate
@@ -99,9 +109,15 @@ jobs:
       - name: Boot the aarch64 kernel on QEMU virt (banner smoke)
         run: cargo xtask arm64-smoke
 
+      - name: Boot the aarch64 ISO on QEMU virt (banner smoke)
+        run: cargo xtask arm64-iso-smoke
+
   release:
-    name: Release ISO (amd64)
-    needs: test
+    name: Release ISOs (amd64 + aarch64)
+    # Both arches gate the release: an amd64 ISO is only worth publishing if the
+    # suite passed, and an arm64 ISO is only worth publishing if something has
+    # actually booted that image.
+    needs: [test, arm64]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -134,8 +150,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 xorriso squashfs-tools e2fsprogs
 
-      - name: Build release ISO
+      - name: Build release ISO (amd64)
         run: cargo xtask iso
+
+      - name: Build release ISO (aarch64)
+        run: cargo xtask iso --arch aarch64
 
       - name: Extract build ULID
         id: ulid
@@ -153,4 +172,16 @@ jobs:
             Automated build from commit ${{ github.sha }}.
 
             Build ULID: `${{ steps.ulid.outputs.ulid }}`
-          files: target/themelios.iso
+
+            | ISO | Architecture | Firmware |
+            |-----|--------------|----------|
+            | `themelios-amd64.iso` | x86_64 | Hybrid BIOS + UEFI |
+            | `themelios-arm64.iso` | aarch64 | UEFI only |
+
+            The images are not interchangeable. The amd64 ISO carries both a BIOS
+            El Torito entry and an EFI one, so it boots on legacy BIOS and UEFI
+            alike. The arm64 ISO is UEFI-only — QEMU `virt` and arm64 platforms
+            generally have no BIOS, so there is no BIOS scaffolding to add.
+          files: |
+            target/themelios-amd64.iso
+            target/themelios-arm64.iso

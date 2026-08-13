@@ -359,30 +359,28 @@ fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
     ]
 }
 
-/// Refuse any subcommand that would route an aarch64 kernel through [`create_iso`].
+/// Refuse `xtask test --arch aarch64`.
 ///
-/// `create_iso` emits an x86-only boot structure: `BOOTX64.EFI`, the BIOS El Torito
-/// images, and a `limine bios-install` pass. It has no `BOOTAA64.EFI` path. But
-/// `cmd_build` *does* honour `--arch`, so without this check `iso --arch aarch64`
-/// and `test --arch aarch64` both compile an aarch64 kernel, wrap it in x86
-/// scaffolding, and produce something that simply never boots on arm64 — silently
-/// wrong output, which is worse than a hard failure. (`run --arch aarch64` is fine:
-/// it diverts to `run_aarch64` and never reaches `create_iso`.)
+/// `create_iso` now builds a real arm64 image, but the *test harness* is still
+/// x86-only: it launches `qemu-system-aarch64` with `-M q35`, x86 VirtIO disk args
+/// and the `isa-debug-exit` device, none of which exist on `virt`. Without this
+/// check the command builds an aarch64 kernel and then issues a nonsense QEMU
+/// invocation. Running the suite on aarch64 is Phase 7.4 work (it needs the
+/// serial-sentinel exit contract, since `isa-debug-exit` is x86-only).
 ///
-/// A real arm64 image is Phase 8 work: `virt` is UEFI-only (no BIOS/El Torito), so
-/// it wants a FAT ESP or GPT disk image rather than a hybrid ISO.
-fn reject_aarch64_iso(target: &str, subcommand: &str) {
+/// `iso`/`run --arch aarch64` are both supported and are not routed here.
+fn reject_aarch64_test(target: &str) {
     if target != "aarch64-unknown-none" {
         return;
     }
-    eprintln!("Error: `xtask {subcommand}` cannot build an aarch64 image yet.");
+    eprintln!("Error: `xtask test` cannot run the suite on aarch64 yet.");
     eprintln!(
-        "create_iso() emits x86-only boot scaffolding (BOOTX64.EFI + BIOS El Torito);\n\
-         an aarch64 image built from it would not boot. A UEFI-only arm64 image is\n\
-         Phase 8 work."
+        "The harness is x86-only: -M q35, x86 VirtIO disk args and isa-debug-exit.\n\
+         An aarch64 suite needs the serial-sentinel exit contract (Phase 7.4)."
     );
-    eprintln!("To boot aarch64 today:  cargo xtask run --arch aarch64");
-    eprintln!("To smoke-test aarch64:  cargo xtask arm64-smoke");
+    eprintln!("To boot aarch64 today:   cargo xtask run --arch aarch64");
+    eprintln!("To smoke-test aarch64:   cargo xtask arm64-smoke");
+    eprintln!("To build an arm64 ISO:   cargo xtask iso --arch aarch64");
     process::exit(1);
 }
 
@@ -877,6 +875,74 @@ fn cmd_arm64_smoke(_args: &[String]) {
     let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
     cmd.args(["-display", "none"]);
     cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+
+    await_aarch64_banner(cmd, &serial_log, "ESP");
+}
+
+/// `cargo xtask arm64-iso-smoke` — build the **arm64 ISO** and boot *it* on QEMU
+/// `virt`, asserting the kernel reaches its banner.
+///
+/// `arm64-smoke` boots from a directory-backed UEFI ESP, which proves the kernel
+/// works but says nothing about the released image. This boots the actual
+/// `themelios-arm64.iso` artifact, so the UEFI-only ISO layout — EFI El Torito with
+/// `BOOTAA64.EFI` and no BIOS scaffolding — is verified rather than assumed.
+fn cmd_arm64_iso_smoke(args: &[String]) {
+    let root = workspace_root();
+
+    // Build the kernel and wrap it in the real arm64 ISO.
+    let mut iso_args: Vec<String> = args.to_vec();
+    iso_args.push("--arch".to_string());
+    iso_args.push("aarch64".to_string());
+    cmd_build(&iso_args);
+
+    let kernel = root.join("target/aarch64-unknown-none/debug/themelios");
+    let limine_dir = ensure_limine(&root);
+    let iso = create_iso(&root, &kernel, &limine_dir, "aarch64-unknown-none");
+
+    let (code, vars) = match find_aavmf() {
+        Some(pair) => pair,
+        None => {
+            eprintln!(
+                "aarch64 UEFI firmware (AAVMF/edk2) not found. Install it — e.g.\n  \
+                 Debian/Ubuntu: apt-get install qemu-efi-aarch64"
+            );
+            process::exit(1);
+        }
+    };
+    // The VARS flash must be writable, so work on a copy rather than the system one.
+    let vars_copy = root.join("target/aarch64-iso-vars.fd");
+    fs::copy(&vars, &vars_copy).expect("copy AAVMF VARS flash");
+
+    let serial_log = root.join("target/aarch64-iso-smoke-serial.log");
+    let _ = fs::remove_file(&serial_log);
+
+    println!("Booting the aarch64 ISO on QEMU virt (headless)...");
+    let mut cmd = Command::new("qemu-system-aarch64");
+    cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-no-reboot"]);
+    cmd.arg("-drive")
+        .arg(format!("if=pflash,format=raw,readonly=on,file={}", code.display()));
+    cmd.arg("-drive")
+        .arg(format!("if=pflash,format=raw,file={}", vars_copy.display()));
+    // Attach the ISO as a read-only VirtIO disk. `virt` has no IDE/ATAPI, so
+    // `-cdrom` is not the right shape here; UEFI boots the EFI System Partition
+    // that xorriso's `-efi-boot-part` embedded in the image.
+    cmd.arg("-drive")
+        .arg(format!("file={},format=raw,if=virtio,readonly=on", iso.display()));
+    cmd.args(["-display", "none"]);
+    cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+
+    await_aarch64_banner(cmd, &serial_log, "ISO");
+}
+
+/// Run `cmd` (a configured headless `qemu-system-aarch64`) and wait for the kernel's
+/// boot banner to appear in `serial_log`, then terminate QEMU.
+///
+/// The 7.0b kernel idles after the banner (there is no self-shutdown until the
+/// timer/exit mechanism lands), so we cannot wait for the process to exit: we poll
+/// the captured serial for the marker and kill QEMU once we see it. Absence of the
+/// marker within the window is a failure. `what` names the boot medium in the
+/// pass/fail message so the two smokes are distinguishable in CI logs.
+fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
 
     // The banner's last line — proves the full Limine→EL1→FP→UART-map→print path ran.
@@ -885,7 +951,7 @@ fn cmd_arm64_smoke(_args: &[String]) {
     for _ in 0..50 {
         // ~25 s budget
         thread::sleep(Duration::from_millis(500));
-        if let Ok(s) = fs::read_to_string(&serial_log) {
+        if let Ok(s) = fs::read_to_string(serial_log) {
             if s.contains(MARKER) {
                 found = true;
                 break;
@@ -898,12 +964,14 @@ fn cmd_arm64_smoke(_args: &[String]) {
     let _ = child.kill();
     let _ = child.wait();
 
-    let serial = fs::read_to_string(&serial_log).unwrap_or_default();
-    println!("--- aarch64 serial output ---\n{serial}\n-----------------------------");
+    let serial = fs::read_to_string(serial_log).unwrap_or_default();
+    println!("--- aarch64 serial output ({what}) ---\n{serial}\n-----------------------------");
     if found {
-        println!("arm64 boot smoke passed: kernel booted to the banner on QEMU virt.");
+        println!("arm64 {what} boot smoke passed: kernel booted to the banner on QEMU virt.");
     } else {
-        eprintln!("arm64 boot smoke FAILED: banner marker '{MARKER}' not seen within the window.");
+        eprintln!(
+            "arm64 {what} boot smoke FAILED: banner marker '{MARKER}' not seen within the window."
+        );
         process::exit(1);
     }
 }
@@ -927,11 +995,19 @@ fn find_aavmf() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path) -> PathBuf {
-    let iso_root = root.join("target/iso_root");
-    let iso_path = root.join("target/themelios.iso");
+fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path, target: &str) -> PathBuf {
+    // aarch64 `virt` (and arm64 platforms generally) are UEFI-only: there is no BIOS,
+    // so no BIOS El Torito image, no `limine-bios.sys`, and no `bios-install` pass.
+    // The arm64 ISO is therefore a pure EFI El Torito image carrying BOOTAA64.EFI.
+    let arm64 = target == "aarch64-unknown-none";
+    let arch_tag = if arm64 { "arm64" } else { "amd64" };
 
-    println!("Creating bootable ISO...");
+    // Separate staging dirs and outputs so building one arch never clobbers the
+    // other — the release job builds both from the same checkout.
+    let iso_root = root.join(format!("target/iso_root_{arch_tag}"));
+    let iso_path = root.join(format!("target/themelios-{arch_tag}.iso"));
+
+    println!("Creating bootable {arch_tag} ISO...");
 
     // Clean and create the ISO directory structure
     let _ = fs::remove_dir_all(&iso_root);
@@ -945,14 +1021,21 @@ fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path) -> PathBuf {
         .expect("Failed to copy kernel to ISO root");
 
     // Copy Limine bootloader files
-    let limine_files = [
-        ("limine-bios.sys", "boot/limine/limine-bios.sys"),
-        ("limine-bios-cd.bin", "boot/limine/limine-bios-cd.bin"),
-        ("limine-uefi-cd.bin", "boot/limine/limine-uefi-cd.bin"),
-        ("BOOTX64.EFI", "EFI/BOOT/BOOTX64.EFI"),
-    ];
+    let limine_files: &[(&str, &str)] = if arm64 {
+        &[
+            ("limine-uefi-cd.bin", "boot/limine/limine-uefi-cd.bin"),
+            ("BOOTAA64.EFI", "EFI/BOOT/BOOTAA64.EFI"),
+        ]
+    } else {
+        &[
+            ("limine-bios.sys", "boot/limine/limine-bios.sys"),
+            ("limine-bios-cd.bin", "boot/limine/limine-bios-cd.bin"),
+            ("limine-uefi-cd.bin", "boot/limine/limine-uefi-cd.bin"),
+            ("BOOTX64.EFI", "EFI/BOOT/BOOTX64.EFI"),
+        ]
+    };
 
-    for (src_name, dst_path) in &limine_files {
+    for (src_name, dst_path) in limine_files {
         let src = limine_dir.join(src_name);
         if !src.exists() {
             eprintln!("Missing Limine file: {}", src.display());
@@ -983,18 +1066,24 @@ fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path) -> PathBuf {
     // -efi-boot-part: create an EFI partition in the ISO
     // --efi-boot-image: the EFI boot image is also accessible as a file
     // --protective-msdos-label: add a protective MBR for hybrid boot
-    let status = Command::new("xorriso")
-        .args([
-            "-as", "mkisofs",
+    let mut cmd = Command::new("xorriso");
+    cmd.args(["-as", "mkisofs"]);
+    if !arm64 {
+        // BIOS El Torito image — x86 only.
+        cmd.args([
             "-b", "boot/limine/limine-bios-cd.bin",
             "-no-emul-boot",
             "-boot-load-size", "4",
             "-boot-info-table",
-            "--efi-boot", "boot/limine/limine-uefi-cd.bin",
-            "-efi-boot-part",
-            "--efi-boot-image",
-            "--protective-msdos-label",
-        ])
+        ]);
+    }
+    cmd.args([
+        "--efi-boot", "boot/limine/limine-uefi-cd.bin",
+        "-efi-boot-part",
+        "--efi-boot-image",
+        "--protective-msdos-label",
+    ]);
+    let status = cmd
         .arg(iso_root.to_str().unwrap())
         .arg("-o")
         .arg(iso_path.to_str().unwrap())
@@ -1006,20 +1095,22 @@ fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path) -> PathBuf {
         process::exit(1);
     }
 
-    // Install Limine's BIOS boot sectors onto the ISO.
-    // This patches the ISO's MBR so that BIOS firmware can boot from it
-    // without relying on El Torito (which some BIOSes don't support for
-    // hard drive-style boot).
-    let limine_cli = limine_dir.join("limine");
-    let status = Command::new(limine_cli.to_str().unwrap())
-        .args(["bios-install"])
-        .arg(iso_path.to_str().unwrap())
-        .status()
-        .expect("Failed to run limine bios-install");
+    if !arm64 {
+        // Install Limine's BIOS boot sectors onto the ISO.
+        // This patches the ISO's MBR so that BIOS firmware can boot from it
+        // without relying on El Torito (which some BIOSes don't support for
+        // hard drive-style boot). Meaningless on arm64, which has no BIOS.
+        let limine_cli = limine_dir.join("limine");
+        let status = Command::new(limine_cli.to_str().unwrap())
+            .args(["bios-install"])
+            .arg(iso_path.to_str().unwrap())
+            .status()
+            .expect("Failed to run limine bios-install");
 
-    if !status.success() {
-        eprintln!("Warning: BIOS boot sector installation failed.");
-        eprintln!("UEFI boot will still work.");
+        if !status.success() {
+            eprintln!("Warning: BIOS boot sector installation failed.");
+            eprintln!("UEFI boot will still work.");
+        }
     }
 
     println!("ISO created: {}", iso_path.display());
@@ -1082,25 +1173,35 @@ fn cmd_build(args: &[String]) {
 /// window:
 ///
 /// ```sh
-/// cargo xtask iso
-/// qemu-system-x86_64 -M q35 -cdrom target/themelios.iso -serial stdio -no-reboot
+/// cargo xtask iso                  # target/themelios-amd64.iso
+/// cargo xtask iso --arch aarch64   # target/themelios-arm64.iso
+/// qemu-system-x86_64 -M q35 -cdrom target/themelios-amd64.iso -serial stdio -no-reboot
 /// ```
+///
+/// The two images differ in more than the kernel inside them: amd64 is a hybrid
+/// BIOS+UEFI ISO, arm64 is UEFI-only (see [`create_iso`]).
 fn cmd_iso(args: &[String]) {
     let opts = parse_options(args);
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
-    reject_aarch64_iso(target, "iso");
-
     cmd_build(args);
 
     let kernel_binary = root.join(format!("target/{target}/debug/themelios"));
     let limine_dir = ensure_limine(&root);
-    let iso_path = create_iso(&root, &kernel_binary, &limine_dir);
+    let iso_path = create_iso(&root, &kernel_binary, &limine_dir, target);
 
     println!();
-    println!("To boot headless:  cargo xtask run");
-    println!("To boot with GUI:  qemu-system-x86_64 -M q35 -cdrom {} -serial stdio -no-reboot", iso_path.display());
+    if target == "aarch64-unknown-none" {
+        println!("To boot headless:  cargo xtask run --arch aarch64");
+        println!("To smoke the ISO:  cargo xtask arm64-iso-smoke");
+    } else {
+        println!("To boot headless:  cargo xtask run");
+        println!(
+            "To boot with GUI:  qemu-system-x86_64 -M q35 -cdrom {} -serial stdio -no-reboot",
+            iso_path.display()
+        );
+    }
 }
 
 /// Build the kernel, create a bootable ISO, and launch it in QEMU.
@@ -1123,7 +1224,7 @@ fn cmd_run(args: &[String]) {
         return;
     }
 
-    let iso_path = create_iso(&root, &kernel_binary, &limine_dir);
+    let iso_path = create_iso(&root, &kernel_binary, &limine_dir, target);
 
     // Step 3: Launch QEMU
     let qemu = qemu_binary(&opts.arch);
@@ -1205,10 +1306,8 @@ fn cmd_test(args: &[String]) {
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
-    // Same trap as `cmd_iso`: this path builds for `--arch` but then goes through
-    // `create_iso` and launches `-M q35` with x86 disk/NIC args. Refuse before doing
-    // any work rather than emitting an unbootable image and a nonsense QEMU command.
-    reject_aarch64_iso(target, "test");
+    // The suite harness is x86-only; refuse before doing any work.
+    reject_aarch64_test(target);
 
     println!("Building ThemeliOS kernel (test mode) for {target}...");
 
@@ -1244,7 +1343,7 @@ fn cmd_test(args: &[String]) {
 
     // Create bootable ISO
     let limine_dir = ensure_limine(&root);
-    let iso_path = create_iso(&root, &kernel_binary, &limine_dir);
+    let iso_path = create_iso(&root, &kernel_binary, &limine_dir, target);
 
     // Launch QEMU with isa-debug-exit device and a timeout.
     let qemu = qemu_binary(&opts.arch);
@@ -1466,7 +1565,9 @@ Commands:
     test     Build and run tests in QEMU
     image    Create the SquashFS root and ext2 data disk images
     docs     Build mdbook and rustdoc
-    arm64-gate  Compile smoltcp for aarch64-unknown-none (dependency gate)
+    arm64-gate       Compile smoltcp + kernel for aarch64-unknown-none (dependency gate)
+    arm64-smoke      Boot the aarch64 kernel on QEMU virt from a UEFI ESP (banner smoke)
+    arm64-iso-smoke  Boot the aarch64 ISO on QEMU virt (banner smoke)
 
 Options:
     --arch <ARCH>  Target architecture: x86_64 (default), arm64
@@ -1499,6 +1600,7 @@ fn main() {
         "docs" => cmd_docs(rest),
         "arm64-gate" => cmd_arm64_gate(rest),
         "arm64-smoke" => cmd_arm64_smoke(rest),
+        "arm64-iso-smoke" => cmd_arm64_iso_smoke(rest),
         "help" | "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("Unknown command: {unknown}\n");
