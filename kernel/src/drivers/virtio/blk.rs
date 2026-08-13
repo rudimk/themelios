@@ -154,6 +154,15 @@ impl Inner {
         data_sectors: usize,
         dev_writes_data: bool,
     ) -> Result<(), BlockError> {
+        // Bail out BEFORE staging anything. The header, status byte, bounce buffer
+        // and all three descriptors are fixed, single-instance DMA memory; if a
+        // previous chain was abandoned the device may still be reading or writing
+        // them, so the staging writes below would race it. Checking at submit time
+        // would be too late — they have already happened by then.
+        if self.queue.is_failed() {
+            return Err(BlockError::DeviceError);
+        }
+
         // --- Build the 16-byte request header in the header DMA buffer ---
         // Layout: type:u32, reserved:u32, sector:u64 (all little-endian).
         // SAFETY: header_phys points to a 16-byte-aligned DMA buffer we own.

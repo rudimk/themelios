@@ -349,6 +349,16 @@ fn ensure_scratch_disk(root: &Path) -> PathBuf {
 ///
 /// Devices are assigned PCI slots in command-line order, so callers control
 /// discovery order by the order they emit these arg groups.
+fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
+    let ro = if readonly { ",readonly=on" } else { "" };
+    vec![
+        "-drive".to_string(),
+        format!("file={},format=raw,if=none,id={id}{ro}", disk_path.display()),
+        "-device".to_string(),
+        format!("virtio-blk-pci,drive={id},disable-legacy=on"),
+    ]
+}
+
 /// Refuse any subcommand that would route an aarch64 kernel through [`create_iso`].
 ///
 /// `create_iso` emits an x86-only boot structure: `BOOTX64.EFI`, the BIOS El Torito
@@ -374,16 +384,6 @@ fn reject_aarch64_iso(target: &str, subcommand: &str) {
     eprintln!("To boot aarch64 today:  cargo xtask run --arch aarch64");
     eprintln!("To smoke-test aarch64:  cargo xtask arm64-smoke");
     process::exit(1);
-}
-
-fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
-    let ro = if readonly { ",readonly=on" } else { "" };
-    vec![
-        "-drive".to_string(),
-        format!("file={},format=raw,if=none,id={id}{ro}", disk_path.display()),
-        "-device".to_string(),
-        format!("virtio-blk-pci,drive={id},disable-legacy=on"),
-    ]
 }
 
 /// QEMU arguments attaching a VirtIO network device backed by user-mode (slirp)
@@ -1255,8 +1255,10 @@ fn cmd_test(args: &[String]) {
     // seconds" this budget was originally sized against. At 90s a slow or loaded CI
     // runner could exhaust the budget mid-suite and report a *timeout* for what was
     // only slowness, which is indistinguishable from a real kernel hang (this
-    // happened on the Phase 7.0b PR). 180s keeps a genuine hang bounded while
-    // leaving room for the aarch64 suite the port adds in 7.4.
+    // happened on the Phase 7.0b PR). 180s keeps a genuine hang bounded while leaving
+    // headroom as the suite grows. Note the workflow's `timeout-minutes` must stay
+    // comfortably above this plus a full from-scratch build, or GitHub kills the job
+    // first — which is a worse diagnostic than the harness's own timeout.
     let timeout_secs = 180;
 
     let mut cmd = Command::new(qemu);

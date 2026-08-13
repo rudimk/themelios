@@ -188,24 +188,34 @@ pub enum VirtioError {
 /// before declaring the device stuck.
 ///
 /// This window is time during which the **entire kernel is frozen** — the caller
-/// holds the device lock, so interrupts are disabled for its whole duration — which
-/// is why it is sized from a measurement rather than a guess. 20,000,000 iterations
-/// of this loop (SeqCst fence + volatile `u16` read + `spin_loop`) were measured at
-/// ~13.7 s under QEMU TCG in a debug build, the exact configuration CI runs: about
-/// 0.68 µs per iteration. 200,000 iterations is therefore a worst case of roughly
-/// 140 ms there. On real hardware an iteration is far cheaper (~180 cycles including
-/// the fence), so the same count is on the order of 12 ms at 3 GHz.
+/// holds the device lock, so interrupts are disabled for its whole duration — so it
+/// is sized against measurements, not estimates. All figures below were measured
+/// under QEMU TCG in a debug build, the configuration CI runs.
 ///
-/// A healthy QEMU device completes in microseconds, leaving three orders of
-/// magnitude of headroom before this can fire. A spurious timeout is safe but not
-/// free: it permanently disables the queue (see [`Virtqueue::fail`]), turning into a
-/// loud I/O failure rather than silent corruption.
+/// What a *healthy* completion costs (per-queue high-water mark over a full suite):
 ///
-/// A calibrated deadline would be better than a raw count — `rdtsc` does keep
-/// advancing with interrupts disabled, contrary to the monotonic tick, which stalls.
-/// The kernel has no TSC calibration yet, so a cycle count would carry no wall-clock
-/// meaning either; adding one is a separate change.
-const MAX_COMPLETION_SPINS: u32 = 200_000;
+/// | condition        | max spins observed | ≈ wall |
+/// |------------------|--------------------|--------|
+/// | idle             | 1,000 – 6,000      | 1–7 ms |
+/// | 4× host CPU load | ~10,000            | ~11 ms |
+///
+/// So completions take **milliseconds, not microseconds**, and the high-water mark
+/// had not converged across four runs (1.0k → 3.1k → 6.0k → 10.0k) — it is a fat
+/// tail measured from few samples. 2,000,000 leaves ~200× headroom over the observed
+/// tail, at a worst-case freeze of ~2.3 s (measured: 200,000 spins ≈ 230–250 ms idle,
+/// ~440 ms under load). That is the trade being made: a *spurious* timeout is safe
+/// but permanently disables the queue ([`Virtqueue::fail`]), which turns a passing
+/// run red, whereas the freeze only ever costs that 2.3 s on a device that has
+/// genuinely wedged.
+///
+/// Note this bound also sets the runtime of the fault-injection test that exercises
+/// the timeout path, so raising it further lengthens the suite proportionally.
+///
+/// A real deadline would be better than a raw count. `rdtsc` keeps advancing with
+/// interrupts disabled (unlike the monotonic tick, which stalls), and the 8254 PIT
+/// counter can be latched and read over ports 0x43/0x40 for a genuine 10 ms-grained
+/// deadline with no calibration at all. Either is a separate change.
+const MAX_COMPLETION_SPINS: u32 = 2_000_000;
 
 /// A single split-virtqueue descriptor (16 bytes, matches the VirtIO spec).
 ///
@@ -402,6 +412,17 @@ impl Virtqueue {
         // up by whichever request polls next. Poison the queue instead.
         self.fail("completion timeout");
         Err(VirtioError::DeviceTimeout)
+    }
+
+    /// Whether this queue has desynchronised and been disabled ([`Virtqueue::fail`]).
+    ///
+    /// Callers stage data into device-owned memory (descriptors, bounce/staging
+    /// buffers) *before* submitting, so they must check this first: once a chain has
+    /// been abandoned, those buffers may still be read by the device, and overwriting
+    /// them races it. Checking only at submit time is too late — the writes have
+    /// already happened.
+    fn is_failed(&self) -> bool {
+        self.failed
     }
 
     /// Mark this queue permanently unusable and say so once.

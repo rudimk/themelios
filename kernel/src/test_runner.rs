@@ -3324,12 +3324,16 @@ fn wait_ticks(timeout_ticks: u64, mut ready: impl FnMut() -> bool) -> bool {
     // without this the deadline below could never expire and we would spin forever,
     // reintroducing the hang we are trying to remove.
     //
-    // Sized so it can actually fire *inside* the harness's QEMU budget. Each
-    // iteration is a `yield_now`, i.e. a full pass through the scheduler, so at a
-    // rough ten microseconds apiece this is on the order of ten seconds. A much
-    // larger cap would need minutes to trip and the suite would be killed first —
-    // which would look exactly like the wedged kernel this is meant to prevent.
-    const MAX_SPINS: u64 = 1_000_000;
+    // Sized so it can actually fire *inside* the harness's QEMU budget, using a
+    // measured cost rather than an assumed one: `sched::yield_now()` is a full pass
+    // through the scheduler and was benchmarked at **174 µs idle and 279 µs under 4×
+    // host CPU load** in this suite — not the ~10 µs one might assume. At that rate
+    // 100,000 iterations is roughly 17–28 s, which fits inside the 180 s budget with
+    // most of the suite already spent. Earlier values of 50M and 1M needed ~500 s and
+    // ~175–280 s respectively, i.e. the harness would kill QEMU first and the
+    // backstop could never fire — indistinguishable from having no backstop at all,
+    // which is exactly the outcome it exists to prevent.
+    const MAX_SPINS: u64 = 100_000;
 
     let start = tick_count();
     let mut spins: u64 = 0;

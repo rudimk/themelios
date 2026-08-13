@@ -175,6 +175,13 @@ impl Inner {
         if frame.len() > MAX_FRAME || VIRTIO_NET_HDR_LEN + frame.len() > RX_BUF_SIZE {
             return Err(NetError::TooLarge);
         }
+        // Bail out BEFORE staging anything. The TX path is single-buffered
+        // (`tx_buf_phys`, descriptor 0), so if a previous chain was abandoned the
+        // device may still be reading that buffer and that descriptor. The staging
+        // writes below would race it; checking at submit time would be too late.
+        if self.tx_queue.is_failed() {
+            return Err(NetError::DeviceError);
+        }
         // Stage: zeroed 12-byte header, then the frame.
         // SAFETY: tx_buf_phys backs one HHDM-mapped frame we own; the total
         // length is bounded by the check above and access is serialised by the
@@ -206,10 +213,8 @@ impl Inner {
         // Spinning here would freeze the kernel: we hold the device lock, so
         // interrupts are disabled.
         //
-        // Note the TX queue is single-buffered (`tx_buf_phys`, descriptor 0), so
-        // once a chain has been abandoned the staging buffer is still device-owned.
-        // `submit_and_wait` refusing every later call is what stops the next frame
-        // from overwriting a buffer the device may still be reading.
+        // The staging buffer and descriptor are protected by the `is_failed` check at
+        // the top of this function, which runs before either is written.
         if let Err(e) = self.tx_queue.submit_and_wait(0) {
             // Log the first failure per queue only; `Virtqueue::fail` already
             // reports the underlying cause, and a chatty TX path under a wedged
