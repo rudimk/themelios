@@ -408,7 +408,7 @@ fn kmain_x86_64() -> ! {
     // Switch from Limine's page tables to our own: a fresh root that clones Limine's
     // kernel mappings (HHDM + kernel image) and is loaded into the architecture's
     // translation-base register. After this we own the page tables and can:
-    // - Map/unmap individual pages (guard pages, the kernel heap, MMIO windows)
+    // - Map/unmap individual pages (the kernel heap, MMIO windows)
     // - Create per-process address spaces (Phase 2 isolation)
     // - Reclaim bootloader-reclaimable memory (Sub-phase 2.2)
     //

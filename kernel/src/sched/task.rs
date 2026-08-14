@@ -24,15 +24,22 @@
 //! memory in the kernel). The layout is:
 //!
 //! ```text
-//! [guard page (4 KiB, UNMAPPED)] [usable stack (16 KiB, 4 pages)]
-//!  ^                              ^                               ^
-//!  phys_base                      usable bottom                   stack_top (initial RSP)
+//! [padding page (4 KiB, RESERVED)] [usable stack (16 KiB, 4 pages)]
+//!  ^                                ^                               ^
+//!  phys_base                        usable bottom                   stack_top (initial RSP)
 //! ```
 //!
-//! The guard page is unmapped in the kernel page tables, so any access to it
-//! triggers a page fault — providing true stack overflow detection instead of
-//! silent memory corruption. The physical frame is still allocated (owned by
-//! the task); it gets re-mapped and freed when the task is cleaned up.
+//! The padding page is **reserved, not unmapped**. It is owned by the task, so nothing
+//! else is placed there and a small overflow runs into the task's own memory rather
+//! than a neighbour's — but it does not fault.
+//!
+//! It used to be described as an unmapped guard page giving "true stack overflow
+//! detection". That was never true. Kernel stacks live in the HHDM, which the
+//! bootloader maps with 2 MiB/1 GiB huge pages, so the 4 KiB unmap walked into a huge
+//! directory entry and cleared eight bytes of unrelated data while leaving the page
+//! mapped (see the note in `sched::create_task`). Real detection requires kernel stacks
+//! in a dedicated virtual window built from 4 KiB mappings — the same treatment the
+//! kernel heap received — tracked as follow-up scheduler work.
 
 use alloc::string::String;
 use crate::mm::addr::PhysAddr;
@@ -101,9 +108,10 @@ impl TaskContext {
 /// 4 pages = 16 KiB — enough for kernel task call stacks in Phase 1.
 pub const STACK_PAGES: usize = 4;
 
-/// Number of guard pages allocated below the stack.
-/// Unmapped in the kernel page tables — any access triggers a page fault,
-/// catching stack overflows before they corrupt adjacent memory.
+/// Number of padding pages allocated below the usable stack.
+///
+/// Reserved (owned by the task) but still mapped — see the module docs. This bounds
+/// the damage of a small overflow; it does not detect one.
 pub const PADDING_PAGES: usize = 1;
 
 /// Total pages allocated per task stack (usable + padding).
