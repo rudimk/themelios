@@ -144,7 +144,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **4** | VirtIO net driver, TCP/IP stack | Complete |
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
-| **7** | aarch64 port (boot, memory, scheduler, shell) | Not started |
+| **7** | aarch64 port (boot, memory, scheduler, shell) | In progress |
 | **8** | Hyperscaler support (AWS, GCP, Azure), secure boot | Not started |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
@@ -158,6 +158,36 @@ line when finishing a sub-phase. Detailed per-sub-phase checklists live in
 `.sisyphus/plans/` (local, gitignored); the git commit history has the full
 narrative per commit._
 
+**Phase 7 — aarch64 port: IN PROGRESS.** A ring-0 kernel-core port to QEMU `virt`
+(ARM64); EL0/userspace, storage, networking and containers on ARM are a separate,
+deferred ABI surface. amd64 stays green every sub-phase — the QEMU suite is the gate.
+Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
+
+- ✅ **7.0a** Arch-neutral `arch::{irq,time}` facade; all tick reads and interrupt
+  sites routed through it, x86 impls re-exported unchanged.
+- ✅ **7.0b** Boot to banner on QEMU `virt`: `linker-aarch64.ld`, aarch64 arch module
+  (`boot`/`serial`/`irq`/`time`), per-arch `kmain` dispatch, `CPACR_EL1.FPEN` enabled
+  in early boot (hardfloat target — compiler-emitted SIMD traps otherwise), and the
+  PL011 mapped by editing Limine's live TTBR1 tables (its HHDM maps RAM, not MMIO).
+- ✅ **7.0c** Separate `themelios-{amd64,arm64}.iso` (amd64 hybrid BIOS+UEFI, arm64
+  UEFI-only with `BOOTAA64.EFI`); `arm64-iso-smoke` boots the shipped image in CI.
+- ✅ **7.1** **MMU/paging on kernel-owned tables.** `mm` is now arch-neutral: the
+  4-level walker drives per-arch descriptor formats through a new `arch::paging`
+  facade (`arch/{x86_64,aarch64}/paging.rs`). aarch64 clones Limine's kernel-half L0
+  entries into its own root and loads **`TTBR1_EL1`** (not TTBR0 — at EL1 with no
+  userspace TTBR0 translates nothing, so switching it would prove nothing);
+  `TTBR0_EL1` is parked at 0. Barrier discipline at every map/unmap
+  (`DSB ISHST` → `TLBI` → `DSB ISH` + `ISB`). **`MAIR_EL1` and `TCR_EL1` are adopted
+  and *verified*, never rewritten** — the cloned entries carry Limine's `AttrIndx`
+  values, so installing our own MAIR would silently reinterpret the cacheability of
+  every inherited mapping. Proven by an arch-neutral
+  `mm::page_table::selftest()` (map → translate → write/read → verify the physical
+  frame via HHDM → unmap → translate-is-None) whose sentinel the CI arm64 smokes now
+  assert. Bootloader memory is deliberately **not** reclaimed on aarch64 until 7.2
+  provides fault reporting.
+- ⬜ **7.2** Exceptions + GIC + timer tick · ⬜ **7.3** Scheduler context switch ·
+  ⬜ **7.4** Shell, portable tests on aarch64 CI, finalize.
+
 **Phase 6 — Management API: COMPLETE (core).** The node is driven entirely
 through an external HTTP API (no SSH, no shell). A ring-3 **`api-server`** holds a
 `Management` **sentinel capability**, opens an inbound-TCP listener via a
@@ -167,7 +197,7 @@ app-layer **bearer token** (which *client* may call the API). Untrusted HTTP/JSO
 parsing stays in ring 3, **fail-closed against a node-halting fault**; every
 container mutation crosses into the kernel through the capability-checked, audited
 **`SYS_MGMT`** ABI. Full design in mdbook `management-api.md`. `cargo xtask test`
-before pushing. **Next up: Phase 7 (aarch64 port).**
+before pushing. **Phase 7 (aarch64 port) is now in progress — see above.**
 
 - ✅ **6.0** HTTP/1.1 request parser + minimal JSON serializer (`http`, `oci::json`),
   `alloc`-only, fail-closed (bounded sizes, `checked_add`, `None`-on-malformed), lifted
