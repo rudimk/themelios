@@ -945,20 +945,43 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
 fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
 
-    // The banner's last line — proves the full Limine→EL1→FP→UART-map→print path ran.
-    const MARKER: &str = "Phase 7.0b boot-to-banner reached";
+    // The success sentinel. As of Phase 7.1 this is the *end* of the memory bring-up,
+    // not the 7.0b banner: the kernel has switched to its own TTBR1 tables and the
+    // map/translate/read-write/unmap self-test has passed.
+    //
+    // Deliberately not the 7.0b banner any more. That line prints before any MMU work,
+    // so keeping it as the marker would let a completely broken pager go green — the
+    // smoke would see the banner and stop looking.
+    const MARKER: &str = "Phase 7.1 MMU/paging reached; self-test passed.";
+
+    // Failure signatures. Without these the only failure mode is "marker never
+    // appeared", which costs the full timeout and reports nothing useful. A panic or a
+    // self-test failure is terminal — stop immediately and say which it was.
+    const FAILURES: &[&str] = &[
+        "KERNEL PANIC",
+        "Phase 7.1 MMU/paging FAILED self-test",
+        "[selftest] paging: FAIL",
+    ];
+
     let mut found = false;
-    for _ in 0..50 {
-        // ~25 s budget
+    let mut failure: Option<String> = None;
+    // ~40 s budget. Phase 7.1 does materially more work before the sentinel than 7.0b
+    // did (memory-map scan, frame bitmap, heap, page-table clone), and CI runners are
+    // slower than a dev box.
+    for _ in 0..80 {
         thread::sleep(Duration::from_millis(500));
         if let Ok(s) = fs::read_to_string(serial_log) {
+            if let Some(f) = FAILURES.iter().find(|f| s.contains(**f)) {
+                failure = Some((*f).to_string());
+                break;
+            }
             if s.contains(MARKER) {
                 found = true;
                 break;
             }
         }
         if let Ok(Some(_)) = child.try_wait() {
-            break; // QEMU exited early (unexpected for the idling 7.0b kernel)
+            break; // QEMU exited early (unexpected — the kernel idles after the test)
         }
     }
     let _ = child.kill();
@@ -966,11 +989,19 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
 
     let serial = fs::read_to_string(serial_log).unwrap_or_default();
     println!("--- aarch64 serial output ({what}) ---\n{serial}\n-----------------------------");
+
+    if let Some(f) = failure {
+        eprintln!("arm64 {what} smoke FAILED: kernel reported '{f}' (see serial above).");
+        process::exit(1);
+    }
     if found {
-        println!("arm64 {what} boot smoke passed: kernel booted to the banner on QEMU virt.");
+        println!(
+            "arm64 {what} smoke passed: booted to the banner, switched to kernel page \
+             tables, and passed the paging self-test on QEMU virt."
+        );
     } else {
         eprintln!(
-            "arm64 {what} boot smoke FAILED: banner marker '{MARKER}' not seen within the window."
+            "arm64 {what} smoke FAILED: sentinel '{MARKER}' not seen within the window."
         );
         process::exit(1);
     }
