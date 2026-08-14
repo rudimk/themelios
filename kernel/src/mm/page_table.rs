@@ -334,7 +334,9 @@ impl AddressSpace {
             // SAFETY: newly allocated frame, exclusive access.
             unsafe { &mut *new_root_phys.as_mut_ptr::<PageTable>() };
 
-        // User half — per-process, starts empty.
+        // User half — per-process, starts empty. Empty range on aarch64, where
+        // KERNEL_ROOT_START is 0 because the kernel owns a separate TTBR1 tree.
+        #[allow(clippy::reversed_empty_ranges)]
         for i in 0..KERNEL_ROOT_START {
             new_root.entries[i].clear();
         }
@@ -534,6 +536,51 @@ impl AddressSpace {
         Some(PhysAddr::new(frame_base + offset))
     }
 
+    /// Decode the leaf descriptor's attributes for a mapped virtual address.
+    ///
+    /// Returns `None` if the address is not mapped by a 4 KiB leaf (absent, or covered
+    /// by a block/huge mapping). Round-tripping through the architecture's
+    /// `encode_leaf`/`flags_of` pair is the only way to observe permission encoding
+    /// without taking a fault, which matters on aarch64 where a mis-encoded
+    /// `AP[2]`/`AttrIndx` is silent rather than fatal.
+    pub fn leaf_flags(&self, virt: VirtAddr) -> Option<PageFlags> {
+        self.leaf_raw(virt).map(paging::flags_of)
+    }
+
+    /// The raw leaf descriptor for a mapped virtual address, undecoded.
+    ///
+    /// [`Self::leaf_flags`] runs the descriptor back through the architecture's own
+    /// decoder, which makes it blind to a *consistent* encode/decode error. Tests that
+    /// need to check a field against an independent source of truth — the live
+    /// `MAIR_EL1`, say, rather than the same helper that chose the index — need the
+    /// undecoded value.
+    pub fn leaf_raw(&self, virt: VirtAddr) -> Option<u64> {
+        let idx = [
+            virt.pml4_index(),
+            virt.pdp_index(),
+            virt.pd_index(),
+            virt.pt_index(),
+        ];
+        let mut table_phys = self.root_phys;
+        for level in 0..4 {
+            // SAFETY: the root, or an address from a present non-block descriptor;
+            // either way a valid HHDM-reachable table. Read-only.
+            let table: &PageTable = unsafe { &*table_phys.as_ptr::<PageTable>() };
+            let entry = table.entries[idx[level]];
+            if !entry.is_present() {
+                return None;
+            }
+            if level == 3 {
+                return Some(entry.as_u64());
+            }
+            if level > 0 && entry.is_huge() {
+                return None; // block mapping — not a 4 KiB leaf
+            }
+            table_phys = entry.phys_addr();
+        }
+        None
+    }
+
     /// Destroy this address space, freeing its user-half table frames.
     ///
     /// Frees the intermediate tables beneath the user half and then the root frame.
@@ -544,6 +591,9 @@ impl AddressSpace {
         // the frames to release.
         let root: &PageTable = unsafe { &*self.root_phys.as_ptr::<PageTable>() };
 
+        // Empty range on aarch64 (KERNEL_ROOT_START is 0): there is no user half in
+        // this tree to tear down.
+        #[allow(clippy::reversed_empty_ranges)]
         for l0_idx in 0..KERNEL_ROOT_START {
             if !root.entries[l0_idx].is_present() {
                 continue;
@@ -669,4 +719,238 @@ impl AddressSpace {
 
         frame_phys
     }
+}
+
+// --- Self-test ---
+
+/// Virtual address used by [`selftest`] as a scratch mapping window.
+///
+/// Must be in the kernel half, page-aligned, and unmapped. Root index 506 on both
+/// architectures: below the MMIO window (`mm::mmio`, index 509) and well clear of the
+/// HHDM and the kernel image, so it collides with nothing. The test asserts the
+/// address really is unmapped before touching it, so a bad choice fails loudly rather
+/// than silently clobbering a live mapping.
+const SELFTEST_VIRT: u64 = 0xFFFF_FD00_0000_0000;
+
+/// Byte pattern written through the test mapping. Asymmetric and non-trivial so a
+/// half-working mapping (wrong offset, stale TLB entry) does not accidentally pass.
+const SELFTEST_PATTERN: u64 = 0x5445_4D45_4C49_4F53; // "TEMELIOS" in ASCII
+
+/// Exercise the page-table implementation end to end: map, translate, read/write
+/// through the mapping, verify the physical frame really changed, unmap, and confirm
+/// the translation is gone.
+///
+/// This is the acceptance check for the MMU work. It is deliberately arch-neutral —
+/// it drives only the portable [`AddressSpace`] API — so the same assertions validate
+/// the x86_64 and aarch64 descriptor encodings. It runs on **both**: from the aarch64
+/// boot path (`arch::aarch64::boot`) and from the amd64 suite (`test_runner`), so a
+/// regression in the shared walker is caught on the architecture that has a real test
+/// suite, not only on the one being ported.
+///
+/// On aarch64 it is the first thing that proves the ARM descriptor format, the
+/// `MAIR`-derived attributes, and the TLB barrier discipline are actually right rather
+/// than merely compiling.
+///
+/// Mapping cycles cover the encodings whose failure modes are *silent*: writable+NX
+/// and read-only (the `AP[2]` inversion) on both architectures, plus uncached/Device
+/// (the `MAIR`/`AttrIndx` selection the plan calls the riskiest unknown) on aarch64
+/// only — see the comment on that cycle for why running it on x86_64 would trade a
+/// documented memory-type alias for coverage that architecture does not need.
+///
+/// ## What this does not prove
+///
+/// Every check here is on descriptor contents, because without exception handlers
+/// (7.2) a wrong permission cannot be *observed* as a fault. So this catches a wrong
+/// bit position, a missing inversion, or an attribute index that does not resolve to
+/// Device memory — but it cannot show that a write to a read-only page actually
+/// faults, that PXN/UXN are enforced, or that Device memory behaves as Device (which
+/// on aarch64 would show up as an unaligned access faulting). Those need 7.2, and the
+/// acceptance claim for this sub-phase should be read with that limit in mind.
+///
+/// Returns `true` if every check passed. Prints a line per stage so a failure in CI
+/// identifies the exact step rather than just "it hung".
+///
+/// # Panics
+///
+/// Panics if called before [`init`], or if the scratch window is already mapped.
+pub fn selftest() -> bool {
+    let space = kernel_address_space();
+    let virt = VirtAddr::new(SELFTEST_VIRT);
+
+    // The window must start out unmapped, or the rest of the test proves nothing.
+    assert!(
+        space.translate(virt).is_none(),
+        "paging selftest: scratch window {:#x} is already mapped",
+        SELFTEST_VIRT
+    );
+
+    let phys = match frame::allocate_frame() {
+        Some(f) => f,
+        None => {
+            println!("[selftest] paging: FAIL — could not allocate a test frame");
+            core::mem::forget(space);
+            return false;
+        }
+    };
+
+    let mut ok = true;
+    let mut check = |cond: bool, what: &str| {
+        if !cond {
+            println!("[selftest] paging: FAIL at {}", what);
+            ok = false;
+        }
+    };
+
+    // 1. Map it writable, non-executable.
+    space.map_page(
+        virt,
+        phys,
+        PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE,
+    );
+
+    // 2. The walker must agree with what we just installed.
+    check(
+        space.translate(virt) == Some(phys),
+        "translate-after-map (walker disagrees with the descriptor it wrote)",
+    );
+
+    // 3. Write through the new mapping. On aarch64 this is where a missing Access
+    //    Flag, a botched AP[2] inversion, or a wrong MAIR index shows up — as a fault
+    //    or as a write that never lands.
+    // SAFETY: `virt` is a page we just mapped writable; nothing else refers to it.
+    unsafe {
+        core::ptr::write_volatile(virt.as_mut_ptr::<u64>(), SELFTEST_PATTERN);
+    }
+
+    // 4. Read it back through the same mapping.
+    // SAFETY: same freshly mapped, writable page.
+    let readback = unsafe { core::ptr::read_volatile(virt.as_ptr::<u64>()) };
+    check(
+        readback == SELFTEST_PATTERN,
+        "read-back through the mapping",
+    );
+
+    // 5. Read the *physical* frame through the HHDM. This is the check that the
+    //    mapping points where we think it does: step 4 alone would still pass if the
+    //    write had gone to some other frame entirely.
+    // SAFETY: HHDM covers all physical RAM; `phys` is a frame we own.
+    let via_hhdm = unsafe { core::ptr::read_volatile(phys.as_ptr::<u64>()) };
+    check(
+        via_hhdm == SELFTEST_PATTERN,
+        "physical frame contents via HHDM (mapping points at the wrong frame)",
+    );
+
+    // 6. Unmap, and confirm we get the same frame back.
+    let returned = space.unmap_page(virt);
+    check(returned == Some(phys), "unmap returned the wrong frame");
+
+    // 7. The translation must be gone.
+    check(
+        space.translate(virt).is_none(),
+        "translate-after-unmap (stale entry left behind)",
+    );
+
+    // 8. Read-only mapping. The write permission is the one encoding that fails
+    //    *silently* on aarch64 if botched: `AP[2]` is read-only-when-set, so an
+    //    omitted inversion yields a writable page where read-only was requested — a
+    //    protection hole, not a fault. Cycle 1 only ever asked for WRITABLE, so a
+    //    stubbed-out inversion would have passed every assertion above. Assert on the
+    //    decoded descriptor, since without exception handlers (7.2) we cannot take the
+    //    fault that would otherwise prove it.
+    space.map_page(virt, phys, PageFlags::PRESENT | PageFlags::NO_EXECUTE);
+    match space.leaf_flags(virt) {
+        Some(f) => check(
+            !f.contains(PageFlags::WRITABLE),
+            "read-only mapping decoded as writable (permission encoding inverted)",
+        ),
+        None => check(false, "read-only mapping produced no leaf descriptor"),
+    }
+    space.unmap_page(virt);
+
+    // 9. Uncached / Device mapping — **aarch64 only**, deliberately.
+    //
+    //    This is the path the plan calls the riskiest unknown in the sub-phase:
+    //    "MAIR/AttrIndx cacheability (wrong attrs = silent corruption or DMA-only
+    //    faults later)". On aarch64 the attribute is selected indirectly through
+    //    MAIR_EL1, nothing else exercises it (`mm::mmio` has no ARM callers yet), and
+    //    a wrong index is silent — so the cycle earns its place.
+    //
+    //    The mismatched-attribute alias this creates is **not** an x86-only problem,
+    //    and it would be dishonest to imply otherwise. Every RAM frame is already
+    //    mapped write-back through the bootloader's HHDM, so mapping one uncached
+    //    gives the same physical page two mappings with different memory types on
+    //    either architecture — undefined per Intel SDM 11.12.4, and CONSTRAINED
+    //    UNPREDICTABLE per the ARM ARM's "Mismatched memory attributes", which is if
+    //    anything the stricter rule. There is no way to avoid it (the HHDM covers all
+    //    RAM) short of cache maintenance.
+    //
+    //    The reason to run it on aarch64 anyway is cost/benefit, not safety: this is
+    //    the only coverage of the MAIR/AttrIndx selection the plan names the riskiest
+    //    unknown in the sub-phase, which is worth a UP-benign alias. On x86_64 there
+    //    is no such payoff — CACHE_DISABLE is one directly encoded bit (PCD), and the
+    //    PCD path is exercised end-to-end by `mm::mmio` for VirtIO — so the alias
+    //    would buy nothing.
+    //
+    //    To keep the alias as narrow as possible we only *inspect* the descriptor and
+    //    never access memory through the uncached mapping: the checks below are what
+    //    actually prove the attribute selection, and reading through the mapping would
+    //    add a genuinely undefined access without adding evidence.
+    #[cfg(target_arch = "aarch64")]
+    {
+        space.map_page(
+            virt,
+            phys,
+            PageFlags::PRESENT
+                | PageFlags::WRITABLE
+                | PageFlags::CACHE_DISABLE
+                | PageFlags::NO_EXECUTE,
+        );
+        match space.leaf_flags(virt) {
+            Some(f) => check(
+                f.contains(PageFlags::CACHE_DISABLE),
+                "uncached mapping did not decode as CACHE_DISABLE (wrong memory attribute)",
+            ),
+            None => check(false, "uncached mapping produced no leaf descriptor"),
+        }
+        // The check above only proves the attribute field round-trips through our own
+        // encoder and decoder — a consistently wrong index would satisfy it. Verify
+        // the selected attribute against an independent source of truth: the
+        // descriptor's raw AttrIndx, resolved through the live MAIR_EL1 register.
+        match space.leaf_raw(virt) {
+            Some(raw) => {
+                let attr_idx = (raw >> 2) & 0x7;
+                let mair = crate::arch::aarch64::paging::read_mair();
+                let attr = (mair >> (attr_idx * 8)) & 0xff;
+                check(
+                    attr == 0x00,
+                    "uncached mapping selected a MAIR attribute that is not \
+                     Device-nGnRnE (device memory would be cacheable)",
+                );
+            }
+            None => check(false, "uncached mapping produced no raw leaf descriptor"),
+        }
+        space.unmap_page(virt);
+    }
+
+    check(
+        space.translate(virt).is_none(),
+        "translate-after-final-unmap (stale entry left behind)",
+    );
+
+    frame::deallocate_frame(phys);
+
+    // Match the surrounding convention of not letting a borrowed kernel-root handle
+    // escape into a teardown path. (`AddressSpace` has no `Drop` today — teardown is
+    // the explicit, consuming `destroy()` — so this is intent, not a load-bearing
+    // guard.)
+    core::mem::forget(space);
+
+    if ok {
+        println!(
+            "[selftest] paging: PASS (map/translate/rw/unmap at {:#x} -> {:#x})",
+            SELFTEST_VIRT,
+            phys.as_u64()
+        );
+    }
+    ok
 }

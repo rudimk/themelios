@@ -21,10 +21,14 @@
 //! | `activate` / `current_root` | address-space switch |
 //! | `flush_page` / `flush_all` | TLB maintenance |
 //!
-//! Only x86_64 implements this today; the aarch64 side arrives with that port.
+//! The two implementations differ far more than the shared vocabulary suggests —
+//! aarch64 has split TTBR0/TTBR1 roots, level-dependent descriptor meanings, inverted
+//! write permission, a mandatory access flag, and MAIR-indirected cacheability. Those
+//! differences are documented where they live, in
+//! [`crate::arch::aarch64::paging`].
 
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::paging::*;
 
-// The aarch64 implementation lands with the rest of that port; until then this facade
-// is empty there, which is harmless because `mm` is not yet compiled on aarch64.
+#[cfg(target_arch = "aarch64")]
+pub use crate::arch::aarch64::paging::*;

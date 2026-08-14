@@ -33,6 +33,14 @@
 //! process will run in its own address space (Phase 2), and the capability system
 //! controls which memory regions a process can share or access. The MM subsystem
 //! enforces this at the hardware level via page table permissions.
+//!
+//! ## Portability
+//!
+//! This subsystem is architecture-neutral as of Phase 7.1. The frame allocator, heap,
+//! and address types never had architecture-specific code; the page-table walker now
+//! drives the per-architecture descriptor format, root register, and TLB maintenance
+//! through the [`crate::arch::paging`] facade. Only `shared` remains x86_64-only,
+//! because it depends on the capability system that ships with the deferred EL0 port.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -46,15 +54,22 @@ pub mod frame;
 pub mod heap;
 pub mod mmio;
 pub mod page_table;
+
+/// Shared-memory regions between processes.
+///
+/// Still x86_64-only: it hands out `cap::CapType::SharedMemory` capabilities, and the
+/// capability system is part of the ring-3/EL0 surface deferred out of the aarch64
+/// port. Un-gate alongside `cap` when EL0 lands.
+#[cfg(target_arch = "x86_64")]
 pub mod shared;
 
 extern crate alloc;
 
 /// Page size: 4 KiB (4096 bytes).
 ///
-/// This is the smallest unit of memory the x86_64 MMU can map individually
-/// and the granularity of our physical frame allocator. Every allocation
-/// and mapping operates in multiples of this size.
+/// The smallest unit either supported MMU maps individually — the x86_64 4 KiB page
+/// and the aarch64 4 KiB translation granule — and the granularity of our physical
+/// frame allocator. Every allocation and mapping operates in multiples of this size.
 pub const PAGE_SIZE: u64 = 4096;
 
 /// Globally stored HHDM offset, set once during early boot.
