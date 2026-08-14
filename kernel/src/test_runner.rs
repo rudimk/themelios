@@ -355,7 +355,7 @@ fn test_page_tables() -> Result<(), &'static str> {
     // 1. Verify we're on custom page tables (CR3 matches our kernel PML4)
     let kernel_as = kernel_address_space();
     let cr3 = crate::arch::x86_64::cpu::read_cr3() & !0xFFF;
-    if cr3 != kernel_as.pml4_phys().as_u64() {
+    if cr3 != kernel_as.root_phys().as_u64() {
         core::mem::forget(kernel_as);
         return Err("CR3 does not match kernel PML4");
     }
