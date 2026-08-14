@@ -44,6 +44,29 @@ const GROWTH_INCREMENT: usize = 256 * 1024;
 /// Maximum total heap size: 16 MiB. Growth beyond this is denied.
 const MAX_HEAP_SIZE: usize = 16 * 1024 * 1024;
 
+/// Base of the kernel heap's dedicated virtual window.
+///
+/// Root-table index 508, one slot below the MMIO window (`mm::mmio`, index 509) and
+/// clear of the HHDM and the kernel image. `MAX_HEAP_SIZE` fits many times over in
+/// the 512 GiB the slot covers.
+///
+/// ## Why the heap does not live in the HHDM
+///
+/// The obvious placement — take physical frames and use their HHDM addresses — works
+/// for a fixed region but breaks the moment the heap has to *grow*, because the HHDM
+/// fixes the virtual→physical relationship. Growth needs virtually contiguous pages,
+/// but the physical frames immediately following the initial block are handed out to
+/// other subsystems almost immediately (page-table init alone takes hundreds), so
+/// they are simply not available.
+///
+/// Mapping arbitrary frames at the HHDM addresses instead does not work either: Limine
+/// maps the HHDM with 2 MiB/1 GiB huge pages, so a 4 KiB `map_page` there walks into a
+/// huge directory entry, writes a descriptor into the data frame beneath it, and the
+/// mapping never takes effect — the CPU keeps translating through the huge page. That
+/// is the hazard `mm::mmio` documents, and it is why both the heap and MMIO get their
+/// own windows, mapped explicitly as 4 KiB pages.
+const HEAP_VIRT_BASE: u64 = 0xFFFF_FE00_0000_0000;
+
 /// The current size of the heap in bytes. Updated atomically on each growth.
 static HEAP_CURRENT_SIZE: AtomicUsize = AtomicUsize::new(0);
 
@@ -116,28 +139,48 @@ static KERNEL_HEAP: KernelHeap = KernelHeap(InterruptMutex::new(Heap::empty()));
 /// After this call, `Vec`, `Box`, `String`, and all other `alloc` types work.
 pub fn init() {
     let page_count = INITIAL_HEAP_SIZE / PAGE_SIZE as usize;
+    let kernel_as = super::page_table::kernel_address_space();
 
-    // Allocate contiguous physical frames for the initial heap. Contiguous
-    // frames give us a contiguous HHDM virtual region, which is what the
-    // linked-list allocator needs for its initial region.
-    let phys_base = super::frame::allocate_contiguous_frames(page_count)
-        .expect("Failed to allocate contiguous frames for kernel heap");
+    // Map the initial heap into its own virtual window. The physical frames need not
+    // be contiguous — the page tables give us a contiguous *virtual* region, which is
+    // what the linked-list allocator requires.
+    for i in 0..page_count {
+        let phys = super::frame::allocate_frame()
+            .expect("Failed to allocate a frame for the kernel heap");
+        let virt = super::addr::VirtAddr::new(HEAP_VIRT_BASE + i as u64 * PAGE_SIZE);
+        kernel_as.map_page(
+            virt,
+            phys,
+            super::page_table::PageFlags::PRESENT
+                | super::page_table::PageFlags::WRITABLE
+                | super::page_table::PageFlags::NO_EXECUTE,
+        );
+    }
 
-    // Convert to virtual address via HHDM.
-    let virt_base = phys_base.to_virt();
-    let virt_top = virt_base.as_u64() + INITIAL_HEAP_SIZE as u64;
+    // Don't let a borrowed handle to the global kernel root escape into a teardown
+    // path. (`AddressSpace` has no `Drop` — teardown is the consuming `destroy()` —
+    // so this states intent rather than preventing anything today.)
+    core::mem::forget(kernel_as);
 
-    // SAFETY: The virtual address points to a valid, contiguous, HHDM-mapped
-    // region of INITIAL_HEAP_SIZE bytes backed by physical frames we just allocated.
-    // No one else has a reference to this memory.
+    let virt_base = super::addr::VirtAddr::new(HEAP_VIRT_BASE);
+
+    // SAFETY: `INITIAL_HEAP_SIZE` bytes from `HEAP_VIRT_BASE` were just mapped as
+    // writable pages backed by frames we own, and nothing else refers to them.
     unsafe {
-        KERNEL_HEAP.0.lock().init(virt_base.as_mut_ptr::<u8>(), INITIAL_HEAP_SIZE);
+        KERNEL_HEAP
+            .0
+            .lock()
+            .init(virt_base.as_mut_ptr::<u8>(), INITIAL_HEAP_SIZE);
     }
 
     HEAP_CURRENT_SIZE.store(INITIAL_HEAP_SIZE, Ordering::Relaxed);
-    HEAP_TOP_VIRT.store(virt_top, Ordering::Relaxed);
+    HEAP_TOP_VIRT.store(HEAP_VIRT_BASE + INITIAL_HEAP_SIZE as u64, Ordering::Relaxed);
 
-    println!("Kernel heap initialized: {} KiB at {}", INITIAL_HEAP_SIZE / 1024, virt_base);
+    println!(
+        "Kernel heap initialized: {} KiB at {}",
+        INITIAL_HEAP_SIZE / 1024,
+        virt_base
+    );
 }
 
 /// Grow the heap by mapping additional physical frames at contiguous virtual
@@ -160,21 +203,25 @@ fn grow_heap_locked(heap: &mut Heap) -> bool {
     // Get the kernel address space for mapping new pages.
     let kernel_as = super::page_table::kernel_address_space();
 
-    // Map each new page individually. The physical frames don't need to be
-    // contiguous — the page table maps them to consecutive virtual addresses.
+    // Map each new page individually. The physical frames need not be contiguous —
+    // the page tables map them to consecutive virtual addresses above the heap top,
+    // inside the heap's dedicated window (see `HEAP_VIRT_BASE`). Growth is only sound
+    // because that window is built from real 4 KiB mappings; attempting the same
+    // inside the HHDM would hit Limine's huge pages and silently do nothing.
     for i in 0..pages_needed {
         let virt = super::addr::VirtAddr::new(heap_top + (i as u64 * PAGE_SIZE));
         let phys = match super::frame::allocate_frame() {
             Some(f) => f,
             None => {
-                // Out of physical frames. We may have already mapped some pages
-                // for this growth — that's fine, we'll extend the heap by what
-                // we managed to map so far.
+                // Out of physical frames. We may have already mapped some pages for
+                // this growth — extend the heap by what we managed to map.
                 if i > 0 {
                     let partial_bytes = i * PAGE_SIZE as usize;
-                    // SAFETY: we just mapped `i` pages at heap_top, which is
-                    // contiguous with the existing heap region.
-                    unsafe { heap.extend(partial_bytes); }
+                    // SAFETY: we just mapped `i` pages at heap_top, contiguous with
+                    // the existing heap region.
+                    unsafe {
+                        heap.extend(partial_bytes);
+                    }
                     HEAP_CURRENT_SIZE.store(current_size + partial_bytes, Ordering::Relaxed);
                     HEAP_TOP_VIRT.store(heap_top + partial_bytes as u64, Ordering::Relaxed);
                     GROWTH_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -187,7 +234,9 @@ fn grow_heap_locked(heap: &mut Heap) -> bool {
         kernel_as.map_page(
             virt,
             phys,
-            super::page_table::PageFlags::PRESENT | super::page_table::PageFlags::WRITABLE,
+            super::page_table::PageFlags::PRESENT
+                | super::page_table::PageFlags::WRITABLE
+                | super::page_table::PageFlags::NO_EXECUTE,
         );
     }
 

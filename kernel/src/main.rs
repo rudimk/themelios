@@ -403,7 +403,22 @@ fn kmain_x86_64() -> ! {
     assert!(free_after == free, "Free count mismatch after alloc/dealloc cycle");
     println!("  Alloc/dealloc cycle verified — count restored to {}", free_after);
 
-    // Initialize the kernel heap (1 MiB) backed by contiguous physical frames.
+    // --- Page table initialization ---
+    //
+    // Switch from Limine's page tables to our own: a fresh root that clones Limine's
+    // kernel mappings (HHDM + kernel image) and is loaded into the architecture's
+    // translation-base register. After this we own the page tables and can:
+    // - Map/unmap individual pages (guard pages, the kernel heap, MMIO windows)
+    // - Create per-process address spaces (Phase 2 isolation)
+    // - Reclaim bootloader-reclaimable memory (Sub-phase 2.2)
+    //
+    // This must run *before* heap init, because the heap is mapped into its own
+    // virtual window rather than the HHDM (see `mm::heap::HEAP_VIRT_BASE`) and so
+    // needs working page tables. It allocates only from the frame allocator and
+    // prints via serial, so it has no heap dependency of its own.
+    mm::page_table::init();
+
+    // Initialize the kernel heap (1 MiB) in its own mapped virtual window.
     // After this, Vec, Box, String, and all alloc types are usable.
     mm::heap::init();
 
@@ -434,18 +449,6 @@ fn kmain_x86_64() -> ! {
     // bootloader memory (which would invalidate Limine's response structures).
     mm::save_memory_map(entries);
 
-    // --- Page table initialization ---
-    //
-    // Switch from Limine's page tables to our own. This creates a new PML4
-    // that clones Limine's kernel mappings (HHDM + kernel image) and writes
-    // it to CR3. After this, we own the page tables and can:
-    // - Map/unmap individual pages (guard pages, heap growth)
-    // - Create per-process address spaces (Phase 2 isolation)
-    // - Reclaim bootloader-reclaimable memory (Sub-phase 2.2)
-    //
-    // Must happen after heap init (allocates a PML4 frame from the frame
-    // allocator, and the AddressSpace methods use println! which needs heap).
-    mm::page_table::init();
 
     // Reclaim bootloader-reclaimable memory now that we own the GDT, page
     // tables, and stack. Limine's boot structures in those regions are no
