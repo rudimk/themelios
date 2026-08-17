@@ -73,6 +73,48 @@ fn read_sysreg_ttbr1() -> u64 {
 }
 
 
+/// Switch to `SP_EL1` for ordinary kernel execution.
+///
+/// Limine hands off with **`SPSel = 0`**, meaning EL1 code runs on `SP_EL0` while
+/// `SP_EL1` holds whatever the bootloader left there. That is not a stylistic detail —
+/// it decides both *where exceptions are delivered* and *what stack they land on*:
+///
+/// - With `SPSel = 0`, a synchronous exception at EL1 goes to the **`0x000`** vector
+///   group ("current EL with SP_EL0"), not the `0x200` group.
+/// - On entry the CPU switches to `SP_EL1` regardless. If nothing has initialised it,
+///   the entry stub's register save writes through a garbage pointer and takes a data
+///   abort *inside the handler* — which then nests, lands in the `0x200` group, and
+///   reports the nested syndrome. The original exception is never seen.
+///
+/// That failure is genuinely confusing from the outside: a `brk` presents as a data
+/// abort at a fixed address, in the wrong vector slot, with an `SPSR` describing the
+/// nested state rather than the interrupted one.
+///
+/// Copying the live stack pointer across and setting `SPSel = 1` makes the kernel run
+/// on `SP_EL1` from here on, so exceptions are delivered to the `0x200` group with a
+/// valid stack already loaded. SP is numerically unchanged, so this is invisible to
+/// the surrounding Rust.
+///
+/// Note that handler and interrupted code then share one stack — there is no IST/TSS
+/// analog on aarch64, so a kernel-stack overflow re-faults on the same stack. Accepted
+/// for bring-up; a dedicated exception stack is future work.
+#[inline(always)]
+fn use_sp_el1() {
+    // SAFETY: copies the current stack pointer into SP_EL1 and selects it, so the
+    // numeric value of `sp` is unchanged across the sequence. The ISB ensures the
+    // SPSel write has taken effect before the next instruction.
+    unsafe {
+        asm!(
+            "mov x9, sp",
+            "msr SPSel, #1",
+            "mov sp, x9",
+            "isb",
+            out("x9") _,
+            options(preserves_flags),
+        );
+    }
+}
+
 /// Enable FP/SIMD at EL1 (`CPACR_EL1.FPEN = 0b11`) so compiler-emitted SIMD does not
 /// trap. Must run before any non-trivial Rust (formatting, struct moves).
 #[inline(always)]
@@ -186,6 +228,8 @@ pub fn kmain_aarch64(
     entries: &[&limine::memory_map::Entry],
 ) -> ! {
     enable_fp();
+    // Must precede anything that can take an exception — see the function docs.
+    use_sp_el1();
 
     // Map the PL011 at its HHDM address (upper-half, currently unmapped) and install
     // the serial writer there.
@@ -210,13 +254,37 @@ pub fn kmain_aarch64(
     crate::println!("[boot] HHDM offset: {:#018x}", hhdm);
     crate::println!("[boot] kernel phys/virt base: {:#x} / {:#018x}", k.phys_base, k.virt_base);
     crate::println!("[boot] FP/SIMD enabled (CPACR_EL1.FPEN)");
+    {
+        let spsel: u64;
+        // SAFETY: reading SPSel has no side effects.
+        unsafe { asm!("mrs {}, SPSel", out(reg) spsel, options(nomem, nostack)) };
+        crate::println!(
+            "[boot] SPSel={} (running on SP_EL{}) — exceptions use the SP_ELx vectors",
+            spsel & 1,
+            spsel & 1
+        );
+    }
     crate::println!("[boot] PL011 mapped + serial online");
     crate::println!("[boot] Phase 7.0b boot-to-banner reached; idling.");
+
+    // Install exception vectors before anything that can fault. Until this runs, a
+    // data abort branches to whatever VBAR_EL1 held at handoff and the kernel dies
+    // silently; afterwards it prints a decoded syndrome, faulting address and PC.
+    // Deliberately ahead of the memory bring-up so a paging mistake is diagnosable.
+    crate::arch::aarch64::exceptions::init();
 
     // --- Phase 7.1: memory management on our own page tables ---
     bring_up_memory(hhdm, k, entries);
 
-    crate::println!("[boot] (exceptions+GIC+timer=7.2, sched=7.3, shell=7.4)");
+    // Prove the synchronous-exception path with a real trap.
+    let exc_ok = crate::arch::aarch64::exceptions::selftest();
+    if exc_ok {
+        crate::println!("[boot] Phase 7.2 exception vectors reached; self-test passed.");
+    } else {
+        crate::println!("[boot] Phase 7.2 exception vectors FAILED self-test.");
+    }
+
+    crate::println!("[boot] (GIC+timer=7.2 cont., sched=7.3, shell=7.4)");
 
     loop {
         crate::arch::irq::halt();

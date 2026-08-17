@@ -945,14 +945,15 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
 fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
 
-    // The success sentinel. As of Phase 7.1 this is the *end* of the memory bring-up,
-    // not the 7.0b banner: the kernel has switched to its own TTBR1 tables and the
-    // map/translate/read-write/unmap self-test has passed.
+    // The success sentinel, which advances with each sub-phase to the *last* thing the
+    // boot path proves — currently the exception-vector self-test, which runs after the
+    // memory bring-up and its paging self-test.
     //
-    // Deliberately not the 7.0b banner any more. That line prints before any MMU work,
-    // so keeping it as the marker would let a completely broken pager go green — the
-    // smoke would see the banner and stop looking.
-    const MARKER: &str = "Phase 7.1 MMU/paging reached; self-test passed.";
+    // It is deliberately never left pointing at an earlier milestone. Every marker so
+    // far (the 7.0b banner, then the 7.1 paging sentinel) prints before the work the
+    // next sub-phase adds, so leaving it behind would let that work break while the
+    // smoke saw its marker and stopped looking.
+    const MARKER: &str = "Phase 7.2 exception vectors reached; self-test passed.";
 
     // Failure signatures. Without these the only failure mode is "marker never
     // appeared", which costs the full timeout and reports nothing useful. A panic or a
@@ -961,6 +962,9 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
         "KERNEL PANIC",
         "Phase 7.1 MMU/paging FAILED self-test",
         "[selftest] paging: FAIL",
+        "Phase 7.2 exception vectors FAILED self-test",
+        "[selftest] exceptions: FAIL",
+        "!!! aarch64 EXCEPTION !!!",
     ];
 
     let mut found = false;

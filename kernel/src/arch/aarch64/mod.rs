@@ -32,6 +32,10 @@
 //
 // Still to come: `mmu` (7.1), `exceptions`+`gic`+`timer` (7.2), `context` (7.3).
 pub mod boot;
+
+/// Exception vectors (`VBAR_EL1`), syndrome decoding, and fault reporting.
+pub mod exceptions;
+
 pub mod irq;
 
 /// Page-table descriptor format, TTBR control, and TLB maintenance.
