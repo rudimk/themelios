@@ -79,6 +79,19 @@ pub struct ExceptionFrame {
     pub far: u64,
 }
 
+/// Bytes the entry stub reserves for an [`ExceptionFrame`].
+///
+/// Kept in sync with the `sub sp, sp, #288` in the assembly below by the assertions
+/// that follow — mechanically, not by comment. This file already has one war story
+/// about hand-maintained assembly geometry drifting out of step (see the note on slot
+/// size); adding a field to `ExceptionFrame` should be a build error, not a handler
+/// that silently reads a neighbouring register's value.
+const EXC_FRAME_RESERVE: usize = 288;
+
+const _: () = assert!(core::mem::size_of::<ExceptionFrame>() <= EXC_FRAME_RESERVE);
+// SP must stay 16-byte aligned across the `bl` into Rust (AAPCS64).
+const _: () = assert!(EXC_FRAME_RESERVE % 16 == 0);
+
 /// Count of `BRK` exceptions handled, so the self-test can prove the handler ran
 /// rather than inferring it from "we did not crash".
 static BRK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -253,7 +266,7 @@ aarch64_vector_table:
 "#
 );
 
-/// Vector-slot tags, matching the `SAVE_AND_DISPATCH` arguments above.
+/// Vector-slot tags, matching the `VECTOR_STUB` arguments above.
 const TAG_CUR_SPX_SYNC: u64 = 4;
 
 /// The IRQ slot, dispatched to the interrupt controller.
@@ -335,9 +348,14 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
 
 /// Install the vector table into `VBAR_EL1`.
 ///
-/// Must run before interrupts are unmasked, and ideally before anything that can
-/// fault. Until this is called, an exception branches to whatever `VBAR_EL1` happened
-/// to hold at handoff — which is why the boot path installs it early.
+/// Must run before interrupts are unmasked. Until it does, an exception branches to
+/// whatever `VBAR_EL1` held at handoff.
+///
+/// Note it is *not* the first thing boot does: the PL011 must be mapped first, since a
+/// vector table whose handler cannot print is of little use. That ordering means the
+/// most fault-prone step in early boot — editing Limine's live TTBR1 tables to map the
+/// UART — still runs unprotected. Moving the install earlier would trade a diagnosable
+/// fault later for an undiagnosable one there.
 pub fn init() {
     unsafe extern "C" {
         /// The table defined by the `global_asm!` block above.

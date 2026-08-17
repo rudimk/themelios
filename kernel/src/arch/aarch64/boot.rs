@@ -6,12 +6,22 @@
 //! minimum to get an interactive-quality console up, then idle. The scheduler, the
 //! kernel's own page tables, exceptions, and the timer land in 7.1–7.3.
 //!
-//! Two things must happen before the first `println!`:
-//! 1. **Enable FP/SIMD.** `aarch64-unknown-none` is a hardfloat target and the
-//!    compiler lowers ordinary struct-moves / formatting to SIMD, which **traps** at
-//!    EL1 unless `CPACR_EL1.FPEN = 0b11` (spike-confirmed: a bare `f64` op faults with
-//!    `ESR_EL1.EC = 0x07`). Limine does not guarantee it.
-//! 2. **Map the PL011 UART.** Limine's HHDM maps RAM but **not** device MMIO, so the
+//! ## FP/SIMD is deliberately left disabled
+//!
+//! Phase 7.0b built for the *hardfloat* `aarch64-unknown-none` target, where the
+//! compiler lowers struct moves and `core::fmt` to SIMD, and so had to enable
+//! `CPACR_EL1.FPEN` before the first `println!` or those lowerings trapped.
+//!
+//! The kernel now targets **`aarch64-unknown-none-softfloat`**, which emits no vector
+//! instructions, so `FPEN` stays as Limine left it. That is not merely simpler — it is
+//! what makes the exception path sound. The entry stub saves x0-x30 and no vector
+//! registers, so a handler touching FP on a returning path would silently corrupt the
+//! interrupted context. With softfloat *and* `FPEN` off, any SIMD that ever sneaks in
+//! traps loudly as `ESR_EL1.EC = 0x07` — which the exception decoder names — instead
+//! of corrupting memory quietly.
+//!
+//! One thing must still happen before the first `println!`:
+//! 1. **Map the PL011 UART.** Limine's HHDM maps RAM but **not** device MMIO, so the
 //!    UART at physical `0x0900_0000` is unmapped after handoff (spike-confirmed: both
 //!    raw-phys and `HHDM + 0x0900_0000` data-abort). We add a single Device-`nGnRnE`
 //!    page to the kernel tables (`TTBR1_EL1`) pointing at the UART, then install the
@@ -115,20 +125,6 @@ fn use_sp_el1() {
     }
 }
 
-/// Enable FP/SIMD at EL1 (`CPACR_EL1.FPEN = 0b11`) so compiler-emitted SIMD does not
-/// trap. Must run before any non-trivial Rust (formatting, struct moves).
-#[inline(always)]
-fn enable_fp() {
-    // SAFETY: CPACR_EL1 write is a PSTATE/feature-enable with an ISB to sequence it.
-    unsafe {
-        asm!(
-            "msr CPACR_EL1, {}",
-            "isb",
-            in(reg) (0b11u64 << 20),
-            options(nostack),
-        );
-    }
-}
 
 /// Allocate a zeroed page table from the pool; returns its kernel virtual address.
 ///
@@ -227,7 +223,6 @@ pub fn kmain_aarch64(
     k: KernelAddr,
     entries: &[&limine::memory_map::Entry],
 ) -> ! {
-    enable_fp();
     // Must precede anything that can take an exception — see the function docs.
     use_sp_el1();
 
@@ -253,7 +248,7 @@ pub fn kmain_aarch64(
     crate::println!("[boot] Limine higher-half handoff OK (MMU on)");
     crate::println!("[boot] HHDM offset: {:#018x}", hhdm);
     crate::println!("[boot] kernel phys/virt base: {:#x} / {:#018x}", k.phys_base, k.virt_base);
-    crate::println!("[boot] FP/SIMD enabled (CPACR_EL1.FPEN)");
+    crate::println!("[boot] FP/SIMD left disabled (softfloat kernel; stray SIMD traps)");
     {
         let spsel: u64;
         // SAFETY: reading SPSel has no side effects.
@@ -298,72 +293,93 @@ pub fn kmain_aarch64(
     }
 }
 
-/// Prove the timer actually ticks: unmask interrupts and wait for the counter to move.
+/// Prove the timer ticks, **at the right rate**.
 ///
-/// This is the acceptance check for the interrupt path, and it exercises every piece
-/// at once — the timer asserts its PPI, the GIC forwards it, the IRQ vector slot
-/// dispatches, the handler re-arms and bumps the counter, and the EOI lets the next
-/// one through. Any of those being wrong shows up here as a counter that does not
-/// advance.
+/// Acceptance for 7.2 is "the timer IRQ fires at a fixed rate and increments the
+/// tick". Counting interrupts alone does not show that, and an earlier version of this
+/// test — which waited for five ticks and checked nothing else — could not tell a
+/// healthy timer from a runaway one.
 ///
-/// Waiting for **several** ticks rather than one is deliberate. A single tick proves
-/// delivery but not *repetition*, and the two most likely mistakes — forgetting to
-/// re-arm `CNTV_TVAL_EL0`, and forgetting the GIC EOI — both produce exactly one tick
-/// and then silence.
+/// The reason is that `CNTV` drives a **level** line into the GIC. If the handler
+/// failed to re-arm, the compare condition would stay met and the GIC would re-pend
+/// immediately after every `EOIR`: five ticks would arrive in microseconds rather than
+/// 50 ms, with five IRQs and no spurious ones, printing a PASS line
+/// character-for-character identical to the healthy case. So the test brackets the
+/// wait with `CNTVCT_EL0` and checks the elapsed counter time is in the right
+/// neighbourhood. That is the difference between "five interrupts happened" and "five
+/// interrupts happened, 10 ms apart".
 ///
-/// The wait is bounded: on failure this returns rather than hanging, so CI reports a
-/// decoded failure instead of a timeout with no explanation.
+/// The wait is deadlined on the counter too, not on `wfi` returns. `wfi` only wakes on
+/// an interrupt, and in this phase the timer is the *only* interrupt source — so if
+/// delivery is broken, `wfi` blocks forever and a loop counting its returns can never
+/// time out. The counter advances regardless, which makes it the only sound clock for
+/// timing out a test of the interrupt path.
 fn timer_selftest() -> bool {
+    use crate::arch::aarch64::timer::read_cntvct;
     use crate::arch::time::tick_count;
 
     const WANT_TICKS: u64 = 5;
-    /// Generous ceiling on `wfi` wakeups while waiting. At 100 Hz five ticks take
-    /// ~50 ms; anything that has not arrived within thousands of wakeups is not going
-    /// to.
-    const MAX_WAITS: u32 = 100_000;
+
+    let reload = crate::arch::aarch64::timer::reload();
+    let expect = reload * WANT_TICKS;
+    // Give delivery four periods of slack before declaring failure.
+    let deadline_ticks = expect * 4;
 
     let start = tick_count();
-    crate::println!("[timer] waiting for {} ticks (tick={})...", WANT_TICKS, start);
+    let c0 = read_cntvct();
+    crate::println!(
+        "[timer] waiting for {} ticks (tick={}, expecting ~{} counter units)...",
+        WANT_TICKS, start, expect
+    );
 
-    // Everything below this point can be interrupted.
     crate::arch::irq::enable();
-
-    let mut waits = 0u32;
-    while tick_count() < start + WANT_TICKS && waits < MAX_WAITS {
+    while tick_count() < start + WANT_TICKS && read_cntvct() - c0 < deadline_ticks {
         crate::arch::irq::halt(); // wfi — sleeps until the next interrupt
-        waits += 1;
     }
-
-    let end = tick_count();
+    let elapsed = read_cntvct() - c0;
     crate::arch::irq::disable();
 
+    let end = tick_count();
     let irqs = crate::arch::aarch64::gic::irq_count();
     let spurious = crate::arch::aarch64::gic::spurious_count();
+    let got_ticks = end >= start + WANT_TICKS;
+    // Half to double the expected interval. Wide enough not to be flaky under a loaded
+    // CI runner, tight enough that a storm (elapsed ≈ 0) or a stalled timer fails.
+    let rate_ok = elapsed >= expect / 2 && elapsed <= expect * 2;
 
-    if end >= start + WANT_TICKS {
+    if got_ticks && rate_ok {
         crate::println!(
-            "[selftest] timer: PASS (tick {} -> {}, {} IRQs dispatched, {} spurious)",
-            start, end, irqs, spurious
+            "[selftest] timer: PASS (tick {} -> {}, {} IRQs, {} spurious, {} counter \
+             units elapsed vs {} expected)",
+            start, end, irqs, spurious, elapsed, expect
         );
-        true
-    } else {
-        crate::println!(
-            "[selftest] timer: FAIL — tick {} -> {} after {} waits ({} IRQs, {} spurious)",
-            start, end, waits, irqs, spurious
-        );
-        // Name the usual suspects, since this is the failure mode with the most
-        // plausible causes and the least informative symptom.
-        if irqs == 0 {
-            crate::println!(
-                "  no IRQs reached the CPU at all: check GICC_PMR/GICC_CTLR/GICD_CTLR,                  the PPI enable, and that DAIF.I is actually clear"
-            );
-        } else if irqs == 1 {
-            crate::println!(
-                "  exactly one IRQ: the timer was not re-armed (CNTV_TVAL_EL0) or the                  GIC was not EOI'd, so nothing further was delivered"
-            );
-        }
-        false
+        return true;
     }
+
+    crate::println!(
+        "[selftest] timer: FAIL — tick {} -> {}, {} IRQs, {} spurious, {} counter units \
+         elapsed vs {} expected",
+        start, end, irqs, spurious, elapsed, expect
+    );
+    // Name the suspect. These branches are now reachable: the loop exits on the
+    // counter deadline even when no interrupt is ever delivered.
+    if irqs == 0 {
+        crate::println!(
+            "  no IRQs reached the CPU: check GICC_PMR/GICC_CTLR/GICD_CTLR, the PPI \
+             enable, and that DAIF.I is actually clear"
+        );
+    } else if got_ticks && !rate_ok && elapsed < expect / 2 {
+        crate::println!(
+            "  ticks arrived far too fast: the timer is not being re-armed, so the \
+             level line stays asserted and the GIC re-pends after every EOI"
+        );
+    } else if irqs == 1 {
+        crate::println!(
+            "  exactly one IRQ: it was never completed (GICC_EOIR), so nothing further \
+             was delivered"
+        );
+    }
+    false
 }
 
 /// Bring up the memory subsystem: frame allocator, kernel heap, and the kernel's own

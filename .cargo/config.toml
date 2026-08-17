@@ -22,5 +22,14 @@ rustflags = ["-Crelocation-model=static", "-Clink-arg=-Tkernel/linker-x86_64.ld"
 
 # Linker script for the aarch64 bare-metal kernel (Phase 7). Same higher-half base
 # as x86_64; the Limine protocol is architecture-neutral.
-[target.aarch64-unknown-none]
+#
+# The **softfloat** variant is deliberate. The hardfloat target enables +neon, and the
+# compiler then lowers ordinary work — struct moves, `memset`, and notably every
+# `core::fmt` path behind `println!` — to SIMD. Kernel code therefore holds live
+# vector-register state at arbitrary points, while the exception entry stub saves only
+# x0-x30. Any handler that touches FP on a path that *returns* would silently corrupt
+# the interrupted context, with no fault. Softfloat removes the hazard by construction
+# rather than by convention, at the cost of no FP in the kernel — the same trade Linux
+# makes. It also means `CPACR_EL1.FPEN` no longer has to be enabled in early boot.
+[target.aarch64-unknown-none-softfloat]
 rustflags = ["-Crelocation-model=static", "-Clink-arg=-Tkernel/linker-aarch64.ld"]

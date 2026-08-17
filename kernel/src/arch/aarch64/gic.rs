@@ -62,6 +62,9 @@ const GICD_TYPER: usize = 0x004;
 const GICD_ISENABLER: usize = 0x100;
 /// Priority, one *byte* per INTID. Lower value = higher priority.
 const GICD_IPRIORITYR: usize = 0x400;
+/// CPU targets, one *byte* per INTID. Resets to 0 on GICv2 — meaning *no CPU* — so an
+/// SPI left untouched here is enabled, prioritised, and never delivered.
+const GICD_ITARGETSR: usize = 0x800;
 
 // --- CPU interface register offsets ---
 /// CPU interface control: bit 0 enables signalling to this core.
@@ -175,6 +178,15 @@ pub fn init() {
 /// calling core — which is what the timer wants, and what will need repeating per core
 /// when SMP arrives.
 pub fn enable_intid(intid: u32) {
+    // The priority/target updates below are read-modify-write. That is safe only
+    // because this runs single-core with interrupts masked; it becomes a live race the
+    // moment a second core or an interrupt-context caller exists.
+    debug_assert!(
+        !crate::arch::irq::are_enabled(),
+        "enable_intid performs unsynchronised read-modify-write on GIC registers; \
+         call it with interrupts masked"
+    );
+
     // Priority is a byte per INTID. 0x80 is mid-range: below the PMR of 0xff we set in
     // `init`, so it is not masked, and leaves room either side for future prioritising.
     let prio_reg = GICD_IPRIORITYR + (intid as usize & !3);
@@ -183,6 +195,21 @@ pub fn enable_intid(intid: u32) {
     prio &= !(0xffu32 << shift);
     prio |= 0x80u32 << shift;
     gicd_write(prio_reg, prio);
+
+    // Shared peripheral interrupts must additionally be *targeted* at a CPU. The
+    // registers for INTIDs 0-31 are banked per core, so PPIs and SGIs need no
+    // targeting — which is why the timer works without this — but ITARGETSR resets to
+    // 0 for SPIs, and 0 means no CPU. Enabling an SPI without setting it produces
+    // exactly the "configured correctly, nothing ever arrives" failure this module
+    // warns about, and it is the first thing a device interrupt in 7.4 would hit.
+    if intid >= 32 {
+        let tgt_reg = GICD_ITARGETSR + (intid as usize & !3);
+        let shift = (intid as usize & 3) * 8;
+        let mut tgt = gicd_read(tgt_reg);
+        tgt &= !(0xffu32 << shift);
+        tgt |= 1u32 << shift; // CPU interface 0 — the only core for now
+        gicd_write(tgt_reg, tgt);
+    }
 
     // Set-enable: one bit per INTID, write-1-to-set (writing 0 does nothing, so this
     // needs no read-modify-write and cannot disturb neighbouring interrupts).

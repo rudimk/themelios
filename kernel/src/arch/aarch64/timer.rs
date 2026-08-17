@@ -31,8 +31,14 @@ use crate::println;
 /// Interrupt ID of the EL1 virtual timer: PPI 27. Private to each core.
 pub const TIMER_INTID: u32 = 27;
 
-/// Tick rate, matching the x86 PIT so `arch::time` means the same on both
-/// architectures: one tick ≈ 10 ms.
+/// Tick rate: one tick ≈ 10 ms, the same nominal rate as the x86 PIT so `arch::time`
+/// is comparable across architectures.
+///
+/// "Comparable", not identical. The 8253 in mode 3 auto-reloads in hardware from the
+/// previous expiry; here the handler re-arms in software. `handle_tick` advances an
+/// absolute deadline and credits skipped periods precisely so the two stay equivalent
+/// for elapsed-time purposes, but the mechanisms differ and anything comparing tick
+/// deltas across arches should know it.
 const TICK_HZ: u64 = 100;
 
 /// Countdown reload value, computed from `CNTFRQ_EL0` at [`init`].
@@ -47,11 +53,31 @@ fn read_cntfrq() -> u64 {
     v
 }
 
-/// Arm the virtual timer to fire after `ticks` counter decrements.
+/// Read the virtual counter. Free-running, monotonic, and — crucially — advancing
+/// whether or not interrupts are being delivered, which makes it the only sound basis
+/// for timing out a wait on the timer itself.
 #[inline]
-fn set_tval(ticks: u64) {
-    // SAFETY: writing CNTV_TVAL_EL0 reloads the down-counter. No memory effect.
-    unsafe { asm!("msr CNTV_TVAL_EL0, {}", in(reg) ticks, options(nomem, nostack)) };
+pub fn read_cntvct() -> u64 {
+    let v: u64;
+    // SAFETY: reading CNTVCT_EL0 has no side effects.
+    unsafe { asm!("mrs {}, CNTVCT_EL0", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Read the current absolute compare value.
+#[inline]
+fn read_cval() -> u64 {
+    let v: u64;
+    // SAFETY: reading CNTV_CVAL_EL0 has no side effects.
+    unsafe { asm!("mrs {}, CNTV_CVAL_EL0", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Set the absolute deadline at which the timer next fires.
+#[inline]
+fn set_cval(deadline: u64) {
+    // SAFETY: writing CNTV_CVAL_EL0 sets the compare value. No memory effect.
+    unsafe { asm!("msr CNTV_CVAL_EL0, {}", in(reg) deadline, options(nomem, nostack)) };
 }
 
 /// Enable or disable the virtual timer.
@@ -72,9 +98,11 @@ fn set_ctl(enable: bool) {
 pub fn init() {
     let freq = read_cntfrq();
     assert!(
-        freq != 0,
-        "CNTFRQ_EL0 reads 0 — the platform did not program the timer frequency, so \
-         no sensible tick interval can be derived"
+        freq >= TICK_HZ,
+        "CNTFRQ_EL0 reads {} Hz, below the {} Hz tick rate — the reload would round to \
+         0, which re-expires immediately and produces an unbreakable interrupt storm",
+        freq,
+        TICK_HZ
     );
 
     let reload = freq / TICK_HZ;
@@ -84,7 +112,9 @@ pub fn init() {
     // timer, so the first expiry has somewhere to go.
     super::gic::enable_intid(TIMER_INTID);
 
-    set_tval(reload);
+    // Arm the first deadline relative to now; every subsequent one is relative to the
+    // previous deadline (see `handle_tick`).
+    set_cval(read_cntvct() + reload);
     set_ctl(true);
 
     println!(
@@ -93,14 +123,47 @@ pub fn init() {
     );
 }
 
+/// The counter units per tick, as computed at [`init`] from `CNTFRQ_EL0`.
+pub fn reload() -> u64 {
+    RELOAD.load(Ordering::Relaxed)
+}
+
 /// Service one timer expiry: re-arm and advance the tick counter.
 ///
 /// Called from the GIC dispatch path. Re-arming first keeps the window in which the
-/// interrupt is still asserted as short as possible.
+/// interrupt is still asserted as short as possible — and re-arming *at all* is
+/// mandatory, because the timer drives a **level** line into the GIC. If the compare
+/// condition stays met, the GIC re-pends the interrupt immediately after every `EOIR`
+/// and the core does nothing but service timer interrupts.
+///
+/// ## Absolute deadlines, not a fixed reload
+///
+/// The obvious implementation writes `CNTV_TVAL_EL0 = reload`, which sets the deadline
+/// to *now* + reload. That anchors each period to when the handler happened to run, so
+/// every tick permanently absorbs interrupt-entry and dispatch latency and the clock
+/// drifts. Advancing `CNTV_CVAL_EL0` by exactly `reload` instead anchors to the
+/// previous deadline, so the period is exact regardless of how long servicing took.
+///
+/// Ticks can still be *lost*: if interrupts are masked for longer than a period, the
+/// line is already asserted and several expiries collapse into one interrupt. The loop
+/// below therefore advances the deadline past `now` and credits every period it skips,
+/// so `tick_count` tracks elapsed time rather than interrupts serviced.
 ///
 /// Phase 7.2 is **tick only** — `schedule()` is wired in here in 7.3, matching the
 /// x86 split where the PIT ISR bumps the tick and separately calls the scheduler.
 pub fn handle_tick() {
-    set_tval(RELOAD.load(Ordering::Relaxed));
-    super::time::bump();
+    let reload = RELOAD.load(Ordering::Relaxed);
+    let now = read_cntvct();
+    let mut deadline = read_cval();
+
+    // Advance past `now`, crediting one tick per elapsed period. Normally this runs
+    // exactly once; it runs more only if we were masked through one or more periods.
+    loop {
+        deadline = deadline.wrapping_add(reload);
+        super::time::bump();
+        if deadline > now {
+            break;
+        }
+    }
+    set_cval(deadline);
 }
