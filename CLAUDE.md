@@ -185,8 +185,23 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   frame via HHDM → unmap → translate-is-None) whose sentinel the CI arm64 smokes now
   assert. Bootloader memory is deliberately **not** reclaimed on aarch64 until 7.2
   provides fault reporting.
-- ⬜ **7.2** Exceptions + GIC + timer tick · ⬜ **7.3** Scheduler context switch ·
-  ⬜ **7.4** Shell, portable tests on aarch64 CI, finalize.
+- ✅ **7.2** **Exceptions + GIC + timer tick.** `VBAR_EL1` vector table (16 slots of
+  *code*, not pointers — the CPU branches into them, so all sixteen are populated and
+  each stub is small enough to fit 128 bytes); `ESR_EL1.EC` decoding with `FAR_EL1` and
+  the fault-status code broken out; `BRK` trapped and resumed (`ELR` points *at* the
+  trapping instruction, unlike `int3`). Early boot now **switches to `SP_EL1`**
+  (`use_sp_el1`) — Limine hands off with `SPSel = 0`, which routes exceptions to the
+  `0x000` vector group *and* lands them on an uninitialised `SP_EL1`, so the entry stub
+  faults, nests, and reports the nested syndrome instead of the real one. GICv2
+  (GICD+GICC) mapped via `mm::mmio`, which is the first real exercise of the
+  Device-`nGnRnE` `AttrIndx` path 7.1 could only verify by inspecting a descriptor.
+  `CNTV` virtual timer (trap-free under EL2, unlike `CNTP`) at 100 Hz on PPI 27 driving
+  `arch::time::tick_count`. Self-tests assert a `brk` is caught and that **five** ticks
+  arrive — one tick would pass even if the timer were never re-armed or the GIC never
+  EOI'd, which are the two failure modes here. Verified in CI: `tick 0 -> 5, 5 IRQs, 0
+  spurious`, `CNTFRQ = 62.5 MHz`, `GICD TYPER` reads 288 INTIDs.
+- ⬜ **7.3** Scheduler context switch · ⬜ **7.4** Shell, portable tests on aarch64 CI,
+  finalize.
 
 **Phase 6 — Management API: COMPLETE (core).** The node is driven entirely
 through an external HTTP API (no SSH, no shell). A ring-3 **`api-server`** holds a
