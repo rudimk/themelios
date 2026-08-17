@@ -36,6 +36,12 @@ pub mod boot;
 /// Exception vectors (`VBAR_EL1`), syndrome decoding, and fault reporting.
 pub mod exceptions;
 
+/// GICv2 interrupt controller (distributor + CPU interface).
+pub mod gic;
+
+/// ARM generic timer (`CNTV`) driving the 100 Hz tick.
+pub mod timer;
+
 pub mod irq;
 
 /// Page-table descriptor format, TTBR control, and TLB maintenance.

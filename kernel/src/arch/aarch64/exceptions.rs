@@ -256,10 +256,7 @@ aarch64_vector_table:
 /// Vector-slot tags, matching the `SAVE_AND_DISPATCH` arguments above.
 const TAG_CUR_SPX_SYNC: u64 = 4;
 
-/// The IRQ slot. Unused so far: IRQs are still masked at this point in the port, so
-/// one arriving is genuinely unexpected and falls through to the diagnostic path
-/// below. The interrupt controller claims this slot when the GIC lands.
-#[allow(dead_code)]
+/// The IRQ slot, dispatched to the interrupt controller.
 const TAG_CUR_SPX_IRQ: u64 = 5;
 
 /// Name a vector slot for diagnostics.
@@ -291,6 +288,12 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
     let frame_at = frame as *const _ as u64;
 
     match tag {
+        // IRQ — the controller says what actually happened.
+        TAG_CUR_SPX_IRQ => {
+            crate::arch::aarch64::gic::dispatch_irq();
+            return;
+        }
+
         // Synchronous at EL1.
         TAG_CUR_SPX_SYNC if ec == EC_BRK => {
             BRK_COUNT.fetch_add(1, Ordering::Relaxed);

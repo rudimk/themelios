@@ -276,18 +276,93 @@ pub fn kmain_aarch64(
     // --- Phase 7.1: memory management on our own page tables ---
     bring_up_memory(hhdm, k, entries);
 
-    // Prove the synchronous-exception path with a real trap.
+    // Prove the synchronous-exception path with a real trap. Reported together with
+    // the interrupt path below, in the single sentinel the CI smokes assert.
     let exc_ok = crate::arch::aarch64::exceptions::selftest();
-    if exc_ok {
-        crate::println!("[boot] Phase 7.2 exception vectors reached; self-test passed.");
+
+    // --- Interrupt controller + periodic tick ---
+    crate::arch::aarch64::gic::init();
+    crate::arch::aarch64::timer::init();
+
+    let timer_ok = timer_selftest();
+    if exc_ok && timer_ok {
+        crate::println!("[boot] Phase 7.2 exceptions+GIC+timer reached; self-tests passed.");
     } else {
-        crate::println!("[boot] Phase 7.2 exception vectors FAILED self-test.");
+        crate::println!("[boot] Phase 7.2 FAILED self-test.");
     }
 
-    crate::println!("[boot] (GIC+timer=7.2 cont., sched=7.3, shell=7.4)");
+    crate::println!("[boot] (sched=7.3, shell=7.4)");
 
     loop {
         crate::arch::irq::halt();
+    }
+}
+
+/// Prove the timer actually ticks: unmask interrupts and wait for the counter to move.
+///
+/// This is the acceptance check for the interrupt path, and it exercises every piece
+/// at once — the timer asserts its PPI, the GIC forwards it, the IRQ vector slot
+/// dispatches, the handler re-arms and bumps the counter, and the EOI lets the next
+/// one through. Any of those being wrong shows up here as a counter that does not
+/// advance.
+///
+/// Waiting for **several** ticks rather than one is deliberate. A single tick proves
+/// delivery but not *repetition*, and the two most likely mistakes — forgetting to
+/// re-arm `CNTV_TVAL_EL0`, and forgetting the GIC EOI — both produce exactly one tick
+/// and then silence.
+///
+/// The wait is bounded: on failure this returns rather than hanging, so CI reports a
+/// decoded failure instead of a timeout with no explanation.
+fn timer_selftest() -> bool {
+    use crate::arch::time::tick_count;
+
+    const WANT_TICKS: u64 = 5;
+    /// Generous ceiling on `wfi` wakeups while waiting. At 100 Hz five ticks take
+    /// ~50 ms; anything that has not arrived within thousands of wakeups is not going
+    /// to.
+    const MAX_WAITS: u32 = 100_000;
+
+    let start = tick_count();
+    crate::println!("[timer] waiting for {} ticks (tick={})...", WANT_TICKS, start);
+
+    // Everything below this point can be interrupted.
+    crate::arch::irq::enable();
+
+    let mut waits = 0u32;
+    while tick_count() < start + WANT_TICKS && waits < MAX_WAITS {
+        crate::arch::irq::halt(); // wfi — sleeps until the next interrupt
+        waits += 1;
+    }
+
+    let end = tick_count();
+    crate::arch::irq::disable();
+
+    let irqs = crate::arch::aarch64::gic::irq_count();
+    let spurious = crate::arch::aarch64::gic::spurious_count();
+
+    if end >= start + WANT_TICKS {
+        crate::println!(
+            "[selftest] timer: PASS (tick {} -> {}, {} IRQs dispatched, {} spurious)",
+            start, end, irqs, spurious
+        );
+        true
+    } else {
+        crate::println!(
+            "[selftest] timer: FAIL — tick {} -> {} after {} waits ({} IRQs, {} spurious)",
+            start, end, waits, irqs, spurious
+        );
+        // Name the usual suspects, since this is the failure mode with the most
+        // plausible causes and the least informative symptom.
+        if irqs == 0 {
+            crate::println!(
+                "  no IRQs reached the CPU at all: check GICC_PMR/GICC_CTLR/GICD_CTLR,                  the PPI enable, and that DAIF.I is actually clear"
+            );
+        } else if irqs == 1 {
+            crate::println!(
+                "  exactly one IRQ: the timer was not re-armed (CNTV_TVAL_EL0) or the                  GIC was not EOI'd, so nothing further was delivered"
+            );
+        }
+        false
     }
 }
 

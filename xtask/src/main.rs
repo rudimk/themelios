@@ -953,7 +953,7 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     // far (the 7.0b banner, then the 7.1 paging sentinel) prints before the work the
     // next sub-phase adds, so leaving it behind would let that work break while the
     // smoke saw its marker and stopped looking.
-    const MARKER: &str = "Phase 7.2 exception vectors reached; self-test passed.";
+    const MARKER: &str = "Phase 7.2 exceptions+GIC+timer reached; self-tests passed.";
 
     // Failure signatures. Without these the only failure mode is "marker never
     // appeared", which costs the full timeout and reports nothing useful. A panic or a
@@ -962,8 +962,9 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
         "KERNEL PANIC",
         "Phase 7.1 MMU/paging FAILED self-test",
         "[selftest] paging: FAIL",
-        "Phase 7.2 exception vectors FAILED self-test",
+        "Phase 7.2 FAILED self-test",
         "[selftest] exceptions: FAIL",
+        "[selftest] timer: FAIL",
         "!!! aarch64 EXCEPTION !!!",
     ];
 
@@ -1000,8 +1001,8 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     }
     if found {
         println!(
-            "arm64 {what} smoke passed: booted to the banner, switched to kernel page \
-             tables, and passed the paging self-test on QEMU virt."
+            "arm64 {what} smoke passed: booted, switched to kernel page tables, and \
+             passed the paging, exception and timer self-tests on QEMU virt."
         );
     } else {
         eprintln!(
