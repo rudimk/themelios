@@ -11,7 +11,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **4** | VirtIO net driver, TCP/IP stack | Complete |
 | **5** | OCI container support | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Management API (Docker-compatible) | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
-| **7** | aarch64 port | Not started |
+| **7** | aarch64 port | In progress |
 | **8** | Hyperscaler support (AWS, GCP, Azure) | Not started |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node | Not started |
@@ -163,7 +163,7 @@ container mutation crosses into the kernel through the capability-checked, audit
 - Broader Engine API surface (networks, volumes, images, events, stats)
 - Configuration injection at boot time beyond `ServerBootInfo`
 
-## Phase 7 — aarch64 port (Not started)
+## Phase 7 — aarch64 port (In progress)
 
 **Goal**: Port all Phase 0 and Phase 1 functionality to aarch64 (ARM64), enabling ThemeliOS to run on ARM-based hardware and cloud instances (e.g., AWS Graviton).
 
@@ -178,6 +178,23 @@ container mutation crosses into the kernel through the capability-checked, audit
 - Serial debug shell (architecture-independent, just works)
 - `cargo xtask run --arch aarch64` boots and passes all tests
 - Automated tests on aarch64 QEMU in CI
+
+**Scope note**: Phase 7 delivers a **ring-0 kernel core** on aarch64 — boot, memory,
+scheduling, and a reduced in-kernel serial shell. EL0/ring-3 userspace, storage,
+networking, and containers on ARM are a separate ABI surface and are deferred; the
+milestone does not imply "containers on ARM".
+
+**Sub-phase status**:
+
+| Sub-phase | Scope | Status |
+|-----------|-------|--------|
+| 7.0a | Arch-neutral `irq`/`time` facade | Complete |
+| 7.0b | Boot to banner on QEMU `virt` (PL011 over UEFI) | Complete |
+| 7.0c | Separate amd64/arm64 ISOs + arm64 ISO boot smoke | Complete |
+| 7.1 | MMU / paging on kernel-owned tables | Complete |
+| 7.2 | Exceptions + GIC + timer tick | Not started |
+| 7.3 | Scheduler context switch | Not started |
+| 7.4 | Shell, portable tests on aarch64 CI, finalize | Not started |
 
 ## Phase 8 — Hyperscaler support (Not started)
 

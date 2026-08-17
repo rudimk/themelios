@@ -37,6 +37,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_scheduler",        func: test_scheduler },
     TestCase { name: "test_interrupts",       func: test_interrupts },
     TestCase { name: "test_page_tables",      func: test_page_tables },
+    TestCase { name: "test_paging_selftest",  func: test_paging_selftest },
     TestCase { name: "test_heap_growth",      func: test_heap_growth },
     TestCase { name: "test_syscall",          func: test_syscall },
     TestCase { name: "test_capabilities",    func: test_capabilities },
@@ -339,6 +340,25 @@ fn test_interrupts() -> Result<(), &'static str> {
     }
 }
 
+/// Run the shared, architecture-neutral page-table self-test.
+///
+/// The same function runs on the aarch64 boot path, where it is that port's acceptance
+/// check. Running it here means a regression in the shared walker or in the x86_64
+/// descriptor encoding is caught by the suite that actually exercises the kernel,
+/// instead of only on the architecture being ported.
+///
+/// Covers the encodings whose failure modes are silent rather than faulting:
+/// writable+NX and read-only. The uncached/Device cycle is aarch64-only — see
+/// `mm::page_table::selftest` for why — so on this architecture the PCD path is
+/// covered by `mm::mmio` via the VirtIO tests instead.
+fn test_paging_selftest() -> Result<(), &'static str> {
+    if crate::mm::page_table::selftest() {
+        Ok(())
+    } else {
+        Err("mm::page_table::selftest reported a failure (see the [selftest] lines above)")
+    }
+}
+
 /// Test the page table manager.
 ///
 /// Verifies:
@@ -355,7 +375,7 @@ fn test_page_tables() -> Result<(), &'static str> {
     // 1. Verify we're on custom page tables (CR3 matches our kernel PML4)
     let kernel_as = kernel_address_space();
     let cr3 = crate::arch::x86_64::cpu::read_cr3() & !0xFFF;
-    if cr3 != kernel_as.pml4_phys().as_u64() {
+    if cr3 != kernel_as.root_phys().as_u64() {
         core::mem::forget(kernel_as);
         return Err("CR3 does not match kernel PML4");
     }

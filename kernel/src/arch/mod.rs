@@ -45,3 +45,6 @@ pub mod time;
 
 /// Serial console (`_print`) — backs the `print!`/`println!` macros.
 pub mod serial;
+
+/// Page-table descriptors, address-space activation, and TLB maintenance.
+pub mod paging;

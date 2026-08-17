@@ -23,6 +23,9 @@
 /// Low-level CPU instructions (I/O ports, halt, etc.).
 pub mod cpu;
 
+/// Page-table descriptor format, CR3 control, and TLB maintenance.
+pub mod paging;
+
 /// 16550 UART serial driver for debug output via COM1.
 pub mod serial;
 

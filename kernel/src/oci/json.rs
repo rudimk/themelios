@@ -155,8 +155,10 @@ struct Parser<'a> {
 /// Maximum container-nesting depth. The manifest/config JSON is **untrusted**
 /// registry input, and this is a recursive-descent parser: a document like
 /// `[[[[…` nests one `array()`/`value()` stack frame per bracket, so without a
-/// bound a few thousand `[` bytes overflow the kernel stack (guard-page fault →
-/// kernel death). 64 levels is far beyond any real OCI manifest/config.
+/// bound a few thousand `[` bytes overflow the kernel stack. This bound is the *only*
+/// thing preventing that: the padding page below each kernel stack is reserved but
+/// still mapped, so an overflow smashes memory silently rather than faulting (see
+/// `sched::task`). 64 levels is far beyond any real OCI manifest/config.
 const MAX_DEPTH: usize = 64;
 
 /// Parse a complete JSON document. Returns `None` on any syntax error (including

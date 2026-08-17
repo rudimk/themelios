@@ -33,5 +33,8 @@
 // Still to come: `mmu` (7.1), `exceptions`+`gic`+`timer` (7.2), `context` (7.3).
 pub mod boot;
 pub mod irq;
+
+/// Page-table descriptor format, TTBR control, and TLB maintenance.
+pub mod paging;
 pub mod serial;
 pub mod time;

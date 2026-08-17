@@ -626,7 +626,7 @@ pub fn process_pml4(pid: ProcessId) -> Option<u64> {
     table.processes.get(pid.as_usize())
         .and_then(|slot| slot.as_ref())
         .and_then(|proc| proc.address_space.as_ref())
-        .map(|as_ref| as_ref.pml4_phys().as_u64())
+        .map(|as_ref| as_ref.root_phys().as_u64())
 }
 
 /// Info about a process, returned by `process_list()` for display purposes.

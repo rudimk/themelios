@@ -34,24 +34,6 @@
 // and `-Zbuild-std=core,alloc` in the build flags (see xtask).
 extern crate alloc;
 
-// On x86_64 the global allocator lives in `mm::heap`. On aarch64 the memory subsystem
-// is not yet ported (Phase 7.1), so provide a placeholder allocator that keeps the
-// crate linkable. The Phase 7.0b boot-to-banner path performs **no** heap allocation;
-// any allocation before 7.1 is a bug and panics loudly here rather than corrupting.
-#[cfg(target_arch = "aarch64")]
-mod aarch64_alloc_placeholder {
-    use core::alloc::{GlobalAlloc, Layout};
-    struct NullAlloc;
-    // SAFETY: never hands out memory; alloc always diverges, dealloc is a no-op.
-    unsafe impl GlobalAlloc for NullAlloc {
-        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-            panic!("aarch64: heap allocation attempted before the Phase 7.1 allocator");
-        }
-        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-    }
-    #[global_allocator]
-    static ALLOCATOR: NullAlloc = NullAlloc;
-}
 
 // --- Limine boot protocol setup ---
 //
@@ -133,7 +115,10 @@ mod sync;
 /// Memory management subsystem.
 /// Handles physical frame allocation, virtual address spaces (page tables),
 /// and the kernel heap allocator.
-#[cfg(target_arch = "x86_64")]
+///
+/// Architecture-neutral as of Phase 7.1: the frame allocator, heap, and address
+/// types were already portable, and the 4-level page-table walker now drives the
+/// per-architecture descriptor format through `arch::paging`.
 mod mm;
 
 /// Process scheduler.
@@ -263,9 +248,16 @@ extern "C" fn kmain() -> ! {
             .get_response()
             .map(|r| (r.physical_base(), r.virtual_base()))
             .unwrap_or((0, 0));
+        // Phase 7.1 needs the memory map to bring up the frame allocator, the heap,
+        // and the kernel's own page tables.
+        let entries = MEMORY_MAP_REQUEST
+            .get_response()
+            .map(|r| r.entries())
+            .unwrap_or(&[]);
         crate::arch::aarch64::boot::kmain_aarch64(
             hhdm,
             crate::arch::aarch64::boot::KernelAddr { phys_base, virt_base },
+            entries,
         );
     }
 
@@ -403,7 +395,22 @@ fn kmain_x86_64() -> ! {
     assert!(free_after == free, "Free count mismatch after alloc/dealloc cycle");
     println!("  Alloc/dealloc cycle verified — count restored to {}", free_after);
 
-    // Initialize the kernel heap (1 MiB) backed by contiguous physical frames.
+    // --- Page table initialization ---
+    //
+    // Switch from Limine's page tables to our own: a fresh root that clones Limine's
+    // kernel mappings (HHDM + kernel image) and is loaded into the architecture's
+    // translation-base register. After this we own the page tables and can:
+    // - Map/unmap individual pages (the kernel heap, MMIO windows)
+    // - Create per-process address spaces (Phase 2 isolation)
+    // - Reclaim bootloader-reclaimable memory (Sub-phase 2.2)
+    //
+    // This must run *before* heap init, because the heap is mapped into its own
+    // virtual window rather than the HHDM (see `mm::heap::HEAP_VIRT_BASE`) and so
+    // needs working page tables. It allocates only from the frame allocator and
+    // prints via serial, so it has no heap dependency of its own.
+    mm::page_table::init();
+
+    // Initialize the kernel heap (1 MiB) in its own mapped virtual window.
     // After this, Vec, Box, String, and all alloc types are usable.
     mm::heap::init();
 
@@ -434,18 +441,6 @@ fn kmain_x86_64() -> ! {
     // bootloader memory (which would invalidate Limine's response structures).
     mm::save_memory_map(entries);
 
-    // --- Page table initialization ---
-    //
-    // Switch from Limine's page tables to our own. This creates a new PML4
-    // that clones Limine's kernel mappings (HHDM + kernel image) and writes
-    // it to CR3. After this, we own the page tables and can:
-    // - Map/unmap individual pages (guard pages, heap growth)
-    // - Create per-process address spaces (Phase 2 isolation)
-    // - Reclaim bootloader-reclaimable memory (Sub-phase 2.2)
-    //
-    // Must happen after heap init (allocates a PML4 frame from the frame
-    // allocator, and the AddressSpace methods use println! which needs heap).
-    mm::page_table::init();
 
     // Reclaim bootloader-reclaimable memory now that we own the GDT, page
     // tables, and stack. Limine's boot structures in those regions are no
