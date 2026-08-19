@@ -142,7 +142,6 @@ mod shell;
 /// When built with `--features test`, the kernel runs self-tests instead of
 /// the interactive shell and exits QEMU with a pass/fail exit code.
 #[cfg(feature = "test")]
-#[cfg(target_arch = "x86_64")]
 mod test_runner;
 
 /// Capability system.
@@ -180,7 +179,6 @@ mod process {
 /// Message passing between processes. Since ThemeliOS is a microkernel,
 /// IPC is the backbone — drivers, filesystems, and services all communicate
 /// through IPC channels.
-#[cfg(target_arch = "x86_64")]
 mod ipc;
 
 /// Audit logging.
@@ -651,6 +649,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("!!! KERNEL PANIC !!!");
     println!("{}", info);
 
+    // In test mode on aarch64, stop the machine rather than halting on it.
+    //
+    // The suite reports its verdict over the serial console and relies on PSCI to power
+    // off afterwards, which is what lets the harness tell "the kernel died partway
+    // through" (QEMU exits, no verdict printed) from "the kernel hung" (no exit at
+    // all). A panic that halts forever collapses those two back together: the harness
+    // waits out its full deadline and reports a hang, when what actually happened is
+    // right there in the log above.
+    //
+    // Only in test mode. Interactively, halting is the better behaviour — it leaves the
+    // machine inspectable from QEMU's monitor instead of tearing it down.
+    #[cfg(all(feature = "test", target_arch = "aarch64"))]
+    crate::arch::aarch64::psci::shutdown_or_hang();
+
+    #[cfg(not(all(feature = "test", target_arch = "aarch64")))]
     hcf();
 }
 

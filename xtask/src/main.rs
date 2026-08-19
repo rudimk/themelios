@@ -25,7 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // Build constants
@@ -358,29 +358,128 @@ fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
         format!("virtio-blk-pci,drive={id},disable-legacy=on"),
     ]
 }
+/// `cargo xtask test --arch aarch64` — run the kernel suite on QEMU `virt`.
+///
+/// Mirrors [`cmd_test`], with one structural difference: how the verdict gets out.
+///
+/// x86_64 writes to QEMU's `isa-debug-exit` device and the result arrives as a process
+/// exit code, which is unambiguous and needs no parsing. The `virt` machine has no such
+/// device — aarch64 has no I/O ports for one to live behind — so the kernel prints a
+/// sentinel line and then powers the machine off through PSCI.
+///
+/// That gives four outcomes rather than two, and the extra two are the useful ones:
+///
+/// | What happened                        | Verdict                             |
+/// |--------------------------------------|-------------------------------------|
+/// | PASS sentinel, QEMU exits            | pass                                |
+/// | FAIL sentinel, QEMU exits            | fail — the `[FAIL]` lines say which |
+/// | QEMU exits, no sentinel              | fail — the kernel died mid-suite    |
+/// | no exit before the deadline          | fail — hang                         |
+///
+/// Without the PSCI shutdown the third and fourth rows collapse into one another, and
+/// a kernel that panicked halfway through looks exactly like a kernel that hung.
+fn cmd_test_aarch64(root: &Path, target: &str) {
+    /// Printed by `test_runner` when every test that ran, passed. Must match
+    /// `AARCH64_PASS_SENTINEL` in `kernel/src/test_runner.rs` exactly — both sides
+    /// spell out the whole line rather than matching a prefix, so a drift is a hard
+    /// failure here rather than a silently weaker check.
+    const PASS: &str = "[test] RESULT: ALL TESTS PASSED";
+    /// Printed when at least one test failed. Matches `AARCH64_FAIL_SENTINEL`.
+    const FAIL: &str = "[test] RESULT: FAILURES PRESENT";
 
-/// Refuse `xtask test --arch aarch64`.
-///
-/// `create_iso` now builds a real arm64 image, but the *test harness* is still
-/// x86-only: it launches `qemu-system-aarch64` with `-M q35`, x86 VirtIO disk args
-/// and the `isa-debug-exit` device, none of which exist on `virt`. Without this
-/// check the command builds an aarch64 kernel and then issues a nonsense QEMU
-/// invocation. Running the suite on aarch64 is Phase 7.4 work (it needs the
-/// serial-sentinel exit contract, since `isa-debug-exit` is x86-only).
-///
-/// `iso`/`run --arch aarch64` are both supported and are not routed here.
-fn reject_aarch64_test(target: &str) {
-    if target != "aarch64-unknown-none-softfloat" {
+    println!("Building ThemeliOS kernel (test mode) for {target}...");
+
+    // Clean cached artifacts so build.rs re-runs and the ULID is fresh, matching the
+    // amd64 path.
+    let _ = Command::new("cargo")
+        .current_dir(root)
+        .args(["clean", "--package", "themelios", "--target", target])
+        .status();
+
+    let status = Command::new("cargo")
+        .current_dir(root)
+        .args([
+            "build",
+            "--package", "themelios",
+            "--target", target,
+            "--features", "test",
+            BUILD_STD,
+            BUILD_STD_FEATURES,
+        ])
+        .status()
+        .expect("Failed to execute cargo build");
+    if !status.success() {
+        eprintln!("aarch64 test build failed!");
+        process::exit(1);
+    }
+
+    let kernel = root.join(format!("target/{target}/debug/themelios"));
+    let limine_dir = ensure_limine(root);
+    let (esp, code, vars) = prepare_aarch64_boot(root, &kernel, &limine_dir);
+
+    let serial_log = root.join("target/aarch64-test-serial.log");
+    let _ = fs::remove_file(&serial_log);
+
+    println!("Running the suite on QEMU virt (headless)...");
+    let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
+    cmd.args(["-display", "none"]);
+    cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+
+    let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
+
+    // Poll for exit rather than blocking on it, so a hung kernel is bounded. The suite
+    // itself takes a couple of seconds; the budget is generous because a CI runner
+    // building nothing but still emulating every instruction is slow, and the cost of
+    // being wrong here is a spurious red build.
+    let deadline = Duration::from_secs(120);
+    let start = Instant::now();
+    let mut exited = false;
+    while start.elapsed() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    if !exited {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+
+    let serial = fs::read_to_string(&serial_log).unwrap_or_default();
+    println!("--- aarch64 serial output ---\n{serial}\n-----------------------------");
+
+    // Order matters: check for the failure sentinel first. A run that prints FAIL has
+    // reported its own verdict, and that is more specific than anything inferred.
+    if serial.contains(FAIL) {
+        eprintln!("aarch64 suite FAILED — see the [FAIL] lines above.");
+        process::exit(1);
+    }
+    if serial.contains(PASS) {
+        if !exited {
+            // The suite passed but PSCI did not stop the machine. Worth saying out
+            // loud: the tests are fine and the shutdown path is not.
+            eprintln!(
+                "aarch64 suite passed, but QEMU did not exit within {}s — PSCI \
+                 SYSTEM_OFF appears not to have taken effect.",
+                deadline.as_secs()
+            );
+            process::exit(1);
+        }
+        println!("aarch64 suite passed.");
         return;
     }
-    eprintln!("Error: `xtask test` cannot run the suite on aarch64 yet.");
-    eprintln!(
-        "The harness is x86-only: -M q35, x86 VirtIO disk args and isa-debug-exit.\n\
-         An aarch64 suite needs the serial-sentinel exit contract (Phase 7.4)."
-    );
-    eprintln!("To boot aarch64 today:   cargo xtask run --arch aarch64");
-    eprintln!("To smoke-test aarch64:   cargo xtask arm64-smoke");
-    eprintln!("To build an arm64 ISO:   cargo xtask iso --arch aarch64");
+    if exited {
+        eprintln!(
+            "aarch64 suite FAILED: QEMU exited without printing a verdict — the kernel \
+             died partway through the suite (look for a panic or an exception above)."
+        );
+    } else {
+        eprintln!(
+            "aarch64 suite FAILED: no verdict and no exit within {}s — the kernel hung.",
+            deadline.as_secs()
+        );
+    }
     process::exit(1);
 }
 
@@ -1346,8 +1445,13 @@ fn cmd_test(args: &[String]) {
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
-    // The suite harness is x86-only; refuse before doing any work.
-    reject_aarch64_test(target);
+    // aarch64 runs the same suite but cannot report its verdict the same way: the
+    // `virt` machine has no `isa-debug-exit`, so the result comes off the serial
+    // console. Different enough in its mechanics to warrant its own function.
+    if target == "aarch64-unknown-none-softfloat" {
+        cmd_test_aarch64(&root, target);
+        return;
+    }
 
     println!("Building ThemeliOS kernel (test mode) for {target}...");
 

@@ -329,15 +329,58 @@ pub fn kmain_aarch64(
         crate::println!("[boot] Phase 7.3 scheduler FAILED self-test.");
     }
 
-    crate::println!("[boot] (shell=7.4)");
-
-    // Leave the machine *running*, not merely stopped. The self-tests above mask
-    // interrupts when they finish measuring, and halting in that state would wedge the
-    // scheduler: `wfi` would keep returning, but no timer interrupt would ever be taken
-    // again, so nothing would preempt this loop. Unmasking hands the CPU back to the
-    // scheduler, which alternates this task with idle until 7.4 gives it real work.
+    // --- Test mode vs interactive ---
+    //
+    // Built with `--features test`, the suite runs here and stops the machine; the
+    // harness reads its verdict off the serial console. Deliberately after every boot
+    // self-test above, so a failure in the bring-up path is reported by the thing that
+    // understands it rather than as a puzzling test failure downstream.
+    // Hand the CPU back to the scheduler before either branch below. The self-tests
+    // above mask interrupts when they stop measuring, and everything past this point
+    // wants a live, preemptive system.
+    //
+    // For the test suite this is not a nicety but a correctness requirement, and it was
+    // wrong at first: with interrupts left masked, the suite's environment depended on
+    // whether some earlier test happened to call `yield_now`, whose tail re-enables
+    // them. Tests that ran before the first yield saw a cooperative-only scheduler and
+    // tests after it saw a preemptive one, which is exactly the kind of order-dependent
+    // environment that produces a test failing once in five runs and never reproducing.
+    // `kmain_x86_64` enables interrupts before its test block for the same reason.
     crate::arch::irq::enable();
 
+    // Let the scheduler reclaim the self-tests' debris before anything measures memory.
+    //
+    // `sched_selftest` and `percpu::selftest` between them leave four dead tasks, and
+    // `cleanup_dead_tasks` frees a dead task's stack lazily — on some later
+    // `schedule()`, whenever that happens to be. That is fine for the scheduler and
+    // fatal for anything asserting on exact frame counts: `test_frame_allocator` checks
+    // `free_after == free_before - N`, and five stack frames returning to the allocator
+    // mid-test breaks that equality. It failed 5 runs out of 5 once interrupts were
+    // enabled early enough for the cleanup to land inside the test.
+    //
+    // Yielding twice drains it: `cleanup_dead_tasks` sweeps every task on each call, so
+    // one pass frees everything already dead and the second covers anything that died
+    // during the first. Boot self-tests should not hand the system to the next stage
+    // with accounting still in flight.
+    for _ in 0..2 {
+        crate::sched::yield_now();
+    }
+
+    #[cfg(feature = "test")]
+    {
+        crate::println!();
+        crate::println!("Running in test mode...");
+        crate::test_runner::run_tests();
+        // Does not return — PSCI powers the machine off.
+    }
+
+    #[cfg(not(feature = "test"))]
+    crate::println!("[boot] (shell=7.4)");
+
+    // Interrupts were unmasked above, so this is a live idle: the timer keeps firing
+    // and the scheduler alternates this task with idle until 7.4 gives it real work.
+    // Halting with them masked would wedge the scheduler — `wfi` would keep returning,
+    // but no timer interrupt would ever be taken again.
     loop {
         crate::arch::irq::halt();
     }

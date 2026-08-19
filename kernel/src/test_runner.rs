@@ -28,6 +28,20 @@ struct TestCase {
     func: fn() -> Result<(), &'static str>,
 }
 
+/// A test that this architecture cannot run, and why.
+///
+/// These exist so that a test which does not run says so. The alternative — and what
+/// this file did before aarch64 could run any tests at all — is a
+/// `#[cfg(not(target_arch = "x86_64"))]` stub returning `Ok(())`, which reports `[PASS]`
+/// for a function whose entire body is `Ok(())`. Thirty-nine of those would have made
+/// an aarch64 run print "54 passed, 0 failed" while asserting almost nothing, which is
+/// worse than running no tests: a green suite that proves nothing is a suite nobody
+/// checks.
+struct SkippedTest {
+    name: &'static str,
+    why: &'static str,
+}
+
 /// The test suite. Each entry is run in order; failures are reported
 /// but don't abort remaining tests (all tests always run).
 static TESTS: &[TestCase] = &[
@@ -39,57 +53,154 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_page_tables",      func: test_page_tables },
     TestCase { name: "test_paging_selftest",  func: test_paging_selftest },
     TestCase { name: "test_heap_growth",      func: test_heap_growth },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_syscall",          func: test_syscall },
     TestCase { name: "test_capabilities",    func: test_capabilities },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_process",         func: test_process },
     TestCase { name: "test_ipc",             func: test_ipc },
     TestCase { name: "test_audit",           func: test_audit },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_pci_scan",        func: test_pci_scan },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_transport", func: test_virtio_transport },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_queue_failure", func: test_virtio_queue_failure },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_blk",       func: test_virtio_blk },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_shared_memory",    func: test_shared_memory },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_server_spawn",     func: test_server_spawn },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_squashfs_server",  func: test_squashfs_server },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_overlay_server",   func: test_overlay_server },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_ext2_read",        func: test_ext2_read },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_ext2_write",       func: test_ext2_write },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_vfs_capability",   func: test_vfs_capability },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_fs_syscalls",      func: test_fs_syscalls },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_net",       func: test_virtio_net },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_net_service",      func: test_net_service },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_net_server_stack", func: test_net_server_stack },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_net_icmp_echo",    func: test_net_icmp_echo },
     // Runs before the other persistent net-server tests so it is the sole NIC
     // drainer (no inbound-frame competition) for the host-driven TCP handshake.
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_api_server",       func: test_api_server },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_dhcp",             func: test_dhcp },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_socket_capability", func: test_socket_capability },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_socket_list",      func: test_socket_list },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_udp_echo",         func: test_udp_echo },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_tcp_client",       func: test_tcp_client },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_elf_exec",         func: test_elf_exec },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_linux_exec",       func: test_linux_exec },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_path_resolve",     func: test_path_resolve },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_linux_fs",         func: test_linux_fs },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_linux_threads",    func: test_linux_threads },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_oci_unpack",       func: test_oci_unpack },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_container_run",    func: test_container_run },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_container_isolation", func: test_container_isolation },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_container_confinement", func: test_container_confinement },
     TestCase { name: "test_sha256",           func: test_sha256 },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_registry_pull",    func: test_registry_pull },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_registry_hardening", func: test_registry_hardening },
     TestCase { name: "test_http_request",      func: test_http_request },
     TestCase { name: "test_json_serialize",    func: test_json_serialize },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_container_registry", func: test_container_registry },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_container_logs",    func: test_container_logs },
+    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_management_capability", func: test_management_capability },
 ];
 
-/// Run all tests and exit QEMU with the appropriate code.
+/// Tests the running architecture cannot execute, with the reason.
+///
+/// Empty on x86_64, which runs the whole suite. On aarch64 these name the deferred
+/// subsystems — ring-3/EL0, VirtIO-PCI and everything downstream of it — rather than
+/// the individual tests, because that is the actual reason and it is one decision, not
+/// thirty-nine.
+#[cfg(target_arch = "aarch64")]
+static SKIPPED: &[SkippedTest] = &[
+    SkippedTest { name: "test_syscall", why: "ring-3/EL0 is deferred on aarch64" },
+    SkippedTest {
+        name: "test_shared_memory",
+        why: "maps a region into a *user* address space; EL0 is deferred",
+    },
+    SkippedTest { name: "test_process", why: "ring-3/EL0 is deferred on aarch64" },
+    SkippedTest { name: "test_userspace_init", why: "ring-3/EL0 is deferred on aarch64" },
+    SkippedTest { name: "test_pci_scan", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
+    SkippedTest { name: "test_virtio_transport", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
+    SkippedTest { name: "test_virtio_queue_failure", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
+    SkippedTest { name: "test_virtio_blk", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
+    SkippedTest { name: "test_block_server_ipc", why: "the storage stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_server_spawn", why: "ring-3/EL0 is deferred on aarch64" },
+    SkippedTest { name: "test_squashfs_server", why: "the storage stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_overlay_server", why: "the storage stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_ext2_read", why: "the storage stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_ext2_write", why: "the storage stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_vfs_capability", why: "the storage stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_fs_syscalls", why: "the Linux personality needs ring-3" },
+    SkippedTest { name: "test_virtio_net", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_net_service", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_net_server_stack", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_net_icmp_echo", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_api_server", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_dhcp", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_socket_capability", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_socket_list", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_udp_echo", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_tcp_client", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_elf_exec", why: "ring-3/EL0 is deferred on aarch64" },
+    SkippedTest { name: "test_linux_exec", why: "the Linux personality needs ring-3" },
+    SkippedTest { name: "test_path_resolve", why: "the Linux personality needs ring-3" },
+    SkippedTest { name: "test_linux_fs", why: "the Linux personality needs ring-3" },
+    SkippedTest { name: "test_linux_threads", why: "the Linux personality needs ring-3" },
+    SkippedTest { name: "test_oci_unpack", why: "containers need ring-3 and the storage stack" },
+    SkippedTest { name: "test_container_run", why: "containers need ring-3 and the storage stack" },
+    SkippedTest { name: "test_container_isolation", why: "containers need ring-3 and the storage stack" },
+    SkippedTest { name: "test_container_confinement", why: "containers need ring-3 and the storage stack" },
+    SkippedTest { name: "test_registry_pull", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_registry_hardening", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest { name: "test_container_registry", why: "containers need ring-3 and the storage stack" },
+    SkippedTest { name: "test_container_logs", why: "containers need ring-3 and the storage stack" },
+    SkippedTest { name: "test_management_capability", why: "containers need ring-3 and the storage stack" },
+];
+
+/// x86_64 runs everything, so nothing is skipped.
+#[cfg(not(target_arch = "aarch64"))]
+static SKIPPED: &[SkippedTest] = &[];
+
+/// Run all tests and stop the machine with a verdict the harness can read.
 ///
 /// Called from `kmain` when the kernel is built with `--features test`.
 /// This function does not return — it terminates QEMU via `exit_qemu()`.
@@ -116,13 +227,30 @@ pub fn run_tests() -> ! {
         }
     }
 
+    for skipped in SKIPPED {
+        println!("[SKIP] {}: {}", skipped.name, skipped.why);
+    }
+
     println!();
     println!("----------------------------------------");
-    println!("  Results: {} passed, {} failed, {} total",
-        passed, failed, TESTS.len());
+    // `total` counts the skipped tests too, so the number is the size of the suite
+    // rather than the size of *this architecture's* subset. A reader comparing an
+    // aarch64 run against an amd64 one should see the same total and a different split,
+    // not two unrelated numbers.
+    println!(
+        "  Results: {} passed, {} failed, {} skipped, {} total",
+        passed,
+        failed,
+        SKIPPED.len(),
+        TESTS.len() + SKIPPED.len()
+    );
     println!("----------------------------------------");
     println!();
 
+    // --- Reporting the verdict, which differs by what the machine can do ---
+    //
+    // x86_64 writes to QEMU's `isa-debug-exit` device, which becomes a process exit
+    // code: the harness learns the result without parsing a single line of output.
     #[cfg(target_arch = "x86_64")]
     if failed == 0 {
         println!("All tests passed — exiting QEMU with success.");
@@ -132,12 +260,38 @@ pub fn run_tests() -> ! {
         crate::arch::x86_64::cpu::exit_qemu(0x00);
     }
 
-    // Fallback for non-x86_64 (shouldn't be reached in Phase 1)
-    #[cfg(not(target_arch = "x86_64"))]
-    loop {
-        core::hint::spin_loop();
+    // aarch64 `virt` has no such device, and no I/O ports for one to live behind, so
+    // the verdict travels over the serial console as a sentinel and PSCI stops the
+    // machine afterwards. Powering off rather than idling is what lets the harness
+    // distinguish "died mid-suite" (QEMU exits, no sentinel) from "hung" (no exit at
+    // all) — without it both present identically, as a timeout.
+    //
+    // The sentinel is printed *before* the shutdown for the obvious reason, and the
+    // PL011 writes are synchronous, so the line is on the wire before PSCI is called.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if failed == 0 {
+            println!("{}", AARCH64_PASS_SENTINEL);
+        } else {
+            println!("{}", AARCH64_FAIL_SENTINEL);
+        }
+        crate::arch::aarch64::psci::shutdown_or_hang();
     }
 }
+
+/// Serial sentinel meaning every test that ran, passed.
+///
+/// Deliberately distinct from any `[PASS]` line: the harness must not conclude success
+/// from a *test* passing, only from the suite reaching its end with no failures. Kept
+/// in sync with `xtask`'s copy by nothing but care — which is why both sides spell out
+/// the whole line rather than matching a prefix.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_PASS_SENTINEL: &str = "[test] RESULT: ALL TESTS PASSED";
+
+/// Serial sentinel meaning at least one test failed. The individual `[FAIL]` lines
+/// above it say which.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_FAIL_SENTINEL: &str = "[test] RESULT: FAILURES PRESENT";
 
 // ========================================================================
 // Test functions
@@ -334,9 +488,26 @@ fn test_interrupts() -> Result<(), &'static str> {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    // aarch64: the same property, through the same arch-neutral facade. `halt` is
+    // `wfi`, which resumes on the next interrupt, and `tick_count` is driven by the
+    // generic-timer ISR rather than the PIT. If the GIC or the timer re-arm were
+    // broken, `wfi` would never resume and this would hang rather than fail — which is
+    // acceptable here only because `boot::timer_selftest` has already proved delivery
+    // at the right rate before the suite starts.
+    #[cfg(target_arch = "aarch64")]
     {
-        Err("interrupt test not implemented for this architecture")
+        use crate::arch::time::tick_count;
+
+        let before = tick_count();
+        for _ in 0..5 {
+            crate::arch::irq::halt();
+        }
+        let after = tick_count();
+
+        if after <= before {
+            return Err("tick counter did not advance across five halts");
+        }
+        Ok(())
     }
 }
 
@@ -372,21 +543,33 @@ fn test_page_tables() -> Result<(), &'static str> {
     use crate::mm::addr::{PhysAddr, VirtAddr};
     use crate::mm::page_table::{AddressSpace, PageFlags, kernel_address_space};
 
-    // 1. Verify we're on custom page tables (CR3 matches our kernel PML4)
+    // 1. Verify we're running on the kernel's own page tables rather than the
+    // bootloader's. Read through the `arch::paging` facade rather than naming CR3:
+    // the aarch64 analog is TTBR1_EL1, and the question — "is the live translation
+    // root the one we built?" — is the same on both.
     let kernel_as = kernel_address_space();
-    let cr3 = crate::arch::x86_64::cpu::read_cr3() & !0xFFF;
-    if cr3 != kernel_as.root_phys().as_u64() {
+    let live_root = crate::arch::paging::current_root();
+    if live_root != kernel_as.root_phys().as_u64() {
         core::mem::forget(kernel_as);
-        return Err("CR3 does not match kernel PML4");
+        return Err("live translation root does not match the kernel address space");
     }
 
     // 2. Verify kernel HHDM addresses translate correctly.
-    // Pick a known physical address (the first page of usable memory)
-    // and verify translate() resolves the HHDM virtual address correctly.
+    //
+    // The physical address comes from the frame allocator rather than a constant. An
+    // earlier version used 0x100000 — "1 MiB, should be in the USABLE range" — which is
+    // true of a PC and false of QEMU `virt`, where RAM starts at 0x4000_0000 and 1 MiB
+    // is an unbacked hole. That made this assert an x86 memory-map assumption while
+    // appearing to test the walker, and it failed on aarch64 for a reason that had
+    // nothing to do with paging. Asking the allocator is both portable and stronger:
+    // the frame is known-usable by construction.
     let hhdm = mm::hhdm_offset();
-    let test_phys = PhysAddr::new(0x100000); // 1 MiB — should be in USABLE range
+    let test_phys = mm::frame::allocate_frame()
+        .ok_or("test_page_tables: no free frame to probe the HHDM with")?;
     let test_virt = VirtAddr::new(test_phys.as_u64() + hhdm);
-    match kernel_as.translate(test_virt) {
+    let hhdm_result = kernel_as.translate(test_virt);
+    mm::frame::deallocate_frame(test_phys);
+    match hhdm_result {
         Some(resolved) => {
             // The resolved physical address should match (including page offset = 0).
             if resolved.as_u64() != test_phys.as_u64() {
@@ -535,6 +718,8 @@ fn test_heap_growth() -> Result<(), &'static str> {
 /// 3. Full ring 3 round trip: spawns a task that transitions to ring 3 via
 ///    iretq, executes SYS_NULL via `syscall`, then SYS_TEST_COMPLETE to
 ///    report the result back to the kernel
+/// x86_64 only — syscall/sysret is the ring-3 entry path; aarch64's SVC analog arrives with EL0.
+#[cfg(target_arch = "x86_64")]
 fn test_syscall() -> Result<(), &'static str> {
     crate::arch::x86_64::syscall::test_syscall_round_trip()
 }
@@ -798,6 +983,8 @@ fn test_capabilities() -> Result<(), &'static str> {
 /// 3. Process list reflects the new process
 /// 4. Destroying a process frees all associated resources
 /// 5. Frame count is stable across create/destroy cycles (no leaks)
+/// x86_64 only — the process table is ring-3 machinery (address spaces, CSpace ownership).
+#[cfg(target_arch = "x86_64")]
 fn test_process() -> Result<(), &'static str> {
     use crate::process;
     use crate::mm;
@@ -1175,6 +1362,8 @@ fn test_audit() -> Result<(), &'static str> {
 /// 2. Init sends IPC messages to the kernel via syscall
 /// 3. The kernel-side server receives the messages
 /// 4. Timer preemption works on the init process
+/// x86_64 only — starts a ring-3 init process.
+#[cfg(target_arch = "x86_64")]
 fn test_userspace_init() -> Result<(), &'static str> {
     use crate::process;
 
@@ -1447,6 +1636,10 @@ fn test_virtio_blk() -> Result<(), &'static str> {
 /// 3. It can be mapped into a (user) address space, and `translate` resolves
 ///    each mapped page to the correct physical frame (the basis for handing a
 ///    block-transfer window to a ring-3 filesystem server)
+/// x86_64 only — step 3 maps the region into a user address space, which on aarch64
+/// would mean TTBR0, deliberately parked at 0 since 7.1. The portable half (allocation,
+/// zeroing, HHDM access) is covered by `test_frame_allocator` and `test_heap`.
+#[cfg(target_arch = "x86_64")]
 fn test_shared_memory() -> Result<(), &'static str> {
     use crate::mm::addr::VirtAddr;
     use crate::mm::page_table::{kernel_address_space, AddressSpace};
