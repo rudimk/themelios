@@ -1,24 +1,43 @@
-//! # aarch64 early boot (Phase 7.0b)
+//! # aarch64 early boot
 //!
 //! Runs after Limine's higher-half handoff — the CPU is already at **EL1 with the MMU
 //! enabled, caches on, stack set, and BSS zeroed** (confirmed by the Phase 7 boot
 //! spike). So this is *not* a bare-metal reset: we inherit Limine's state and do the
-//! minimum to get an interactive-quality console up, then idle. The scheduler, the
-//! kernel's own page tables, exceptions, and the timer land in 7.1–7.3.
+//! minimum to get a console up, then bring the kernel-core subsystems online in
+//! dependency order, each proved by a self-test before the next one starts:
 //!
-//! ## FP/SIMD is deliberately left disabled
+//! | Sub-phase | Brought up here                                     |
+//! |-----------|-----------------------------------------------------|
+//! | 7.0b      | PL011 UART mapped, serial console, banner           |
+//! | 7.1       | Frame allocator, kernel page tables, heap           |
+//! | 7.2       | `VBAR_EL1` vectors, GICv2, `CNTV` tick              |
+//! | 7.3       | Scheduler: preemptive round-robin over kernel tasks |
+//!
+//! The self-tests are not decoration. This is a bring-up path with no debugger and no
+//! test harness, where the failure mode of almost everything below is a silent hang —
+//! so each stage prints a sentinel the CI smoke asserts on, and the smoke fails on the
+//! specific `FAIL` line rather than on a timeout.
+//!
+//! ## FP/SIMD is deliberately trapped
 //!
 //! Phase 7.0b built for the *hardfloat* `aarch64-unknown-none` target, where the
 //! compiler lowers struct moves and `core::fmt` to SIMD, and so had to enable
 //! `CPACR_EL1.FPEN` before the first `println!` or those lowerings trapped.
 //!
 //! The kernel now targets **`aarch64-unknown-none-softfloat`**, which emits no vector
-//! instructions, so `FPEN` stays as Limine left it. That is not merely simpler — it is
-//! what makes the exception path sound. The entry stub saves x0-x30 and no vector
-//! registers, so a handler touching FP on a returning path would silently corrupt the
-//! interrupted context. With softfloat *and* `FPEN` off, any SIMD that ever sneaks in
-//! traps loudly as `ESR_EL1.EC = 0x07` — which the exception decoder names — instead
-//! of corrupting memory quietly.
+//! instructions, so boot *disables* FP access rather than enabling it. That is not
+//! merely simpler — it is what makes both the exception path and the context switch
+//! sound. Neither saves any
+//! vector register: the entry stub saves x0-x30, and `switch_context` saves x19-x30,
+//! even though AAPCS64 makes the low half of `v8`-`v15` callee-saved. With softfloat
+//! *and* `FPEN` trapping, any SIMD that ever sneaks in raises `ESR_EL1.EC = 0x07` —
+//! which the exception decoder names — instead of corrupting another task's
+//! floating-point state with no fault to point at.
+//!
+//! That backstop is **checked**, not assumed:
+//! [`exceptions::verify_fp_trapped`](crate::arch::aarch64::exceptions::verify_fp_trapped)
+//! reads `CPACR_EL1` at boot and the 7.3 sentinel depends on it. It was asserted in
+//! three comments and read by nothing until Phase 7.3.
 //!
 //! One thing must still happen before the first `println!`:
 //! 1. **Map the PL011 UART.** Limine's HHDM maps RAM but **not** device MMIO, so the
@@ -216,8 +235,9 @@ unsafe fn map_device_page(k: KernelAddr, hhdm: u64, virt: u64, phys: u64) {
 /// aarch64 kernel entry (called from the arch-neutral `kmain` prologue). Diverges.
 ///
 /// `hhdm` is Limine's higher-half direct-map offset; `k` captures the kernel image's
-/// physical/virtual bases (both from Limine). Enables FP, maps + installs the UART,
-/// prints a banner + a few sysregs, then idles.
+/// physical/virtual bases (both from Limine). Maps and installs the UART, prints a
+/// banner and a few sysregs, then brings up memory, exceptions, the timer and the
+/// scheduler in the order the module docs lay out — idling once all of it is proved.
 pub fn kmain_aarch64(
     hhdm: u64,
     k: KernelAddr,
@@ -248,7 +268,6 @@ pub fn kmain_aarch64(
     crate::println!("[boot] Limine higher-half handoff OK (MMU on)");
     crate::println!("[boot] HHDM offset: {:#018x}", hhdm);
     crate::println!("[boot] kernel phys/virt base: {:#x} / {:#018x}", k.phys_base, k.virt_base);
-    crate::println!("[boot] FP/SIMD left disabled (softfloat kernel; stray SIMD traps)");
     {
         let spsel: u64;
         // SAFETY: reading SPSel has no side effects.
@@ -268,6 +287,18 @@ pub fn kmain_aarch64(
     // Deliberately ahead of the memory bring-up so a paging mistake is diagnosable.
     crate::arch::aarch64::exceptions::init();
 
+    // Point TPIDR_EL1 at the per-CPU block before anything can read it. The exception
+    // reporter installed just above dereferences it to name the faulting task, so this
+    // must not wait for the scheduler.
+    crate::arch::aarch64::percpu::init();
+
+    // Establish — then confirm — the assumption the context switch and the exception
+    // stub both rest on: FP/SIMD traps, so the absent v8-v15 save area cannot corrupt
+    // state silently. Deliberately after the vector table is live, so that a stray
+    // vector instruction is reported rather than branching into bootloader leftovers.
+    crate::arch::aarch64::exceptions::trap_fp_access();
+    let fp_trapped = crate::arch::aarch64::exceptions::verify_fp_trapped();
+
     // --- Phase 7.1: memory management on our own page tables ---
     bring_up_memory(hhdm, k, entries);
 
@@ -286,11 +317,420 @@ pub fn kmain_aarch64(
         crate::println!("[boot] Phase 7.2 FAILED self-test.");
     }
 
-    crate::println!("[boot] (sched=7.3, shell=7.4)");
+    // --- Phase 7.3: preemptive scheduling ---
+    crate::sched::init();
+    let sched_ok = sched_selftest();
+    // Run after the scheduler test, which is what gives the per-CPU block dozens of
+    // switches to have been updated by; before it there would be nothing to check.
+    let percpu_ok = crate::arch::aarch64::percpu::selftest();
+    if sched_ok && percpu_ok && fp_trapped {
+        crate::println!("[boot] Phase 7.3 scheduler reached; self-test passed.");
+    } else {
+        crate::println!("[boot] Phase 7.3 scheduler FAILED self-test.");
+    }
+
+    crate::println!("[boot] (shell=7.4)");
+
+    // Leave the machine *running*, not merely stopped. The self-tests above mask
+    // interrupts when they finish measuring, and halting in that state would wedge the
+    // scheduler: `wfi` would keep returning, but no timer interrupt would ever be taken
+    // again, so nothing would preempt this loop. Unmasking hands the CPU back to the
+    // scheduler, which alternates this task with idle until 7.4 gives it real work.
+    crate::arch::irq::enable();
 
     loop {
         crate::arch::irq::halt();
     }
+}
+
+// ------------------------------------------------------------------------
+// Phase 7.3 scheduler self-test
+// ------------------------------------------------------------------------
+
+/// Per-worker loop-iteration counters, indexed by worker number.
+///
+/// Informational only — see [`WORKER_TICKS`] for why these are *not* what fairness is
+/// asserted on; the only thing checked here is that each is non-zero.
+///
+/// Plain atomics rather than a lock: the workers are preempted at arbitrary instruction
+/// boundaries by the timer, and a worker holding a lock when its slice expires would
+/// deadlock against the next worker.
+///
+/// `Relaxed` is enough, and not for the reason two earlier versions of this comment
+/// gave. It is *not* the `Acquire`/`Release` pair on [`WORKERS_EXITED`], which orders
+/// only the all-workers-exited path while the test deliberately also handles a drain
+/// that times out with workers still running. Nor does the reader mask interrupts
+/// first — the counters are read with interrupts still enabled, before the drain.
+///
+/// What makes it sound is simply that these are `AtomicU64` loads: they cannot tear, so
+/// every value read is a value some worker actually wrote. The result is a slightly
+/// skewed snapshot — one worker's count may be a few iterations newer than another's —
+/// and nothing here cares. These counters are only tested for being non-zero; the
+/// bounded checks are on [`WORKER_TICKS`], where the quantities are in the tens and a
+/// skew of a few iterations cannot move a residency count at all.
+static WORKER_ITERS: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Per-worker count of **distinct timer ticks observed while running**.
+///
+/// This, not [`WORKER_ITERS`], is what the fairness check asserts on.
+///
+/// Iteration counts measure how much work a worker got through, which under QEMU's
+/// TCG is wildly variable: the first task to reach a given loop pays for translating
+/// it, the host runner is shared, and a measured run showed shares of 4.5×, 1.2× and
+/// 1.45× across three otherwise identical boots. None of that variation is the
+/// scheduler's doing, so asserting on it would be asserting on the emulator's mood.
+///
+/// A worker's *residency* is immune to all of that. Each worker notes the tick counter
+/// on every iteration; when it sees a value it has not seen before, it was resident
+/// for a tick it previously was not. Round-robin over N runnable tasks gives each one
+/// roughly `elapsed_ticks / N` distinct ticks no matter how fast the underlying CPU
+/// happens to be, because the tick *is* the scheduling quantum.
+static WORKER_TICKS: [core::sync::atomic::AtomicU64; 3] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Set false to ask the workers to return from their entry functions.
+static RUN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Set by a worker that gave up waiting to be preempted and returned on its own.
+///
+/// This is what turns the sub-phase's single most likely regression from a hang into a
+/// diagnosis. If `task_bootstrap` failed to unmask `DAIF.I`, the first worker switched
+/// to would run with interrupts masked forever: no timer IRQ, so the tick never
+/// advances, so the bootstrap task is never resumed — and a deadline evaluated *in the
+/// bootstrap task* can never fire, however carefully it is bounded. The only code still
+/// executing is the worker, so the escape has to live there.
+///
+/// A worker that escapes returns normally, which routes through `task_exit` and hands
+/// the CPU to the next task cooperatively. Every worker in turn does the same, control
+/// reaches the bootstrap task, and the test reports which workers were never preempted
+/// instead of the CI job timing out with an empty log.
+static WORKER_ESCAPED: [core::sync::atomic::AtomicBool; 3] = [
+    core::sync::atomic::AtomicBool::new(false),
+    core::sync::atomic::AtomicBool::new(false),
+    core::sync::atomic::AtomicBool::new(false),
+];
+
+/// Wall-clock ticks a worker will spin before concluding it is never going to be
+/// preempted. A healthy worker lives for the measured window plus the drain — about 55
+/// ticks — against this deadline of 200.
+///
+/// Being measured on `CNTVCT_EL0` is what makes the escape *work* when interrupts are
+/// masked, but on its own it is what would make the deadline **fragile**: a real-time
+/// deadline racing a tick-counted window is exactly how a slow runner produces a
+/// spurious failure. The margin holds because the other side of the race is pinned to
+/// real time too — [`timer::handle_tick`](crate::arch::aarch64::timer::handle_tick)
+/// advances an absolute deadline and credits every skipped period, so accumulating 50
+/// *delivered* ticks takes ~0.5 s of wall clock no matter how slow or contended the
+/// host is. Replace that skip-crediting with a fixed reload and this constant becomes a
+/// flake.
+const WORKER_ESCAPE_TICKS: u64 = 200;
+
+/// Number of workers that reached the end of their entry function.
+static WORKERS_EXITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Entry function shared by the self-test workers.
+///
+/// A worker cannot be told which index it is — [`crate::sched::spawn`] takes a bare
+/// `fn()` with no argument — so each index gets a one-line wrapper below.
+///
+/// The body deliberately does **not** yield. The whole point of the test is
+/// *involuntary* preemption: if the loop only advanced when it called `yield_now`,
+/// a passing result would prove cooperative switching and say nothing about whether
+/// the timer interrupt actually reaches `schedule()`.
+fn worker_body(index: usize) {
+    use crate::arch::aarch64::timer::{read_cntvct, reload};
+    use core::sync::atomic::Ordering;
+
+    // Tick value last observed by *this* worker. A plain local: it lives in the
+    // worker's own registers/stack, which the context switch preserves, so each
+    // worker tracks its own residency without any shared state.
+    let mut last_tick = u64::MAX;
+
+    // See `WORKER_ESCAPED`: the deadline has to be evaluated here, by the worker, on a
+    // clock that advances whether or not interrupts are being delivered.
+    let escape_at = read_cntvct() + reload() * WORKER_ESCAPE_TICKS;
+
+    while RUN.load(Ordering::Acquire) {
+        WORKER_ITERS[index].fetch_add(1, Ordering::Relaxed);
+
+        let now = crate::arch::time::tick_count();
+        if now != last_tick {
+            last_tick = now;
+            WORKER_TICKS[index].fetch_add(1, Ordering::Relaxed);
+        }
+
+        if read_cntvct() >= escape_at {
+            WORKER_ESCAPED[index].store(true, Ordering::Relaxed);
+            break;
+        }
+
+        core::hint::spin_loop();
+    }
+    WORKERS_EXITED.fetch_add(1, Ordering::Release);
+    // Returning here falls into `task_bootstrap`'s `bl task_exit`, which marks the
+    // task Dead and schedules away — the path this self-test also exercises.
+}
+
+fn worker_0() {
+    worker_body(0);
+}
+fn worker_1() {
+    worker_body(1);
+}
+fn worker_2() {
+    worker_body(2);
+}
+
+/// Prove the aarch64 scheduler preempts and round-robins.
+///
+/// Acceptance for 7.3 is "≥2 in-kernel tasks preempt and round-robin under the
+/// timer". Three properties have to hold, and each is checked separately because
+/// they fail in different ways:
+///
+/// 1. **Every worker ran.** A zero counter means that task was never switched *to* —
+///    a broken initial stack frame, or a `switch_context` that does not restore `x30`.
+/// 2. **They ran without yielding.** Nothing in `worker_body` calls into the
+///    scheduler, so the only way control leaves a worker is the timer IRQ reaching
+///    `schedule()`. This is what separates 7.3 from cooperative switching.
+/// 3. **Each got a real share of slices.** Round-robin, not "one task monopolised the
+///    CPU and the others got a slice apiece" — which is why the check is a *band*
+///    (half to double an equal share) and not a floor. A floor alone would pass the
+///    monopoly case it claims to reject. Measured in ticks of residency rather than
+///    work done, for the reason in [`WORKER_TICKS`].
+/// 4. **Each returned from its entry function**, and none of them escaped. That
+///    exercises `task_exit` and the Dead-task cleanup in `schedule()`, which nothing
+///    else on aarch64 has run yet — and the escape flag is what catches a worker that
+///    was never preempted at all (see [`WORKER_ESCAPED`]).
+/// 5. **The time is accounted for.** Per-worker bounds alone permit three workers to
+///    clear the floor while most of the window went to the idle task, so their combined
+///    residency is checked against the elapsed window too.
+///
+/// Termination is bounded from two directions, because one is not enough. The bootstrap
+/// task's own loops are deadlined on `CNTVCT_EL0`, which covers a timer that stops
+/// delivering while the bootstrap task is running. It does *not* cover a worker that
+/// runs with interrupts masked — the bootstrap task is then never resumed to evaluate
+/// any deadline at all — so the workers carry their own escape.
+fn sched_selftest() -> bool {
+    use crate::arch::aarch64::timer::{read_cntvct, reload};
+    use crate::arch::time::tick_count;
+    use core::sync::atomic::Ordering;
+
+    // ~50 ticks ≈ 500 ms at 100 Hz: enough slices for round-robin to be visible.
+    const RUN_TICKS: u64 = 50;
+
+    let ids = [
+        crate::sched::spawn("w0", worker_0),
+        crate::sched::spawn("w1", worker_1),
+        crate::sched::spawn("w2", worker_2),
+    ];
+    crate::println!("[sched] spawned workers {:?}; running {} ticks...", ids, RUN_TICKS);
+
+    crate::arch::irq::enable();
+
+    // Absorb the backlog before starting the clock.
+    //
+    // Interrupts have been masked since the end of the 7.2 timer self-test, across
+    // `sched::init`, three task-stack allocations and half a dozen UART writes — on
+    // QEMU that is hundreds of milliseconds. The generic timer kept counting through
+    // all of it, so `handle_tick`'s skip-crediting (correctly) advances the tick by the
+    // whole elapsed backlog on the first interrupt after unmasking. A measured run saw
+    // one interrupt take the tick from 5 to 77.
+    //
+    // A window opened before that point is therefore satisfied the instant the backlog
+    // lands, and measures nothing at all: an earlier version of this test "ran for 50
+    // ticks" that were entirely credited by a single interrupt, and the workers got
+    // three slices between them. So wait for the catch-up interrupt, and only then
+    // start counting.
+    //
+    // Bounded on `CNTVCT_EL0`, not on tick changes: if delivery is broken the tick
+    // never moves and a loop waiting on it would hang the boot rather than fail it.
+    // The counter advances regardless of interrupt state, which is what makes it the
+    // only sound timeout for a test of the interrupt path.
+    {
+        let t0 = tick_count();
+        let c0 = read_cntvct();
+        let deadline = reload() * 10;
+        while tick_count() == t0 && read_cntvct() - c0 < deadline {
+            core::hint::spin_loop();
+        }
+    }
+
+    // The catch-up interrupt also ran `schedule()`, so the workers may already have a
+    // slice or two. Zero the counters so the numbers reported below describe exactly
+    // the measured window. A worker racing this store loses at most one count, which a
+    // floor-based check does not care about.
+    for i in 0..3 {
+        WORKER_ITERS[i].store(0, Ordering::Relaxed);
+        WORKER_TICKS[i].store(0, Ordering::Relaxed);
+    }
+
+    // From here until the workers are asked to stop, the timer IRQ preempts this task
+    // too — the bootstrap task is an ordinary scheduler citizen and goes back on the
+    // ready queue like any other. `tick_count` is updated by the timer handler
+    // regardless of which task is running, so this deadline is sound *when interrupts
+    // are being delivered*.
+    //
+    // Which is why it is not the only bound. `CNTVCT_EL0` advances regardless of
+    // interrupt state, so this loop still terminates if delivery stops entirely while
+    // the bootstrap task is the one running — a dead GIC or an unarmed timer.
+    //
+    // It is *not* sufficient on its own, and it is worth being exact about why, because
+    // the obvious reading is wrong. If `task_bootstrap` failed to unmask DAIF — the
+    // single most likely regression here — the first worker switched to would run
+    // masked, no timer IRQ would ever be taken again, and this task would never be
+    // resumed at all. A deadline evaluated *in this loop* cannot fire if this loop is
+    // never re-entered. That case is caught by `WORKER_ESCAPED`, in the only code still
+    // running: the worker itself.
+    let start = tick_count();
+    let c_start = read_cntvct();
+    let hang_bound = reload() * RUN_TICKS * 4;
+    while tick_count() < start + RUN_TICKS && read_cntvct() - c_start < hang_bound {
+        core::hint::spin_loop();
+    }
+
+    // Snapshot before the drain. The workers keep counting until they actually observe
+    // `RUN == false`, which can take another slice apiece, so reading the counters
+    // after the drain would score them over a longer interval than `RUN_TICKS` — and
+    // the floor below is derived from `RUN_TICKS`. Mixing the two denominators would
+    // make the check quietly more lenient than it reads.
+    let iters = [
+        WORKER_ITERS[0].load(Ordering::Relaxed),
+        WORKER_ITERS[1].load(Ordering::Relaxed),
+        WORKER_ITERS[2].load(Ordering::Relaxed),
+    ];
+    let slices = [
+        WORKER_TICKS[0].load(Ordering::Relaxed),
+        WORKER_TICKS[1].load(Ordering::Relaxed),
+        WORKER_TICKS[2].load(Ordering::Relaxed),
+    ];
+    let ticks = tick_count() - start;
+
+    // Ask the workers to return. They are still runnable, so give them slices to
+    // notice: `yield_now` puts this task at the back of the queue each time round.
+    RUN.store(false, Ordering::Release);
+    // Bounded on both clocks, like the loops above. The tick deadline is the useful one
+    // in a healthy run; the `CNTVCT` one is what makes termination unconditional. A
+    // tick-only bound would freeze along with the tick if delivery stopped, and while
+    // this loop would still drain eventually — `yield_now` hands the CPU over
+    // cooperatively, and a worker that cannot be preempted escapes on its own deadline
+    // — that is a second-order argument, and relying on one is what the rest of this
+    // test was rewritten to stop doing.
+    let drain_deadline = tick_count() + RUN_TICKS;
+    let drain_c0 = read_cntvct();
+    let drain_bound = reload() * RUN_TICKS * 4;
+    while WORKERS_EXITED.load(Ordering::Acquire) < ids.len() as u64
+        && tick_count() < drain_deadline
+        && read_cntvct() - drain_c0 < drain_bound
+    {
+        crate::sched::yield_now();
+    }
+    crate::arch::irq::disable();
+
+    let exited = WORKERS_EXITED.load(Ordering::Acquire);
+
+    // Runnable tasks during the measured window: three workers plus the bootstrap
+    // task, which goes back on the ready queue like any other. The idle task never
+    // enters the queue, so it does not dilute the share.
+    const RUNNABLE: u64 = 4;
+    let share = RUN_TICKS / RUNNABLE; // 12 ticks apiece at RUN_TICKS = 50
+
+    // Round-robin means a *band*, not a floor. A floor alone would pass `[60, 6, 6]` —
+    // precisely the "one task monopolised the CPU and the others got a token slice"
+    // outcome this is supposed to reject — so bound it from above as well.
+    //
+    // Half to double an equal share. Measured runs sit at 12-14 against a share of 12,
+    // so both bounds have better than 40% headroom; loose enough for a busy CI runner,
+    // tight enough that starvation or monopoly fails.
+    let floor = share / 2; // 6
+    let ceiling = share * 2; // 24
+
+    let escaped = [
+        WORKER_ESCAPED[0].load(Ordering::Relaxed),
+        WORKER_ESCAPED[1].load(Ordering::Relaxed),
+        WORKER_ESCAPED[2].load(Ordering::Relaxed),
+    ];
+
+    let all_ran = iters.iter().all(|&c| c > 0);
+    let none_escaped = !escaped.iter().any(|&e| e);
+    let fair = slices.iter().all(|&s| s >= floor && s <= ceiling);
+    // Per-worker bounds say nothing about where the *rest* of the time went: slices of
+    // [6, 6, 6] over 52 ticks clear the floor while leaving 34 ticks unaccounted for,
+    // which is what it would look like if the idle task were being scheduled in
+    // preference to runnable work. Three of the four runnable tasks are workers, so
+    // their combined residency should be around three quarters of the window; require
+    // at least half of it.
+    let total: u64 = slices.iter().sum();
+    let accounted = total >= ticks / 2;
+    let all_exited = exited == ids.len() as u64;
+
+    if all_ran && none_escaped && fair && accounted && all_exited {
+        crate::println!(
+            "[selftest] sched: PASS (slices {:?} within [{}, {}], {} of {} measured \
+             ticks accounted for; iterations {:?}; {}/{} workers exited cleanly, none \
+             escaped)",
+            slices, floor, ceiling, total, ticks, iters, exited, ids.len()
+        );
+        return true;
+    }
+
+    crate::println!(
+        "[selftest] sched: FAIL — slices {:?} (want [{}, {}], sum {} of {} ticks), \
+         iterations {:?}, {}/{} workers exited, escaped {:?}",
+        slices, floor, ceiling, total, ticks, iters, exited, ids.len(), escaped
+    );
+    if !none_escaped {
+        crate::println!(
+            "  a worker gave up waiting to be preempted and returned on its own after \
+             {} ticks of wall clock: while it was running, no timer interrupt was ever \
+             taken. Check that `task_bootstrap` unmasks DAIF.I — a new task is entered \
+             by `ret` out of the IRQ handler, where hardware masked it, not by `eret`.",
+            WORKER_ESCAPE_TICKS
+        );
+    } else if !all_ran {
+        crate::println!(
+            "  a worker never ran at all: check `setup_initial_stack`'s frame layout \
+             against `switch_context`'s restore offsets (x19 = entry, x30 = \
+             task_bootstrap)"
+        );
+    } else if !fair {
+        let starved = slices.iter().any(|&s| s < floor);
+        if starved {
+            crate::println!(
+                "  a worker ran but was starved of slices: the timer IRQ is reaching \
+                 `schedule()` from some tasks and not others — check that \
+                 `task_bootstrap` unmasks DAIF.I, and that the IRQ path re-enables \
+                 delivery on every return"
+            );
+        } else {
+            crate::println!(
+                "  a worker got far more than an equal share: the ready queue is not \
+                 round-robin — check that `schedule()` pushes the preempted task to \
+                 the *back* of the queue and pops from the front"
+            );
+        }
+    } else if !accounted {
+        crate::println!(
+            "  the workers together account for only {} of {} ticks. The likeliest \
+             cause is not the scheduler but the host: when QEMU's vCPU is descheduled, \
+             `handle_tick` credits every skipped period at once, which inflates the \
+             tick count while a resident worker records only one. Suspect a loaded \
+             runner before suspecting `schedule()`.",
+            total, ticks
+        );
+    } else if !all_exited {
+        crate::println!(
+            "  a worker never returned from its entry function: check `task_exit` and \
+             the Dead-task cleanup path in `schedule()`"
+        );
+    }
+    false
 }
 
 /// Prove the timer ticks, **at the right rate**.

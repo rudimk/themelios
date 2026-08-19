@@ -43,6 +43,7 @@
 
 use alloc::string::String;
 use crate::mm::addr::PhysAddr;
+#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessId;
 
 /// Unique identifier for each task.
@@ -72,37 +73,19 @@ pub enum TaskState {
     Dead,
 }
 
-/// Saved CPU context for context switching.
+/// Saved CPU context for context switching, supplied by the active architecture.
 ///
-/// Only stores the stack pointer — all callee-saved registers (rbx, rbp,
-/// r12-r15) are pushed onto the task's own kernel stack by `switch_context`.
-/// When switching away from a task, `switch_context` pushes registers and
-/// stores RSP here. When switching back, it loads RSP from here and pops
-/// the saved registers.
+/// Both implementations store only a stack pointer; the callee-saved registers live
+/// *on* that stack, pushed by `switch_context`. Which registers those are, and how a
+/// freshly created task's frame is laid out so the first switch lands in the bootstrap
+/// trampoline, is architecture-specific — see
+/// [`arch::x86_64::context`](crate::arch::x86_64::context) and
+/// [`arch::aarch64::context`](crate::arch::aarch64::context).
 ///
-/// For a newly created task, `rsp` points to a pre-built stack frame that
-/// mimics a `switch_context` save: callee-saved register slots (with r12
-/// holding the entry function address) and a return address pointing to
-/// `task_bootstrap`. When `switch_context` "restores" this context, it
-/// pops the initial values and `ret`s into `task_bootstrap`.
-#[repr(C)]
-pub struct TaskContext {
-    /// Stack pointer pointing to the saved callee-saved registers on this
-    /// task's kernel stack.
-    pub rsp: u64,
-}
+/// Re-exported so `Task` and the scheduler name one type regardless of whether the
+/// stack pointer underneath is called `rsp` or `sp`.
+pub use crate::arch::context::TaskContext;
 
-impl TaskContext {
-    /// Create an empty (zeroed) context.
-    ///
-    /// Used for the bootstrap task (task 0) which represents the current
-    /// execution context at the time `sched::init()` is called. Its context
-    /// will be filled in by the first call to `switch_context` when the
-    /// scheduler preempts it.
-    pub const fn empty() -> Self {
-        Self { rsp: 0 }
-    }
-}
 
 /// Number of 4 KiB pages for the usable stack area.
 /// 4 pages = 16 KiB — enough for kernel task call stacks in Phase 1.
@@ -142,16 +125,24 @@ pub struct Task {
     pub stack_phys_base: Option<PhysAddr>,
 
     /// Top of this task's kernel stack (highest valid address, stack grows down).
+    ///
     /// Written to TSS.RSP0 and PerCpu.kernel_stack_top on every context switch
     /// so that ring 3 → ring 0 transitions (syscall, interrupt) land on the
     /// correct kernel stack. Zero for the bootstrap task (which uses Limine's
     /// boot stack and never transitions from ring 3).
+    ///
+    /// x86_64 only — it exists to feed TSS.RSP0, and aarch64 has no TSS. The
+    /// equivalent there is `SP_EL1`, which the CPU switches to on exception entry
+    /// without the kernel having to stage an address anywhere, so this field arrives
+    /// with the EL0 port rather than with the scheduler.
+    #[cfg(target_arch = "x86_64")]
     pub kernel_stack_top: u64,
 
     /// The process this task belongs to. All boot-time tasks (main, idle, shell)
     /// belong to PID 0 (the kernel process). User tasks belong to the process
     /// that spawned them. The scheduler uses this to determine whether a CR3
     /// switch is needed on context switch (different process → different address space).
+    #[cfg(target_arch = "x86_64")]
     pub process_id: ProcessId,
 
     /// The x86-64 `IA32_FS_BASE` value for this task (Phase 5.1). Linux thread-
@@ -159,15 +150,47 @@ pub struct Task {
     /// FS base is a global register not saved by `switch_context`, so — exactly
     /// like the GS base — the scheduler restores it from here on every context
     /// switch. 0 for tasks that don't use TLS (kernel tasks, native servers).
+    #[cfg(target_arch = "x86_64")]
     pub fs_base: u64,
 
     /// Ring-3 entry for a task created by Linux `clone` (Phase 5.3): the child
     /// resumes at the parent's post-`syscall` RIP on its own stack. `(rip, rsp)`;
     /// `None` for tasks that enter ring 3 by other means (ELF exec, servers).
+    #[cfg(target_arch = "x86_64")]
     pub clone_entry: Option<(u64, u64)>,
 
     /// The Linux `CLONE_CHILD_CLEARTID` / `set_tid_address` futex word (Phase
     /// 5.3): on thread exit the kernel writes 0 here and futex-wakes it, which is
     /// how `pthread_join` observes a thread has finished. 0 if unset.
+    #[cfg(target_arch = "x86_64")]
     pub clear_child_tid: u64,
+}
+
+impl Task {
+    /// Virtual bounds of this task's usable kernel stack, as `(top, limit)`.
+    ///
+    /// `top` is one past the highest usable byte (the stack grows down from it) and
+    /// `limit` is the lowest address the stack may reach before it runs into the
+    /// padding page reserved beneath it. Both are HHDM addresses, matching what
+    /// `create_task` hands to `setup_initial_stack`.
+    ///
+    /// `None` for the bootstrap task, which runs on the stack Limine handed over and
+    /// whose extent the kernel therefore does not know. Callers must treat that as
+    /// "unknown", not as "zero-sized" — a bounds check that fires on every address is
+    /// worse than no bounds check at all.
+    ///
+    /// The arithmetic is architecture-neutral; the `cfg` is about the *consumer*. Only
+    /// the aarch64 per-CPU block records stack bounds today, so on x86_64 this is dead
+    /// code rather than shared code. Gated by consumer, the same way the ring-3 fields
+    /// above are.
+    #[cfg(target_arch = "aarch64")]
+    pub fn kernel_stack_bounds(&self) -> Option<(u64, u64)> {
+        let base = self.stack_phys_base?;
+        let top = base.as_u64() + (TOTAL_STACK_PAGES as u64) * crate::mm::PAGE_SIZE;
+        let limit = base.as_u64() + (PADDING_PAGES as u64) * crate::mm::PAGE_SIZE;
+        Some((
+            PhysAddr::new(top).to_virt().as_u64(),
+            PhysAddr::new(limit).to_virt().as_u64(),
+        ))
+    }
 }

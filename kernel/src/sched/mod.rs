@@ -1,8 +1,26 @@
 //! # Preemptive round-robin scheduler
 //!
 //! Manages kernel tasks and decides which one runs on the CPU at any given
-//! time. The scheduler is driven by the PIT timer interrupt (IRQ0, ~100 Hz)
-//! which calls `schedule()` on every tick for preemptive multitasking.
+//! time. The scheduler is driven by the platform's periodic timer interrupt
+//! (~100 Hz), whose handler calls `schedule()` on every tick.
+//!
+//! ## Architecture-neutral, since Phase 7.3
+//!
+//! Everything in this module is shared between x86_64 and aarch64: the ready
+//! queue, the task lifecycle, the round-robin policy, and stack allocation.
+//! The parts that cannot be shared sit behind two seams:
+//!
+//! - [`arch::context`](crate::arch::context) — `TaskContext`, `switch_context`,
+//!   the bootstrap trampoline, and the initial stack frame. Register sets and
+//!   calling conventions differ, and so does how a task "returns" into its
+//!   entry point (x86 pops a return address; aarch64 branches through `x30`).
+//! - [`arch::irq`](crate::arch::irq) and [`arch::time`](crate::arch::time) —
+//!   masking and the tick source (PIT/8259 vs. the ARM generic timer + GICv2).
+//!
+//! `schedule()` additionally carries ring-3 support that is x86_64-only today
+//! (TSS.RSP0 staging, FS-base restore, CR3 switching) and a per-CPU pointer
+//! refresh that is aarch64-only (`TPIDR_EL1`); both are `#[cfg]`'d, and each is
+//! commented where it appears.
 //!
 //! ## Design
 //!
@@ -11,9 +29,9 @@
 //!   of the ready queue.
 //! - **Ready queue**: a `VecDeque<TaskId>` of tasks waiting to run. The
 //!   scheduler pops from the front and pushes preempted tasks to the back.
-//! - **Idle task**: a special task that runs `hlt` in a loop when no other
-//!   tasks are ready. It is never placed in the ready queue — it's used as
-//!   a fallback when the queue is empty.
+//! - **Idle task**: a special task that halts (`hlt` / `wfi`) in a loop when
+//!   no other tasks are ready. It is never placed in the ready queue — it's
+//!   used as a fallback when the queue is empty.
 //! - **Bootstrap task**: task 0, representing the initial execution context
 //!   (kmain's continuation after `sched::init()`). Uses the Limine-provided
 //!   boot stack, so it has no allocated stack to free.
@@ -23,15 +41,19 @@
 //! When the timer interrupt fires while task A is running:
 //!
 //! ```text
-//! Timer fires → CPU pushes interrupt frame onto A's stack
-//!   → isr_common saves all GPRs → exception_handler → irq_handler(0)
-//!   → send EOI → schedule()
-//!   → schedule picks task B, calls switch_context(&mut A.ctx, &B.ctx)
-//!   → switch_context saves A's callee-saved regs, loads B's RSP
-//!   → switch_context pops B's callee-saved regs, ret's into B's schedule()
-//!   → B's schedule() returns → B's irq_handler → B's exception_handler
-//!   → isr_common restores B's GPRs → iretq → B resumes
+//! Timer fires → CPU pushes an exception frame onto A's own stack
+//!   → entry stub saves the GPRs → timer handler → EOI
+//!   → schedule() picks task B, calls switch_context(&mut A.ctx, &B.ctx)
+//!   → switch_context saves A's callee-saved regs on A's stack,
+//!     loads B's stack pointer, restores B's callee-saved regs
+//!   → returns into B's schedule(), which returns into B's timer handler
+//!   → B's entry stub restores B's GPRs → exception return → B resumes
 //! ```
+//!
+//! The exception frame living on the *interrupted task's* stack, rather than on
+//! a shared handler stack, is what makes it safe to switch away from inside the
+//! handler: A's frame stays intact while B runs, and A unwinds through it when
+//! it is next scheduled.
 //!
 //! ## Lock management
 //!
@@ -59,11 +81,12 @@ use crate::mm::addr::PhysAddr;
 use crate::println;
 use crate::sync::InterruptMutex;
 
-pub mod context;
 pub mod task;
 
+#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessId;
-use task::{Task, TaskContext, TaskId, TaskState, TOTAL_STACK_PAGES};
+use crate::arch::context::{self, TaskContext};
+use task::{Task, TaskId, TaskState, TOTAL_STACK_PAGES};
 
 /// Whether the scheduler has been initialized. Checked by the timer interrupt
 /// handler to avoid calling `schedule()` before the scheduler exists.
@@ -146,10 +169,16 @@ pub fn init() {
         state: TaskState::Running,
         context: TaskContext::empty(),
         stack_phys_base: None,
+        // Ring-3 / Linux-thread state, x86_64 only — see `task::Task`.
+        #[cfg(target_arch = "x86_64")]
         kernel_stack_top: 0, // Bootstrap uses Limine's stack; never returns from ring 3
+        #[cfg(target_arch = "x86_64")]
         process_id: ProcessId::KERNEL,
+        #[cfg(target_arch = "x86_64")]
         fs_base: 0,
+        #[cfg(target_arch = "x86_64")]
         clone_entry: None,
+        #[cfg(target_arch = "x86_64")]
         clear_child_tid: 0,
     }));
     sched.current_id = bootstrap_id;
@@ -195,6 +224,7 @@ pub fn spawn(name: &str, entry: fn()) -> TaskId {
     id
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Set the current task's `IA32_FS_BASE` (Linux TLS) and apply it immediately.
 ///
 /// Called by `arch_prctl(ARCH_SET_FS)` (Phase 5.1): records the base on the task
@@ -213,6 +243,7 @@ pub fn set_current_fs_base(fs_base: u64) {
     crate::arch::x86_64::syscall::write_fs_base(fs_base);
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Set another task's FS base (Linux TLS) by id — used by `clone(CLONE_SETTLS)`
 /// to seed a freshly-created thread's `%fs` before it first runs.
 pub fn set_task_fs_base(id: TaskId, fs_base: u64) {
@@ -223,6 +254,7 @@ pub fn set_task_fs_base(id: TaskId, fs_base: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Record a `clone`-created thread's ring-3 entry `(rip, rsp)` (Phase 5.3). The
 /// [`thread_trampoline`](crate::linux::thread::thread_trampoline) reads it back.
 pub fn set_task_clone_entry(id: TaskId, rip: u64, rsp: u64) {
@@ -233,6 +265,7 @@ pub fn set_task_clone_entry(id: TaskId, rip: u64, rsp: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Set a task's `CLONE_CHILD_CLEARTID` futex word address (Phase 5.3).
 pub fn set_task_clear_child_tid(id: TaskId, addr: u64) {
     let mut guard = SCHEDULER.lock();
@@ -242,6 +275,7 @@ pub fn set_task_clear_child_tid(id: TaskId, addr: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Read the current task's `clone` entry `(rip, rsp)`, if it was created by
 /// `clone` (used by the thread trampoline to enter ring 3).
 pub fn current_clone_entry() -> Option<(u64, u64)> {
@@ -254,6 +288,7 @@ pub fn current_clone_entry() -> Option<(u64, u64)> {
         .and_then(|t| t.clone_entry)
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Read (and clear) the current task's `clear_child_tid` address — called on
 /// thread exit so the kernel can zero + futex-wake the join word exactly once.
 pub fn take_current_clear_child_tid() -> u64 {
@@ -268,6 +303,7 @@ pub fn take_current_clear_child_tid() -> u64 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Set the current task's `clear_child_tid` (Linux `set_tid_address`).
 pub fn set_current_clear_child_tid(addr: u64) {
     let mut guard = SCHEDULER.lock();
@@ -277,6 +313,7 @@ pub fn set_current_clear_child_tid(addr: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Read the current task's `IA32_FS_BASE` value (for `arch_prctl(ARCH_GET_FS)`).
 pub fn current_fs_base() -> u64 {
     let guard = SCHEDULER.lock();
@@ -298,6 +335,22 @@ pub fn current_fs_base() -> u64 {
 /// Must be called with interrupts disabled (which is guaranteed when
 /// called from an interrupt handler).
 pub fn schedule() {
+    // The "interrupts must be disabled" contract above, made mechanical.
+    //
+    // Every part of this function assumes it: the lock is dropped before the stack
+    // switch, so a timer interrupt landing in the window would re-enter `schedule()`
+    // on a half-switched context; and `switch_context`'s own `# Safety` clause
+    // requires it outright. The invariant is also invisible at each call site — it is
+    // established by the caller, or by hardware on exception entry — which is exactly
+    // the shape of bug that shipped once already: Phase 7.0a left the `arch::irq`
+    // calls in `yield_now`, `exit_current_task` and `block_current_task` gated to
+    // x86_64, so on aarch64 all three would have called straight into here with
+    // interrupts live. Nothing would have caught that but a rare, inexplicable crash.
+    debug_assert!(
+        !crate::arch::irq::are_enabled(),
+        "schedule() entered with interrupts unmasked"
+    );
+
     // Extract the context pointers while holding the scheduler lock,
     // then release the lock before doing the actual context switch.
     // We release the lock so the new task doesn't inherit a held lock
@@ -354,56 +407,121 @@ pub fn schedule() {
         // base, IA32_FS_BASE is a global register `switch_context` does not save,
         // so a Linux thread's `%fs`-relative TLS accesses would use whatever base
         // the previous task left behind. Reload it from the task on every switch.
+        //
+        // aarch64's analog is TPIDR_EL0, which arrives with the EL0 port.
         #[cfg(target_arch = "x86_64")]
         crate::arch::x86_64::syscall::write_fs_base(
             sched.tasks[next_id].as_ref().unwrap().fs_base,
         );
 
-        // Update TSS.RSP0 and PerCpu.kernel_stack_top for the new task.
-        // This must happen BEFORE the context switch so that if the new task
-        // is in ring 3 and gets interrupted (or does a syscall), the CPU uses
-        // the correct kernel stack. On a single-core system with interrupts
-        // disabled, there's no race — the values are set before the switch.
-        // (For kernel tasks with kernel_stack_top == 0 we leave the stack alone;
-        // they never enter `syscall_entry`, and the next ring-3 switch sets it.)
-        let next_stack_top = sched.tasks[next_id].as_ref().unwrap().kernel_stack_top;
-        if next_stack_top != 0 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
-                crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Update TSS.RSP0 and PerCpu.kernel_stack_top for the new task.
+            // This must happen BEFORE the context switch so that if the new task
+            // is in ring 3 and gets interrupted (or does a syscall), the CPU uses
+            // the correct kernel stack. On a single-core system with interrupts
+            // disabled, there's no race — the values are set before the switch.
+            // (For kernel tasks with kernel_stack_top == 0 we leave the stack alone;
+            // they never enter `syscall_entry`, and the next ring-3 switch sets it.)
+            let next_stack_top = sched.tasks[next_id].as_ref().unwrap().kernel_stack_top;
+            if next_stack_top != 0 {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
+                    crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
+                }
             }
         }
 
-        // Switch CR3 if the next task belongs to a different process.
-        // Changing CR3 flushes the user-half TLB entries (kernel-half entries
-        // are shared across all address spaces via the same PML4 upper-half
-        // entries, but the CPU flushes everything on CR3 write). We skip the
-        // CR3 write if both tasks are in the same process (same address space)
-        // or if both are in the kernel process (PID 0, which has no separate
-        // address space).
-        let current_pid = sched.tasks[current_id].as_ref().unwrap().process_id;
-        let next_pid = sched.tasks[next_id].as_ref().unwrap().process_id;
-        if current_pid != next_pid {
-            if let Some(pml4_phys) = crate::process::process_pml4(next_pid) {
-                #[cfg(target_arch = "x86_64")]
-                unsafe { crate::arch::x86_64::cpu::write_cr3(pml4_phys); }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Switch CR3 if the next task belongs to a different process.
+            // Changing CR3 flushes the user-half TLB entries (kernel-half entries
+            // are shared across all address spaces via the same PML4 upper-half
+            // entries, but the CPU flushes everything on CR3 write). We skip the
+            // CR3 write if both tasks are in the same process (same address space)
+            // or if both are in the kernel process (PID 0, which has no separate
+            // address space).
+            let current_pid = sched.tasks[current_id].as_ref().unwrap().process_id;
+            let next_pid = sched.tasks[next_id].as_ref().unwrap().process_id;
+            if current_pid != next_pid {
+                if let Some(pml4_phys) = crate::process::process_pml4(next_pid) {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { crate::arch::x86_64::cpu::write_cr3(pml4_phys); }
+                }
             }
         }
+
+        // Stack bounds of the incoming task, for the aarch64 per-CPU block. Read here
+        // because it needs the lock; *published* further down, next to the switch
+        // itself — see the note there for why the gap matters.
+        #[cfg(target_arch = "aarch64")]
+        let next_stack_bounds = sched.tasks[next_id]
+            .as_ref()
+            .unwrap()
+            .kernel_stack_bounds()
+            .unwrap_or((0, 0));
 
         // Get raw pointers to the task contexts. These point into the Vec's
         // buffer, which won't be reallocated because:
         // 1. Interrupts are disabled — no other code can push to the Vec.
         // 2. We're about to drop the lock and immediately use the pointers.
-        let old_ctx = &mut sched.tasks[current_id].as_mut().unwrap().context
-            as *mut TaskContext;
-        let new_ctx = &sched.tasks[next_id].as_ref().unwrap().context
-            as *const TaskContext;
+        //
+        // Both are derived from the Vec's data pointer and then indexed to two
+        // *distinct* slots (`next_id != current_id` is established above). Going
+        // through `as_mut_ptr` rather than taking `&mut sched.tasks[a]` and then
+        // `&sched.tasks[b]` matters: the latter creates a shared borrow of the whole
+        // Vec after a mutable one, which invalidates the first pointer under Stacked
+        // Borrows even though the two elements never overlap.
+        let base = sched.tasks.as_mut_ptr();
+        // SAFETY: `current_id` and `next_id` are valid indices into `tasks` (both were
+        // just dereferenced through it), both slots are `Some` (ditto), and the two
+        // indices differ — so the resulting references borrow disjoint elements.
+        let (old_ctx, new_ctx) = unsafe {
+            let old = &raw mut (*base.add(current_id)).as_mut().unwrap().context;
+            let new = &raw const (*base.add(next_id)).as_ref().unwrap().context;
+            (old, new)
+        };
 
-        Some((old_ctx, new_ctx))
+        #[cfg(target_arch = "aarch64")]
+        {
+            Some((old_ctx, new_ctx, next_id, next_stack_bounds))
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            Some((old_ctx, new_ctx))
+        }
         // Guard dropped here — lock released
     };
 
+    #[cfg(target_arch = "aarch64")]
+    if let Some((old_ctx, new_ctx, next_id, (top, limit))) = switch_info {
+        // Publish the per-CPU block as late as possible — the next statement is the
+        // switch itself.
+        //
+        // Between this write and `switch_context` swapping stacks, the block says the
+        // incoming task is running while the CPU is still on the *outgoing* task's
+        // stack. Anything that reads it in that window names the wrong task, and
+        // `stack_overflow_hint` compares the outgoing SP against the incoming task's
+        // bounds — which will almost always be outside them and print a spurious
+        // "kernel stack overflow". That window used to be thirty lines of scheduler
+        // bookkeeping wide, and it is newly reachable now that SErrors are unmasked.
+        // It cannot be closed entirely (something has to write the block before the
+        // switch) but it can be made two instructions long, which is this.
+        //
+        // SAFETY: interrupts are masked for the whole of `schedule()` (asserted at the
+        // top), which is what `on_context_switch` requires so that an exception cannot
+        // observe the block half-updated.
+        unsafe {
+            crate::arch::aarch64::percpu::on_context_switch(next_id as u64, top, limit);
+            // SAFETY: Both pointers are valid (checked above), point to stable
+            // memory (Vec buffer with interrupts disabled), and the new task's
+            // stack contains valid saved registers.
+            context::switch_context(old_ctx, new_ctx);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     if let Some((old_ctx, new_ctx)) = switch_info {
         // SAFETY: Both pointers are valid (checked above), point to stable
         // memory (Vec buffer with interrupts disabled), and the new task's
@@ -425,14 +543,12 @@ pub fn schedule() {
 pub fn yield_now() {
     // Disable interrupts for the scheduling critical section.
     // schedule() expects interrupts to be disabled on entry.
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::disable();
 
     schedule();
 
     // Re-enable interrupts after returning from schedule.
     // (When the task resumes, we're back here with interrupts still disabled.)
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::enable();
 }
 
@@ -442,7 +558,6 @@ pub fn yield_now() {
 /// returns. This function never returns — the dead task will never be
 /// scheduled again.
 pub fn exit_current_task() -> ! {
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::disable();
 
     {
@@ -467,6 +582,7 @@ pub fn current_task_id() -> TaskId {
         .current_id
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Get the current task's process ID.
 pub fn current_process_id() -> ProcessId {
     let guard = SCHEDULER.lock();
@@ -474,6 +590,7 @@ pub fn current_process_id() -> ProcessId {
     sched.tasks[sched.current_id].as_ref().unwrap().process_id
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Spawn a new task within a specific process.
 ///
 /// Like `spawn()`, but assigns the task to the given process instead of
@@ -574,7 +691,6 @@ pub fn kill_task(id: TaskId) -> bool {
 ///
 /// Must NOT be called from an interrupt handler — only from task context.
 pub fn block_current_task() {
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::disable();
 
     {
@@ -587,7 +703,6 @@ pub fn block_current_task() {
     schedule();
 
     // When we return here, the task has been woken up.
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::enable();
 }
 
@@ -648,7 +763,7 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
     // with the scheduler, not with the MMU port.
 
     // The usable stack starts after the padding page(s) and extends to the top.
-    // Stack grows downward, so the initial RSP points to the top (highest address).
+    // Stack grows downward, so the initial SP points to the top (highest address).
     let stack_top_phys = PhysAddr::new(
         phys_base.as_u64() + (TOTAL_STACK_PAGES as u64) * mm::PAGE_SIZE
     );
@@ -656,18 +771,26 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
 
     // Set up the initial stack frame to look like switch_context just saved
     // the task's state. See context.rs for the expected stack layout.
-    let initial_rsp = setup_initial_stack(stack_top_virt.as_u64(), entry);
+    // SAFETY: `stack_top_virt` is the top of freshly allocated, mapped stack frames
+    // owned by this task; nothing else refers to them yet.
+    let initial_sp = unsafe { context::setup_initial_stack(stack_top_virt.as_u64(), entry) };
 
     let task = Task {
         id,
         name: String::from(name),
         state: TaskState::Ready,
-        context: TaskContext { rsp: initial_rsp },
+        context: TaskContext::new(initial_sp),
         stack_phys_base: Some(phys_base),
+        // Ring-3 / Linux-thread state, x86_64 only — see `task::Task`.
+        #[cfg(target_arch = "x86_64")]
         kernel_stack_top: stack_top_virt.as_u64(),
+        #[cfg(target_arch = "x86_64")]
         process_id: ProcessId::KERNEL, // Default to kernel process; caller can override
+        #[cfg(target_arch = "x86_64")]
         fs_base: 0, // set by arch_prctl(ARCH_SET_FS) for Linux TLS (Phase 5.1)
+        #[cfg(target_arch = "x86_64")]
         clone_entry: None, // set by Linux clone() for thread tasks (Phase 5.3)
+        #[cfg(target_arch = "x86_64")]
         clear_child_tid: 0,
     };
 
@@ -687,62 +810,6 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
     }
 
     id
-}
-
-/// Set up the initial stack frame for a new task.
-///
-/// Builds a stack frame that mimics the state after `switch_context` has
-/// pushed all callee-saved registers. When `switch_context` later "restores"
-/// from this frame, it will:
-/// 1. Pop r15-r12, rbp, rbx (r12 gets the entry function address)
-/// 2. `ret` into `task_bootstrap` (the return address we place on the stack)
-///
-/// Returns the initial RSP value to store in the task's `TaskContext`.
-///
-/// Stack layout (addresses decreasing = stack growing down):
-/// ```text
-/// stack_top (16-byte aligned):
-///   -0x08: task_bootstrap address   (return addr for switch_context's `ret`)
-///   -0x10: 0                        (initial rbx)
-///   -0x18: 0                        (initial rbp)
-///   -0x20: entry function address   (initial r12 — called by task_bootstrap)
-///   -0x28: 0                        (initial r13)
-///   -0x30: 0                        (initial r14)
-///   -0x38: 0                        (initial r15)
-///          ↑ initial RSP points here
-/// ```
-fn setup_initial_stack(stack_top: u64, entry: fn()) -> u64 {
-    let mut sp = stack_top;
-
-    // The return address for switch_context's `ret` — enters task_bootstrap.
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = context::task_bootstrap as *const () as u64; }
-
-    // rbx = 0 (no specific initial value needed)
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    // rbp = 0 (frame pointer — zero to terminate stack traces)
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    // r12 = entry function address (task_bootstrap will `call r12`)
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = entry as *const () as u64; }
-
-    // r13 = 0
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    // r14 = 0
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    // r15 = 0
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    sp
 }
 
 /// Clean up dead tasks by freeing their stacks and clearing their slots.
@@ -776,16 +843,16 @@ fn cleanup_dead_tasks(sched: &mut Scheduler, current_id: TaskId) {
 
 /// Entry function for the idle task.
 ///
-/// Runs in an infinite loop, halting the CPU between timer interrupts.
-/// Interrupts must be enabled (they are — `task_bootstrap` calls `sti`
+/// Runs in an infinite loop, halting the CPU between timer interrupts
+/// (`hlt` on x86_64, `wfi` on aarch64 — both resume on the next interrupt).
+/// Interrupts must be enabled (they are — `task_bootstrap` unmasks them
 /// before jumping to the entry function) so the timer can wake the CPU
-/// from `hlt` and preempt the idle task when a real task becomes ready.
+/// and preempt the idle task when a real task becomes ready.
+///
+/// If interrupts were ever masked here the halt would never return, so the
+/// idle task would wedge the whole system rather than merely spin.
 fn idle_entry() {
     loop {
-        #[cfg(target_arch = "x86_64")]
         crate::arch::irq::halt();
-
-        #[cfg(not(target_arch = "x86_64"))]
-        core::hint::spin_loop();
     }
 }

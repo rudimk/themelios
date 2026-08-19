@@ -167,7 +167,8 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   sites routed through it, x86 impls re-exported unchanged.
 - ✅ **7.0b** Boot to banner on QEMU `virt`: `linker-aarch64.ld`, aarch64 arch module
   (`boot`/`serial`/`irq`/`time`), per-arch `kmain` dispatch, `CPACR_EL1.FPEN` enabled
-  in early boot (hardfloat target — compiler-emitted SIMD traps otherwise), and the
+  in early boot (hardfloat target — compiler-emitted SIMD traps otherwise; **reversed
+  in 7.3**, which targets softfloat and *clears* FPEN so stray SIMD traps), and the
   PL011 mapped by editing Limine's live TTBR1 tables (its HHDM maps RAM, not MMIO).
 - ✅ **7.0c** Separate `themelios-{amd64,arm64}.iso` (amd64 hybrid BIOS+UEFI, arm64
   UEFI-only with `BOOTAA64.EFI`); `arm64-iso-smoke` boots the shipped image in CI.
@@ -200,8 +201,40 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   arrive — one tick would pass even if the timer were never re-armed or the GIC never
   EOI'd, which are the two failure modes here. Verified in CI: `tick 0 -> 5, 5 IRQs, 0
   spurious`, `CNTFRQ = 62.5 MHz`, `GICD TYPER` reads 288 INTIDs.
-- ⬜ **7.3** Scheduler context switch · ⬜ **7.4** Shell, portable tests on aarch64 CI,
-  finalize.
+- ✅ **7.3** **Scheduler context switch + preemption.** `sched` is now arch-neutral: the
+  ready queue, task lifecycle and round-robin policy are shared, with context switching
+  behind a new `arch::context` facade (`arch/{x86_64,aarch64}/context.rs`). aarch64
+  saves the AAPCS64 callee-saved set (x19-x30, 96 bytes — **no FP save area**, sound
+  only because the kernel is softfloat) and `ret`s through the restored **`x30`**, not
+  off the stack as x86 does, so a new task's initial frame puts `task_bootstrap` in the
+  `x30` slot and the entry fn in `x19`. The timer IRQ calls `schedule()` **after**
+  `GICC_EOIR` — a GICv2 CPU interface delivers nothing while an interrupt is active, so
+  scheduling first would stop the next tick ever arriving. What is *not* ported is the
+  ring-3 machinery `sched` also carries (`kernel_stack_top`→TSS.RSP0, `fs_base`,
+  `clone_entry`, CR3 swaps): each is EL0-era state whose aarch64 analog (`SP_EL1`,
+  `TPIDR_EL0`, `TTBR0_EL1`) has nothing to hold in a ring-0-only kernel, so it is
+  `#[cfg]`'d off rather than guessed at. **`TPIDR_EL1` *is* plumbed** as the GS-base
+  analog: a `PerCpu` block rewritten on **every** switch (the structural form of the
+  4.5 stale-GS fix), read back *through the register* so it cannot be decorative, and
+  used by the fatal-exception reporter to name the faulting task — which must not take
+  the scheduler lock, since `schedule()` holds it. Also fixed `arch::irq` calls in
+  `sched` that 7.0a had left `#[cfg]`-gated to x86 — live on aarch64, they would have
+  entered `schedule()` with interrupts unmasked; `schedule()` now `debug_assert!`s that
+  contract. Proven by boot self-tests the CI smokes assert: three non-yielding workers
+  score **13 tick-slices each** (equal share is 12 across 4 runnable tasks) inside a
+  band of [6, 24] — a floor alone would pass `[60,6,6]`, the monopoly it claims to
+  reject — and all three return through `task_exit`. Fairness is measured in *ticks
+  resident*, not loop iterations: under TCG the latter varied 4.5x between identical
+  boots and says nothing about the scheduler.
+  Two defects the adversarial review caught, both silent: `task_bootstrap` cleared only
+  `DAIF.I`, so every spawned task inherited **masked SError** for life (a new task is
+  entered by `ret` out of the IRQ handler, not `eret`, and the mask then propagated
+  through `SPSR`) — disabling 7.2's abort vector and misattributing any pending SError
+  to a later task; and `CPACR_EL1.FPEN` was **`0b11`** — Limine leaves FP enabled, so
+  the "stray SIMD traps loudly" backstop justifying the absent `v8`-`v15` save area had
+  never existed. FPEN is now cleared *and verified* at boot, `verify_fp_trapped` gates
+  the sentinel, and the kernel passes every self-test with FP trapping.
+- ⬜ **7.4** Shell, portable tests on aarch64 CI, finalize.
 
 **Phase 6 — Management API: COMPLETE (core).** The node is driven entirely
 through an external HTTP API (no SSH, no shell). A ring-3 **`api-server`** holds a

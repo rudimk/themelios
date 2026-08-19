@@ -48,3 +48,6 @@ pub mod serial;
 
 /// Page-table descriptors, address-space activation, and TLB maintenance.
 pub mod paging;
+
+/// Task context switching (`TaskContext`, `switch_context`, task bootstrap).
+pub mod context;
