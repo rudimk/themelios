@@ -425,14 +425,12 @@ pub fn schedule() {
 pub fn yield_now() {
     // Disable interrupts for the scheduling critical section.
     // schedule() expects interrupts to be disabled on entry.
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::disable();
 
     schedule();
 
     // Re-enable interrupts after returning from schedule.
     // (When the task resumes, we're back here with interrupts still disabled.)
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::enable();
 }
 
@@ -442,7 +440,6 @@ pub fn yield_now() {
 /// returns. This function never returns — the dead task will never be
 /// scheduled again.
 pub fn exit_current_task() -> ! {
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::disable();
 
     {
@@ -574,7 +571,6 @@ pub fn kill_task(id: TaskId) -> bool {
 ///
 /// Must NOT be called from an interrupt handler — only from task context.
 pub fn block_current_task() {
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::disable();
 
     {
@@ -587,7 +583,6 @@ pub fn block_current_task() {
     schedule();
 
     // When we return here, the task has been woken up.
-    #[cfg(target_arch = "x86_64")]
     crate::arch::irq::enable();
 }
 
@@ -729,16 +724,16 @@ fn cleanup_dead_tasks(sched: &mut Scheduler, current_id: TaskId) {
 
 /// Entry function for the idle task.
 ///
-/// Runs in an infinite loop, halting the CPU between timer interrupts.
-/// Interrupts must be enabled (they are — `task_bootstrap` calls `sti`
+/// Runs in an infinite loop, halting the CPU between timer interrupts
+/// (`hlt` on x86_64, `wfi` on aarch64 — both resume on the next interrupt).
+/// Interrupts must be enabled (they are — `task_bootstrap` unmasks them
 /// before jumping to the entry function) so the timer can wake the CPU
-/// from `hlt` and preempt the idle task when a real task becomes ready.
+/// and preempt the idle task when a real task becomes ready.
+///
+/// If interrupts were ever masked here the halt would never return, so the
+/// idle task would wedge the whole system rather than merely spin.
 fn idle_entry() {
     loop {
-        #[cfg(target_arch = "x86_64")]
         crate::arch::irq::halt();
-
-        #[cfg(not(target_arch = "x86_64"))]
-        core::hint::spin_loop();
     }
 }
