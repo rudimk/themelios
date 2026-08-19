@@ -36,6 +36,9 @@ pub mod boot;
 /// Exception vectors (`VBAR_EL1`), syndrome decoding, and fault reporting.
 pub mod exceptions;
 
+/// Task context switching (callee-saved register save/restore, task bootstrap).
+pub mod context;
+
 /// GICv2 interrupt controller (distributor + CPU interface).
 pub mod gic;
 
