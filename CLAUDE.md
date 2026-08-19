@@ -212,14 +212,27 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   ring-3 machinery `sched` also carries (`kernel_stack_top`→TSS.RSP0, `fs_base`,
   `clone_entry`, CR3 swaps): each is EL0-era state whose aarch64 analog (`SP_EL1`,
   `TPIDR_EL0`, `TTBR0_EL1`) has nothing to hold in a ring-0-only kernel, so it is
-  `#[cfg]`'d off rather than guessed at. Also fixed `arch::irq` calls in `sched` that
-  7.0a had left `#[cfg]`-gated to x86 — live on aarch64, they would have entered
-  `schedule()` with interrupts unmasked. Proven by a boot self-test the CI smokes
-  assert: three non-yielding workers score **12-14 tick-slices each** (fair share is
-  12.5 across 4 runnable tasks) against a floor of 6, and all three return through
-  `task_exit`. Fairness is measured in *ticks resident*, not loop iterations — under
-  TCG the latter varied 4.5x between identical boots and says nothing about the
-  scheduler.
+  `#[cfg]`'d off rather than guessed at. **`TPIDR_EL1` *is* plumbed** as the GS-base
+  analog: a `PerCpu` block rewritten on **every** switch (the structural form of the
+  4.5 stale-GS fix), read back *through the register* so it cannot be decorative, and
+  used by the fatal-exception reporter to name the faulting task — which must not take
+  the scheduler lock, since `schedule()` holds it. Also fixed `arch::irq` calls in
+  `sched` that 7.0a had left `#[cfg]`-gated to x86 — live on aarch64, they would have
+  entered `schedule()` with interrupts unmasked; `schedule()` now `debug_assert!`s that
+  contract. Proven by boot self-tests the CI smokes assert: three non-yielding workers
+  score **13 tick-slices each** (equal share is 12 across 4 runnable tasks) inside a
+  band of [6, 24] — a floor alone would pass `[60,6,6]`, the monopoly it claims to
+  reject — and all three return through `task_exit`. Fairness is measured in *ticks
+  resident*, not loop iterations: under TCG the latter varied 4.5x between identical
+  boots and says nothing about the scheduler.
+  Two defects the adversarial review caught, both silent: `task_bootstrap` cleared only
+  `DAIF.I`, so every spawned task inherited **masked SError** for life (a new task is
+  entered by `ret` out of the IRQ handler, not `eret`, and the mask then propagated
+  through `SPSR`) — disabling 7.2's abort vector and misattributing any pending SError
+  to a later task; and `CPACR_EL1.FPEN` was **`0b11`** — Limine leaves FP enabled, so
+  the "stray SIMD traps loudly" backstop justifying the absent `v8`-`v15` save area had
+  never existed. FPEN is now cleared *and verified* at boot, `verify_fp_trapped` gates
+  the sentinel, and the kernel passes every self-test with FP trapping.
 - ⬜ **7.4** Shell, portable tests on aarch64 CI, finalize.
 
 **Phase 6 — Management API: COMPLETE (core).** The node is driven entirely
