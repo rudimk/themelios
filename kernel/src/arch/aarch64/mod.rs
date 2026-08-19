@@ -47,6 +47,9 @@ pub mod timer;
 
 pub mod irq;
 
+/// Per-CPU data addressed through `TPIDR_EL1` (the GS-base analog).
+pub mod percpu;
+
 /// Page-table descriptor format, TTBR control, and TLB maintenance.
 pub mod paging;
 pub mod serial;

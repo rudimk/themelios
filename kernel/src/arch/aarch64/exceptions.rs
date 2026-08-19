@@ -342,6 +342,31 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
     println!("!!! aarch64 EXCEPTION !!!");
     println!("  vector:  {} (slot {})", slot_name(tag), tag);
     println!("  frame at:{:#018x} (exception stack pointer)", frame_at);
+
+    // Name the task through the per-CPU block, never through the scheduler.
+    // `sched::current_task_id()` takes the scheduler lock, and `schedule()` holds that
+    // lock while it runs — so a fault raised from inside it (or from anything else
+    // holding it) would deadlock here, in the handler, with nothing printed. The
+    // TPIDR_EL1 block is written by `schedule()` itself and read with no lock at all.
+    if crate::sched::is_initialized() {
+        // SAFETY: `percpu::init` runs in early boot, before any exception is possible.
+        let pc = unsafe { crate::arch::aarch64::percpu::current() };
+        println!(
+            "  task:    {} (per-CPU block; {} context switches)",
+            pc.current_task, pc.switches
+        );
+        // The handler is running on the *faulting* stack — there is no IST/TSS analog
+        // to escape to — so if this fault is a stack overflow, saying so is the only
+        // warning that will ever be printed. It is also the fault most likely to be
+        // misread as a wild pointer.
+        if let Some(hint) = crate::arch::aarch64::percpu::stack_overflow_hint(frame_at) {
+            println!("  !! {}", hint);
+            println!(
+                "     stack is [{:#018x}, {:#018x})",
+                pc.kernel_stack_limit, pc.kernel_stack_top
+            );
+        }
+    }
     println!("  ESR_EL1: {:#018x}  EC={:#04x} ({})", frame.esr, ec, ec_name(ec));
     if matches!(
         ec,

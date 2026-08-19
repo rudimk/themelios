@@ -281,6 +281,11 @@ pub fn kmain_aarch64(
     // Deliberately ahead of the memory bring-up so a paging mistake is diagnosable.
     crate::arch::aarch64::exceptions::init();
 
+    // Point TPIDR_EL1 at the per-CPU block before anything can read it. The exception
+    // reporter installed just above dereferences it to name the faulting task, so this
+    // must not wait for the scheduler.
+    crate::arch::aarch64::percpu::init();
+
     // --- Phase 7.1: memory management on our own page tables ---
     bring_up_memory(hhdm, k, entries);
 
@@ -302,7 +307,10 @@ pub fn kmain_aarch64(
     // --- Phase 7.3: preemptive scheduling ---
     crate::sched::init();
     let sched_ok = sched_selftest();
-    if sched_ok {
+    // Run after the scheduler test, which is what gives the per-CPU block dozens of
+    // switches to have been updated by; before it there would be nothing to check.
+    let percpu_ok = crate::arch::aarch64::percpu::selftest();
+    if sched_ok && percpu_ok {
         crate::println!("[boot] Phase 7.3 scheduler reached; self-test passed.");
     } else {
         crate::println!("[boot] Phase 7.3 scheduler FAILED self-test.");

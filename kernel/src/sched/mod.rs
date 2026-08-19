@@ -414,6 +414,28 @@ pub fn schedule() {
             }
         }
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Re-point TPIDR_EL1 at the per-CPU block and describe the incoming task.
+            // The aarch64 analog of `refresh_kernel_gs_base` above, in the same place
+            // and for the same reason: TPIDR_EL1 is a global register that
+            // `switch_context` does not save, so the only way it cannot go stale is to
+            // rewrite it on every switch rather than on the switches that seem to need
+            // it. That "seem to need it" is exactly what produced the Phase 4.5 stale
+            // GS-base bug.
+            let (top, limit) = sched.tasks[next_id]
+                .as_ref()
+                .unwrap()
+                .kernel_stack_bounds()
+                .unwrap_or((0, 0));
+            // SAFETY: interrupts are masked for the whole of `schedule()`, which is
+            // what `on_context_switch` requires so that an exception cannot observe
+            // the block half-updated.
+            unsafe {
+                crate::arch::aarch64::percpu::on_context_switch(next_id as u64, top, limit);
+            }
+        }
+
         // Get raw pointers to the task contexts. These point into the Vec's
         // buffer, which won't be reallocated because:
         // 1. Interrupts are disabled — no other code can push to the Vec.

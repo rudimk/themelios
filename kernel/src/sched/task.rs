@@ -169,3 +169,32 @@ pub struct Task {
     #[cfg(target_arch = "x86_64")]
     pub clear_child_tid: u64,
 }
+
+impl Task {
+    /// Virtual bounds of this task's usable kernel stack, as `(top, limit)`.
+    ///
+    /// `top` is one past the highest usable byte (the stack grows down from it) and
+    /// `limit` is the lowest address the stack may reach before it runs into the
+    /// padding page reserved beneath it. Both are HHDM addresses, matching what
+    /// `create_task` hands to `setup_initial_stack`.
+    ///
+    /// `None` for the bootstrap task, which runs on the stack Limine handed over and
+    /// whose extent the kernel therefore does not know. Callers must treat that as
+    /// "unknown", not as "zero-sized" — a bounds check that fires on every address is
+    /// worse than no bounds check at all.
+    ///
+    /// The arithmetic is architecture-neutral; the `cfg` is about the *consumer*. Only
+    /// the aarch64 per-CPU block records stack bounds today, so on x86_64 this is dead
+    /// code rather than shared code. Gated by consumer, the same way the ring-3 fields
+    /// above are.
+    #[cfg(target_arch = "aarch64")]
+    pub fn kernel_stack_bounds(&self) -> Option<(u64, u64)> {
+        let base = self.stack_phys_base?;
+        let top = base.as_u64() + (TOTAL_STACK_PAGES as u64) * crate::mm::PAGE_SIZE;
+        let limit = base.as_u64() + (PADDING_PAGES as u64) * crate::mm::PAGE_SIZE;
+        Some((
+            PhysAddr::new(top).to_virt().as_u64(),
+            PhysAddr::new(limit).to_virt().as_u64(),
+        ))
+    }
+}
