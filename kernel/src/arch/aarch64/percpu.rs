@@ -119,7 +119,7 @@ static mut PER_CPU: PerCpu = PerCpu {
 /// that if anything does read the register during that brief window, it reads
 /// recognisable nonsense instead of faulting on a garbage address — a test for a
 /// diagnostic facility should not be able to take the machine down.
-static mut DECOY_PER_CPU: PerCpu = PerCpu {
+static DECOY_PER_CPU: PerCpu = PerCpu {
     current_task: u64::MAX,
     kernel_stack_top: 0,
     kernel_stack_limit: 0,
@@ -187,9 +187,12 @@ pub fn snapshot() -> Option<PerCpu> {
         return None;
     }
     let base = read_tpidr();
-    // SAFETY: `INITIALIZED` is set only by `init`, and only after it has written the
-    // address of a `'static` `PerCpu` into the register. `PerCpu` is `Copy` and
-    // contains no padding of consequence, so this reads a complete, aligned value.
+    // SAFETY: the register always addresses *some* live `'static` `PerCpu` once
+    // `INITIALIZED` is set. That is deliberately weaker than "the address `init`
+    // wrote": `on_context_switch` re-writes the register on every switch, and
+    // `selftest` parks `DECOY_PER_CPU` there on purpose — which is exactly why the
+    // decoy is a real `PerCpu` and not a poison bit pattern. `PerCpu` is `Copy` and
+    // aligned, so this reads a complete value whichever block is installed.
     Some(unsafe { *(base as *const PerCpu) })
 }
 
@@ -326,6 +329,17 @@ pub fn selftest() -> bool {
 
     // --- Property 3: the per-switch write ---
     //
+    // Mask first, and keep everything below inside that window. The probe task must be
+    // spawned with interrupts already masked: if a tick landed between the spawn and
+    // the mask, it would run the probe to completion, empty the ready queue again, and
+    // the `schedule()` below would take the "next_id == current_id" early return — a
+    // false FAIL claiming the per-switch write is unproven. Nothing today can deliver
+    // that tick (the caller happens to leave interrupts masked), but relying on that is
+    // an invisible cross-function coupling, which is the defect class this branch has
+    // been repeatedly bitten by.
+    let irqs_were_enabled = crate::arch::irq::are_enabled();
+    crate::arch::irq::disable();
+
     // Give `schedule()` somewhere to go. By this point the round-robin workers are all
     // dead and the ready queue is empty, so a bare `schedule()` would take the
     // "next_id == current_id" early return and never reach `on_context_switch`.
@@ -333,8 +347,6 @@ pub fn selftest() -> bool {
 
     let decoy = &raw const DECOY_PER_CPU as u64;
     let switches_before = pc.switches;
-
-    crate::arch::irq::disable();
     // SAFETY: `DECOY_PER_CPU` is a live, correctly-typed `PerCpu`, so the register
     // still points at readable memory for the duration; interrupts are masked, so the
     // only reader that could observe it (the exception reporter) cannot run.
@@ -346,7 +358,12 @@ pub fn selftest() -> bool {
     // the register is still poisoned and must not be left that way.
     // SAFETY: `expected` is the address of the real block.
     unsafe { write_tpidr(expected) };
-    crate::arch::irq::enable();
+    // Leave interrupts as they were found, so this function has one postcondition
+    // rather than one per exit path — the early-return FAIL branches above never touch
+    // the mask, and 7.4 will add code after this call.
+    if irqs_were_enabled {
+        crate::arch::irq::enable();
+    }
 
     let switched = snapshot().is_some_and(|p| p.switches > switches_before);
     if !switched {
@@ -367,11 +384,15 @@ pub fn selftest() -> bool {
         return false;
     }
 
+    // Re-read rather than reporting `pc`, which was sampled before the probe switch and
+    // is two switches stale by now. A diagnostic whose whole point is fidelity should
+    // not print a number it knows to be old.
+    let switches_now = snapshot().map_or(pc.switches, |p| p.switches);
     println!(
         "[selftest] percpu: PASS (TPIDR_EL1 -> {:#018x}, task {} agrees with the \
          scheduler, {} switches recorded, register repaired by a switch after being \
          poisoned)",
-        expected, pc.current_task, pc.switches
+        expected, pc.current_task, switches_now
     );
     true
 }

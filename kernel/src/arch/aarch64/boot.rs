@@ -18,7 +18,7 @@
 //! so each stage prints a sentinel the CI smoke asserts on, and the smoke fails on the
 //! specific `FAIL` line rather than on a timeout.
 //!
-//! ## FP/SIMD is deliberately left disabled
+//! ## FP/SIMD is deliberately trapped
 //!
 //! Phase 7.0b built for the *hardfloat* `aarch64-unknown-none` target, where the
 //! compiler lowers struct moves and `core::fmt` to SIMD, and so had to enable
@@ -365,8 +365,9 @@ pub fn kmain_aarch64(
 /// What makes it sound is simply that these are `AtomicU64` loads: they cannot tear, so
 /// every value read is a value some worker actually wrote. The result is a slightly
 /// skewed snapshot — one worker's count may be a few iterations newer than another's —
-/// and nothing here cares, because the checks are a floor and a ceiling on quantities
-/// in the tens, sampled from counts in the hundreds of thousands.
+/// and nothing here cares. These counters are only tested for being non-zero; the
+/// bounded checks are on [`WORKER_TICKS`], where the quantities are in the tens and a
+/// skew of a few iterations cannot move a residency count at all.
 static WORKER_ITERS: [core::sync::atomic::AtomicU64; 3] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -417,9 +418,18 @@ static WORKER_ESCAPED: [core::sync::atomic::AtomicBool; 3] = [
 ];
 
 /// Wall-clock ticks a worker will spin before concluding it is never going to be
-/// preempted. Comfortably beyond the measured window plus the drain (~110 ticks in a
-/// healthy run), so it cannot fire on a slow runner: it is bounded on `CNTVCT_EL0`,
-/// which is real time and does not care how fast the emulated CPU is.
+/// preempted. A healthy worker lives for the measured window plus the drain — about 55
+/// ticks — against this deadline of 200.
+///
+/// Being measured on `CNTVCT_EL0` is what makes the escape *work* when interrupts are
+/// masked, but on its own it is what would make the deadline **fragile**: a real-time
+/// deadline racing a tick-counted window is exactly how a slow runner produces a
+/// spurious failure. The margin holds because the other side of the race is pinned to
+/// real time too — [`timer::handle_tick`](crate::arch::aarch64::timer::handle_tick)
+/// advances an absolute deadline and credits every skipped period, so accumulating 50
+/// *delivered* ticks takes ~0.5 s of wall clock no matter how slow or contended the
+/// host is. Replace that skip-crediting with a fixed reload and this constant becomes a
+/// flake.
 const WORKER_ESCAPE_TICKS: u64 = 200;
 
 /// Number of workers that reached the end of their entry function.
@@ -605,9 +615,19 @@ fn sched_selftest() -> bool {
     // Ask the workers to return. They are still runnable, so give them slices to
     // notice: `yield_now` puts this task at the back of the queue each time round.
     RUN.store(false, Ordering::Release);
+    // Bounded on both clocks, like the loops above. The tick deadline is the useful one
+    // in a healthy run; the `CNTVCT` one is what makes termination unconditional. A
+    // tick-only bound would freeze along with the tick if delivery stopped, and while
+    // this loop would still drain eventually — `yield_now` hands the CPU over
+    // cooperatively, and a worker that cannot be preempted escapes on its own deadline
+    // — that is a second-order argument, and relying on one is what the rest of this
+    // test was rewritten to stop doing.
     let drain_deadline = tick_count() + RUN_TICKS;
+    let drain_c0 = read_cntvct();
+    let drain_bound = reload() * RUN_TICKS * 4;
     while WORKERS_EXITED.load(Ordering::Acquire) < ids.len() as u64
         && tick_count() < drain_deadline
+        && read_cntvct() - drain_c0 < drain_bound
     {
         crate::sched::yield_now();
     }
@@ -697,9 +717,11 @@ fn sched_selftest() -> bool {
         }
     } else if !accounted {
         crate::println!(
-            "  the workers together account for only {} of {} ticks: runnable tasks are \
-             losing the CPU to something else — check that `schedule()` prefers the \
-             ready queue over the idle task",
+            "  the workers together account for only {} of {} ticks. The likeliest \
+             cause is not the scheduler but the host: when QEMU's vCPU is descheduled, \
+             `handle_tick` credits every skipped period at once, which inflates the \
+             tick count while a resident worker records only one. Suspect a loaded \
+             runner before suspecting `schedule()`.",
             total, ticks
         );
     } else if !all_exited {

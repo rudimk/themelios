@@ -167,7 +167,8 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   sites routed through it, x86 impls re-exported unchanged.
 - ✅ **7.0b** Boot to banner on QEMU `virt`: `linker-aarch64.ld`, aarch64 arch module
   (`boot`/`serial`/`irq`/`time`), per-arch `kmain` dispatch, `CPACR_EL1.FPEN` enabled
-  in early boot (hardfloat target — compiler-emitted SIMD traps otherwise), and the
+  in early boot (hardfloat target — compiler-emitted SIMD traps otherwise; **reversed
+  in 7.3**, which targets softfloat and *clears* FPEN so stray SIMD traps), and the
   PL011 mapped by editing Limine's live TTBR1 tables (its HHDM maps RAM, not MMIO).
 - ✅ **7.0c** Separate `themelios-{amd64,arm64}.iso` (amd64 hybrid BIOS+UEFI, arm64
   UEFI-only with `BOOTAA64.EFI`); `arm64-iso-smoke` boots the shipped image in CI.
