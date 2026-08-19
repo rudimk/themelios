@@ -343,7 +343,7 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
             // the schedule() that just ran, but "nothing does" is an invariant no line
             // of source states, so check it here rather than discover it as a rare and
             // impossible-looking wrong return.
-            crate::arch::aarch64::percpu::debug_assert_irqs_masked("IRQ vector exit");
+            debug_assert_irqs_masked("IRQ vector exit");
             return;
         }
 
@@ -372,9 +372,7 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
     // lock while it runs — so a fault raised from inside it (or from anything else
     // holding it) would deadlock here, in the handler, with nothing printed. The
     // TPIDR_EL1 block is written by `schedule()` itself and read with no lock at all.
-    if crate::sched::is_initialized() {
-        // SAFETY: `percpu::init` runs in early boot, before any exception is possible.
-        let pc = unsafe { crate::arch::aarch64::percpu::current() };
+    if let Some(pc) = crate::arch::aarch64::percpu::snapshot() {
         println!(
             "  task:    {} (per-CPU block; {} context switches)",
             pc.current_task, pc.switches
@@ -409,6 +407,31 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
     println!("  x29/x30: {:#018x} {:#018x}", frame.x[29], frame.x[30]);
 
     panic!("unhandled aarch64 exception (EC={:#04x}: {})", ec, ec_name(ec));
+}
+
+/// Assert that interrupts are masked, for the exception-return tail.
+///
+/// The aarch64 analog of the Phase 4.5 "syscall-exit double-fault" fix, which made the
+/// x86 exit tail atomic by masking interrupts across it. The shared state at risk here
+/// is different but the shape is the same: `ELR_EL1` and `SPSR_EL1` are single
+/// registers, and between the stub writing them back from the frame and the `eret` they
+/// hold *this* task's return state. An exception in that window overwrites both, and
+/// the `eret` returns to the wrong place with the wrong PSTATE.
+///
+/// The window is closed by construction — the CPU masks `DAIF.I` on exception entry and
+/// nothing in the handler path unmasks it, `schedule()` included. That is a property
+/// worth checking rather than assuming, because it is invisible in the source: no line
+/// says "interrupts are off here", and a future handler that enables them to do
+/// something slow would break the exit tail with no symptom but rare, impossible-looking
+/// returns.
+#[inline]
+fn debug_assert_irqs_masked(where_: &str) {
+    debug_assert!(
+        !crate::arch::irq::are_enabled(),
+        "{}: interrupts are unmasked inside the exception path — the ELR/SPSR \
+         write-back before `eret` is no longer atomic",
+        where_
+    );
 }
 
 /// Install the vector table into `VBAR_EL1`.

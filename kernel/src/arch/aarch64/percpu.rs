@@ -2,8 +2,8 @@
 //!
 //! The aarch64 counterpart to the x86_64 `PerCpu` block that
 //! [`crate::arch::x86_64::syscall`] reaches through the GS base: a small structure of
-//! state that belongs to *the CPU*, not to a task, holding whatever the currently
-//! running task is. `TPIDR_EL1` — the EL1 software thread-ID register, which the
+//! state that belongs to *the CPU*, not to a task, describing whichever task is
+//! currently running. `TPIDR_EL1` — the EL1 software thread-ID register, which the
 //! architecture reserves for exactly this and gives no other meaning — points at it.
 //!
 //! ## Why this exists before there is an EL0 to need it
@@ -27,18 +27,25 @@
 //! calls x86_64's `refresh_kernel_gs_base`.
 //!
 //! To be precise about what that buys today, since the comment is easy to overstate:
-//! nothing currently writes `TPIDR_EL1` except this module, so at present the register
+//! this module is currently the only writer of `TPIDR_EL1`, so at present the register
 //! could not go stale even if the write were conditional. The unconditional write is
-//! what keeps that true once EL0 lands and the register acquires a second writer.
+//! what keeps that true once EL0 lands and the register acquires a second writer. It is
+//! nonetheless *tested* rather than assumed — see [`selftest`], which poisons the
+//! register and requires a context switch to have repaired it.
 //!
 //! ## Reading it back through the register
 //!
-//! [`current`] deliberately loads `TPIDR_EL1` and dereferences *that*, rather than
-//! returning `&PER_CPU` directly. Taking the static's address would be faster and
-//! obviously correct — and would make the register decorative, since a `TPIDR_EL1` that
-//! was never written, or written with a wrong value, would read back fine. Going
-//! through the register means every per-CPU access is a live test of it, and
-//! [`selftest`] can check the two agree.
+//! [`snapshot`] loads `TPIDR_EL1` and dereferences *that*, rather than reading
+//! `PER_CPU` directly. Naming the static would be faster and obviously correct — and
+//! would make the register decorative, since a `TPIDR_EL1` that was never written, or
+//! written with a wrong value, would read back fine. Going through the register makes
+//! every per-CPU access a live test of it.
+//!
+//! It returns a *copy* rather than a reference. The block describes whichever task is
+//! running **now**, so a borrow held across a context switch silently describes a
+//! different task; handing out `&'static PerCpu` from a `static mut` would let the type
+//! system promise a lifetime the data does not have. A `Copy` snapshot cannot go stale
+//! in the caller's hands — it can only be *old*, which is obvious at the use site.
 //!
 //! ## Contents
 //!
@@ -53,9 +60,10 @@
 //!   IST/TSS analog, so the handler runs on the *overflowing* stack; naming the
 //!   condition explicitly is the only warning that will ever be printed.
 //! - `switches` — context switches performed, which is what lets [`selftest`] prove the
-//!   per-switch write actually happens rather than assuming it.
+//!   per-switch update happens rather than assuming it.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::println;
 
@@ -67,6 +75,7 @@ use crate::println;
 /// the wrong offset is the kind of bug that corrupts silently. Pinning the layout now
 /// costs nothing and makes a future reordering a build error.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct PerCpu {
     /// Task ID currently scheduled on this CPU.
     pub current_task: u64,
@@ -103,6 +112,29 @@ static mut PER_CPU: PerCpu = PerCpu {
     switches: 0,
 };
 
+/// A second, never-installed block used only by [`selftest`] as a poison value.
+///
+/// The self-test parks a *wrong but valid* pointer in `TPIDR_EL1` to check that a
+/// context switch repairs it. Pointing at real, mapped, correctly-typed memory means
+/// that if anything does read the register during that brief window, it reads
+/// recognisable nonsense instead of faulting on a garbage address — a test for a
+/// diagnostic facility should not be able to take the machine down.
+static mut DECOY_PER_CPU: PerCpu = PerCpu {
+    current_task: u64::MAX,
+    kernel_stack_top: 0,
+    kernel_stack_limit: 0,
+    switches: 0,
+};
+
+/// Set once [`init`] has pointed `TPIDR_EL1` at [`PER_CPU`].
+///
+/// `TPIDR_EL1`'s reset value is architecturally UNKNOWN, so before `init` the register
+/// is not a pointer at all. This flag is what lets [`snapshot`] be a *safe* function:
+/// it answers "is the register meaningful yet" without the caller having to know the
+/// boot order. That matters most for the fault path, which is exactly where a caller
+/// is least able to reason about how far boot got.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Read `TPIDR_EL1`.
 #[inline]
 pub fn read_tpidr() -> u64 {
@@ -116,7 +148,7 @@ pub fn read_tpidr() -> u64 {
 ///
 /// # Safety
 ///
-/// `value` must be the address of a live [`PerCpu`], since [`current`] dereferences
+/// `value` must be the address of a live [`PerCpu`], since [`snapshot`] dereferences
 /// whatever is in the register.
 #[inline]
 unsafe fn write_tpidr(value: u64) {
@@ -129,31 +161,36 @@ unsafe fn write_tpidr(value: u64) {
 
 /// Point `TPIDR_EL1` at the per-CPU block.
 ///
-/// Must run before anything calls [`current`] — that is, before the scheduler starts
-/// and before any exception can be taken by a handler that reports per-CPU state. A
-/// `TPIDR_EL1` left at its reset value would be dereferenced as a pointer.
+/// Must run before anything expects [`snapshot`] to return data — that is, before the
+/// scheduler starts and before the exception reporter is relied on to name a task.
+/// Until it does, `snapshot` returns `None` rather than dereferencing a register whose
+/// reset value the architecture leaves UNKNOWN.
 pub fn init() {
     let addr = &raw const PER_CPU as u64;
     // SAFETY: `addr` is the address of the static above, which lives for the whole
     // program.
     unsafe { write_tpidr(addr) };
+    INITIALIZED.store(true, Ordering::Release);
     println!("[percpu] TPIDR_EL1 -> {:#018x} (per-CPU block)", addr);
 }
 
-/// The per-CPU block for the running CPU, reached through `TPIDR_EL1`.
+/// A copy of the per-CPU block for the running CPU, read through `TPIDR_EL1`.
 ///
-/// # Safety
+/// `None` before [`init`], when the register holds no meaningful address.
 ///
-/// [`init`] must have run. Callers must not hold a reference across a context switch:
-/// the contents describe *whichever* task is running now, so a reference taken before a
-/// switch describes the wrong one afterwards.
+/// The value describes the task running *at the moment of the call*. It is a snapshot,
+/// not a view: after a context switch it is history, and treating it as current is the
+/// caller's bug rather than a memory-safety one.
 #[inline]
-pub unsafe fn current() -> &'static PerCpu {
+pub fn snapshot() -> Option<PerCpu> {
+    if !INITIALIZED.load(Ordering::Acquire) {
+        return None;
+    }
     let base = read_tpidr();
-    debug_assert!(base != 0, "TPIDR_EL1 read before percpu::init()");
-    // SAFETY: `init` put the address of a `'static` PerCpu here, and this is the only
-    // writer of the register.
-    unsafe { &*(base as *const PerCpu) }
+    // SAFETY: `INITIALIZED` is set only by `init`, and only after it has written the
+    // address of a `'static` `PerCpu` into the register. `PerCpu` is `Copy` and
+    // contains no padding of consequence, so this reads a complete, aligned value.
+    Some(unsafe { *(base as *const PerCpu) })
 }
 
 /// Record a context switch: point `TPIDR_EL1` at the per-CPU block and describe the
@@ -166,13 +203,20 @@ pub unsafe fn current() -> &'static PerCpu {
 /// a previous context's value on every other path. Refreshing unconditionally is one
 /// `msr` and removes the failure mode instead of narrowing it.
 ///
+/// Call it as late as possible — immediately before `switch_context`. Between this
+/// call and the actual stack switch the block claims the incoming task is running while
+/// the CPU is still on the outgoing task's stack, so an exception taken in that window
+/// is reported against the wrong task and compared against the wrong stack bounds.
+/// The window cannot be eliminated (something must write the block first) but it can be
+/// made a couple of instructions long, which is what `schedule()` does.
+///
 /// Passing zero for the stack bounds means "unknown" (the bootstrap task, which runs on
 /// the bootloader's stack); the overflow check then simply does not fire.
 ///
 /// # Safety
 ///
-/// Must be called with interrupts masked — that is, from inside `schedule()`. The three
-/// stores below are not atomic with respect to an observer, so an exception taken
+/// Must be called with interrupts masked — that is, from inside `schedule()`. The four
+/// field stores below are not atomic with respect to an observer, so an exception taken
 /// between them would read a half-updated block and mis-report the faulting task.
 /// `schedule()` guarantees the masking; see its contract.
 pub unsafe fn on_context_switch(task_id: u64, stack_top: u64, stack_limit: u64) {
@@ -195,21 +239,14 @@ pub unsafe fn on_context_switch(task_id: u64, stack_top: u64, stack_limit: u64) 
     }
 }
 
-/// Context switches recorded so far.
-pub fn switch_count() -> u64 {
-    // SAFETY: a single aligned u64 read on a uniprocessor; a torn value is not possible
-    // and a stale one is acceptable for a diagnostic counter.
-    unsafe { (*(&raw const PER_CPU)).switches }
-}
-
 /// Classify a stack pointer against the running task's stack bounds.
 ///
-/// Returns `None` when the bounds are unknown (the bootstrap task) or when `sp` is
-/// inside them. Returns a description when it is not — which is the case worth naming,
-/// because the handler that calls this is *itself* running on the stack in question.
+/// Returns `None` when the bounds are unknown (the bootstrap task), when the per-CPU
+/// block is not up yet, or when `sp` is inside them. Returns a description when it is
+/// not — which is the case worth naming, because the handler that calls this is
+/// *itself* running on the stack in question.
 pub fn stack_overflow_hint(sp: u64) -> Option<&'static str> {
-    // SAFETY: `init` has run by the time any exception can be taken; see `current`.
-    let pc = unsafe { current() };
+    let pc = snapshot()?;
     let (top, limit) = (pc.kernel_stack_top, pc.kernel_stack_limit);
     if top == 0 || limit == 0 {
         return None;
@@ -226,18 +263,34 @@ pub fn stack_overflow_hint(sp: u64) -> Option<&'static str> {
     }
 }
 
-/// Prove the per-CPU pointer is real: that `TPIDR_EL1` addresses the block, that the
-/// scheduler updates it on switches, and that what it says agrees with the scheduler.
+/// Entry function for the throwaway task [`selftest`] spawns. Returns immediately;
+/// its only job is to exist so that a `schedule()` call has somewhere to switch to.
+fn probe_entry() {}
+
+/// Prove the per-CPU pointer is real, and that it is refreshed on **every** switch.
 ///
-/// The agreement check is the one that matters. `current_task` is written by
-/// `schedule()` and read back through the register, so a `TPIDR_EL1` that was never
-/// refreshed, or refreshed with the wrong address, disagrees with
-/// [`crate::sched::current_task_id`] — which reads the scheduler's own state through a
-/// different path entirely.
+/// Three separate properties, because they fail independently:
+///
+/// 1. `TPIDR_EL1` addresses the block. Checked directly against the static's address.
+/// 2. The block agrees with the scheduler. `current_task` is written by `schedule()`
+///    and read back *through the register*, while
+///    [`crate::sched::current_task_id`] reads the scheduler's own state through an
+///    entirely different path; a register pointing somewhere wrong disagrees.
+/// 3. **The per-switch `msr` actually happens.** This is the one worth the effort. An
+///    earlier version of this test asserted it in prose and could not detect it:
+///    `init()` already leaves the correct value in the register and nothing else writes
+///    it, so deleting the `write_tpidr` from [`on_context_switch`] entirely would have
+///    left every check passing. So the test now *poisons* the register with a decoy
+///    block, forces a context switch, and requires the switch to have repaired it.
+///    Nothing but the per-switch write can do that.
+///
+/// The poison window is held with interrupts masked and points at real, mapped memory
+/// ([`DECOY_PER_CPU`]), and the register is restored unconditionally afterwards — so
+/// even a `schedule()` that declines to switch cannot leave the machine poisoned.
 pub fn selftest() -> bool {
-    let tpidr = read_tpidr();
     let expected = &raw const PER_CPU as u64;
 
+    let tpidr = read_tpidr();
     if tpidr != expected {
         println!(
             "[selftest] percpu: FAIL — TPIDR_EL1 is {:#018x}, expected {:#018x}",
@@ -246,16 +299,16 @@ pub fn selftest() -> bool {
         return false;
     }
 
-    // SAFETY: checked non-null and equal to the static's address just above.
-    let pc = unsafe { current() };
-    let seen_task = pc.current_task;
+    let Some(pc) = snapshot() else {
+        println!("[selftest] percpu: FAIL — snapshot() is None after init()");
+        return false;
+    };
     let real_task = crate::sched::current_task_id() as u64;
-    let switches = pc.switches;
 
-    // The scheduler must have switched by now — the self-test runs after the round-robin
-    // test, which measured dozens of slices. Zero here means `on_context_switch` is
-    // never being called, which no other check in this file would notice.
-    if switches == 0 {
+    // The scheduler must have switched by now — this runs after the round-robin test,
+    // which measured dozens of slices. Zero means `on_context_switch` is never called
+    // at all, which no other check here would notice.
+    if pc.switches == 0 {
         println!(
             "[selftest] percpu: FAIL — no context switches recorded; \
              `on_context_switch` is not wired into schedule()"
@@ -263,53 +316,62 @@ pub fn selftest() -> bool {
         return false;
     }
 
-    if seen_task != real_task {
+    if pc.current_task != real_task {
         println!(
             "[selftest] percpu: FAIL — TPIDR_EL1 block says task {}, scheduler says {}",
-            seen_task, real_task
+            pc.current_task, real_task
+        );
+        return false;
+    }
+
+    // --- Property 3: the per-switch write ---
+    //
+    // Give `schedule()` somewhere to go. By this point the round-robin workers are all
+    // dead and the ready queue is empty, so a bare `schedule()` would take the
+    // "next_id == current_id" early return and never reach `on_context_switch`.
+    crate::sched::spawn("tpidr-probe", probe_entry);
+
+    let decoy = &raw const DECOY_PER_CPU as u64;
+    let switches_before = pc.switches;
+
+    crate::arch::irq::disable();
+    // SAFETY: `DECOY_PER_CPU` is a live, correctly-typed `PerCpu`, so the register
+    // still points at readable memory for the duration; interrupts are masked, so the
+    // only reader that could observe it (the exception reporter) cannot run.
+    unsafe { write_tpidr(decoy) };
+    // `schedule()` requires interrupts masked, which they are.
+    crate::sched::schedule();
+    let after = read_tpidr();
+    // Restore unconditionally, before deciding anything. If the switch did not happen,
+    // the register is still poisoned and must not be left that way.
+    // SAFETY: `expected` is the address of the real block.
+    unsafe { write_tpidr(expected) };
+    crate::arch::irq::enable();
+
+    let switched = snapshot().is_some_and(|p| p.switches > switches_before);
+    if !switched {
+        println!(
+            "[selftest] percpu: FAIL — could not force a context switch, so the \
+             per-switch TPIDR_EL1 write is unproven"
+        );
+        return false;
+    }
+    if after != expected {
+        println!(
+            "[selftest] percpu: FAIL — after a context switch TPIDR_EL1 is {:#018x}, \
+             expected {:#018x}: `on_context_switch` is updating the block's fields but \
+             not re-writing the register, so it can go stale once EL0 has a second \
+             writer",
+            after, expected
         );
         return false;
     }
 
     println!(
         "[selftest] percpu: PASS (TPIDR_EL1 -> {:#018x}, task {} agrees with the \
-         scheduler, {} switches recorded)",
-        tpidr, seen_task, switches
+         scheduler, {} switches recorded, register repaired by a switch after being \
+         poisoned)",
+        expected, pc.current_task, pc.switches
     );
     true
-}
-
-/// Assert that interrupts are masked, for the exception-return tail.
-///
-/// The aarch64 analog of the Phase 4.5 "syscall-exit double-fault" fix, which made the
-/// x86 exit tail atomic by masking interrupts across it.
-///
-/// The shared state at risk here is different but the shape is the same. `ELR_EL1` and
-/// `SPSR_EL1` are *single registers*, not per-task storage: the entry stub copies them
-/// into the frame on the way in and writes them back on the way out, and between that
-/// write-back and the `eret` they hold this task's return state. An exception taken in
-/// that window would overwrite both with its own, and the `eret` would return to the
-/// wrong place with the wrong PSTATE — the same class of bug as a shared RSP scratch
-/// slot read with interrupts enabled.
-///
-/// Today the window is closed by construction: the CPU masks `DAIF.I` on exception
-/// entry and nothing in the handler path unmasks it, including the `schedule()` call,
-/// which is entered and left masked. That is a property worth *checking* rather than
-/// assuming, because it is invisible in the source — no line says "interrupts are off
-/// here", and a future handler that enables them to do something slow would break the
-/// exit tail with no other symptom than rare, impossible-looking returns.
-#[inline]
-pub fn debug_assert_irqs_masked(where_: &str) {
-    if cfg!(debug_assertions) {
-        let daif: u64;
-        // SAFETY: reading DAIF has no side effects.
-        unsafe { asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack)) };
-        // DAIF bit 7 is I (IRQ mask). Set means masked.
-        assert!(
-            daif & (1 << 7) != 0,
-            "{}: interrupts are unmasked inside the exception path — the ELR/SPSR \
-             write-back before `eret` is no longer atomic",
-            where_
-        );
-    }
 }

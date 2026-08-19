@@ -452,27 +452,15 @@ pub fn schedule() {
             }
         }
 
+        // Stack bounds of the incoming task, for the aarch64 per-CPU block. Read here
+        // because it needs the lock; *published* further down, next to the switch
+        // itself — see the note there for why the gap matters.
         #[cfg(target_arch = "aarch64")]
-        {
-            // Re-point TPIDR_EL1 at the per-CPU block and describe the incoming task.
-            // The aarch64 analog of `refresh_kernel_gs_base` above, in the same place
-            // and for the same reason: TPIDR_EL1 is a global register that
-            // `switch_context` does not save, so the only way it cannot go stale is to
-            // rewrite it on every switch rather than on the switches that seem to need
-            // it. That "seem to need it" is exactly what produced the Phase 4.5 stale
-            // GS-base bug.
-            let (top, limit) = sched.tasks[next_id]
-                .as_ref()
-                .unwrap()
-                .kernel_stack_bounds()
-                .unwrap_or((0, 0));
-            // SAFETY: interrupts are masked for the whole of `schedule()` (asserted at
-            // the top), which is what `on_context_switch` requires so that an exception
-            // cannot observe the block half-updated.
-            unsafe {
-                crate::arch::aarch64::percpu::on_context_switch(next_id as u64, top, limit);
-            }
-        }
+        let next_stack_bounds = sched.tasks[next_id]
+            .as_ref()
+            .unwrap()
+            .kernel_stack_bounds()
+            .unwrap_or((0, 0));
 
         // Get raw pointers to the task contexts. These point into the Vec's
         // buffer, which won't be reallocated because:
@@ -495,10 +483,45 @@ pub fn schedule() {
             (old, new)
         };
 
-        Some((old_ctx, new_ctx))
+        #[cfg(target_arch = "aarch64")]
+        {
+            Some((old_ctx, new_ctx, next_id, next_stack_bounds))
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            Some((old_ctx, new_ctx))
+        }
         // Guard dropped here — lock released
     };
 
+    #[cfg(target_arch = "aarch64")]
+    if let Some((old_ctx, new_ctx, next_id, (top, limit))) = switch_info {
+        // Publish the per-CPU block as late as possible — the next statement is the
+        // switch itself.
+        //
+        // Between this write and `switch_context` swapping stacks, the block says the
+        // incoming task is running while the CPU is still on the *outgoing* task's
+        // stack. Anything that reads it in that window names the wrong task, and
+        // `stack_overflow_hint` compares the outgoing SP against the incoming task's
+        // bounds — which will almost always be outside them and print a spurious
+        // "kernel stack overflow". That window used to be thirty lines of scheduler
+        // bookkeeping wide, and it is newly reachable now that SErrors are unmasked.
+        // It cannot be closed entirely (something has to write the block before the
+        // switch) but it can be made two instructions long, which is this.
+        //
+        // SAFETY: interrupts are masked for the whole of `schedule()` (asserted at the
+        // top), which is what `on_context_switch` requires so that an exception cannot
+        // observe the block half-updated.
+        unsafe {
+            crate::arch::aarch64::percpu::on_context_switch(next_id as u64, top, limit);
+            // SAFETY: Both pointers are valid (checked above), point to stable
+            // memory (Vec buffer with interrupts disabled), and the new task's
+            // stack contains valid saved registers.
+            context::switch_context(old_ctx, new_ctx);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     if let Some((old_ctx, new_ctx)) = switch_info {
         // SAFETY: Both pointers are valid (checked above), point to stable
         // memory (Vec buffer with interrupts disabled), and the new task's
