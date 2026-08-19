@@ -946,14 +946,14 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
 
     // The success sentinel, which advances with each sub-phase to the *last* thing the
-    // boot path proves — currently the exception-vector self-test, which runs after the
-    // memory bring-up and its paging self-test.
+    // boot path proves — currently the scheduler self-test, which runs after the memory
+    // bring-up, the paging self-test, and the exception/GIC/timer self-tests.
     //
     // It is deliberately never left pointing at an earlier milestone. Every marker so
-    // far (the 7.0b banner, then the 7.1 paging sentinel) prints before the work the
-    // next sub-phase adds, so leaving it behind would let that work break while the
-    // smoke saw its marker and stopped looking.
-    const MARKER: &str = "Phase 7.2 exceptions+GIC+timer reached; self-tests passed.";
+    // far (the 7.0b banner, then the 7.1 paging sentinel, then the 7.2 timer sentinel)
+    // prints before the work the next sub-phase adds, so leaving it behind would let
+    // that work break while the smoke saw its marker and stopped looking.
+    const MARKER: &str = "Phase 7.3 scheduler reached; self-test passed.";
 
     // Failure signatures. Without these the only failure mode is "marker never
     // appeared", which costs the full timeout and reports nothing useful. A panic or a
@@ -965,6 +965,8 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
         "Phase 7.2 FAILED self-test",
         "[selftest] exceptions: FAIL",
         "[selftest] timer: FAIL",
+        "Phase 7.3 scheduler FAILED self-test",
+        "[selftest] sched: FAIL",
         "!!! aarch64 EXCEPTION !!!",
     ];
 
@@ -1002,7 +1004,7 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     if found {
         println!(
             "arm64 {what} smoke passed: booted, switched to kernel page tables, and \
-             passed the paging, exception and timer self-tests on QEMU virt."
+             passed the paging, exception, timer and scheduler self-tests on QEMU virt."
         );
     } else {
         eprintln!(
