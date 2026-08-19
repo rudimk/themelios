@@ -200,8 +200,27 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   arrive — one tick would pass even if the timer were never re-armed or the GIC never
   EOI'd, which are the two failure modes here. Verified in CI: `tick 0 -> 5, 5 IRQs, 0
   spurious`, `CNTFRQ = 62.5 MHz`, `GICD TYPER` reads 288 INTIDs.
-- ⬜ **7.3** Scheduler context switch · ⬜ **7.4** Shell, portable tests on aarch64 CI,
-  finalize.
+- ✅ **7.3** **Scheduler context switch + preemption.** `sched` is now arch-neutral: the
+  ready queue, task lifecycle and round-robin policy are shared, with context switching
+  behind a new `arch::context` facade (`arch/{x86_64,aarch64}/context.rs`). aarch64
+  saves the AAPCS64 callee-saved set (x19-x30, 96 bytes — **no FP save area**, sound
+  only because the kernel is softfloat) and `ret`s through the restored **`x30`**, not
+  off the stack as x86 does, so a new task's initial frame puts `task_bootstrap` in the
+  `x30` slot and the entry fn in `x19`. The timer IRQ calls `schedule()` **after**
+  `GICC_EOIR` — a GICv2 CPU interface delivers nothing while an interrupt is active, so
+  scheduling first would stop the next tick ever arriving. What is *not* ported is the
+  ring-3 machinery `sched` also carries (`kernel_stack_top`→TSS.RSP0, `fs_base`,
+  `clone_entry`, CR3 swaps): each is EL0-era state whose aarch64 analog (`SP_EL1`,
+  `TPIDR_EL0`, `TTBR0_EL1`) has nothing to hold in a ring-0-only kernel, so it is
+  `#[cfg]`'d off rather than guessed at. Also fixed `arch::irq` calls in `sched` that
+  7.0a had left `#[cfg]`-gated to x86 — live on aarch64, they would have entered
+  `schedule()` with interrupts unmasked. Proven by a boot self-test the CI smokes
+  assert: three non-yielding workers score **12-14 tick-slices each** (fair share is
+  12.5 across 4 runnable tasks) against a floor of 6, and all three return through
+  `task_exit`. Fairness is measured in *ticks resident*, not loop iterations — under
+  TCG the latter varied 4.5x between identical boots and says nothing about the
+  scheduler.
+- ⬜ **7.4** Shell, portable tests on aarch64 CI, finalize.
 
 **Phase 6 — Management API: COMPLETE (core).** The node is driven entirely
 through an external HTTP API (no SSH, no shell). A ring-3 **`api-server`** holds a
