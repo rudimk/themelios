@@ -61,6 +61,14 @@ impl TaskContext {
     /// Used for the bootstrap task, which represents the execution context already
     /// running when the scheduler starts; its real context is written by the first
     /// [`switch_context`] that preempts it.
+    /// A context whose saved stack pointer is `stack_pointer`.
+    ///
+    /// The pointer must address a frame built by [`setup_initial_stack`] (for a task
+    /// that has never run) or written by [`switch_context`].
+    pub const fn new(stack_pointer: u64) -> Self {
+        Self { sp: stack_pointer }
+    }
+
     pub const fn empty() -> Self {
         Self { sp: 0 }
     }

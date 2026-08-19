@@ -23,6 +23,9 @@
 /// Low-level CPU instructions (I/O ports, halt, etc.).
 pub mod cpu;
 
+/// Task context switching (callee-saved register save/restore, task bootstrap).
+pub mod context;
+
 /// Page-table descriptor format, CR3 control, and TLB maintenance.
 pub mod paging;
 

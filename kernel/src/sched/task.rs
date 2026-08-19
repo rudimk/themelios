@@ -83,26 +83,12 @@ pub enum TaskState {
 /// For a newly created task, `rsp` points to a pre-built stack frame that
 /// mimics a `switch_context` save: callee-saved register slots (with r12
 /// holding the entry function address) and a return address pointing to
-/// `task_bootstrap`. When `switch_context` "restores" this context, it
-/// pops the initial values and `ret`s into `task_bootstrap`.
-#[repr(C)]
-pub struct TaskContext {
-    /// Stack pointer pointing to the saved callee-saved registers on this
-    /// task's kernel stack.
-    pub rsp: u64,
-}
+/// Saved CPU context for a task, supplied by the active architecture.
+///
+/// Re-exported so `Task` and the scheduler name one type regardless of whether the
+/// stack pointer underneath is called `rsp` or `sp`.
+pub use crate::arch::context::TaskContext;
 
-impl TaskContext {
-    /// Create an empty (zeroed) context.
-    ///
-    /// Used for the bootstrap task (task 0) which represents the current
-    /// execution context at the time `sched::init()` is called. Its context
-    /// will be filled in by the first call to `switch_context` when the
-    /// scheduler preempts it.
-    pub const fn empty() -> Self {
-        Self { rsp: 0 }
-    }
-}
 
 /// Number of 4 KiB pages for the usable stack area.
 /// 4 pages = 16 KiB — enough for kernel task call stacks in Phase 1.

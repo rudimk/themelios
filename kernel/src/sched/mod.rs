@@ -59,11 +59,11 @@ use crate::mm::addr::PhysAddr;
 use crate::println;
 use crate::sync::InterruptMutex;
 
-pub mod context;
 pub mod task;
 
 use crate::process::ProcessId;
-use task::{Task, TaskContext, TaskId, TaskState, TOTAL_STACK_PAGES};
+use crate::arch::context::{self, TaskContext};
+use task::{Task, TaskId, TaskState, TOTAL_STACK_PAGES};
 
 /// Whether the scheduler has been initialized. Checked by the timer interrupt
 /// handler to avoid calling `schedule()` before the scheduler exists.
@@ -656,13 +656,15 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
 
     // Set up the initial stack frame to look like switch_context just saved
     // the task's state. See context.rs for the expected stack layout.
-    let initial_rsp = setup_initial_stack(stack_top_virt.as_u64(), entry);
+    // SAFETY: `stack_top_virt` is the top of freshly allocated, mapped stack frames
+    // owned by this task; nothing else refers to them yet.
+    let initial_rsp = unsafe { context::setup_initial_stack(stack_top_virt.as_u64(), entry) };
 
     let task = Task {
         id,
         name: String::from(name),
         state: TaskState::Ready,
-        context: TaskContext { rsp: initial_rsp },
+        context: TaskContext::new(initial_rsp),
         stack_phys_base: Some(phys_base),
         kernel_stack_top: stack_top_virt.as_u64(),
         process_id: ProcessId::KERNEL, // Default to kernel process; caller can override
@@ -695,55 +697,6 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
 /// pushed all callee-saved registers. When `switch_context` later "restores"
 /// from this frame, it will:
 /// 1. Pop r15-r12, rbp, rbx (r12 gets the entry function address)
-/// 2. `ret` into `task_bootstrap` (the return address we place on the stack)
-///
-/// Returns the initial RSP value to store in the task's `TaskContext`.
-///
-/// Stack layout (addresses decreasing = stack growing down):
-/// ```text
-/// stack_top (16-byte aligned):
-///   -0x08: task_bootstrap address   (return addr for switch_context's `ret`)
-///   -0x10: 0                        (initial rbx)
-///   -0x18: 0                        (initial rbp)
-///   -0x20: entry function address   (initial r12 — called by task_bootstrap)
-///   -0x28: 0                        (initial r13)
-///   -0x30: 0                        (initial r14)
-///   -0x38: 0                        (initial r15)
-///          ↑ initial RSP points here
-/// ```
-fn setup_initial_stack(stack_top: u64, entry: fn()) -> u64 {
-    let mut sp = stack_top;
-
-    // The return address for switch_context's `ret` — enters task_bootstrap.
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = context::task_bootstrap as *const () as u64; }
-
-    // rbx = 0 (no specific initial value needed)
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    // rbp = 0 (frame pointer — zero to terminate stack traces)
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    // r12 = entry function address (task_bootstrap will `call r12`)
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = entry as *const () as u64; }
-
-    // r13 = 0
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    // r14 = 0
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    // r15 = 0
-    sp -= 8;
-    unsafe { *(sp as *mut u64) = 0; }
-
-    sp
-}
 
 /// Clean up dead tasks by freeing their stacks and clearing their slots.
 ///
