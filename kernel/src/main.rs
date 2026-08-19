@@ -149,7 +149,6 @@ mod test_runner;
 /// The core security primitive of ThemeliOS. All resource access is mediated
 /// by unforgeable capability tokens — processes can only use resources they've
 /// been explicitly granted access to.
-#[cfg(target_arch = "x86_64")]
 mod cap;
 
 /// Process abstraction.
@@ -157,6 +156,25 @@ mod cap;
 /// unit of isolation. The kernel process (PID 0) owns all boot-time tasks.
 #[cfg(target_arch = "x86_64")]
 mod process;
+
+/// Process identity, without a process table.
+///
+/// The full `process` module — the table, address spaces, CSpace ownership, the
+/// embedded-server plumbing — is ring-3 machinery and stays x86_64-only until the EL0
+/// port. But `ProcessId` is just a newtype, and both `cap` and `audit` need it to say
+/// *who* performed an operation. On aarch64 the honest answer is always the kernel:
+/// there is exactly one process until EL0 lands, and `sched::current_process_id`
+/// returns `ProcessId::KERNEL` to say so.
+///
+/// Exposing the identity type without the table keeps the capability system and the
+/// audit log genuinely portable, rather than stubbing them out and losing the
+/// architecture's flagship test on half its targets.
+#[cfg(not(target_arch = "x86_64"))]
+mod process {
+    #[path = "pid.rs"]
+    pub mod pid;
+    pub use pid::ProcessId;
+}
 
 /// Inter-process communication.
 /// Message passing between processes. Since ThemeliOS is a microkernel,
@@ -169,7 +187,6 @@ mod ipc;
 /// A tamper-evident ring buffer recording all security-relevant kernel
 /// operations: capability create/grant/revoke, IPC send/receive, and
 /// syscall invocations. Kernel-internal only in Phase 2.
-#[cfg(target_arch = "x86_64")]
 mod audit;
 
 /// Device drivers.
@@ -198,7 +215,6 @@ mod linux;
 /// Dependency-light (alloc-only) so it can lift into a ring-3 `oci-server`. Used
 /// by the Phase 5.5 container runtime.
 #[allow(dead_code)] // a complete tar/JSON reader; callers use a subset
-#[cfg(target_arch = "x86_64")]
 mod oci;
 
 /// Container runtime (Phase 5.5): unpack an image, assemble its rootfs, and launch
@@ -211,7 +227,6 @@ mod container;
 /// so it lifts into the ring-3 `api-server`; the registry client reuses the shared
 /// helpers for its response parsing.
 #[allow(dead_code)] // request parser + helpers; the api-server (6.5) uses the full surface
-#[cfg(target_arch = "x86_64")]
 mod http;
 
 /// Container management ABI (Phase 6.3): the capability-guarded ring-0 surface the

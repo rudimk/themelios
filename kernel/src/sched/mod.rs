@@ -83,7 +83,6 @@ use crate::sync::InterruptMutex;
 
 pub mod task;
 
-#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessId;
 use crate::arch::context::{self, TaskContext};
 use task::{Task, TaskId, TaskState, TOTAL_STACK_PAGES};
@@ -582,8 +581,21 @@ pub fn current_task_id() -> TaskId {
         .current_id
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Get the current task's process ID.
+///
+/// On aarch64 this is always [`ProcessId::KERNEL`], and that is a statement of fact
+/// rather than a placeholder: the port is ring-0 only, so every task belongs to the
+/// kernel process and `Task` carries no `process_id` field to read. The capability
+/// system and the audit log both attribute operations to a process, and answering
+/// "the kernel" is correct there — where it stops being correct is the moment EL0
+/// lands, at which point `Task::process_id` un-gates and this reads it like x86 does.
+#[cfg(target_arch = "aarch64")]
+pub fn current_process_id() -> ProcessId {
+    ProcessId::KERNEL
+}
+
+/// Get the current task's process ID.
+#[cfg(target_arch = "x86_64")]
 pub fn current_process_id() -> ProcessId {
     let guard = SCHEDULER.lock();
     let sched = guard.as_ref().expect("Scheduler not initialized");

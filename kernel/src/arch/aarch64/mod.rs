@@ -47,6 +47,9 @@ pub mod timer;
 
 pub mod irq;
 
+/// PSCI power control — how the machine stops (the `isa-debug-exit` analog).
+pub mod psci;
+
 /// Per-CPU data addressed through `TPIDR_EL1` (the GS-base analog).
 pub mod percpu;
 
