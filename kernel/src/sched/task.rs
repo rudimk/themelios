@@ -43,6 +43,7 @@
 
 use alloc::string::String;
 use crate::mm::addr::PhysAddr;
+#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessId;
 
 /// Unique identifier for each task.
@@ -128,16 +129,24 @@ pub struct Task {
     pub stack_phys_base: Option<PhysAddr>,
 
     /// Top of this task's kernel stack (highest valid address, stack grows down).
+    ///
     /// Written to TSS.RSP0 and PerCpu.kernel_stack_top on every context switch
     /// so that ring 3 → ring 0 transitions (syscall, interrupt) land on the
     /// correct kernel stack. Zero for the bootstrap task (which uses Limine's
     /// boot stack and never transitions from ring 3).
+    ///
+    /// x86_64 only — it exists to feed TSS.RSP0, and aarch64 has no TSS. The
+    /// equivalent there is `SP_EL1`, which the CPU switches to on exception entry
+    /// without the kernel having to stage an address anywhere, so this field arrives
+    /// with the EL0 port rather than with the scheduler.
+    #[cfg(target_arch = "x86_64")]
     pub kernel_stack_top: u64,
 
     /// The process this task belongs to. All boot-time tasks (main, idle, shell)
     /// belong to PID 0 (the kernel process). User tasks belong to the process
     /// that spawned them. The scheduler uses this to determine whether a CR3
     /// switch is needed on context switch (different process → different address space).
+    #[cfg(target_arch = "x86_64")]
     pub process_id: ProcessId,
 
     /// The x86-64 `IA32_FS_BASE` value for this task (Phase 5.1). Linux thread-
@@ -145,15 +154,18 @@ pub struct Task {
     /// FS base is a global register not saved by `switch_context`, so — exactly
     /// like the GS base — the scheduler restores it from here on every context
     /// switch. 0 for tasks that don't use TLS (kernel tasks, native servers).
+    #[cfg(target_arch = "x86_64")]
     pub fs_base: u64,
 
     /// Ring-3 entry for a task created by Linux `clone` (Phase 5.3): the child
     /// resumes at the parent's post-`syscall` RIP on its own stack. `(rip, rsp)`;
     /// `None` for tasks that enter ring 3 by other means (ELF exec, servers).
+    #[cfg(target_arch = "x86_64")]
     pub clone_entry: Option<(u64, u64)>,
 
     /// The Linux `CLONE_CHILD_CLEARTID` / `set_tid_address` futex word (Phase
     /// 5.3): on thread exit the kernel writes 0 here and futex-wakes it, which is
     /// how `pthread_join` observes a thread has finished. 0 if unset.
+    #[cfg(target_arch = "x86_64")]
     pub clear_child_tid: u64,
 }

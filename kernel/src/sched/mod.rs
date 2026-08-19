@@ -61,6 +61,7 @@ use crate::sync::InterruptMutex;
 
 pub mod task;
 
+#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessId;
 use crate::arch::context::{self, TaskContext};
 use task::{Task, TaskId, TaskState, TOTAL_STACK_PAGES};
@@ -146,10 +147,16 @@ pub fn init() {
         state: TaskState::Running,
         context: TaskContext::empty(),
         stack_phys_base: None,
+        // Ring-3 / Linux-thread state, x86_64 only — see `task::Task`.
+        #[cfg(target_arch = "x86_64")]
         kernel_stack_top: 0, // Bootstrap uses Limine's stack; never returns from ring 3
+        #[cfg(target_arch = "x86_64")]
         process_id: ProcessId::KERNEL,
+        #[cfg(target_arch = "x86_64")]
         fs_base: 0,
+        #[cfg(target_arch = "x86_64")]
         clone_entry: None,
+        #[cfg(target_arch = "x86_64")]
         clear_child_tid: 0,
     }));
     sched.current_id = bootstrap_id;
@@ -195,6 +202,7 @@ pub fn spawn(name: &str, entry: fn()) -> TaskId {
     id
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Set the current task's `IA32_FS_BASE` (Linux TLS) and apply it immediately.
 ///
 /// Called by `arch_prctl(ARCH_SET_FS)` (Phase 5.1): records the base on the task
@@ -213,6 +221,7 @@ pub fn set_current_fs_base(fs_base: u64) {
     crate::arch::x86_64::syscall::write_fs_base(fs_base);
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Set another task's FS base (Linux TLS) by id — used by `clone(CLONE_SETTLS)`
 /// to seed a freshly-created thread's `%fs` before it first runs.
 pub fn set_task_fs_base(id: TaskId, fs_base: u64) {
@@ -223,6 +232,7 @@ pub fn set_task_fs_base(id: TaskId, fs_base: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Record a `clone`-created thread's ring-3 entry `(rip, rsp)` (Phase 5.3). The
 /// [`thread_trampoline`](crate::linux::thread::thread_trampoline) reads it back.
 pub fn set_task_clone_entry(id: TaskId, rip: u64, rsp: u64) {
@@ -233,6 +243,7 @@ pub fn set_task_clone_entry(id: TaskId, rip: u64, rsp: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Set a task's `CLONE_CHILD_CLEARTID` futex word address (Phase 5.3).
 pub fn set_task_clear_child_tid(id: TaskId, addr: u64) {
     let mut guard = SCHEDULER.lock();
@@ -242,6 +253,7 @@ pub fn set_task_clear_child_tid(id: TaskId, addr: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Read the current task's `clone` entry `(rip, rsp)`, if it was created by
 /// `clone` (used by the thread trampoline to enter ring 3).
 pub fn current_clone_entry() -> Option<(u64, u64)> {
@@ -254,6 +266,7 @@ pub fn current_clone_entry() -> Option<(u64, u64)> {
         .and_then(|t| t.clone_entry)
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Read (and clear) the current task's `clear_child_tid` address — called on
 /// thread exit so the kernel can zero + futex-wake the join word exactly once.
 pub fn take_current_clear_child_tid() -> u64 {
@@ -268,6 +281,7 @@ pub fn take_current_clear_child_tid() -> u64 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Set the current task's `clear_child_tid` (Linux `set_tid_address`).
 pub fn set_current_clear_child_tid(addr: u64) {
     let mut guard = SCHEDULER.lock();
@@ -277,6 +291,7 @@ pub fn set_current_clear_child_tid(addr: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Read the current task's `IA32_FS_BASE` value (for `arch_prctl(ARCH_GET_FS)`).
 pub fn current_fs_base() -> u64 {
     let guard = SCHEDULER.lock();
@@ -354,40 +369,48 @@ pub fn schedule() {
         // base, IA32_FS_BASE is a global register `switch_context` does not save,
         // so a Linux thread's `%fs`-relative TLS accesses would use whatever base
         // the previous task left behind. Reload it from the task on every switch.
+        //
+        // aarch64's analog is TPIDR_EL0, which arrives with the EL0 port.
         #[cfg(target_arch = "x86_64")]
         crate::arch::x86_64::syscall::write_fs_base(
             sched.tasks[next_id].as_ref().unwrap().fs_base,
         );
 
-        // Update TSS.RSP0 and PerCpu.kernel_stack_top for the new task.
-        // This must happen BEFORE the context switch so that if the new task
-        // is in ring 3 and gets interrupted (or does a syscall), the CPU uses
-        // the correct kernel stack. On a single-core system with interrupts
-        // disabled, there's no race — the values are set before the switch.
-        // (For kernel tasks with kernel_stack_top == 0 we leave the stack alone;
-        // they never enter `syscall_entry`, and the next ring-3 switch sets it.)
-        let next_stack_top = sched.tasks[next_id].as_ref().unwrap().kernel_stack_top;
-        if next_stack_top != 0 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
-                crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Update TSS.RSP0 and PerCpu.kernel_stack_top for the new task.
+            // This must happen BEFORE the context switch so that if the new task
+            // is in ring 3 and gets interrupted (or does a syscall), the CPU uses
+            // the correct kernel stack. On a single-core system with interrupts
+            // disabled, there's no race — the values are set before the switch.
+            // (For kernel tasks with kernel_stack_top == 0 we leave the stack alone;
+            // they never enter `syscall_entry`, and the next ring-3 switch sets it.)
+            let next_stack_top = sched.tasks[next_id].as_ref().unwrap().kernel_stack_top;
+            if next_stack_top != 0 {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
+                    crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
+                }
             }
         }
 
-        // Switch CR3 if the next task belongs to a different process.
-        // Changing CR3 flushes the user-half TLB entries (kernel-half entries
-        // are shared across all address spaces via the same PML4 upper-half
-        // entries, but the CPU flushes everything on CR3 write). We skip the
-        // CR3 write if both tasks are in the same process (same address space)
-        // or if both are in the kernel process (PID 0, which has no separate
-        // address space).
-        let current_pid = sched.tasks[current_id].as_ref().unwrap().process_id;
-        let next_pid = sched.tasks[next_id].as_ref().unwrap().process_id;
-        if current_pid != next_pid {
-            if let Some(pml4_phys) = crate::process::process_pml4(next_pid) {
-                #[cfg(target_arch = "x86_64")]
-                unsafe { crate::arch::x86_64::cpu::write_cr3(pml4_phys); }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Switch CR3 if the next task belongs to a different process.
+            // Changing CR3 flushes the user-half TLB entries (kernel-half entries
+            // are shared across all address spaces via the same PML4 upper-half
+            // entries, but the CPU flushes everything on CR3 write). We skip the
+            // CR3 write if both tasks are in the same process (same address space)
+            // or if both are in the kernel process (PID 0, which has no separate
+            // address space).
+            let current_pid = sched.tasks[current_id].as_ref().unwrap().process_id;
+            let next_pid = sched.tasks[next_id].as_ref().unwrap().process_id;
+            if current_pid != next_pid {
+                if let Some(pml4_phys) = crate::process::process_pml4(next_pid) {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { crate::arch::x86_64::cpu::write_cr3(pml4_phys); }
+                }
             }
         }
 
@@ -464,6 +487,7 @@ pub fn current_task_id() -> TaskId {
         .current_id
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Get the current task's process ID.
 pub fn current_process_id() -> ProcessId {
     let guard = SCHEDULER.lock();
@@ -471,6 +495,7 @@ pub fn current_process_id() -> ProcessId {
     sched.tasks[sched.current_id].as_ref().unwrap().process_id
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Spawn a new task within a specific process.
 ///
 /// Like `spawn()`, but assigns the task to the given process instead of
@@ -643,7 +668,7 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
     // with the scheduler, not with the MMU port.
 
     // The usable stack starts after the padding page(s) and extends to the top.
-    // Stack grows downward, so the initial RSP points to the top (highest address).
+    // Stack grows downward, so the initial SP points to the top (highest address).
     let stack_top_phys = PhysAddr::new(
         phys_base.as_u64() + (TOTAL_STACK_PAGES as u64) * mm::PAGE_SIZE
     );
@@ -653,18 +678,24 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
     // the task's state. See context.rs for the expected stack layout.
     // SAFETY: `stack_top_virt` is the top of freshly allocated, mapped stack frames
     // owned by this task; nothing else refers to them yet.
-    let initial_rsp = unsafe { context::setup_initial_stack(stack_top_virt.as_u64(), entry) };
+    let initial_sp = unsafe { context::setup_initial_stack(stack_top_virt.as_u64(), entry) };
 
     let task = Task {
         id,
         name: String::from(name),
         state: TaskState::Ready,
-        context: TaskContext::new(initial_rsp),
+        context: TaskContext::new(initial_sp),
         stack_phys_base: Some(phys_base),
+        // Ring-3 / Linux-thread state, x86_64 only — see `task::Task`.
+        #[cfg(target_arch = "x86_64")]
         kernel_stack_top: stack_top_virt.as_u64(),
+        #[cfg(target_arch = "x86_64")]
         process_id: ProcessId::KERNEL, // Default to kernel process; caller can override
+        #[cfg(target_arch = "x86_64")]
         fs_base: 0, // set by arch_prctl(ARCH_SET_FS) for Linux TLS (Phase 5.1)
+        #[cfg(target_arch = "x86_64")]
         clone_entry: None, // set by Linux clone() for thread tasks (Phase 5.3)
+        #[cfg(target_arch = "x86_64")]
         clear_child_tid: 0,
     };
 

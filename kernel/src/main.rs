@@ -124,7 +124,12 @@ mod mm;
 /// Process scheduler.
 /// Manages kernel and userspace tasks, implements scheduling policies,
 /// and handles context switching.
-#[cfg(target_arch = "x86_64")]
+///
+/// Architecture-neutral as of Phase 7.3: the ready queue, task lifecycle and
+/// round-robin policy are shared, while context switching goes through
+/// `arch::context`. The ring-3/EL0 machinery it also carries on x86_64 — TSS
+/// stack switching, FS-base restore, CR3 swaps, and the Linux thread fields — is
+/// `#[cfg]`'d out on aarch64 along with the rest of the deferred userspace port.
 mod sched;
 
 /// Interactive debug shell.
