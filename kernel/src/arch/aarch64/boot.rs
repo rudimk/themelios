@@ -6,12 +6,22 @@
 //! minimum to get an interactive-quality console up, then idle. The scheduler, the
 //! kernel's own page tables, exceptions, and the timer land in 7.1–7.3.
 //!
-//! Two things must happen before the first `println!`:
-//! 1. **Enable FP/SIMD.** `aarch64-unknown-none` is a hardfloat target and the
-//!    compiler lowers ordinary struct-moves / formatting to SIMD, which **traps** at
-//!    EL1 unless `CPACR_EL1.FPEN = 0b11` (spike-confirmed: a bare `f64` op faults with
-//!    `ESR_EL1.EC = 0x07`). Limine does not guarantee it.
-//! 2. **Map the PL011 UART.** Limine's HHDM maps RAM but **not** device MMIO, so the
+//! ## FP/SIMD is deliberately left disabled
+//!
+//! Phase 7.0b built for the *hardfloat* `aarch64-unknown-none` target, where the
+//! compiler lowers struct moves and `core::fmt` to SIMD, and so had to enable
+//! `CPACR_EL1.FPEN` before the first `println!` or those lowerings trapped.
+//!
+//! The kernel now targets **`aarch64-unknown-none-softfloat`**, which emits no vector
+//! instructions, so `FPEN` stays as Limine left it. That is not merely simpler — it is
+//! what makes the exception path sound. The entry stub saves x0-x30 and no vector
+//! registers, so a handler touching FP on a returning path would silently corrupt the
+//! interrupted context. With softfloat *and* `FPEN` off, any SIMD that ever sneaks in
+//! traps loudly as `ESR_EL1.EC = 0x07` — which the exception decoder names — instead
+//! of corrupting memory quietly.
+//!
+//! One thing must still happen before the first `println!`:
+//! 1. **Map the PL011 UART.** Limine's HHDM maps RAM but **not** device MMIO, so the
 //!    UART at physical `0x0900_0000` is unmapped after handoff (spike-confirmed: both
 //!    raw-phys and `HHDM + 0x0900_0000` data-abort). We add a single Device-`nGnRnE`
 //!    page to the kernel tables (`TTBR1_EL1`) pointing at the UART, then install the
@@ -73,20 +83,48 @@ fn read_sysreg_ttbr1() -> u64 {
 }
 
 
-/// Enable FP/SIMD at EL1 (`CPACR_EL1.FPEN = 0b11`) so compiler-emitted SIMD does not
-/// trap. Must run before any non-trivial Rust (formatting, struct moves).
+/// Switch to `SP_EL1` for ordinary kernel execution.
+///
+/// Limine hands off with **`SPSel = 0`**, meaning EL1 code runs on `SP_EL0` while
+/// `SP_EL1` holds whatever the bootloader left there. That is not a stylistic detail —
+/// it decides both *where exceptions are delivered* and *what stack they land on*:
+///
+/// - With `SPSel = 0`, a synchronous exception at EL1 goes to the **`0x000`** vector
+///   group ("current EL with SP_EL0"), not the `0x200` group.
+/// - On entry the CPU switches to `SP_EL1` regardless. If nothing has initialised it,
+///   the entry stub's register save writes through a garbage pointer and takes a data
+///   abort *inside the handler* — which then nests, lands in the `0x200` group, and
+///   reports the nested syndrome. The original exception is never seen.
+///
+/// That failure is genuinely confusing from the outside: a `brk` presents as a data
+/// abort at a fixed address, in the wrong vector slot, with an `SPSR` describing the
+/// nested state rather than the interrupted one.
+///
+/// Copying the live stack pointer across and setting `SPSel = 1` makes the kernel run
+/// on `SP_EL1` from here on, so exceptions are delivered to the `0x200` group with a
+/// valid stack already loaded. SP is numerically unchanged, so this is invisible to
+/// the surrounding Rust.
+///
+/// Note that handler and interrupted code then share one stack — there is no IST/TSS
+/// analog on aarch64, so a kernel-stack overflow re-faults on the same stack. Accepted
+/// for bring-up; a dedicated exception stack is future work.
 #[inline(always)]
-fn enable_fp() {
-    // SAFETY: CPACR_EL1 write is a PSTATE/feature-enable with an ISB to sequence it.
+fn use_sp_el1() {
+    // SAFETY: copies the current stack pointer into SP_EL1 and selects it, so the
+    // numeric value of `sp` is unchanged across the sequence. The ISB ensures the
+    // SPSel write has taken effect before the next instruction.
     unsafe {
         asm!(
-            "msr CPACR_EL1, {}",
+            "mov x9, sp",
+            "msr SPSel, #1",
+            "mov sp, x9",
             "isb",
-            in(reg) (0b11u64 << 20),
-            options(nostack),
+            out("x9") _,
+            options(preserves_flags),
         );
     }
 }
+
 
 /// Allocate a zeroed page table from the pool; returns its kernel virtual address.
 ///
@@ -185,7 +223,8 @@ pub fn kmain_aarch64(
     k: KernelAddr,
     entries: &[&limine::memory_map::Entry],
 ) -> ! {
-    enable_fp();
+    // Must precede anything that can take an exception — see the function docs.
+    use_sp_el1();
 
     // Map the PL011 at its HHDM address (upper-half, currently unmapped) and install
     // the serial writer there.
@@ -209,18 +248,138 @@ pub fn kmain_aarch64(
     crate::println!("[boot] Limine higher-half handoff OK (MMU on)");
     crate::println!("[boot] HHDM offset: {:#018x}", hhdm);
     crate::println!("[boot] kernel phys/virt base: {:#x} / {:#018x}", k.phys_base, k.virt_base);
-    crate::println!("[boot] FP/SIMD enabled (CPACR_EL1.FPEN)");
+    crate::println!("[boot] FP/SIMD left disabled (softfloat kernel; stray SIMD traps)");
+    {
+        let spsel: u64;
+        // SAFETY: reading SPSel has no side effects.
+        unsafe { asm!("mrs {}, SPSel", out(reg) spsel, options(nomem, nostack)) };
+        crate::println!(
+            "[boot] SPSel={} (running on SP_EL{}) — exceptions use the SP_ELx vectors",
+            spsel & 1,
+            spsel & 1
+        );
+    }
     crate::println!("[boot] PL011 mapped + serial online");
     crate::println!("[boot] Phase 7.0b boot-to-banner reached; idling.");
+
+    // Install exception vectors before anything that can fault. Until this runs, a
+    // data abort branches to whatever VBAR_EL1 held at handoff and the kernel dies
+    // silently; afterwards it prints a decoded syndrome, faulting address and PC.
+    // Deliberately ahead of the memory bring-up so a paging mistake is diagnosable.
+    crate::arch::aarch64::exceptions::init();
 
     // --- Phase 7.1: memory management on our own page tables ---
     bring_up_memory(hhdm, k, entries);
 
-    crate::println!("[boot] (exceptions+GIC+timer=7.2, sched=7.3, shell=7.4)");
+    // Prove the synchronous-exception path with a real trap. Reported together with
+    // the interrupt path below, in the single sentinel the CI smokes assert.
+    let exc_ok = crate::arch::aarch64::exceptions::selftest();
+
+    // --- Interrupt controller + periodic tick ---
+    crate::arch::aarch64::gic::init();
+    crate::arch::aarch64::timer::init();
+
+    let timer_ok = timer_selftest();
+    if exc_ok && timer_ok {
+        crate::println!("[boot] Phase 7.2 exceptions+GIC+timer reached; self-tests passed.");
+    } else {
+        crate::println!("[boot] Phase 7.2 FAILED self-test.");
+    }
+
+    crate::println!("[boot] (sched=7.3, shell=7.4)");
 
     loop {
         crate::arch::irq::halt();
     }
+}
+
+/// Prove the timer ticks, **at the right rate**.
+///
+/// Acceptance for 7.2 is "the timer IRQ fires at a fixed rate and increments the
+/// tick". Counting interrupts alone does not show that, and an earlier version of this
+/// test — which waited for five ticks and checked nothing else — could not tell a
+/// healthy timer from a runaway one.
+///
+/// The reason is that `CNTV` drives a **level** line into the GIC. If the handler
+/// failed to re-arm, the compare condition would stay met and the GIC would re-pend
+/// immediately after every `EOIR`: five ticks would arrive in microseconds rather than
+/// 50 ms, with five IRQs and no spurious ones, printing a PASS line
+/// character-for-character identical to the healthy case. So the test brackets the
+/// wait with `CNTVCT_EL0` and checks the elapsed counter time is in the right
+/// neighbourhood. That is the difference between "five interrupts happened" and "five
+/// interrupts happened, 10 ms apart".
+///
+/// The wait is deadlined on the counter too, not on `wfi` returns. `wfi` only wakes on
+/// an interrupt, and in this phase the timer is the *only* interrupt source — so if
+/// delivery is broken, `wfi` blocks forever and a loop counting its returns can never
+/// time out. The counter advances regardless, which makes it the only sound clock for
+/// timing out a test of the interrupt path.
+fn timer_selftest() -> bool {
+    use crate::arch::aarch64::timer::read_cntvct;
+    use crate::arch::time::tick_count;
+
+    const WANT_TICKS: u64 = 5;
+
+    let reload = crate::arch::aarch64::timer::reload();
+    let expect = reload * WANT_TICKS;
+    // Give delivery four periods of slack before declaring failure.
+    let deadline_ticks = expect * 4;
+
+    let start = tick_count();
+    let c0 = read_cntvct();
+    crate::println!(
+        "[timer] waiting for {} ticks (tick={}, expecting ~{} counter units)...",
+        WANT_TICKS, start, expect
+    );
+
+    crate::arch::irq::enable();
+    while tick_count() < start + WANT_TICKS && read_cntvct() - c0 < deadline_ticks {
+        crate::arch::irq::halt(); // wfi — sleeps until the next interrupt
+    }
+    let elapsed = read_cntvct() - c0;
+    crate::arch::irq::disable();
+
+    let end = tick_count();
+    let irqs = crate::arch::aarch64::gic::irq_count();
+    let spurious = crate::arch::aarch64::gic::spurious_count();
+    let got_ticks = end >= start + WANT_TICKS;
+    // Half to double the expected interval. Wide enough not to be flaky under a loaded
+    // CI runner, tight enough that a storm (elapsed ≈ 0) or a stalled timer fails.
+    let rate_ok = elapsed >= expect / 2 && elapsed <= expect * 2;
+
+    if got_ticks && rate_ok {
+        crate::println!(
+            "[selftest] timer: PASS (tick {} -> {}, {} IRQs, {} spurious, {} counter \
+             units elapsed vs {} expected)",
+            start, end, irqs, spurious, elapsed, expect
+        );
+        return true;
+    }
+
+    crate::println!(
+        "[selftest] timer: FAIL — tick {} -> {}, {} IRQs, {} spurious, {} counter units \
+         elapsed vs {} expected",
+        start, end, irqs, spurious, elapsed, expect
+    );
+    // Name the suspect. These branches are now reachable: the loop exits on the
+    // counter deadline even when no interrupt is ever delivered.
+    if irqs == 0 {
+        crate::println!(
+            "  no IRQs reached the CPU: check GICC_PMR/GICC_CTLR/GICD_CTLR, the PPI \
+             enable, and that DAIF.I is actually clear"
+        );
+    } else if got_ticks && !rate_ok && elapsed < expect / 2 {
+        crate::println!(
+            "  ticks arrived far too fast: the timer is not being re-armed, so the \
+             level line stays asserted and the GIC re-pends after every EOI"
+        );
+    } else if irqs == 1 {
+        crate::println!(
+            "  exactly one IRQ: it was never completed (GICC_EOIR), so nothing further \
+             was delivered"
+        );
+    }
+    false
 }
 
 /// Bring up the memory subsystem: frame allocator, kernel heap, and the kernel's own

@@ -614,7 +614,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // Disable interrupts immediately — we don't want any more interrupt
     // handlers running after a panic. This must happen BEFORE printing,
     // in case a timer or other interrupt tries to use panicked state.
-    #[cfg(target_arch = "x86_64")]
+    //
+    // Arch-neutral, deliberately. This used to be gated to x86_64, which was
+    // harmless only while aarch64 took no interrupts at all. Once the GIC and timer
+    // are up (Phase 7.2) a gated version means a panicked ARM kernel keeps servicing
+    // timer interrupts while it prints — and once the scheduler is wired into that
+    // handler (7.3), a panicked kernel would be preempted and scheduled away,
+    // continuing to run normally after a fault. For a capability-enforcing
+    // microkernel that is the worst available post-fault behaviour.
     crate::arch::irq::disable();
 
     // Print the panic info to the global serial writer. If the serial port
@@ -629,22 +636,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 /// Halt and Catch Fire — stop the CPU permanently.
 ///
-/// Disables interrupts (CLI) and then enters an infinite halt loop. With
-/// interrupts disabled, `hlt` will never wake up — the CPU is fully stopped.
-/// The loop is a safety net in case an NMI (non-maskable interrupt) wakes
-/// the CPU despite CLI; we just halt again.
+/// Masks interrupts and then enters an infinite halt loop (`hlt` on x86_64, `wfi` on
+/// aarch64). With interrupts masked the halt never wakes, so the CPU is genuinely
+/// stopped. The loop is a safety net in case something non-maskable wakes it anyway.
+///
+/// Both steps go through the arch-neutral [`arch::irq`] facade. They were previously
+/// gated to x86_64, leaving aarch64 spinning with interrupts *unmasked* — which stops
+/// being cosmetic the moment there is a live timer to wake it.
+///
+/// [`arch::irq`]: crate::arch::irq
 fn hcf() -> ! {
-    // Disable interrupts so that `hlt` truly halts — without CLI, any
-    // pending interrupt would wake the CPU from `hlt` and we'd resume
-    // execution, which we don't want after a panic or clean shutdown.
-    #[cfg(target_arch = "x86_64")]
+    // Mask interrupts so the halt below truly halts — otherwise any pending
+    // interrupt wakes the CPU and we resume executing after a panic or shutdown.
     crate::arch::irq::disable();
 
     loop {
-        #[cfg(target_arch = "x86_64")]
         crate::arch::irq::halt();
-
-        #[cfg(not(target_arch = "x86_64"))]
-        core::hint::spin_loop();
     }
 }

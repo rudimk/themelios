@@ -192,7 +192,7 @@ milestone does not imply "containers on ARM".
 | 7.0b | Boot to banner on QEMU `virt` (PL011 over UEFI) | Complete |
 | 7.0c | Separate amd64/arm64 ISOs + arm64 ISO boot smoke | Complete |
 | 7.1 | MMU / paging on kernel-owned tables | Complete |
-| 7.2 | Exceptions + GIC + timer tick | Not started |
+| 7.2 | Exceptions + GIC + timer tick | Complete |
 | 7.3 | Scheduler context switch | Not started |
 | 7.4 | Shell, portable tests on aarch64 CI, finalize | Not started |
 

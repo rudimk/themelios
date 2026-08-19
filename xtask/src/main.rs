@@ -51,7 +51,7 @@ const BUILD_STD_FEATURES: &str = "-Zbuild-std-features=compiler-builtins-mem";
 fn resolve_target(arch: &str) -> &'static str {
     match arch {
         "x86_64" | "amd64" | "x86-64" => "x86_64-unknown-none",
-        "aarch64" | "arm64" => "aarch64-unknown-none",
+        "aarch64" | "arm64" => "aarch64-unknown-none-softfloat",
         other => {
             eprintln!("Error: unknown architecture '{other}'");
             eprintln!("Supported: x86_64 (amd64), aarch64 (arm64)");
@@ -370,7 +370,7 @@ fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
 ///
 /// `iso`/`run --arch aarch64` are both supported and are not routed here.
 fn reject_aarch64_test(target: &str) {
-    if target != "aarch64-unknown-none" {
+    if target != "aarch64-unknown-none-softfloat" {
         return;
     }
     eprintln!("Error: `xtask test` cannot run the suite on aarch64 yet.");
@@ -854,7 +854,7 @@ fn cmd_arm64_smoke(_args: &[String]) {
     let status = Command::new("cargo")
         .current_dir(&root)
         .args([
-            "build", "--package", "themelios", "--target", "aarch64-unknown-none",
+            "build", "--package", "themelios", "--target", "aarch64-unknown-none-softfloat",
             BUILD_STD, BUILD_STD_FEATURES,
         ])
         .status()
@@ -864,7 +864,7 @@ fn cmd_arm64_smoke(_args: &[String]) {
         process::exit(1);
     }
 
-    let kernel = root.join("target/aarch64-unknown-none/debug/themelios");
+    let kernel = root.join("target/aarch64-unknown-none-softfloat/debug/themelios");
     let limine_dir = ensure_limine(&root);
     let (esp, code, vars) = prepare_aarch64_boot(&root, &kernel, &limine_dir);
 
@@ -895,9 +895,9 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
     iso_args.push("aarch64".to_string());
     cmd_build(&iso_args);
 
-    let kernel = root.join("target/aarch64-unknown-none/debug/themelios");
+    let kernel = root.join("target/aarch64-unknown-none-softfloat/debug/themelios");
     let limine_dir = ensure_limine(&root);
-    let iso = create_iso(&root, &kernel, &limine_dir, "aarch64-unknown-none");
+    let iso = create_iso(&root, &kernel, &limine_dir, "aarch64-unknown-none-softfloat");
 
     let (code, vars) = match find_aavmf() {
         Some(pair) => pair,
@@ -945,14 +945,15 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
 fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
 
-    // The success sentinel. As of Phase 7.1 this is the *end* of the memory bring-up,
-    // not the 7.0b banner: the kernel has switched to its own TTBR1 tables and the
-    // map/translate/read-write/unmap self-test has passed.
+    // The success sentinel, which advances with each sub-phase to the *last* thing the
+    // boot path proves — currently the exception-vector self-test, which runs after the
+    // memory bring-up and its paging self-test.
     //
-    // Deliberately not the 7.0b banner any more. That line prints before any MMU work,
-    // so keeping it as the marker would let a completely broken pager go green — the
-    // smoke would see the banner and stop looking.
-    const MARKER: &str = "Phase 7.1 MMU/paging reached; self-test passed.";
+    // It is deliberately never left pointing at an earlier milestone. Every marker so
+    // far (the 7.0b banner, then the 7.1 paging sentinel) prints before the work the
+    // next sub-phase adds, so leaving it behind would let that work break while the
+    // smoke saw its marker and stopped looking.
+    const MARKER: &str = "Phase 7.2 exceptions+GIC+timer reached; self-tests passed.";
 
     // Failure signatures. Without these the only failure mode is "marker never
     // appeared", which costs the full timeout and reports nothing useful. A panic or a
@@ -961,6 +962,10 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
         "KERNEL PANIC",
         "Phase 7.1 MMU/paging FAILED self-test",
         "[selftest] paging: FAIL",
+        "Phase 7.2 FAILED self-test",
+        "[selftest] exceptions: FAIL",
+        "[selftest] timer: FAIL",
+        "!!! aarch64 EXCEPTION !!!",
     ];
 
     let mut found = false;
@@ -996,8 +1001,8 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     }
     if found {
         println!(
-            "arm64 {what} smoke passed: booted to the banner, switched to kernel page \
-             tables, and passed the paging self-test on QEMU virt."
+            "arm64 {what} smoke passed: booted, switched to kernel page tables, and \
+             passed the paging, exception and timer self-tests on QEMU virt."
         );
     } else {
         eprintln!(
@@ -1030,7 +1035,7 @@ fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path, target: &str) 
     // aarch64 `virt` (and arm64 platforms generally) are UEFI-only: there is no BIOS,
     // so no BIOS El Torito image, no `limine-bios.sys`, and no `bios-install` pass.
     // The arm64 ISO is therefore a pure EFI El Torito image carrying BOOTAA64.EFI.
-    let arm64 = target == "aarch64-unknown-none";
+    let arm64 = target == "aarch64-unknown-none-softfloat";
     let arch_tag = if arm64 { "arm64" } else { "amd64" };
 
     // Separate staging dirs and outputs so building one arch never clobbers the
@@ -1223,7 +1228,7 @@ fn cmd_iso(args: &[String]) {
     let iso_path = create_iso(&root, &kernel_binary, &limine_dir, target);
 
     println!();
-    if target == "aarch64-unknown-none" {
+    if target == "aarch64-unknown-none-softfloat" {
         println!("To boot headless:  cargo xtask run --arch aarch64");
         println!("To smoke the ISO:  cargo xtask arm64-iso-smoke");
     } else {
@@ -1529,7 +1534,7 @@ fn cmd_docs(_args: &[String]) {
     }
 }
 
-/// `cargo xtask arm64-gate` — compile smoltcp alone for `aarch64-unknown-none`.
+/// `cargo xtask arm64-gate` — compile smoltcp alone for `aarch64-unknown-none-softfloat`.
 ///
 /// Phase 4 runs and tests only on amd64, but the TCP/IP stack (smoltcp) is meant
 /// to be architecture-independent so the Phase 7 arm64 port inherits it unchanged.
@@ -1540,19 +1545,19 @@ fn cmd_arm64_gate(_args: &[String]) {
     let root = workspace_root();
     let gate_dir = root.join("servers/smoltcp-gate");
 
-    println!("Compiling smoltcp for aarch64-unknown-none (arm64 dependency gate)...");
+    println!("Compiling smoltcp for aarch64-unknown-none-softfloat (arm64 dependency gate)...");
     let status = Command::new("cargo")
         .current_dir(&gate_dir)
         .args([
             "build",
-            "--target", "aarch64-unknown-none",
+            "--target", "aarch64-unknown-none-softfloat",
             BUILD_STD,
         ])
         .status()
         .expect("Failed to execute cargo build for the arm64 gate");
 
     if !status.success() {
-        eprintln!("arm64 gate FAILED: smoltcp did not build for aarch64-unknown-none.");
+        eprintln!("arm64 gate FAILED: smoltcp did not build for aarch64-unknown-none-softfloat.");
         process::exit(1);
     }
     println!("  smoltcp: OK");
@@ -1562,24 +1567,24 @@ fn cmd_arm64_gate(_args: &[String]) {
     // build — "amd64 stays green" alone is insufficient once the arch seam is shared.
     // The kernel embeds no userspace servers on aarch64 (they are cfg-gated out), so a
     // direct `cargo build` needs no prior server staging.
-    println!("Compiling the kernel for aarch64-unknown-none (arm64 kernel gate)...");
+    println!("Compiling the kernel for aarch64-unknown-none-softfloat (arm64 kernel gate)...");
     let kstatus = Command::new("cargo")
         .current_dir(&root)
         .args([
             "build",
             "--package", "themelios",
-            "--target", "aarch64-unknown-none",
+            "--target", "aarch64-unknown-none-softfloat",
             BUILD_STD,
             BUILD_STD_FEATURES,
         ])
         .status()
         .expect("Failed to execute cargo build for the aarch64 kernel");
     if !kstatus.success() {
-        eprintln!("arm64 gate FAILED: the kernel did not build for aarch64-unknown-none.");
+        eprintln!("arm64 gate FAILED: the kernel did not build for aarch64-unknown-none-softfloat.");
         process::exit(1);
     }
     println!("  kernel: OK");
-    println!("arm64 gate passed: smoltcp + kernel build for aarch64-unknown-none.");
+    println!("arm64 gate passed: smoltcp + kernel build for aarch64-unknown-none-softfloat.");
 }
 
 /// Print usage information.
@@ -1596,7 +1601,7 @@ Commands:
     test     Build and run tests in QEMU
     image    Create the SquashFS root and ext2 data disk images
     docs     Build mdbook and rustdoc
-    arm64-gate       Compile smoltcp + kernel for aarch64-unknown-none (dependency gate)
+    arm64-gate       Compile smoltcp + kernel for aarch64-unknown-none-softfloat (dependency gate)
     arm64-smoke      Boot the aarch64 kernel on QEMU virt from a UEFI ESP (banner smoke)
     arm64-iso-smoke  Boot the aarch64 ISO on QEMU virt (banner smoke)
 

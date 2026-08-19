@@ -2,7 +2,7 @@
 //!
 //! A do-nothing `no_std` library whose only purpose is to make the compiler
 //! build `smoltcp` — with the net server's exact feature set — for a bare-metal
-//! target. CI builds this crate for `aarch64-unknown-none`; a green build is the
+//! target. CI builds this crate for `aarch64-unknown-none-softfloat`; a green build is the
 //! evidence that ThemeliOS has not taken an amd64-only (or `std`) dependency into
 //! its TCP/IP stack, so the Phase 7 arm64 port can inherit the stack unchanged.
 //!
