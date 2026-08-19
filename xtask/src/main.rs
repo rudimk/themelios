@@ -967,6 +967,8 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
         "[selftest] timer: FAIL",
         "Phase 7.3 scheduler FAILED self-test",
         "[selftest] sched: FAIL",
+        "[selftest] percpu: FAIL",
+        "FP/SIMD does NOT trap at EL1",
         "!!! aarch64 EXCEPTION !!!",
     ];
 

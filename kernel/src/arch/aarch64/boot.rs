@@ -26,11 +26,17 @@
 //!
 //! The kernel now targets **`aarch64-unknown-none-softfloat`**, which emits no vector
 //! instructions, so `FPEN` stays as Limine left it. That is not merely simpler — it is
-//! what makes the exception path sound. The entry stub saves x0-x30 and no vector
-//! registers, so a handler touching FP on a returning path would silently corrupt the
-//! interrupted context. With softfloat *and* `FPEN` off, any SIMD that ever sneaks in
-//! traps loudly as `ESR_EL1.EC = 0x07` — which the exception decoder names — instead
-//! of corrupting memory quietly.
+//! what makes both the exception path and the context switch sound. Neither saves any
+//! vector register: the entry stub saves x0-x30, and `switch_context` saves x19-x30,
+//! even though AAPCS64 makes the low half of `v8`-`v15` callee-saved. With softfloat
+//! *and* `FPEN` trapping, any SIMD that ever sneaks in raises `ESR_EL1.EC = 0x07` —
+//! which the exception decoder names — instead of corrupting another task's
+//! floating-point state with no fault to point at.
+//!
+//! That backstop is **checked**, not assumed:
+//! [`exceptions::verify_fp_trapped`](crate::arch::aarch64::exceptions::verify_fp_trapped)
+//! reads `CPACR_EL1` at boot and the 7.3 sentinel depends on it. It was asserted in
+//! three comments and read by nothing until Phase 7.3.
 //!
 //! One thing must still happen before the first `println!`:
 //! 1. **Map the PL011 UART.** Limine's HHDM maps RAM but **not** device MMIO, so the
@@ -286,6 +292,13 @@ pub fn kmain_aarch64(
     // must not wait for the scheduler.
     crate::arch::aarch64::percpu::init();
 
+    // Establish — then confirm — the assumption the context switch and the exception
+    // stub both rest on: FP/SIMD traps, so the absent v8-v15 save area cannot corrupt
+    // state silently. Deliberately after the vector table is live, so that a stray
+    // vector instruction is reported rather than branching into bootloader leftovers.
+    crate::arch::aarch64::exceptions::trap_fp_access();
+    let fp_trapped = crate::arch::aarch64::exceptions::verify_fp_trapped();
+
     // --- Phase 7.1: memory management on our own page tables ---
     bring_up_memory(hhdm, k, entries);
 
@@ -310,7 +323,7 @@ pub fn kmain_aarch64(
     // Run after the scheduler test, which is what gives the per-CPU block dozens of
     // switches to have been updated by; before it there would be nothing to check.
     let percpu_ok = crate::arch::aarch64::percpu::selftest();
-    if sched_ok && percpu_ok {
+    if sched_ok && percpu_ok && fp_trapped {
         crate::println!("[boot] Phase 7.3 scheduler reached; self-test passed.");
     } else {
         crate::println!("[boot] Phase 7.3 scheduler FAILED self-test.");
@@ -341,9 +354,14 @@ pub fn kmain_aarch64(
 ///
 /// Plain atomics rather than a lock: the workers are preempted at arbitrary instruction
 /// boundaries by the timer, and a worker holding a lock when its slice expires would
-/// deadlock against the next worker. `Relaxed` is enough — the final read happens after
-/// the workers have been observed to stop, and that observation is ordered by the
-/// `Acquire`/`Release` pair on [`WORKERS_EXITED`].
+/// deadlock against the next worker.
+///
+/// `Relaxed` is enough for a reason that has nothing to do with the `Acquire`/`Release`
+/// pair on [`WORKERS_EXITED`] — that pair only orders the all-workers-exited path, and
+/// the test deliberately also handles a drain that times out with workers still
+/// running. What actually makes these reads sound is that the machine is
+/// uniprocessor and the reader masks interrupts first, so no writer can be mid-flight.
+/// On SMP this would need real ordering.
 static WORKER_ITERS: [core::sync::atomic::AtomicU64; 3] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -432,9 +450,10 @@ fn worker_2() {
 ///    scheduler, so the only way control leaves a worker is the timer IRQ reaching
 ///    `schedule()`. This is what separates 7.3 from cooperative switching.
 /// 3. **Each got a real share of slices.** Round-robin, not "one task monopolised the
-///    CPU and the others got a slice apiece". Measured in ticks of residency rather
-///    than work done — see [`WORKER_TICKS`] — and checked against a floor of half an
-///    equal share, which measured runs clear by better than 2×.
+///    CPU and the others got a slice apiece" — which is why the check is a *band*
+///    (half to double an equal share) and not a floor. A floor alone would pass the
+///    monopoly case it claims to reject. Measured in ticks of residency rather than
+///    work done, for the reason in [`WORKER_TICKS`].
 /// 4. **Each returned from its entry function.** That exercises `task_exit` and the
 ///    Dead-task cleanup in `schedule()`, which nothing else on aarch64 has run yet.
 ///
@@ -442,6 +461,7 @@ fn worker_2() {
 /// scheduler that never switches at all still terminates the test instead of hanging
 /// the boot — the timer keeps ticking whether or not `schedule()` does anything useful.
 fn sched_selftest() -> bool {
+    use crate::arch::aarch64::timer::{read_cntvct, reload};
     use crate::arch::time::tick_count;
     use core::sync::atomic::Ordering;
 
@@ -477,7 +497,6 @@ fn sched_selftest() -> bool {
     // The counter advances regardless of interrupt state, which is what makes it the
     // only sound timeout for a test of the interrupt path.
     {
-        use crate::arch::aarch64::timer::{read_cntvct, reload};
         let t0 = tick_count();
         let c0 = read_cntvct();
         let deadline = reload() * 10;
@@ -498,11 +517,40 @@ fn sched_selftest() -> bool {
     // From here until the workers are asked to stop, the timer IRQ preempts this task
     // too — the bootstrap task is an ordinary scheduler citizen and goes back on the
     // ready queue like any other. `tick_count` is updated by the timer handler
-    // regardless of which task is running, so this deadline is sound.
+    // regardless of which task is running, so this deadline is sound *when interrupts
+    // are being delivered*.
+    //
+    // Which is exactly why it is not the only bound. Consider the most likely
+    // regression this whole test exists to catch: `task_bootstrap` failing to unmask
+    // DAIF. The first worker switched to would then run with interrupts masked, no
+    // further timer IRQ would ever be taken, `tick_count` would freeze, and this loop
+    // would spin forever — hanging the boot until the CI job's timeout, with no output
+    // and no clue. The FAIL branch below that names that exact cause would be
+    // unreachable. `CNTVCT_EL0` keeps advancing regardless of interrupt state, so it is
+    // the bound that survives the failure it is meant to report.
     let start = tick_count();
-    while tick_count() < start + RUN_TICKS {
+    let c_start = read_cntvct();
+    let hang_bound = reload() * RUN_TICKS * 4;
+    while tick_count() < start + RUN_TICKS && read_cntvct() - c_start < hang_bound {
         core::hint::spin_loop();
     }
+
+    // Snapshot before the drain. The workers keep counting until they actually observe
+    // `RUN == false`, which can take another slice apiece, so reading the counters
+    // after the drain would score them over a longer interval than `RUN_TICKS` — and
+    // the floor below is derived from `RUN_TICKS`. Mixing the two denominators would
+    // make the check quietly more lenient than it reads.
+    let iters = [
+        WORKER_ITERS[0].load(Ordering::Relaxed),
+        WORKER_ITERS[1].load(Ordering::Relaxed),
+        WORKER_ITERS[2].load(Ordering::Relaxed),
+    ];
+    let slices = [
+        WORKER_TICKS[0].load(Ordering::Relaxed),
+        WORKER_TICKS[1].load(Ordering::Relaxed),
+        WORKER_TICKS[2].load(Ordering::Relaxed),
+    ];
+    let ticks = tick_count() - start;
 
     // Ask the workers to return. They are still runnable, so give them slices to
     // notice: `yield_now` puts this task at the back of the queue each time round.
@@ -515,45 +563,41 @@ fn sched_selftest() -> bool {
     }
     crate::arch::irq::disable();
 
-    let iters = [
-        WORKER_ITERS[0].load(Ordering::Relaxed),
-        WORKER_ITERS[1].load(Ordering::Relaxed),
-        WORKER_ITERS[2].load(Ordering::Relaxed),
-    ];
-    let slices = [
-        WORKER_TICKS[0].load(Ordering::Relaxed),
-        WORKER_TICKS[1].load(Ordering::Relaxed),
-        WORKER_TICKS[2].load(Ordering::Relaxed),
-    ];
     let exited = WORKERS_EXITED.load(Ordering::Acquire);
-    let ticks = tick_count() - start;
 
     // Runnable tasks during the measured window: three workers plus the bootstrap
     // task, which goes back on the ready queue like any other. The idle task never
     // enters the queue, so it does not dilute the share.
     const RUNNABLE: u64 = 4;
-    // Half of an equal share. Loose enough to absorb slice-boundary rounding and a
-    // busy CI runner, tight enough that a worker scheduled once or twice fails: an
-    // equal share here is ~12 ticks, and the floor is 6.
-    let floor = RUN_TICKS / RUNNABLE / 2;
+    let share = RUN_TICKS / RUNNABLE; // 12 ticks apiece at RUN_TICKS = 50
+
+    // Round-robin means a *band*, not a floor. A floor alone would pass `[60, 6, 6]` —
+    // precisely the "one task monopolised the CPU and the others got a token slice"
+    // outcome this is supposed to reject — so bound it from above as well.
+    //
+    // Half to double an equal share. Measured runs sit at 12-14 against a share of 12,
+    // so both bounds have better than 40% headroom; loose enough for a busy CI runner,
+    // tight enough that starvation or monopoly fails.
+    let floor = share / 2; // 6
+    let ceiling = share * 2; // 24
 
     let all_ran = iters.iter().all(|&c| c > 0);
-    let fair = slices.iter().all(|&s| s >= floor);
+    let fair = slices.iter().all(|&s| s >= floor && s <= ceiling);
     let all_exited = exited == ids.len() as u64;
 
     if all_ran && fair && all_exited {
         crate::println!(
-            "[selftest] sched: PASS (slices {:?} ≥ {} each over {} ticks; iterations \
-             {:?}; {}/{} workers exited cleanly)",
-            slices, floor, ticks, iters, exited, ids.len()
+            "[selftest] sched: PASS (slices {:?} within [{}, {}] over {} measured \
+             ticks; iterations {:?}; {}/{} workers exited cleanly)",
+            slices, floor, ceiling, ticks, iters, exited, ids.len()
         );
         return true;
     }
 
     crate::println!(
-        "[selftest] sched: FAIL — slices {:?} (floor {}), iterations {:?}, over {} \
-         ticks, {}/{} workers exited",
-        slices, floor, iters, ticks, exited, ids.len()
+        "[selftest] sched: FAIL — slices {:?} (want [{}, {}]), iterations {:?}, over \
+         {} measured ticks, {}/{} workers exited",
+        slices, floor, ceiling, iters, ticks, exited, ids.len()
     );
     if !all_ran {
         crate::println!(
@@ -562,11 +606,21 @@ fn sched_selftest() -> bool {
              task_bootstrap)"
         );
     } else if !fair {
-        crate::println!(
-            "  a worker ran but was starved of slices: the timer IRQ is reaching \
-             `schedule()` from some tasks and not others — check that `task_bootstrap` \
-             unmasks DAIF.I, and that the IRQ path re-enables delivery on every return"
-        );
+        let starved = slices.iter().any(|&s| s < floor);
+        if starved {
+            crate::println!(
+                "  a worker ran but was starved of slices: the timer IRQ is reaching \
+                 `schedule()` from some tasks and not others — check that \
+                 `task_bootstrap` unmasks DAIF.I, and that the IRQ path re-enables \
+                 delivery on every return"
+            );
+        } else {
+            crate::println!(
+                "  a worker got far more than an equal share: the ready queue is not \
+                 round-robin — check that `schedule()` pushes the preempted task to \
+                 the *back* of the queue and pops from the front"
+            );
+        }
     } else if !all_exited {
         crate::println!(
             "  a worker never returned from its entry function: check `task_exit` and \

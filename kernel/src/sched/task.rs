@@ -73,18 +73,14 @@ pub enum TaskState {
     Dead,
 }
 
-/// Saved CPU context for context switching.
+/// Saved CPU context for context switching, supplied by the active architecture.
 ///
-/// Only stores the stack pointer — all callee-saved registers (rbx, rbp,
-/// r12-r15) are pushed onto the task's own kernel stack by `switch_context`.
-/// When switching away from a task, `switch_context` pushes registers and
-/// stores RSP here. When switching back, it loads RSP from here and pops
-/// the saved registers.
-///
-/// For a newly created task, `rsp` points to a pre-built stack frame that
-/// mimics a `switch_context` save: callee-saved register slots (with r12
-/// holding the entry function address) and a return address pointing to
-/// Saved CPU context for a task, supplied by the active architecture.
+/// Both implementations store only a stack pointer; the callee-saved registers live
+/// *on* that stack, pushed by `switch_context`. Which registers those are, and how a
+/// freshly created task's frame is laid out so the first switch lands in the bootstrap
+/// trampoline, is architecture-specific — see
+/// [`arch::x86_64::context`](crate::arch::x86_64::context) and
+/// [`arch::aarch64::context`](crate::arch::aarch64::context).
 ///
 /// Re-exported so `Task` and the scheduler name one type regardless of whether the
 /// stack pointer underneath is called `rsp` or `sp`.

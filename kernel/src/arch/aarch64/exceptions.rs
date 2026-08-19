@@ -197,7 +197,23 @@ aarch64_exc_common:
                             // x1 already holds the vector tag
     bl  aarch64_exception_entry
 
-    // The handler may have moved ELR (stepping over a BRK), so write it back.
+    // Restore ELR_EL1/SPSR_EL1 from the frame. This is NOT merely "in case the handler
+    // moved ELR to step over a BRK" — since 7.3 it is load-bearing for every single
+    // preemption, and must not be optimised into a conditional write-back.
+    //
+    // ELR_EL1 and SPSR_EL1 are single system registers, not per-task storage. When the
+    // handler calls schedule(), this task is switched away and some other task runs —
+    // taking its own exceptions, each of which overwrites both registers. By the time
+    // this task is resumed and reaches here, they describe whichever exception ran
+    // last, on whatever task. Only reloading them from *this* task's frame, which the
+    // entry sequence filled and which lives on this task's own stack, makes the `eret`
+    // below return to the right place with the right PSTATE.
+    //
+    // The window between these two writes and the `eret` is the aarch64 analog of the
+    // x86 syscall-exit tail: an exception taken inside it would clobber both registers
+    // again. It is closed because DAIF.I is masked from exception entry all the way
+    // through here — nothing in the handler path, schedule() included, unmasks it —
+    // which `aarch64_exception_entry` asserts on the way out.
     ldp x2, x3, [sp, #(31 * 8)]
     msr ELR_EL1, x2
     msr SPSR_EL1, x3
@@ -320,6 +336,14 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
             if reschedule && crate::sched::is_initialized() {
                 crate::sched::schedule();
             }
+
+            // The stub is about to write ELR_EL1/SPSR_EL1 back from the frame and
+            // `eret`. That tail is only atomic while interrupts are masked — see the
+            // long note beside the write-back. Nothing above unmasks them, including
+            // the schedule() that just ran, but "nothing does" is an invariant no line
+            // of source states, so check it here rather than discover it as a rare and
+            // impossible-looking wrong return.
+            crate::arch::aarch64::percpu::debug_assert_irqs_masked("IRQ vector exit");
             return;
         }
 
@@ -425,6 +449,106 @@ pub fn init() {
         );
         println!("[exc] VBAR_EL1 installed at {:#018x}", vbar);
     }
+
+    // Now that there is somewhere for one to land, unmask SErrors.
+    //
+    // Limine hands off with the whole of DAIF masked, and `arch::irq::enable` only
+    // touches the I bit — correctly, since SError masking is not an interrupt-disable
+    // and `irq::disable` has no business re-masking it. So without this the `A` bit
+    // stays set forever and the SError vector slot, which exists precisely to report
+    // asynchronous external aborts, is never reached.
+    //
+    // Deliberately *after* the VBAR write: unmasking first would mean a pending SError
+    // (an abort left over from the bootloader's device probing, say) is taken against
+    // whatever vector table Limine left behind.
+    //
+    // SAFETY: clears DAIF.A only. The vector table is installed and the ISB above has
+    // retired, so an SError taken from here on reaches our handler.
+    unsafe {
+        core::arch::asm!("msr DAIFClr, #4", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Trap FP/SIMD access at EL1 by clearing `CPACR_EL1.FPEN`.
+///
+/// Must run **after** [`init`] has installed the vector table: the entire point is to
+/// turn a stray vector instruction into a reported exception, and before `VBAR_EL1` is
+/// valid that same instruction would branch into whatever the bootloader left behind.
+///
+/// Phase 7.0b did the opposite — it *enabled* `FPEN`, because the hardfloat
+/// `aarch64-unknown-none` target lowers struct moves and `core::fmt` to SIMD, so the
+/// first `println!` trapped without it. The move to `aarch64-unknown-none-softfloat`
+/// inverted that: the kernel now emits no vector instructions at all, which is the
+/// premise both the exception stub and `switch_context` rest on when they save no
+/// vector registers.
+///
+/// Limine hands off with `FPEN = 0b11` — FP fully enabled — which was *measured*, not
+/// assumed, by [`verify_fp_trapped`] on the first boot that checked. Three separate
+/// comments in this port had already claimed the opposite ("with `FPEN` off, any SIMD
+/// that ever sneaks in traps loudly"), describing a safety net that did not exist.
+/// This makes the claim true instead of deleting it.
+pub fn trap_fp_access() {
+    // FPEN is CPACR_EL1 bits 21:20. 0b00 traps FP/SIMD at both EL0 and EL1.
+    // SAFETY: read-modify-write of a control register that gates FP access only. The
+    // ISB retires it before the next instruction, so no access can slip past on the
+    // old setting. Sound because this kernel is softfloat and executes no FP.
+    unsafe {
+        let cpacr: u64;
+        core::arch::asm!("mrs {}, CPACR_EL1", out(reg) cpacr, options(nomem, nostack));
+        core::arch::asm!(
+            "msr CPACR_EL1, {}",
+            "isb",
+            in(reg) cpacr & !(0b11 << 20),
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Verify FP/SIMD is trapped, which is what makes the missing FP save area sound.
+///
+/// [`crate::arch::aarch64::context`] saves `x19`-`x30` and no vector registers, even
+/// though AAPCS64 makes the low 64 bits of `v8`-`v15` callee-saved. That is only sound
+/// because the kernel is built for `aarch64-unknown-none-softfloat` and emits no vector
+/// instructions at all.
+///
+/// "Emits none today" is a property of the current build, though, and the backstop for
+/// the day it stops holding is `CPACR_EL1.FPEN`, cleared by [`trap_fp_access`]: with FP
+/// access trapped, a stray SIMD instruction raises `EC = 0x07` — which [`ec_name`]
+/// names — instead of quietly corrupting another task's floating-point state across a
+/// context switch, with no fault to point at it.
+///
+/// Checking it is not ceremony. That backstop was asserted in three separate comments
+/// and never once read, and the first boot that actually read the register found
+/// `FPEN = 0b11`: Limine leaves FP fully enabled, so the net had never existed. Same
+/// spirit as `paging::verify_tcr` — confirm the register the surrounding code depends
+/// on rather than trust the comment about it.
+///
+/// Returns `true` if FP access traps at EL1.
+pub fn verify_fp_trapped() -> bool {
+    let cpacr: u64;
+    // SAFETY: reading CPACR_EL1 has no side effects.
+    unsafe { core::arch::asm!("mrs {}, CPACR_EL1", out(reg) cpacr, options(nomem, nostack)) };
+
+    // FPEN is bits 21:20. 0b11 means "no trapping at either EL"; 0b01 traps EL0 only;
+    // 0b00 and 0b10 both trap EL1. We need EL1 accesses to trap.
+    let fpen = (cpacr >> 20) & 0b11;
+    let trapped = fpen != 0b11 && fpen != 0b01;
+
+    if trapped {
+        println!(
+            "[exc] CPACR_EL1.FPEN={:#04b} — FP/SIMD traps at EL1 (softfloat kernel; \
+             stray SIMD is reported, not silently mis-saved)",
+            fpen
+        );
+    } else {
+        println!(
+            "[exc] CPACR_EL1.FPEN={:#04b} — FP/SIMD does NOT trap at EL1. The context \
+             switch saves no v8-v15, so floating-point state would be corrupted across \
+             tasks with no fault to show for it.",
+            fpen
+        );
+    }
+    trapped
 }
 
 /// Number of `BRK` exceptions handled since boot.

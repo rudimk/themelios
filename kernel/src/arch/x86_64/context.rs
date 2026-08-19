@@ -38,11 +38,6 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
-    /// An empty (zeroed) context.
-    ///
-    /// Used for the bootstrap task, which represents the execution context already
-    /// running when the scheduler starts; its real context is written by the first
-    /// [`switch_context`] that preempts it.
     /// A context whose saved stack pointer is `stack_pointer`.
     ///
     /// The pointer must address a frame built by [`setup_initial_stack`] (for a task
@@ -51,6 +46,11 @@ impl TaskContext {
         Self { rsp: stack_pointer }
     }
 
+    /// An empty (zeroed) context.
+    ///
+    /// Used for the bootstrap task, which represents the execution context already
+    /// running when the scheduler starts; its real context is written by the first
+    /// [`switch_context`] that saves *out of* it.
     pub const fn empty() -> Self {
         Self { rsp: 0 }
     }
@@ -165,7 +165,7 @@ pub unsafe extern "C" fn task_bootstrap() {
 ///
 /// This function never returns — `exit_current_task` calls `schedule()`,
 /// which switches to a different task and never comes back to a dead one.
-fn task_exit() -> ! {
+extern "C" fn task_exit() -> ! {
     crate::sched::exit_current_task();
 }
 

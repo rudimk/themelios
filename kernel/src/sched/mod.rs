@@ -1,8 +1,26 @@
 //! # Preemptive round-robin scheduler
 //!
 //! Manages kernel tasks and decides which one runs on the CPU at any given
-//! time. The scheduler is driven by the PIT timer interrupt (IRQ0, ~100 Hz)
-//! which calls `schedule()` on every tick for preemptive multitasking.
+//! time. The scheduler is driven by the platform's periodic timer interrupt
+//! (~100 Hz), whose handler calls `schedule()` on every tick.
+//!
+//! ## Architecture-neutral, since Phase 7.3
+//!
+//! Everything in this module is shared between x86_64 and aarch64: the ready
+//! queue, the task lifecycle, the round-robin policy, and stack allocation.
+//! The parts that cannot be shared sit behind two seams:
+//!
+//! - [`arch::context`](crate::arch::context) — `TaskContext`, `switch_context`,
+//!   the bootstrap trampoline, and the initial stack frame. Register sets and
+//!   calling conventions differ, and so does how a task "returns" into its
+//!   entry point (x86 pops a return address; aarch64 branches through `x30`).
+//! - [`arch::irq`](crate::arch::irq) and [`arch::time`](crate::arch::time) —
+//!   masking and the tick source (PIT/8259 vs. the ARM generic timer + GICv2).
+//!
+//! `schedule()` additionally carries ring-3 support that is x86_64-only today
+//! (TSS.RSP0 staging, FS-base restore, CR3 switching) and a per-CPU pointer
+//! refresh that is aarch64-only (`TPIDR_EL1`); both are `#[cfg]`'d, and each is
+//! commented where it appears.
 //!
 //! ## Design
 //!
@@ -11,9 +29,9 @@
 //!   of the ready queue.
 //! - **Ready queue**: a `VecDeque<TaskId>` of tasks waiting to run. The
 //!   scheduler pops from the front and pushes preempted tasks to the back.
-//! - **Idle task**: a special task that runs `hlt` in a loop when no other
-//!   tasks are ready. It is never placed in the ready queue — it's used as
-//!   a fallback when the queue is empty.
+//! - **Idle task**: a special task that halts (`hlt` / `wfi`) in a loop when
+//!   no other tasks are ready. It is never placed in the ready queue — it's
+//!   used as a fallback when the queue is empty.
 //! - **Bootstrap task**: task 0, representing the initial execution context
 //!   (kmain's continuation after `sched::init()`). Uses the Limine-provided
 //!   boot stack, so it has no allocated stack to free.
@@ -23,15 +41,19 @@
 //! When the timer interrupt fires while task A is running:
 //!
 //! ```text
-//! Timer fires → CPU pushes interrupt frame onto A's stack
-//!   → isr_common saves all GPRs → exception_handler → irq_handler(0)
-//!   → send EOI → schedule()
-//!   → schedule picks task B, calls switch_context(&mut A.ctx, &B.ctx)
-//!   → switch_context saves A's callee-saved regs, loads B's RSP
-//!   → switch_context pops B's callee-saved regs, ret's into B's schedule()
-//!   → B's schedule() returns → B's irq_handler → B's exception_handler
-//!   → isr_common restores B's GPRs → iretq → B resumes
+//! Timer fires → CPU pushes an exception frame onto A's own stack
+//!   → entry stub saves the GPRs → timer handler → EOI
+//!   → schedule() picks task B, calls switch_context(&mut A.ctx, &B.ctx)
+//!   → switch_context saves A's callee-saved regs on A's stack,
+//!     loads B's stack pointer, restores B's callee-saved regs
+//!   → returns into B's schedule(), which returns into B's timer handler
+//!   → B's entry stub restores B's GPRs → exception return → B resumes
 //! ```
+//!
+//! The exception frame living on the *interrupted task's* stack, rather than on
+//! a shared handler stack, is what makes it safe to switch away from inside the
+//! handler: A's frame stays intact while B runs, and A unwinds through it when
+//! it is next scheduled.
 //!
 //! ## Lock management
 //!
@@ -313,6 +335,22 @@ pub fn current_fs_base() -> u64 {
 /// Must be called with interrupts disabled (which is guaranteed when
 /// called from an interrupt handler).
 pub fn schedule() {
+    // The "interrupts must be disabled" contract above, made mechanical.
+    //
+    // Every part of this function assumes it: the lock is dropped before the stack
+    // switch, so a timer interrupt landing in the window would re-enter `schedule()`
+    // on a half-switched context; and `switch_context`'s own `# Safety` clause
+    // requires it outright. The invariant is also invisible at each call site — it is
+    // established by the caller, or by hardware on exception entry — which is exactly
+    // the shape of bug that shipped once already: Phase 7.0a left the `arch::irq`
+    // calls in `yield_now`, `exit_current_task` and `block_current_task` gated to
+    // x86_64, so on aarch64 all three would have called straight into here with
+    // interrupts live. Nothing would have caught that but a rare, inexplicable crash.
+    debug_assert!(
+        !crate::arch::irq::are_enabled(),
+        "schedule() entered with interrupts unmasked"
+    );
+
     // Extract the context pointers while holding the scheduler lock,
     // then release the lock before doing the actual context switch.
     // We release the lock so the new task doesn't inherit a held lock
@@ -428,9 +466,9 @@ pub fn schedule() {
                 .unwrap()
                 .kernel_stack_bounds()
                 .unwrap_or((0, 0));
-            // SAFETY: interrupts are masked for the whole of `schedule()`, which is
-            // what `on_context_switch` requires so that an exception cannot observe
-            // the block half-updated.
+            // SAFETY: interrupts are masked for the whole of `schedule()` (asserted at
+            // the top), which is what `on_context_switch` requires so that an exception
+            // cannot observe the block half-updated.
             unsafe {
                 crate::arch::aarch64::percpu::on_context_switch(next_id as u64, top, limit);
             }
@@ -440,10 +478,22 @@ pub fn schedule() {
         // buffer, which won't be reallocated because:
         // 1. Interrupts are disabled — no other code can push to the Vec.
         // 2. We're about to drop the lock and immediately use the pointers.
-        let old_ctx = &mut sched.tasks[current_id].as_mut().unwrap().context
-            as *mut TaskContext;
-        let new_ctx = &sched.tasks[next_id].as_ref().unwrap().context
-            as *const TaskContext;
+        //
+        // Both are derived from the Vec's data pointer and then indexed to two
+        // *distinct* slots (`next_id != current_id` is established above). Going
+        // through `as_mut_ptr` rather than taking `&mut sched.tasks[a]` and then
+        // `&sched.tasks[b]` matters: the latter creates a shared borrow of the whole
+        // Vec after a mutable one, which invalidates the first pointer under Stacked
+        // Borrows even though the two elements never overlap.
+        let base = sched.tasks.as_mut_ptr();
+        // SAFETY: `current_id` and `next_id` are valid indices into `tasks` (both were
+        // just dereferenced through it), both slots are `Some` (ditto), and the two
+        // indices differ — so the resulting references borrow disjoint elements.
+        let (old_ctx, new_ctx) = unsafe {
+            let old = &raw mut (*base.add(current_id)).as_mut().unwrap().context;
+            let new = &raw const (*base.add(next_id)).as_ref().unwrap().context;
+            (old, new)
+        };
 
         Some((old_ctx, new_ctx))
         // Guard dropped here — lock released
@@ -738,13 +788,6 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
 
     id
 }
-
-/// Set up the initial stack frame for a new task.
-///
-/// Builds a stack frame that mimics the state after `switch_context` has
-/// pushed all callee-saved registers. When `switch_context` later "restores"
-/// from this frame, it will:
-/// 1. Pop r15-r12, rbp, rbx (r12 gets the entry function address)
 
 /// Clean up dead tasks by freeing their stacks and clearing their slots.
 ///

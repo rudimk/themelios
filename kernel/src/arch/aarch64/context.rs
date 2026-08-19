@@ -130,15 +130,37 @@ pub unsafe extern "C" fn switch_context(_old: *mut TaskContext, _new: *const Tas
 /// address in the `x30` slot. By then the initial frame has been restored, so `x19`
 /// holds the task's entry function.
 ///
-/// 1. Unmask IRQs. The scheduler runs with them masked; a task needs them on or the
-///    timer can never preempt it.
+/// 1. Unmask IRQs and SErrors. The scheduler runs with them masked; a task needs IRQs
+///    on or the timer can never preempt it.
 /// 2. Call the entry function.
 /// 3. If it returns, fall into the exit path rather than branching to garbage.
+///
+/// ## Why `#6` and not `#2`
+///
+/// A new task is *not* entered through `eret`. The first switch to it comes from
+/// inside the timer's IRQ handler, so it arrives by `ret` out of [`switch_context`]
+/// carrying the DAIF the CPU set on exception entry — where hardware masks **all** of
+/// `D`, `A`, `I` and `F`. Clearing only `I` would leave the other three masked for the
+/// rest of the task's life, because the next preemption captures that DAIF into the
+/// task's `SPSR_EL1` frame slot and `eret` faithfully restores it. Nothing would ever
+/// clear them again.
+///
+/// For `A` that is a real loss: SErrors would be masked for every spawned task, which
+/// silently disables the asynchronous-abort vector Phase 7.2 installed — and worse, a
+/// masked SError stays *pending* and is taken on the next `eret` into a context with
+/// `A` clear, i.e. reported against an unrelated task. `#6` is `A|I` of the
+/// `{D=8, A=4, I=2, F=1}` mask, so both are cleared here.
+///
+/// `F` (FIQ) and `D` (debug) are deliberately left masked. The GIC is configured with
+/// `GICC_CTLR.FIQEn` clear, so nothing this kernel programs can raise an FIQ, and
+/// there is no debug-exception handling to route `D` to. Both are decisions, not
+/// oversights — if either ever becomes live it must be unmasked here too.
 #[unsafe(naked)]
 pub unsafe extern "C" fn task_bootstrap() {
     naked_asm!(
-        // The x86 analog is `sti`. `#2` is the I bit of the {D=8,A=4,I=2,F=1} mask.
-        "msr DAIFClr, #2",
+        // The x86 analog is `sti`, but wider: `#6` is A|I of the {D=8,A=4,I=2,F=1}
+        // mask. See the note above on why clearing I alone is not enough.
+        "msr DAIFClr, #6",
 
         // Call the entry function, whose address `switch_context` just restored into
         // x19. SP is 16-byte aligned here — `blr` pushes nothing, unlike x86's `call`,
