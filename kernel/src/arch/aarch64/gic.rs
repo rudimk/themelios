@@ -224,26 +224,36 @@ pub fn enable_intid(intid: u32) {
 /// Called from the IRQ vector slot. The value read from `IAR` is passed straight to
 /// `EOIR` — see the acknowledge/EOI discipline in the module docs; completing with a
 /// different value, or not at all, wedges the controller.
-pub fn dispatch_irq() {
+///
+/// Returns `true` if the interrupt was the scheduling timer, meaning the caller should
+/// consider preempting the interrupted task. The decision is *reported* rather than
+/// acted on here so that the caller can schedule after the EOI has been issued.
+pub fn dispatch_irq() -> bool {
     let iar = gicc_read(GICC_IAR);
     let intid = iar & IAR_INTID_MASK;
 
     // A spurious read means there was nothing to claim. It must not be EOI'd.
     if intid == SPURIOUS_INTID {
         SPURIOUS_COUNT.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
 
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 
+    let mut reschedule = false;
     if intid == super::timer::TIMER_INTID {
         super::timer::handle_tick();
+        // The timer is the preemption source: tell the caller a time slice expired.
+        // Reported rather than acted on here so the scheduling happens *after* the
+        // EOI below — see the caller for why that ordering matters.
+        reschedule = true;
     }
     // Unrecognised INTIDs are still acknowledged and completed below: leaving one
     // active would stop all further delivery, which is a far worse failure than
     // silently ignoring an interrupt we did not ask for.
 
     gicc_write(GICC_EOIR, iar);
+    reschedule
 }
 
 /// Number of hardware interrupts dispatched since boot.

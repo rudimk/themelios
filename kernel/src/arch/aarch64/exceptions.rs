@@ -303,7 +303,23 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
     match tag {
         // IRQ — the controller says what actually happened.
         TAG_CUR_SPX_IRQ => {
-            crate::arch::aarch64::gic::dispatch_irq();
+            let reschedule = crate::arch::aarch64::gic::dispatch_irq();
+
+            // Preempt *after* the EOI issued inside `dispatch_irq`, never before.
+            // `schedule()` switches stacks and does not return until this task runs
+            // again, so scheduling with the interrupt still active would leave it
+            // active in the controller for the whole intervening period — and a GICv2
+            // CPU interface delivers nothing further while an interrupt is active.
+            // The x86_64 timer ISR sequences it the same way: send the EOI, then
+            // `schedule()`.
+            //
+            // Doing this from the handler is sound because the exception frame lives
+            // on the *interrupted task's own stack*: switching away leaves it intact,
+            // and when this task is resumed it unwinds back through here on that same
+            // stack and `eret`s exactly where it left off.
+            if reschedule && crate::sched::is_initialized() {
+                crate::sched::schedule();
+            }
             return;
         }
 

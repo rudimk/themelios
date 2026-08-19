@@ -56,11 +56,6 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
-    /// An empty (zeroed) context.
-    ///
-    /// Used for the bootstrap task, which represents the execution context already
-    /// running when the scheduler starts; its real context is written by the first
-    /// [`switch_context`] that preempts it.
     /// A context whose saved stack pointer is `stack_pointer`.
     ///
     /// The pointer must address a frame built by [`setup_initial_stack`] (for a task
@@ -69,6 +64,11 @@ impl TaskContext {
         Self { sp: stack_pointer }
     }
 
+    /// An empty (zeroed) context.
+    ///
+    /// Used for the bootstrap task, which represents the execution context already
+    /// running when the scheduler starts; its real context is written by the first
+    /// [`switch_context`] that saves *out of* it.
     pub const fn empty() -> Self {
         Self { sp: 0 }
     }
@@ -160,17 +160,10 @@ pub unsafe extern "C" fn task_bootstrap() {
 /// Catches a task whose entry function returned.
 ///
 /// Without it the task would `ret` to an undefined `x30` and jump somewhere arbitrary.
-///
-/// **Not yet wired.** `sched` is still `#[cfg(target_arch = "x86_64")]`; un-gating it
-/// is the next step of Phase 7.3, at which point this becomes
-/// `crate::sched::exit_current_task()`. Nothing on aarch64 can reach here until then —
-/// no task is ever switched *to* — so the panic states the contract rather than
-/// standing in for a live path.
+/// Marks the task Dead and schedules away; it is never switched back to, so this
+/// diverges.
 extern "C" fn task_exit() -> ! {
-    panic!(
-        "aarch64 task_exit: a task entry function returned, but the scheduler is not \
-         yet un-gated on this architecture (Phase 7.3)"
-    );
+    crate::sched::exit_current_task();
 }
 
 /// Build the initial stack frame for a new task.
