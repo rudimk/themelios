@@ -18,6 +18,7 @@
 - [Network Architecture](./networking.md)
 - [Container Runtime](./containers.md)
 - [Management API](./management-api.md)
+- [The aarch64 Port](./aarch64.md)
 
 # Roadmap
 

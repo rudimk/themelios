@@ -144,7 +144,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **4** | VirtIO net driver, TCP/IP stack | Complete |
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
-| **7** | aarch64 port (boot, memory, scheduler, shell) | In progress |
+| **7** | aarch64 port (boot, memory, scheduler, shell) | Complete (ring-0 core; EL0/storage/net/containers deferred) |
 | **8** | Hyperscaler support (AWS, GCP, Azure), secure boot | Not started |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
@@ -158,7 +158,7 @@ line when finishing a sub-phase. Detailed per-sub-phase checklists live in
 `.sisyphus/plans/` (local, gitignored); the git commit history has the full
 narrative per commit._
 
-**Phase 7 — aarch64 port: IN PROGRESS.** A ring-0 kernel-core port to QEMU `virt`
+**Phase 7 — aarch64 port: COMPLETE (ring-0 core).** A ring-0 kernel-core port to QEMU `virt`
 (ARM64); EL0/userspace, storage, networking and containers on ARM are a separate,
 deferred ABI surface. amd64 stays green every sub-phase — the QEMU suite is the gate.
 Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
@@ -234,7 +234,27 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   the "stray SIMD traps loudly" backstop justifying the absent `v8`-`v15` save area had
   never existed. FPEN is now cleared *and verified* at boot, `verify_fp_trapped` gates
   the sentinel, and the kernel passes every self-test with FP trapping.
-- ⬜ **7.4** Shell, portable tests on aarch64 CI, finalize.
+- ✅ **7.4** **Shell, portable tests, CI, finalize.** `mod shell` and `mod test_runner`
+  un-gated; `cap`/`audit`/`ipc`/`http`/`oci`/`mm::shared` un-gated for aarch64 (all
+  `alloc`-only; `cap`+`audit` needed only `ProcessId`, so aarch64 gets the 41-line
+  identity newtype without the 712-line process table and `current_process_id` answers
+  `ProcessId::KERNEL`). **aarch64 suite: 14 passed / 0 failed / 40 skipped of 54** —
+  skipped tests name the deferred subsystem instead of the 39 `Ok(())` stubs that
+  would have reported a vacuous "54 passed". **Exit contract** (the plan's riskiest
+  unknown): no `isa-debug-exit` on `virt`, so a serial sentinel carries the verdict and
+  **PSCI `SYSTEM_OFF`** (HVC conduit) stops the machine — which is what distinguishes
+  "died mid-suite" from "hung"; all four rows verified by fault injection. **Shell**:
+  PL011 RX via `IMSC` `RXIM`+**`RTIM`** (timeout is load-bearing — typing never reaches
+  the 8-char FIFO trigger), UART on **SPI 1 = INTID 33**, 8 of 25 commands with the
+  rest `#[cfg]`'d out of dispatcher, impls *and* help text. Three defects the tests
+  caught: `test_page_tables` assumed 1 MiB is RAM (true on a PC, an unbacked hole on
+  `virt`); the suite ran with interrupts in whatever state boot left them, enabled only
+  as a side effect of the first `yield_now` (an order-dependent environment → a
+  1-in-5 `test_ipc` flake); and the boot self-tests left dead-task stacks for
+  `cleanup_dead_tasks` to reclaim mid-test, breaking `test_frame_allocator`'s exact
+  frame-count equality 5 runs of 5. Plus one in the shell: the RX handler buffered
+  bytes but never called `wake_shell`, so every register read correctly and the console
+  was silent. mdbook `aarch64.md` documents the port.
 
 **Phase 6 — Management API: COMPLETE (core).** The node is driven entirely
 through an external HTTP API (no SSH, no shell). A ring-3 **`api-server`** holds a
