@@ -21,8 +21,28 @@ use crate::sync::InterruptMutex;
 /// PL011 register offsets (from the MMIO base).
 const UART_DR: usize = 0x00; // data register
 const UART_FR: usize = 0x18; // flag register
+/// Interrupt mask set/clear — a *set* bit here enables that interrupt.
+const UART_IMSC: usize = 0x38;
+/// Masked interrupt status: which enabled interrupts are currently asserting.
+const UART_MIS: usize = 0x40;
+/// Interrupt clear — write 1s to acknowledge.
+const UART_ICR: usize = 0x44;
+
 /// `UART_FR` bit 5: transmit FIFO full.
 const FR_TXFF: u32 = 1 << 5;
+/// `UART_FR` bit 4: receive FIFO empty.
+const FR_RXFE: u32 = 1 << 4;
+
+/// `IMSC`/`MIS`/`ICR` bit 4: receive interrupt — the RX FIFO reached its trigger level.
+const INT_RX: u32 = 1 << 4;
+/// `IMSC`/`MIS`/`ICR` bit 6: receive *timeout* — characters are sitting in the FIFO but
+/// it never filled to the trigger level.
+///
+/// Both are needed, and forgetting the timeout is the classic PL011 bug. Interactive
+/// typing almost never reaches the FIFO trigger level (default: 1/2 full, eight
+/// characters), so with only `INT_RX` enabled the first seven keystrokes sit in the
+/// FIFO with no interrupt raised, and the shell appears dead until the eighth arrives.
+const INT_RX_TIMEOUT: u32 = 1 << 6;
 
 /// A PL011 instance addressed by a **mapped virtual** base address.
 struct Pl011 {
@@ -35,6 +55,52 @@ struct Pl011 {
 unsafe impl Send for Pl011 {}
 
 impl Pl011 {
+    /// Read one byte if the receive FIFO has anything, else `None`.
+    fn getc(&self) -> Option<u8> {
+        // SAFETY: `base` is a device-mapped PL011; FR/DR are inside the mapped page.
+        unsafe {
+            let fr = core::ptr::read_volatile((self.base + UART_FR) as *const u32);
+            if fr & FR_RXFE != 0 {
+                return None;
+            }
+            Some(core::ptr::read_volatile((self.base + UART_DR) as *const u32) as u8)
+        }
+    }
+
+    /// Enable receive interrupts (data available, and data sitting idle in the FIFO).
+    fn enable_rx_interrupt(&self) {
+        // SAFETY: `base` is a device-mapped PL011; IMSC/ICR are inside the mapped page.
+        unsafe {
+            // Clear anything already latched, so enabling does not immediately deliver
+            // an interrupt for a character received before the handler existed.
+            core::ptr::write_volatile(
+                (self.base + UART_ICR) as *mut u32,
+                INT_RX | INT_RX_TIMEOUT,
+            );
+            let imsc = core::ptr::read_volatile((self.base + UART_IMSC) as *const u32);
+            core::ptr::write_volatile(
+                (self.base + UART_IMSC) as *mut u32,
+                imsc | INT_RX | INT_RX_TIMEOUT,
+            );
+        }
+    }
+
+    /// Acknowledge the receive interrupts at the UART.
+    ///
+    /// Distinct from the GIC's EOI, and both are required: the GIC stops tracking the
+    /// interrupt as active, while this clears the *source*. Skip this and the PL011
+    /// keeps asserting its line, so the GIC re-pends immediately after every EOI and
+    /// the machine makes no further progress.
+    fn ack_rx(&self) {
+        // SAFETY: `base` is a device-mapped PL011; ICR is inside the mapped page.
+        unsafe {
+            core::ptr::write_volatile(
+                (self.base + UART_ICR) as *mut u32,
+                INT_RX | INT_RX_TIMEOUT,
+            );
+        }
+    }
+
     fn putc(&self, c: u8) {
         // SAFETY: `base` is a device-mapped PL011 (installed by `init`); DR/FR are
         // within the mapped 4 KiB page.
@@ -79,3 +145,50 @@ pub fn _print(args: fmt::Arguments) {
         let _ = uart.write_fmt(args);
     }
 }
+
+/// Enable PL011 receive interrupts. Called by the shell once it is ready to consume
+/// input; until then the UART is transmit-only.
+pub fn enable_receive_interrupt() {
+    if let Some(ref uart) = *SERIAL.lock() {
+        uart.enable_rx_interrupt();
+    }
+}
+
+/// Drain the receive FIFO into the shell's input buffer, from the IRQ handler.
+///
+/// Reads until the FIFO is empty rather than taking a single byte. The receive-timeout
+/// interrupt fires once for a burst that is sitting in the FIFO, so a handler that
+/// consumed one character per interrupt would leave the rest stranded until the *next*
+/// keystroke — input would lag one character behind forever.
+///
+/// Returns the number of bytes taken, for the caller's diagnostics.
+pub fn handle_receive_interrupt() -> usize {
+    let guard = SERIAL.lock();
+    let Some(ref uart) = *guard else {
+        return 0;
+    };
+
+    let mut taken = 0;
+    while let Some(byte) = uart.getc() {
+        crate::shell::input::push_byte(byte);
+        taken += 1;
+    }
+
+    // Acknowledge at the source *after* draining. Clearing first would leave a window
+    // where a character arriving between the clear and the last read is consumed here
+    // but leaves no pending interrupt behind.
+    uart.ack_rx();
+    drop(guard);
+
+    // Waking is a separate step from buffering, and forgetting it is silent: the bytes
+    // land in the ring buffer, the interrupt is acknowledged, and the shell — blocked
+    // in `read_line` — is never made runnable again, so a perfectly working receive
+    // path looks like a dead console. Only wake when something actually arrived; a
+    // timeout interrupt with an empty FIFO is not a reason to schedule anyone.
+    if taken > 0 {
+        crate::shell::input::wake_shell();
+    }
+
+    taken
+}
+

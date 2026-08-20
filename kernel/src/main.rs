@@ -135,7 +135,6 @@ mod sched;
 /// Interactive debug shell.
 /// Runs as a scheduler task, provides commands for inspecting memory,
 /// tasks, and kernel state at runtime via the serial console.
-#[cfg(target_arch = "x86_64")]
 mod shell;
 
 /// Automated test harness.

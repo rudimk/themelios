@@ -374,8 +374,22 @@ pub fn kmain_aarch64(
         // Does not return — PSCI powers the machine off.
     }
 
+    // --- Interactive mode: the debug shell ---
+    //
+    // `shell::init` routes the UART's SPI through the GIC, and `enable_intid` asserts
+    // interrupts are masked — it does an unsynchronised read-modify-write of the
+    // distributor's priority and target registers, which is sound single-threaded and
+    // a race otherwise. Interrupts are live by this point (they have to be: the
+    // scheduler drain above needs them), so mask across the call rather than moving it
+    // earlier, which would put shell startup before the drain it must not disturb.
+    //
+    // The shell task then blocks until a keystroke wakes it, costing nothing while idle.
     #[cfg(not(feature = "test"))]
-    crate::println!("[boot] (shell=7.4)");
+    {
+        crate::arch::irq::disable();
+        crate::shell::init();
+        crate::arch::irq::enable();
+    }
 
     // Interrupts were unmasked above, so this is a live idle: the timer keeps firing
     // and the scheduler alternates this task with idle until 7.4 gives it real work.

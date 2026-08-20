@@ -15,6 +15,8 @@ use crate::println;
 use crate::sched;
 use crate::sched::task::TaskState;
 use crate::process;
+/// The process table's per-process state enum — x86_64 only, like the table itself.
+#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessState;
 use crate::cap::CapType;
 use crate::audit;
@@ -22,6 +24,8 @@ use crate::audit;
 /// Print a list of available commands.
 pub fn cmd_help(_args: &str) {
     println!("Available commands:");
+
+    // Portable — backed by subsystems both architectures have.
     println!("  help             — show this message");
     println!("  mem              — show memory statistics");
     println!("  tasks            — list all tasks");
@@ -29,24 +33,42 @@ pub fn cmd_help(_args: &str) {
     println!("  kill <id>        — kill a task by ID");
     println!("  peek <addr> [n]  — hex dump n bytes at virtual address");
     println!("  pgtable <addr>   — walk page tables for a virtual address");
-    println!("  procs            — list all processes");
-    println!("  caps [pid]       — list capabilities in a process's CSpace");
     println!("  audit [n]        — show last n audit log entries (default 20)");
-    println!("  mount            — list mounted filesystems");
-    println!("  ls <path>        — list a directory");
-    println!("  cat <path>       — print file contents");
-    println!("  stat <path>      — show file size and type");
-    println!("  write <path> <s> — create/write a file (overlay or /data)");
-    println!("  mkdir <path>     — create a directory");
-    println!("  ifconfig         — show network interface configuration");
-    println!("  sockets          — list open sockets and their state");
-    println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
-    println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
-    println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
-    println!("  run [image]      — create + launch a container (default: demo)");
-    println!("  ps               — list containers and their state");
-    println!("  logs <id>        — print a container's captured stdout/stderr");
-    println!("  stop <pid>       — force-terminate a running container");
+
+    // The rest depend on the process table, the storage stack, the network stack or
+    // containers — all part of the ring-3/VirtIO-PCI surface deferred on aarch64.
+    //
+    // The list is `#[cfg]`'d rather than printed unconditionally because a help text
+    // that advertises commands the dispatcher will reject as "Unknown command" is worse
+    // than a shorter one: it sends the reader looking for a bug that is not there.
+    #[cfg(target_arch = "x86_64")]
+    {
+        println!("  procs            — list all processes");
+        println!("  caps [pid]       — list capabilities in a process's CSpace");
+        println!("  mount            — list mounted filesystems");
+        println!("  ls <path>        — list a directory");
+        println!("  cat <path>       — print file contents");
+        println!("  stat <path>      — show file size and type");
+        println!("  write <path> <s> — create/write a file (overlay or /data)");
+        println!("  mkdir <path>     — create a directory");
+        println!("  ifconfig         — show network interface configuration");
+        println!("  sockets          — list open sockets and their state");
+        println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
+        println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
+        println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
+        println!("  run [image]      — create + launch a container (default: demo)");
+        println!("  ps               — list containers and their state");
+        println!("  logs <id>        — print a container's captured stdout/stderr");
+        println!("  stop <pid>       — force-terminate a running container");
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        println!();
+        println!("  (filesystem, network, container and process-table commands are");
+        println!("   x86_64-only for now — those subsystems are deferred on aarch64,");
+        println!("   which runs a ring-0 kernel core.)");
+    }
 }
 
 /// Print memory statistics: frame allocator and heap usage.
@@ -133,6 +155,8 @@ pub fn cmd_kill(args: &str) {
 
 /// Print a container's captured stdout/stderr (`docker logs`, Phase 6.2). Works on
 /// exited containers too (the log outlives the process, until the row is removed).
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_logs(args: &str) {
     let id = args.trim();
     if id.is_empty() {
@@ -156,6 +180,8 @@ pub fn cmd_logs(args: &str) {
 /// which operates on **task** IDs: `stop` takes a **process** ID and only tears
 /// down actual containers (`container::terminate` refuses kernel services), so it
 /// can't be used to nuke the block/ext2/net servers.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_stop(args: &str) {
     let args = args.trim();
     if args.is_empty() {
@@ -348,6 +374,8 @@ pub fn cmd_pgtable(args: &str) {
 }
 
 /// List all processes with PID, name, task count, capability count, and state.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_procs(_args: &str) {
     let procs = process::process_list();
 
@@ -368,6 +396,7 @@ pub fn cmd_procs(_args: &str) {
 ///
 /// Usage: `caps [pid]` — defaults to PID 0 (kernel process) if no PID given.
 /// Shows each capability's handle, type, rights, and parent relationship.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_caps(args: &str) {
     let args = args.trim();
     let pid_val = if args.is_empty() {
@@ -504,6 +533,7 @@ extern crate alloc;
 // volume; everything else routes to the overlay/SquashFS root.
 
 /// Resolve a shell path to (mount_id, path-within-mount).
+#[cfg(target_arch = "x86_64")]
 fn resolve_mount(path: &str) -> Option<(u64, alloc::string::String)> {
     use crate::fs;
     if path == "/data" {
@@ -516,11 +546,15 @@ fn resolve_mount(path: &str) -> Option<(u64, alloc::string::String)> {
 }
 
 /// `mount` — list mounted filesystems.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_mount(_args: &str) {
     crate::fs::print_mount_status();
 }
 
 /// `ls <path>` — list a directory's entries.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_ls(args: &str) {
     use crate::fs;
     let path = args.trim();
@@ -568,6 +602,8 @@ pub fn cmd_ls(args: &str) {
 }
 
 /// `cat <path>` — print a file's contents to serial.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_cat(args: &str) {
     use crate::fs;
     let path = args.trim();
@@ -613,6 +649,8 @@ pub fn cmd_cat(args: &str) {
 }
 
 /// `stat <path>` — show a file's size and type.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_stat(args: &str) {
     let path = args.trim();
     if path.is_empty() {
@@ -635,6 +673,8 @@ pub fn cmd_stat(args: &str) {
 }
 
 /// `write <path> <content>` — create and write a file.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_write(args: &str) {
     use crate::fs;
     let args = args.trim();
@@ -667,6 +707,8 @@ pub fn cmd_write(args: &str) {
 }
 
 /// `mkdir <path>` — create a directory.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_mkdir(args: &str) {
     let path = args.trim();
     if path.is_empty() {
@@ -692,6 +734,8 @@ pub fn cmd_mkdir(args: &str) {
 /// NIC's MAC and MTU, the IPv4 address/gateway/DNS the ring-3 stack acquired via
 /// DHCP, and the RX-overflow drop counter. The kernel does not parse packets — it
 /// only reports what the net server told it over `MSG_CONFIG`.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_ifconfig(_args: &str) {
     let st = crate::net::net_service::status();
     if !st.present {
@@ -744,6 +788,8 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 /// ephemeral local port, sends `msg`, and closes. Uses the kernel-internal
 /// socket ops (the shell runs in the kernel); userspace goes through the
 /// capability-checked syscalls instead.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_udpsend(args: &str) {
     use crate::net::socket;
 
@@ -798,6 +844,8 @@ pub fn cmd_udpsend(args: &str) {
 /// socket, connect (non-blocking; poll until established or refused), send a
 /// short request, and print whatever comes back. Uses the kernel-internal socket
 /// ops (the shell runs in the kernel).
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_tcpconnect(args: &str) {
     use crate::net::socket::{self, SockError};
 
@@ -923,6 +971,8 @@ fn sock_state_name(state: u8) -> &'static str {
 /// socket table: each socket's id, transport, TCP state (or `-`/`icmp`), bound
 /// local port, and connected peer. The kernel only relays the listing — the
 /// socket state lives entirely in the net server.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_sockets(_args: &str) {
     use crate::net::socket;
     let list = match socket::ksocket_list() {
@@ -964,6 +1014,8 @@ pub fn cmd_sockets(_args: &str) {
 /// slirp proxies guest ICMP to host pings, which needs host raw-socket/ping
 /// privileges that may be unavailable — a timeout there is an environment limit,
 /// not a stack bug (`ifconfig` + `udpsend` still prove the stack is live).
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_ping(args: &str) {
     use crate::net::socket::{self, SockError};
 
@@ -1045,6 +1097,8 @@ fn now_ms() -> u64 {
 /// capability-isolated Linux container, waits for it to exit, and prints the exit
 /// code. State transitions Created → Running → Exited are recorded in the registry
 /// (`ps` shows them). Live registry pull for arbitrary images is deferred.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_run(args: &str) {
     use crate::container::registry::{self, ContainerState};
     let image = {
@@ -1090,6 +1144,8 @@ pub fn cmd_run(args: &str) {
 /// `ps` — list containers and their metadata (Docker-style, Phase 6.1). Shows all
 /// containers including exited ones (like `docker ps -a`), since a metadata row
 /// survives its process until removed.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_ps(_args: &str) {
     let list = crate::container::registry::list();
     if list.is_empty() {

@@ -228,6 +228,16 @@ pub fn enable_intid(intid: u32) {
 /// Returns `true` if the interrupt was the scheduling timer, meaning the caller should
 /// consider preempting the interrupted task. The decision is *reported* rather than
 /// acted on here so that the caller can schedule after the EOI has been issued.
+/// Interrupt ID of the PL011 UART on QEMU `virt`: **SPI 1**, so INTID 33.
+///
+/// SPIs are numbered from 32, and the `virt` device tree describes the UART's
+/// interrupt as `<GIC_SPI 1 ...>` — the "1" is the SPI index, not the INTID. Getting
+/// that off by 32 is the standard way to enable the wrong line and see no input at all.
+///
+/// Unlike the timer's PPI, an SPI is shared and must be *targeted* at a CPU, which
+/// `enable_intid` handles.
+pub const UART_INTID: u32 = 33;
+
 pub fn dispatch_irq() -> bool {
     let iar = gicc_read(GICC_IAR);
     let intid = iar & IAR_INTID_MASK;
@@ -241,7 +251,13 @@ pub fn dispatch_irq() -> bool {
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let mut reschedule = false;
-    if intid == super::timer::TIMER_INTID {
+    if intid == UART_INTID {
+        // Serial input. The shell task is woken from inside the drain, so a keystroke
+        // is a scheduling event as much as a timer tick is — but the reschedule still
+        // happens after the EOI below, for the same reason.
+        let taken = super::serial::handle_receive_interrupt();
+        reschedule = taken > 0;
+    } else if intid == super::timer::TIMER_INTID {
         super::timer::handle_tick();
         // The timer is the preemption source: tell the caller a time slice expired.
         // Reported rather than acted on here so the scheduling happens *after* the
