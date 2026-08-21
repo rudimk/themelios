@@ -12,7 +12,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **5** | OCI container support | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Management API (Docker-compatible) | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port | Complete (ring-0 core) |
-| **8** | Hyperscaler support (AWS, GCP, Azure) | Not started |
+| **8** | aarch64 parity, then hyperscaler support (AWS, GCP, Azure) | Planned |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -207,11 +207,32 @@ milestone does not imply "containers on ARM".
 | 7.3 | Scheduler context switch + preemption | Complete |
 | 7.4 | Shell, portable tests on aarch64 CI, finalize | Complete |
 
-## Phase 8 — Hyperscaler support (Not started)
+## Phase 8 — aarch64 parity, then hyperscaler support (Planned)
 
-**Goal**: Boot and run on AWS, GCP, and Azure.
+**Goal**: Bring aarch64 from the Phase 7 ring-0 kernel core to full amd64 parity, then
+boot and run on AWS, GCP, and Azure — including their ARM instance families.
 
-**Deliverables**:
+Phase 7 delivered a *kernel core* on ARM: paging, exceptions, the GIC, the timer, the
+scheduler, and an in-kernel shell. What it did not deliver is everything above EL1 —
+userspace, storage, networking, containers, the management API. Phase 8 closes that gap
+first, because Graviton is the reason the ARM port exists and none of the hyperscaler
+work below is useful until an ARM node can actually run a container.
+
+Parity has one measurable definition: the kernel's 54-test suite currently runs **54/54
+on amd64 and 16/54 on aarch64**, with 38 tests carrying written skip reasons. Parity is
+that skip list reaching zero.
+
+**Deliverables — aarch64 parity (8.0–8.7)**:
+- User address spaces on `TTBR0_EL1` (fixes `AddressSpace::new_user` on aarch64)
+- SVC syscall entry, the drop to EL0, and `copy_from_user`/`copy_to_user`
+- `libthemelios` and the userspace server toolchain built for aarch64
+- The Linux personality on the aarch64 syscall table (`asm-generic/unistd.h`)
+- A VirtIO transport abstraction plus a virtio-mmio implementation
+- Storage, networking, containers, and the management API un-gated on aarch64
+
+**Deliverables — hyperscaler (8.8–8.10)**:
+- Device discovery via flattened device tree and ACPI static tables
+- GICv3 and SMP bring-up via PSCI `CPU_ON`
 - Instance metadata service (IMDS) clients for all three providers
 - Cloud-aware configuration injection at boot time
 - Machine image tooling (`cargo xtask image --cloud aws/gcp/azure`)

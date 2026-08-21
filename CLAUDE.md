@@ -145,7 +145,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Complete (ring-0 core; EL0/storage/net/containers deferred) |
-| **8** | Hyperscaler support (AWS, GCP, Azure), secure boot | Not started |
+| **8** | aarch64 parity (EL0, storage, net, containers), then hyperscaler + secure boot | Planned |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -155,13 +155,24 @@ When starting or completing a phase, update all three locations (this table, the
 
 _Single source of truth for "where are we / what's next". Update the relevant
 line when finishing a sub-phase. Detailed per-sub-phase checklists live in
-`.sisyphus/plans/` (local, gitignored); the git commit history has the full
+`.sisyphus/plans/` (tracked in git); the git commit history has the full
 narrative per commit._
+
+**Phase 8 — aarch64 parity, then hyperscaler: PLANNED, not started.** Plan in
+`.sisyphus/plans/phase8-aarch64-parity.md`. Eleven sub-phases taking aarch64 from the
+Phase 7 ring-0 core to full amd64 parity (EL0, storage, networking, containers,
+management API — 8.0–8.7), then onto real ARM server hardware (device discovery,
+GICv3, SMP, secure boot — 8.8–8.10). **This re-scopes the roadmap's Phase 8 label
+rather than renumbering**: Graviton is why parity matters, and every hyperscaler item
+is dead weight until an ARM node can run a container. Parity has one measurable
+definition — `test_runner`'s `SKIPPED` list is empty on both architectures, i.e. 54/54
+running on each. It is **16 running / 38 skipped** on aarch64 today.
 
 **Phase 7 — aarch64 port: COMPLETE (ring-0 core).** A ring-0 kernel-core port to QEMU `virt`
 (ARM64); EL0/userspace, storage, networking and containers on ARM are a separate,
 deferred ABI surface. amd64 stays green every sub-phase — the QEMU suite is the gate.
-Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
+Detailed plan in `.sisyphus/plans/phase7-aarch64.md`. **Phase 8 continues this work to
+parity — see above.**
 
 - ✅ **7.0a** Arch-neutral `arch::{irq,time}` facade; all tick reads and interrupt
   sites routed through it, x86 impls re-exported unchanged.
