@@ -54,9 +54,9 @@ jobs:
         run: cargo xtask test
 
   arm64:
-    name: aarch64 — build + boot (QEMU virt)
+    name: aarch64 — build + boot + test suite (QEMU virt)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     # Three levels of aarch64 coverage, cheapest first:
     #
@@ -111,6 +111,9 @@ jobs:
 
       - name: Boot the aarch64 ISO on QEMU virt (banner smoke)
         run: cargo xtask arm64-iso-smoke
+
+      - name: Run the kernel test suite on QEMU virt
+        run: cargo xtask test --arch aarch64
 
   release:
     name: Release ISOs (amd64 + aarch64)
