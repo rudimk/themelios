@@ -12,7 +12,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **5** | OCI container support | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Management API (Docker-compatible) | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port | Complete (ring-0 core) |
-| **8** | aarch64 parity, then hyperscaler support (AWS, GCP, Azure) | Planned |
+| **8** | aarch64 parity, then any SystemReady ARM64 node | Planned |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -207,43 +207,58 @@ milestone does not imply "containers on ARM".
 | 7.3 | Scheduler context switch + preemption | Complete |
 | 7.4 | Shell, portable tests on aarch64 CI, finalize | Complete |
 
-## Phase 8 — aarch64 parity, then hyperscaler support (Planned)
+## Phase 8 — aarch64 parity, then any SystemReady ARM64 node (Planned)
 
 **Goal**: Bring aarch64 from the Phase 7 ring-0 kernel core to full amd64 parity, then
-boot and run on AWS, GCP, and Azure — including their ARM instance families.
+boot and run on real ARM server hardware.
 
 Phase 7 delivered a *kernel core* on ARM: paging, exceptions, the GIC, the timer, the
 scheduler, and an in-kernel shell. What it did not deliver is everything above EL1 —
 userspace, storage, networking, containers, the management API. Phase 8 closes that gap
-first, because Graviton is the reason the ARM port exists and none of the hyperscaler
-work below is useful until an ARM node can actually run a container.
+first, because none of the hardware work below is useful until an ARM node can actually
+run a container.
+
+**The target is a conformance class, not a vendor**: a SystemReady SR/SBBR node — UEFI +
+ACPI static tables + GICv3 + PCIe + PSCI. AWS Graviton, Ampere Altra/AmpereOne, NVIDIA
+Grace, and the Arm VM offerings of GCP and Azure are all instances of that class.
+SystemReady IR (UEFI + devicetree) is a second, explicitly scoped class; non-UEFI
+devicetree boot is out of scope by name.
+
+Genericity is checked rather than asserted. Every boot prints one `platform:` line —
+firmware source, GIC version, UART type, CPU count, PA bits, timer frequency — and CI
+boots the **same unmodified image** on both `-M virt` and `-M sbsa-ref` (GICv3, ACPI,
+TF-A + EDK2, PCIe, no virtio at all, a completely different memory map), asserting that
+the sentinel matches and the two `platform:` lines **differ**. A kernel still secretly
+using hard-coded constants prints identical lines on two different machines.
 
 Parity has one measurable definition: the kernel's 54-test suite currently runs **54/54
 on amd64 and 16/54 on aarch64**, with 38 tests carrying written skip reasons. Parity is
 that skip list reaching zero.
 
-**Deliverables — aarch64 parity (8.0–8.7)**:
-- User address spaces on `TTBR0_EL1` (fixes `AddressSpace::new_user` on aarch64)
-- SVC syscall entry, the drop to EL0, and `copy_from_user`/`copy_to_user`
-- `libthemelios` and the userspace server toolchain built for aarch64
+**Deliverables — aarch64 parity (8.1–8.10)**:
+- An arch-neutral device-discovery seam and a `VirtioTransport` trait (amd64-only
+  refactors, landing alone so "amd64 green" is a checkable claim about each)
+- virtio-mmio on QEMU `virt`, with rings as Normal memory and explicit virtqueue barriers
+- User address spaces on `TTBR0_EL1`, SVC syscall entry, the drop to EL0, per-task
+  `SP_EL0`/`TPIDR_EL0`/FPSIMD state, and `copy_from_user`/`copy_to_user`
+- `libthemelios`, six hand-written `_start` routines, and the server toolchain for aarch64
+- Storage and networking un-gated on aarch64
 - The Linux personality on the aarch64 syscall table (`asm-generic/unistd.h`)
-- A VirtIO transport abstraction plus a virtio-mmio implementation
-- Storage, networking, containers, and the management API un-gated on aarch64
+- Containers and the management API on aarch64 — the parity gate
 
-**Deliverables — hyperscaler (8.8–8.10)**:
-- Device discovery via flattened device tree and ACPI static tables
-- GICv3 and SMP bring-up via PSCI `CPU_ON`
-- Instance metadata service (IMDS) clients for all three providers
-- Cloud-aware configuration injection at boot time
-- Machine image tooling (`cargo xtask image --cloud aws/gcp/azure`)
-- AMI creation for AWS (raw disk import via `aws ec2 import-image`)
-- GCP image creation (raw disk tarball + `gcloud compute images create`)
-- Azure VHD image creation
+**Deliverables — real hardware (8.11–8.17)**:
+- Platform discovery: ACPI static tables (FADT/MADT/GTDT/MCFG/SPCR/IORT/PPTT/TPM2) and
+  flattened device tree, selected at runtime, failing closed rather than falling back to
+  constants
+- GICv3 including the ITS, without which PCIe MSI-X cannot be delivered
+- PCIe ECAM enumeration and MSI-X
+- SMP bring-up via PSCI `CPU_ON`, plus a multi-core audit of every kernel lock
+- One cloud end to end: an NVMe driver plus that cloud's NIC. Note that **none of the
+  three clouds runs virtio** — AWS is ENA, GCP is gVNIC, Azure is MANA/NetVSC, all with
+  NVMe — so the second and third clouds are deferred by name as one NIC driver each
 - UEFI Secure Boot chain verification and kernel image signing
-- Measured boot (TPM support)
-- Boot validation on each provider's compute instances
-- GitHub Actions workflow to build downloadable QEMU ISOs (x86_64, aarch64)
-- GitHub Actions workflows to build and publish cloud-specific machine images
+- Measured boot: the UEFI TCG2 event log and a TPM 2.0 discovered via ACPI, failing
+  closed to "unmeasured" where no TPM is present
 
 ## Phase 9 — Testing and benchmarks (Not started)
 
