@@ -82,22 +82,25 @@ pub unsafe fn system_off() {
     // implemented raises a synchronous exception the installed vectors report. Neither
     // corrupts state.
     //
-    // The clobber list covers x0-x3, which is the SMCCC 1.1 contract. Under SMCCC 1.0 a
-    // callee may clobber x4-x17 and `in(reg)` can allocate the ID register there —
-    // harmless only because a successful call never returns.
+    // The ID goes through x0 directly rather than a scratch register. The previous
+    // form (`in(reg)` plus an x0-x3 clobber list) excused itself with "harmless because
+    // a successful call never returns" — which is self-cancelling, since the second
+    // block exists *only* for the case where the first one does return. Under SMCCC 1.0
+    // a callee may clobber x4-x17, which is exactly where `in(reg)` could have put the
+    // ID, and the compiler would have assumed it survived.
     unsafe {
         asm!(
-            "mov x0, {id}",
             "hvc #0",
-            id = in(reg) PSCI_SYSTEM_OFF,
-            out("x0") _, out("x1") _, out("x2") _, out("x3") _,
+            inout("x0") PSCI_SYSTEM_OFF => _,
+            out("x1") _, out("x2") _, out("x3") _,
+            clobber_abi("C"),
             options(nostack),
         );
         asm!(
-            "mov x0, {id}",
             "smc #0",
-            id = in(reg) PSCI_SYSTEM_OFF,
-            out("x0") _, out("x1") _, out("x2") _, out("x3") _,
+            inout("x0") PSCI_SYSTEM_OFF => _,
+            out("x1") _, out("x2") _, out("x3") _,
+            clobber_abi("C"),
             options(nostack),
         );
     }

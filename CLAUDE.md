@@ -252,8 +252,10 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   rest `#[cfg]`'d out of dispatcher, impls *and* help text. Three defects the tests
   caught: `test_page_tables` assumed 1 MiB is RAM (true on a PC, an unbacked hole on
   `virt`); the suite ran with interrupts in whatever state boot left them, enabled only
-  as a side effect of the first `yield_now` (an order-dependent environment → a
-  1-in-5 `test_ipc` flake); and the boot self-tests left dead-task stacks for
+  as a side effect of the first `yield_now` (an order-dependent environment — real, but
+  **not** the cause of the `test_ipc` flake I attributed to it: that was `ipc`'s
+  lost-wakeup guard, `#[cfg]`'d to x86 by the same 7.0a sweep 7.3 fixed in `sched`,
+  reproducing at 2-in-10 until un-gated); and the boot self-tests left dead-task stacks for
   `cleanup_dead_tasks` to reclaim mid-test, breaking `test_frame_allocator`'s exact
   frame-count equality 5 runs of 5. Plus one in the shell: the RX handler buffered
   bytes but never called `wake_shell`, so every register read correctly and the console

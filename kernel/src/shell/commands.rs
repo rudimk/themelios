@@ -82,6 +82,14 @@ pub fn cmd_mem(_args: &str) {
     // at 0 it counts the hole below as "used": QEMU `virt` puts RAM at 0x4000_0000, and
     // a 512 MiB guest previously reported "1037 MiB used".
     let usable_frames = mm::frame::usable_frame_count();
+    // `free` can never exceed `usable` — `reclaim_region` raises both together — so a
+    // plain subtraction is right. Using `saturating_sub` here previously turned a
+    // broken invariant into a plausible-looking "0 MiB used" instead of surfacing it.
+    debug_assert!(
+        free_frames <= usable_frames,
+        "free frames ({free_frames}) exceed usable ({usable_frames}) — usable_count is \
+         not tracking a pool change"
+    );
     let used_frames = usable_frames.saturating_sub(free_frames);
 
     let free_mib = (free_frames as u64 * mm::PAGE_SIZE) / (1024 * 1024);
@@ -259,14 +267,14 @@ pub fn cmd_peek(args: &str) {
     // (kernel space, above 0xffff800000000000) and within a reasonable
     // range. A page fault will still crash the kernel, so we do our best.
     if !is_valid_address(addr, count) {
-        println!("Address {:#x} is not in a known mapped range.", addr);
-        // Report the *live* HHDM base: it differs per architecture (0xffff8000…
-        // on x86_64, 0xffff0000… on aarch64), and printing a constant told the
-        // reader a range that was wrong for the machine they were on.
+        println!("Address {:#x} is not mapped (checked against the page tables).", addr);
+        // Point at the HHDM base rather than claiming a range: the walk above is the
+        // authority now, and an advertised window is exactly what previously named
+        // addresses that would fault. `pgtable <addr>` shows why a given address fails.
         println!(
-            "Valid ranges: HHDM ({:#x}+4GiB), kernel image ({:#x}+16MiB)",
+            "  Physical memory is reachable through the HHDM at {:#x}; try `pgtable {:#x}`.",
             mm::hhdm_offset(),
-            KERNEL_IMAGE_BASE
+            addr
         );
         return;
     }
@@ -287,37 +295,43 @@ const KERNEL_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 
 fn is_valid_address(addr: u64, count: usize) -> bool {
     let end = addr.wrapping_add(count as u64);
-    let hhdm = mm::hhdm_offset();
+    if end < addr {
+        return false; // wrapped
+    }
 
-    // Must be in the upper half (kernel space).
+    // Ask the page tables, rather than guessing from address ranges.
     //
-    // The floor is derived from the live HHDM base rather than hard-coded to x86's
-    // 0xffff_8000_0000_0000. Limine's aarch64 HHDM sits at 0xffff_0000_0000_0000 —
-    // *below* that constant — so the hard-coded version rejected the entire aarch64
-    // HHDM window and made the branch below it unreachable, leaving `peek` able to
-    // read only the kernel image on that architecture. Inspecting physical memory
-    // through the HHDM is the command's main use.
-    let upper_half_floor = hhdm.min(KERNEL_IMAGE_BASE);
-    if addr < upper_half_floor {
-        return false;
+    // This used to be a pair of hard-coded windows: "upper half, and either
+    // HHDM+4GiB or the kernel image". Both halves were wrong somewhere. The floor was
+    // x86's `0xffff_8000_0000_0000`, which sits *above* Limine's aarch64 HHDM base and
+    // so rejected that whole window; and the HHDM+4GiB span accepts addresses that are
+    // definitionally unmapped on QEMU `virt`, whose RAM starts a gigabyte up — so the
+    // very address the old error message advertised would hard-fault the kernel.
+    //
+    // `AddressSpace::translate` has existed since 7.1, and `cmd_pgtable` forty lines
+    // below already walks the tables. A heuristic was never necessary; it was just
+    // older than the walker.
+    let kernel_as = mm::page_table::kernel_address_space();
+    // Check every page the dump will touch, not just the first: a range can start on a
+    // mapped page and run off the end of it.
+    let first_page = addr & !(mm::PAGE_SIZE - 1);
+    let last_page = (end - 1) & !(mm::PAGE_SIZE - 1);
+    let mut page = first_page;
+    let mut ok = true;
+    loop {
+        if kernel_as.translate(mm::addr::VirtAddr::new(page)).is_none() {
+            ok = false;
+            break;
+        }
+        if page == last_page {
+            break;
+        }
+        page += mm::PAGE_SIZE;
     }
-
-    // HHDM region: hhdm_offset .. hhdm_offset + some physical memory limit.
-    // With 256 MiB QEMU memory, physical addresses go up to ~0x10000000.
-    // Be generous and allow up to 4 GiB above the HHDM base.
-    let hhdm_end = hhdm + 4 * 1024 * 1024 * 1024; // 4 GiB
-    if addr >= hhdm && end <= hhdm_end {
-        return true;
-    }
-
-    // Kernel image region: 16 MiB from the higher-half load address.
-    let kernel_base: u64 = KERNEL_IMAGE_BASE;
-    let kernel_end: u64 = kernel_base + 16 * 1024 * 1024;
-    if addr >= kernel_base && end <= kernel_end {
-        return true;
-    }
-
-    false
+    // `kernel_address_space()` hands back a lightweight handle over the live tables;
+    // dropping it would tear them down. Same treatment as `cmd_pgtable`.
+    core::mem::forget(kernel_as);
+    ok
 }
 
 /// Print a hex dump of memory in traditional format.

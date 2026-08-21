@@ -971,11 +971,14 @@ fn cmd_arm64_smoke(_args: &[String]) {
     let _ = fs::remove_file(&serial_log);
 
     println!("Booting aarch64 kernel on QEMU virt (headless)...");
+    let sock = root.join("target/aarch64-smoke.sock");
     let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
-    cmd.args(["-display", "none"]);
-    cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+    cmd.args(["-display", "none", "-monitor", "none"]);
+    cmd.arg("-chardev")
+        .arg(format!("socket,id=s0,path={},server=on,wait=off", sock.display()));
+    cmd.args(["-serial", "chardev:s0"]);
 
-    await_aarch64_banner(cmd, &serial_log, "ESP");
+    await_aarch64_banner(cmd, &sock, &serial_log, "ESP");
 }
 
 /// `cargo xtask arm64-iso-smoke` — build the **arm64 ISO** and boot *it* on QEMU
@@ -1027,10 +1030,13 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
     // that xorriso's `-efi-boot-part` embedded in the image.
     cmd.arg("-drive")
         .arg(format!("file={},format=raw,if=virtio,readonly=on", iso.display()));
-    cmd.args(["-display", "none"]);
-    cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+    let sock = root.join("target/aarch64-iso-smoke.sock");
+    cmd.args(["-display", "none", "-monitor", "none"]);
+    cmd.arg("-chardev")
+        .arg(format!("socket,id=s0,path={},server=on,wait=off", sock.display()));
+    cmd.args(["-serial", "chardev:s0"]);
 
-    await_aarch64_banner(cmd, &serial_log, "ISO");
+    await_aarch64_banner(cmd, &sock, &serial_log, "ISO");
 }
 
 /// Run `cmd` (a configured headless `qemu-system-aarch64`) and wait for the kernel's
@@ -1041,30 +1047,29 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
 /// the captured serial for the marker and kill QEMU once we see it. Absence of the
 /// marker within the window is a failure. `what` names the boot medium in the
 /// pass/fail message so the two smokes are distinguishable in CI logs.
-fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
+fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: &str) {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    let _ = fs::remove_file(sock);
     let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
 
     // The success sentinel, which advances with each sub-phase to the *last* thing the
-    // boot path proves — currently shell startup, which runs after the memory bring-up,
-    // the paging self-test, the exception/GIC/timer self-tests and the scheduler one.
+    // boot path proves — currently the shell's own banner, printed by the shell task
+    // rather than by `shell::init`, so reaching it proves the task was actually
+    // scheduled and not merely spawned.
     //
     // It is deliberately never left pointing at an earlier milestone. Every marker so
     // far (the 7.0b banner, the 7.1 paging sentinel, the 7.2 timer sentinel, the 7.3
     // scheduler sentinel) prints before the work the next sub-phase adds, so leaving it
     // behind would let that work break while the smoke saw its marker and stopped
-    // looking.
-    //
-    // 7.4 nearly shipped having broken that rule: the shell is the only new thing in
-    // the boot path, and the suite run by `xtask test --arch aarch64` builds with
-    // `--features test`, which takes the other branch and never starts a shell at all.
-    // With the marker left at 7.3, nothing in CI would have executed `shell::init` —
-    // and two real defects in the receive path were found by hand precisely because
-    // nothing was executing it.
-    const MARKER: &str = "Shell initialized";
+    // looking. 7.4 nearly shipped having broken exactly that rule.
+    const MARKER: &str = "ThemeliOS debug shell";
 
-    // Failure signatures. Without these the only failure mode is "marker never
-    // appeared", which costs the full timeout and reports nothing useful. A panic or a
-    // self-test failure is terminal — stop immediately and say which it was.
+    // Failure signatures, checked before the marker on every poll. Without these the
+    // only failure mode is "marker never appeared", which costs the full timeout and
+    // reports nothing useful.
     const FAILURES: &[&str] = &[
         "KERNEL PANIC",
         "Phase 7.1 MMU/paging FAILED self-test",
@@ -1079,49 +1084,127 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
         "!!! aarch64 EXCEPTION !!!",
     ];
 
-    let mut found = false;
-    let mut failure: Option<String> = None;
-    // ~40 s budget. Phase 7.1 does materially more work before the sentinel than 7.0b
-    // did (memory-map scan, frame bitmap, heap, page-table clone), and CI runners are
-    // slower than a dev box.
-    for _ in 0..80 {
-        thread::sleep(Duration::from_millis(500));
-        if let Ok(s) = fs::read_to_string(serial_log) {
-            if let Some(f) = FAILURES.iter().find(|f| s.contains(**f)) {
-                failure = Some((*f).to_string());
-                break;
-            }
-            if s.contains(MARKER) {
-                found = true;
-                break;
-            }
+    // Connect to QEMU's serial socket. It is created with `server=on,wait=off`, so the
+    // listener may not exist for a moment after spawn.
+    let mut stream = None;
+    for _ in 0..100 {
+        thread::sleep(Duration::from_millis(100));
+        if let Ok(s) = UnixStream::connect(sock) {
+            stream = Some(s);
+            break;
         }
         if let Ok(Some(_)) = child.try_wait() {
-            break; // QEMU exited early (unexpected — the kernel idles after the test)
+            break;
         }
     }
+    let Some(stream) = stream else {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("arm64 {what} smoke FAILED: QEMU never opened its serial socket.");
+        process::exit(1);
+    };
+
+    // Drain the socket on a background thread. A reader thread rather than polling a
+    // file because the socket is bidirectional — being able to type back is the point.
+    let captured = Arc::new(Mutex::new(String::new()));
+    {
+        let captured = Arc::clone(&captured);
+        let mut rx = stream.try_clone().expect("clone serial socket");
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = rx.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+
+    let seen = |needle: &str| captured.lock().unwrap().contains(needle);
+    let hit_failure = || {
+        let s = captured.lock().unwrap();
+        FAILURES.iter().find(|f| s.contains(**f)).map(|f| (*f).to_string())
+    };
+
+    let mut found = false;
+    let mut failure: Option<String> = None;
+    // ~40 s budget. CI runners are slower than a dev box, and the boot runs four
+    // self-tests before the shell starts.
+    for _ in 0..80 {
+        thread::sleep(Duration::from_millis(500));
+        if let Some(f) = hit_failure() {
+            failure = Some(f);
+            break;
+        }
+        if seen(MARKER) {
+            found = true;
+            break;
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            break; // QEMU exited early — the kernel should idle at the shell prompt
+        }
+    }
+
+    // If the shell came up, type at it. This is what exercises the receive path — the
+    // PL011 RX interrupt, the GIC SPI route, the ring buffer, the wake, and the line
+    // editor — none of which booting alone touches.
+    //
+    // It is here because that gap let two real defects ship: a handler that buffered
+    // bytes without ever waking the shell, and an acknowledge ordering that could wedge
+    // the console permanently. Both were found by hand; neither survives this.
+    let mut answered = false;
+    if found && failure.is_none() {
+        let mut tx = stream;
+        let _ = tx.write_all(b"help\r");
+        let _ = tx.flush();
+        for _ in 0..40 {
+            thread::sleep(Duration::from_millis(250));
+            // Match a line unique to the command's *output*, not the echoed input, so
+            // this proves the shell dispatched the command rather than merely echoing.
+            if seen("show memory statistics") {
+                answered = true;
+                break;
+            }
+            if let Some(f) = hit_failure() {
+                failure = Some(f);
+                break;
+            }
+        }
+    }
+
     let _ = child.kill();
     let _ = child.wait();
 
-    let serial = fs::read_to_string(serial_log).unwrap_or_default();
+    let serial = captured.lock().unwrap().clone();
+    // Keep writing the log file: CI and humans both go looking for it.
+    let _ = fs::write(serial_log, &serial);
     println!("--- aarch64 serial output ({what}) ---\n{serial}\n-----------------------------");
 
     if let Some(f) = failure {
         eprintln!("arm64 {what} smoke FAILED: kernel reported '{f}' (see serial above).");
         process::exit(1);
     }
-    if found {
-        println!(
-            "arm64 {what} smoke passed: booted, switched to kernel page tables, passed \
-             the paging, exception, timer and scheduler self-tests, and started the \
-             shell on QEMU virt."
-        );
-    } else {
+    if !found {
+        eprintln!("arm64 {what} smoke FAILED: sentinel '{MARKER}' not seen within the window.");
+        process::exit(1);
+    }
+    if !answered {
         eprintln!(
-            "arm64 {what} smoke FAILED: sentinel '{MARKER}' not seen within the window."
+            "arm64 {what} smoke FAILED: the shell started but did not answer a typed \
+             command — serial input is not reaching it (check the PL011 receive \
+             interrupt, the GIC SPI route, and that the handler wakes the shell task)."
         );
         process::exit(1);
     }
+    println!(
+        "arm64 {what} smoke passed: booted, switched to kernel page tables, passed the \
+         paging, exception, timer and scheduler self-tests, started the shell, and \
+         answered a typed command on QEMU virt."
+    );
 }
 
 /// Locate the aarch64 UEFI firmware pair (CODE, VARS) across common distro/macOS

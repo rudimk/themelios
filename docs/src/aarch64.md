@@ -17,7 +17,7 @@ That boundary is visible in the test suite rather than left to prose: an aarch64
 | Kernel page tables | ✅ | ✅ |
 | Exceptions, interrupts, timer | ✅ | ✅ |
 | Preemptive scheduler | ✅ | ✅ |
-| Capability system, IPC, audit | ✅ | ✅ |
+| Capability system, IPC, audit | ✅ | ✅ (compiled and tested; no *user* of them yet on a non-test boot) |
 | Debug shell | ✅ | reduced (8 of 25 commands) |
 | Ring-3 / EL0 | ✅ | deferred |
 | VirtIO-PCI, storage, network | ✅ | deferred |
@@ -35,7 +35,7 @@ Architecture-specific code lives under `kernel/src/arch/{x86_64,aarch64}/`. Shar
 | `arch::paging` | descriptors, TLB, roots | PML4 / CR3 | VMSAv8-64 / TTBR1 |
 | `arch::context` | task switch | System V, `rsp` | AAPCS64, `sp` |
 
-Everything else — `mm`, `sched`, `cap`, `ipc`, `audit`, `http`, `oci` — compiles unmodified on both.
+`cap`, `audit`, `http` and `oci` compile unmodified on both. `mm` and `sched` are shared but not untouched: both carry `#[cfg(target_arch = "x86_64")]` for the ring-3 machinery they also hold — TSS stack staging, FS-base restore, CR3 swaps, the Linux thread fields.
 
 ## Differences that actually mattered
 

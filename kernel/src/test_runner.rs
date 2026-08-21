@@ -41,9 +41,15 @@ struct TestCase {
 /// All of them are deleted. That is worth stating as a checkable fact rather than an
 /// intention, because the first version of this change *left three behind*: their
 /// `TESTS` entries were un-gated while their implementations stayed x86-gated, so the
-/// table bound the stub and three of the "14 real tests" were eight bytes of
+/// table bound the stub and three of the "16 real tests" were eight bytes of
 /// `mov x0, xzr; ret`. `grep -c 'cfg(not(target_arch = "x86_64"))'` over this file
 /// should find nothing but this comment.
+///
+/// One honest exception, so nobody has to discover it by disassembling: `test_boot`'s
+/// body really is `Ok(())` on both architectures. It is not a stub standing in for a
+/// gated implementation — reaching it *is* the assertion, since the harness only runs
+/// once serial, memory and the scheduler are up. It is the same eight bytes, for a
+/// different reason.
 struct SkippedTest {
     name: &'static str,
     why: &'static str,
@@ -159,7 +165,15 @@ static SKIPPED: &[SkippedTest] = &[
     SkippedTest { name: "test_syscall", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest {
         name: "test_shared_memory",
-        why: "maps a region into a *user* address space; EL0 is deferred",
+        // Not "EL0 is deferred": nothing here enters EL0, and `mm::shared` and
+        // `AddressSpace::new_user` both compile on aarch64. The real blocker is that
+        // `new_user` is not *ported* — a fresh address space inherits the low-half
+        // entries, so the 1 GiB block QEMU `virt` maps at VA 0x4000_0000 is present in
+        // it, and mapping a 4 KiB page beneath a block panics `ensure_table`. Tracked
+        // as follow-up work; it lands with the EL0 port, which is what will give
+        // `new_user` a reason to produce an empty low half.
+        why: "`AddressSpace::new_user` is not ported — a fresh space inherits low-half \
+              block mappings",
     },
     SkippedTest { name: "test_process", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_userspace_init", why: "ring-3/EL0 is deferred on aarch64" },
@@ -174,7 +188,7 @@ static SKIPPED: &[SkippedTest] = &[
     SkippedTest { name: "test_ext2_read", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_ext2_write", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_vfs_capability", why: "the storage stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_fs_syscalls", why: "the Linux personality needs ring-3" },
+    SkippedTest { name: "test_fs_syscalls", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_virtio_net", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_net_service", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_net_server_stack", why: "the network stack rides on VirtIO-PCI" },
@@ -1449,7 +1463,6 @@ fn test_pci_scan() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 // ============================================================
 //  test_virtio_transport — VirtIO PCI transport (Phase 3.1)
 // ============================================================
@@ -1504,7 +1517,6 @@ fn test_virtio_transport() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 /// Fault-injection for the VirtIO queue-failure paths.
 ///
 /// A healthy QEMU device always completes, so the timeout and desynchronisation
@@ -1516,7 +1528,6 @@ fn test_virtio_transport() -> Result<(), &'static str> {
 fn test_virtio_queue_failure() -> Result<(), &'static str> {
     crate::drivers::virtio::test_queue_failure_paths()
 }
-
 
 // ============================================================
 //  test_virtio_blk — VirtIO block driver round-trip (Phase 3.2)
@@ -1612,7 +1623,6 @@ fn test_virtio_blk() -> Result<(), &'static str> {
 
     Ok(())
 }
-
 
 // ============================================================
 //  test_shared_memory — Shared memory regions (Phase 3.3)
@@ -1773,7 +1783,6 @@ fn test_block_server_ipc() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 // ============================================================
 //  test_server_spawn — Userspace server framework (Phase 3.4)
 // ============================================================
@@ -1839,7 +1848,6 @@ fn test_server_spawn() -> Result<(), &'static str> {
 
     Ok(())
 }
-
 
 // ============================================================
 //  test_squashfs_server — SquashFS filesystem server (Phase 3.5)
@@ -2060,7 +2068,6 @@ fn test_squashfs_server() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 // ============================================================
 //  test_overlay_server — Overlay filesystem server (Phase 3.6)
 // ============================================================
@@ -2278,7 +2285,6 @@ fn test_overlay_server() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 // ============================================================
 //  test_ext2_read — ext2 server read path (Phase 3.7, step 1)
 // ============================================================
@@ -2462,7 +2468,6 @@ fn test_ext2_read() -> Result<(), &'static str> {
 
     Ok(())
 }
-
 
 // ============================================================
 //  test_ext2_write — ext2 server write path (Phase 3.7, step 2)
@@ -2650,7 +2655,6 @@ fn test_ext2_write() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 // ============================================================
 //  test_vfs_capability — VFS dispatch + capability gating (Phase 3.8)
 // ============================================================
@@ -2765,7 +2769,6 @@ fn test_vfs_capability() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 // ============================================================
 //  test_fs_syscalls — FS syscalls from ring 3 (Phase 3.8, step 2)
 // ============================================================
@@ -2857,7 +2860,6 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
     }
 }
 
-
 // ============================================================
 //  test_virtio_net — VirtIO-net driver TX/RX round-trip (Phase 4.0)
 // ============================================================
@@ -2940,7 +2942,6 @@ fn test_virtio_net() -> Result<(), &'static str> {
     }
     Ok(())
 }
-
 
 // ============================================================
 //  test_net_service — kernel net service frame bridge (Phase 4.1)
@@ -3043,7 +3044,6 @@ fn test_net_service() -> Result<(), &'static str> {
     }
     Ok(())
 }
-
 
 // ============================================================
 //  test_net_server_stack — ring-3 smoltcp stack round-trip (Phase 4.2)
@@ -3169,7 +3169,6 @@ fn test_net_server_stack() -> Result<(), &'static str> {
     }
     Ok(())
 }
-
 
 // ============================================================
 //  test_net_icmp_echo — ring-3 smoltcp answers ICMP echo (Phase 4.3)
@@ -3335,7 +3334,6 @@ fn test_net_icmp_echo() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 // ============================================================
 //  test_dhcp — DHCPv4 address acquisition end to end (Phase 4.4)
 // ============================================================
@@ -3431,7 +3429,6 @@ fn test_dhcp() -> Result<(), &'static str> {
     }
     Ok(())
 }
-
 
 // ============================================================
 //  Socket API tests (Phase 4.5)
@@ -3624,7 +3621,6 @@ fn test_socket_capability() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 /// Test the `sockets` listing path (`OP_SOCK_LIST`) and the ICMP socket /
 /// ping-send plumbing (`OP_SOCK_PING`), both introduced in sub-phase 4.7.
 ///
@@ -3686,7 +3682,6 @@ fn test_socket_list() -> Result<(), &'static str> {
     let _ = socket::ksocket_close(icmp);
     Ok(())
 }
-
 
 /// Test the Phase 5.0 ELF loader end to end: load the embedded `elf-smoke` ELF
 /// into a fresh process, build its initial stack with a known argv, map a result
@@ -3762,7 +3757,6 @@ fn test_elf_exec() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 /// Test the Phase 5.1 Linux syscall personality end to end: load the `linux-smoke`
 /// ELF, mark the process `Personality::Linux`, run it, and verify it self-checked
 /// the core Linux syscall surface — `arch_prctl(SET_FS)` + `%fs` TLS, `brk` growth,
@@ -3826,7 +3820,6 @@ fn test_linux_exec() -> Result<(), &'static str> {
     }
 }
 
-
 /// Unit-test the security-critical Linux path resolver (Phase 5.2): `..` must be
 /// clamped at the root so a container path can never escape its rootfs.
 #[cfg(target_arch = "x86_64")]
@@ -3854,7 +3847,6 @@ fn test_path_resolve() -> Result<(), &'static str> {
     }
     Ok(())
 }
-
 
 /// Test the Phase 5.2 Linux filesystem syscalls end to end: stage a file on an
 /// ext2 mount, use it as a Linux process's container rootfs, and run `fs-smoke`,
@@ -3974,7 +3966,6 @@ fn test_linux_fs() -> Result<(), &'static str> {
     }
 }
 
-
 /// Test the Phase 5.3 threads + futex path end to end: run `threads-smoke`, which
 /// `clone`s a thread (sharing the address space, with its own TLS), has the child
 /// write a magic and `exit`, then **joins** by `futex`-waiting on the
@@ -4029,7 +4020,6 @@ fn test_linux_threads() -> Result<(), &'static str> {
         Some(_) => Err("threads-smoke: unknown failure code"),
     }
 }
-
 
 /// Build one 512-byte USTAR header for `name`/`size`/`typeflag` (test helper).
 fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
@@ -4146,7 +4136,6 @@ fn test_oci_unpack() -> Result<(), &'static str> {
 
     Ok(())
 }
-
 
 /// Bring up an ext2 server on the ext2 disk and register it as a VFS mount,
 /// returning the mount id. Shared by the FS/container tests.
@@ -4275,7 +4264,6 @@ fn test_container_run() -> Result<(), &'static str> {
     }
 }
 
-
 /// Container isolation is *enforced*, not incidental (Phase 5.7). Runs the
 /// `isolation-smoke` probe as a container `/init` over a bundle that also stages
 /// `/only` (known bytes). The probe (see `servers/isolation-smoke`) asserts, from
@@ -4355,7 +4343,6 @@ fn test_container_isolation() -> Result<(), &'static str> {
         None => Err("isolation probe did not run"),
     }
 }
-
 
 /// Per-container rootfs confinement (Phase 6.1b). Proves both halves of the
 /// boundary against a container confined to `/c/conftest` on a mount that also
@@ -4451,7 +4438,6 @@ fn test_container_confinement() -> Result<(), &'static str> {
     }
 }
 
-
 /// Test SHA-256 against known FIPS 180-4 vectors (used for registry blob digest
 /// verification, Phase 5.6).
 fn test_sha256() -> Result<(), &'static str> {
@@ -4475,7 +4461,6 @@ fn test_sha256() -> Result<(), &'static str> {
     }
     Ok(())
 }
-
 
 /// Wrap `data` in a minimal RFC-1952 gzip member (test helper).
 ///
@@ -4748,7 +4733,6 @@ fn test_http_request() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 /// JSON serializer (Phase 6.0): exact compact output, correct escaping, and a
 /// parse → serialize round-trip (used to build Docker Engine API responses).
 fn test_json_serialize() -> Result<(), &'static str> {
@@ -4794,7 +4778,6 @@ fn test_json_serialize() -> Result<(), &'static str> {
 
     Ok(())
 }
-
 
 /// Container metadata registry (Phase 6.1): create two containers, verify the
 /// table + id-prefix/name lookup + metadata, drive the state machine, run one
@@ -4906,7 +4889,6 @@ fn test_container_registry() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 /// Per-container stdout/stderr capture (Phase 6.2). Runs the demo container (whose
 /// `/init`, linux-smoke, writes `"linux-smoke ok\n"` to fd 1), then reads the
 /// capture buffer back — proving output is captured per-container, **survives the
@@ -4996,7 +4978,6 @@ fn test_container_logs() -> Result<(), &'static str> {
 
     Ok(())
 }
-
 
 /// Management ABI capability gate (Phase 6.3). Proves the security property the
 /// sub-phase adds: the container control surface is *ambient-authority-free*. A
@@ -5164,7 +5145,6 @@ fn test_management_capability() -> Result<(), &'static str> {
     Ok(())
 }
 
-
 /// Build a minimal DNS A-record query for "example.com" (29 bytes).
 #[cfg(target_arch = "x86_64")]
 fn build_dns_query() -> [u8; 29] {
@@ -5254,7 +5234,6 @@ fn test_udp_echo() -> Result<(), &'static str> {
     }
     Ok(())
 }
-
 
 // ============================================================
 //  test_tcp_client — outbound TCP connect through the socket API (Phase 4.6)
@@ -5378,7 +5357,6 @@ fn test_tcp_client() -> Result<(), &'static str> {
     let _ = socket::ksocket_close(id);
     Ok(())
 }
-
 
 // ============================================================
 //  test_api_server — ring-3 Docker Engine API over TCP (Phase 6.5)
@@ -5594,5 +5572,4 @@ fn test_api_server() -> Result<(), &'static str> {
     );
     Ok(())
 }
-
 

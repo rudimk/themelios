@@ -46,7 +46,8 @@ pub struct BitmapFrameAllocator {
     bitmap_len: usize,
     /// Total number of frames tracked (= highest_phys_addr / PAGE_SIZE).
     frame_count: usize,
-    /// Frames the memory map reported as usable RAM.
+    /// Frames this allocator can hand out: RAM the memory map called usable, less the
+    /// pages the bitmap itself occupies, plus anything later reclaimed.
     ///
     /// Distinct from `frame_count`, which is the *span* of the bitmap: it runs from
     /// physical 0 to the highest usable address, so on any machine whose RAM does not
@@ -54,6 +55,14 @@ pub struct BitmapFrameAllocator {
     /// so a 512 MiB guest has a `frame_count` covering 1.5 GiB and `frame_count -
     /// free_count` reports a gigabyte of phantom "used" memory. Reporting needs the
     /// usable total, not the span.
+    ///
+    /// It is a running total rather than a boot-time constant because
+    /// [`reclaim_region`] genuinely adds to the pool. Snapshotting it once at init and
+    /// leaving it there is wrong in the other direction: x86_64 reclaims ~2500
+    /// bootloader frames immediately after boot, which would put `free_count` *above*
+    /// the total and make `usable - free` underflow to zero.
+    ///
+    /// [`reclaim_region`]: Self::reclaim_region
     usable_count: usize,
     /// Number of currently free frames.
     free_count: usize,
@@ -170,9 +179,9 @@ impl BitmapFrameAllocator {
             .map(|byte| byte.count_ones() as usize)
             .sum();
 
-        // Nothing has been handed out yet, so every frame that is free right now is a
-        // frame the memory map called usable. Capturing it here is what lets `mem`
-        // report against real RAM rather than against the bitmap's address span.
+        // Nothing has been handed out yet, so every frame free right now is one this
+        // allocator can hand out. That is the denominator `mem` needs — real capacity,
+        // not the bitmap's address span. `reclaim_region` keeps it current afterwards.
         allocator.usable_count = allocator.free_count;
 
         allocator
@@ -335,7 +344,8 @@ impl BitmapFrameAllocator {
         self.frame_count
     }
 
-    /// Frames backed by real RAM, per the bootloader's memory map.
+    /// Frames this allocator can hand out — usable RAM minus its own bitmap, plus
+    /// anything reclaimed since boot. The denominator for "how much memory is in use".
     pub fn usable_frame_count(&self) -> usize {
         self.usable_count
     }
@@ -358,6 +368,11 @@ impl BitmapFrameAllocator {
             if frame_idx < self.frame_count && !self.is_free(frame_idx) {
                 self.mark_free(frame_idx as u64);
                 self.free_count += 1;
+                // Reclaimed frames become part of the usable pool, so the usable total
+                // grows with them. Without this, `free_count` climbs past `usable_count`
+                // — x86_64 reclaims ~2500 frames right after boot — and every consumer
+                // that computes `usable - free` reads a nonsense "0 used".
+                self.usable_count += 1;
                 reclaimed += 1;
             }
         }
@@ -440,7 +455,8 @@ pub fn free_frame_count() -> usize {
         .free_frame_count()
 }
 
-/// Frames backed by real RAM, per the bootloader's memory map.
+/// Frames the allocator can hand out — usable RAM minus its own bitmap, plus anything
+/// reclaimed since boot.
 pub fn usable_frame_count() -> usize {
     FRAME_ALLOCATOR
         .lock()
