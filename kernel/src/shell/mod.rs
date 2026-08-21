@@ -74,23 +74,40 @@ fn shell_entry() {
             "kill" => commands::cmd_kill(args),
             "peek" => commands::cmd_peek(args),
             "pgtable" => commands::cmd_pgtable(args),
+            #[cfg(target_arch = "x86_64")]
             "procs" => commands::cmd_procs(args),
+            #[cfg(target_arch = "x86_64")]
             "caps" => commands::cmd_caps(args),
             "audit" => commands::cmd_audit(args),
+            #[cfg(target_arch = "x86_64")]
             "mount" => commands::cmd_mount(args),
+            #[cfg(target_arch = "x86_64")]
             "ls" => commands::cmd_ls(args),
+            #[cfg(target_arch = "x86_64")]
             "cat" => commands::cmd_cat(args),
+            #[cfg(target_arch = "x86_64")]
             "stat" => commands::cmd_stat(args),
+            #[cfg(target_arch = "x86_64")]
             "write" => commands::cmd_write(args),
+            #[cfg(target_arch = "x86_64")]
             "mkdir" => commands::cmd_mkdir(args),
+            #[cfg(target_arch = "x86_64")]
             "ifconfig" => commands::cmd_ifconfig(args),
+            #[cfg(target_arch = "x86_64")]
             "sockets" => commands::cmd_sockets(args),
+            #[cfg(target_arch = "x86_64")]
             "ping" => commands::cmd_ping(args),
+            #[cfg(target_arch = "x86_64")]
             "udpsend" => commands::cmd_udpsend(args),
+            #[cfg(target_arch = "x86_64")]
             "tcpconnect" => commands::cmd_tcpconnect(args),
+            #[cfg(target_arch = "x86_64")]
             "run" => commands::cmd_run(args),
+            #[cfg(target_arch = "x86_64")]
             "ps" => commands::cmd_ps(args),
+            #[cfg(target_arch = "x86_64")]
             "logs" => commands::cmd_logs(args),
+            #[cfg(target_arch = "x86_64")]
             "stop" => commands::cmd_stop(args),
             _ => {
                 println!("Unknown command: '{}'. Type 'help' for available commands.", cmd);
@@ -156,19 +173,31 @@ fn read_line(buf: &mut [u8; MAX_LINE_LEN]) -> usize {
 /// Enables serial receive interrupts (IRQ4), unmasks IRQ4 in the PIC,
 /// and spawns the shell task. Call this after the scheduler is initialized.
 pub fn init() {
-    // Enable COM1 receive interrupts so IRQ4 fires on input
+    // Turn on serial receive interrupts and let them reach the CPU. The same two steps
+    // on both architectures — enable the interrupt at the UART, then unmask it at the
+    // interrupt controller — spelled differently by each.
     #[cfg(target_arch = "x86_64")]
     {
         crate::arch::x86_64::serial::enable_receive_interrupt();
         crate::arch::x86_64::pic::unmask(4);
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::serial::enable_receive_interrupt();
+        // An SPI, unlike the timer's PPI, is shared and must be targeted at a CPU;
+        // `enable_intid` does that. It also asserts interrupts are masked, which they
+        // are — `shell::init` runs from the boot path before the final unmask.
+        crate::arch::aarch64::gic::enable_intid(crate::arch::aarch64::gic::UART_INTID);
+    }
 
-    // Spawn the shell task and register its ID for IRQ4 wakeup
+    // Spawn the shell task and register its ID for the receive-interrupt wakeup
     let shell_id = sched::spawn("shell", shell_entry);
     input::set_shell_task_id(shell_id);
 
-    // Assign the shell task to the kernel process (PID 0)
+    // Assign the shell task to the kernel process (PID 0). x86_64 only: aarch64 has
+    // process *identity* but no process table to register with — see `main.rs`.
+    #[cfg(target_arch = "x86_64")]
     crate::process::assign_task_to_kernel(shell_id);
 
-    println!("Shell initialized (task {}, IRQ4 enabled)", shell_id);
+    println!("Shell initialized (task {}, serial input interrupt enabled)", shell_id);
 }

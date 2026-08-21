@@ -14,7 +14,12 @@ use crate::mm;
 use crate::println;
 use crate::sched;
 use crate::sched::task::TaskState;
+/// x86_64 only: aarch64 has `ProcessId` but no process table, and every command
+/// that reaches for one is gated out.
+#[cfg(target_arch = "x86_64")]
 use crate::process;
+/// The process table's per-process state enum — x86_64 only, like the table itself.
+#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessState;
 use crate::cap::CapType;
 use crate::audit;
@@ -22,6 +27,8 @@ use crate::audit;
 /// Print a list of available commands.
 pub fn cmd_help(_args: &str) {
     println!("Available commands:");
+
+    // Portable — backed by subsystems both architectures have.
     println!("  help             — show this message");
     println!("  mem              — show memory statistics");
     println!("  tasks            — list all tasks");
@@ -29,38 +36,68 @@ pub fn cmd_help(_args: &str) {
     println!("  kill <id>        — kill a task by ID");
     println!("  peek <addr> [n]  — hex dump n bytes at virtual address");
     println!("  pgtable <addr>   — walk page tables for a virtual address");
-    println!("  procs            — list all processes");
-    println!("  caps [pid]       — list capabilities in a process's CSpace");
     println!("  audit [n]        — show last n audit log entries (default 20)");
-    println!("  mount            — list mounted filesystems");
-    println!("  ls <path>        — list a directory");
-    println!("  cat <path>       — print file contents");
-    println!("  stat <path>      — show file size and type");
-    println!("  write <path> <s> — create/write a file (overlay or /data)");
-    println!("  mkdir <path>     — create a directory");
-    println!("  ifconfig         — show network interface configuration");
-    println!("  sockets          — list open sockets and their state");
-    println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
-    println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
-    println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
-    println!("  run [image]      — create + launch a container (default: demo)");
-    println!("  ps               — list containers and their state");
-    println!("  logs <id>        — print a container's captured stdout/stderr");
-    println!("  stop <pid>       — force-terminate a running container");
+
+    // The rest depend on the process table, the storage stack, the network stack or
+    // containers — all part of the ring-3/VirtIO-PCI surface deferred on aarch64.
+    //
+    // The list is `#[cfg]`'d rather than printed unconditionally because a help text
+    // that advertises commands the dispatcher will reject as "Unknown command" is worse
+    // than a shorter one: it sends the reader looking for a bug that is not there.
+    #[cfg(target_arch = "x86_64")]
+    {
+        println!("  procs            — list all processes");
+        println!("  caps [pid]       — list capabilities in a process's CSpace");
+        println!("  mount            — list mounted filesystems");
+        println!("  ls <path>        — list a directory");
+        println!("  cat <path>       — print file contents");
+        println!("  stat <path>      — show file size and type");
+        println!("  write <path> <s> — create/write a file (overlay or /data)");
+        println!("  mkdir <path>     — create a directory");
+        println!("  ifconfig         — show network interface configuration");
+        println!("  sockets          — list open sockets and their state");
+        println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
+        println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
+        println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
+        println!("  run [image]      — create + launch a container (default: demo)");
+        println!("  ps               — list containers and their state");
+        println!("  logs <id>        — print a container's captured stdout/stderr");
+        println!("  stop <pid>       — force-terminate a running container");
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        println!();
+        println!("  (filesystem, network, container and process-table commands are");
+        println!("   x86_64-only for now — those subsystems are deferred on aarch64,");
+        println!("   which runs a ring-0 kernel core.)");
+    }
 }
 
 /// Print memory statistics: frame allocator and heap usage.
 pub fn cmd_mem(_args: &str) {
     let free_frames = mm::frame::free_frame_count();
-    let total_frames = mm::frame::total_frame_count();
-    let used_frames = total_frames - free_frames;
+    // Report against *usable* RAM, not the bitmap's address span. The span runs from
+    // physical 0 to the top of usable memory, so on a machine whose RAM does not start
+    // at 0 it counts the hole below as "used": QEMU `virt` puts RAM at 0x4000_0000, and
+    // a 512 MiB guest previously reported "1037 MiB used".
+    let usable_frames = mm::frame::usable_frame_count();
+    // `free` can never exceed `usable` — `reclaim_region` raises both together — so a
+    // plain subtraction is right. Using `saturating_sub` here previously turned a
+    // broken invariant into a plausible-looking "0 MiB used" instead of surfacing it.
+    debug_assert!(
+        free_frames <= usable_frames,
+        "free frames ({free_frames}) exceed usable ({usable_frames}) — usable_count is \
+         not tracking a pool change"
+    );
+    let used_frames = usable_frames.saturating_sub(free_frames);
 
     let free_mib = (free_frames as u64 * mm::PAGE_SIZE) / (1024 * 1024);
     let used_mib = (used_frames as u64 * mm::PAGE_SIZE) / (1024 * 1024);
 
     println!("Memory:");
-    println!("  Frames: {} free / {} total ({} MiB free, {} MiB used)",
-        free_frames, total_frames, free_mib, used_mib);
+    println!("  Frames: {} free / {} usable ({} MiB free, {} MiB used)",
+        free_frames, usable_frames, free_mib, used_mib);
     println!("  Heap:   {} used, {} free (of {} KiB total)",
         mm::heap::used(), mm::heap::free(), mm::heap::total_size() / 1024);
     let growth = mm::heap::growth_count();
@@ -133,6 +170,8 @@ pub fn cmd_kill(args: &str) {
 
 /// Print a container's captured stdout/stderr (`docker logs`, Phase 6.2). Works on
 /// exited containers too (the log outlives the process, until the row is removed).
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_logs(args: &str) {
     let id = args.trim();
     if id.is_empty() {
@@ -156,6 +195,8 @@ pub fn cmd_logs(args: &str) {
 /// which operates on **task** IDs: `stop` takes a **process** ID and only tears
 /// down actual containers (`container::terminate` refuses kernel services), so it
 /// can't be used to nuke the block/ext2/net servers.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_stop(args: &str) {
     let args = args.trim();
     if args.is_empty() {
@@ -226,8 +267,28 @@ pub fn cmd_peek(args: &str) {
     // (kernel space, above 0xffff800000000000) and within a reasonable
     // range. A page fault will still crash the kernel, so we do our best.
     if !is_valid_address(addr, count) {
-        println!("Address {:#x} is not in a known mapped range.", addr);
-        println!("Valid ranges: HHDM (0xffff800000000000+), kernel image (0xffffffff80000000+)");
+        println!("Address {:#x} is not mapped (checked against the page tables).", addr);
+        // Name an address that actually works, not the HHDM base.
+        //
+        // Two versions of this message have now pointed at somewhere unusable: first a
+        // hard-coded `hhdm..hhdm+4GiB` window, then the bare HHDM base — which is just
+        // as unmapped on QEMU `virt`, where RAM starts a gigabyte up. Deriving the
+        // suggestion from a frame the allocator actually owns means it cannot be wrong
+        // on a machine whose memory does not start at zero.
+        match mm::frame::allocate_frame() {
+            Some(probe) => {
+                let example = probe.as_u64() + mm::hhdm_offset();
+                mm::frame::deallocate_frame(probe);
+                println!(
+                    "  Physical memory is reachable through the HHDM — e.g. {:#x}. \
+                     `pgtable {:#x}` shows why this address is not.",
+                    example, addr
+                );
+            }
+            None => {
+                println!("  `pgtable {:#x}` shows why this address is not mapped.", addr);
+            }
+        }
         return;
     }
 
@@ -241,31 +302,66 @@ pub fn cmd_peek(args: &str) {
 /// so we use a conservative heuristic based on known memory layout:
 /// - HHDM region: maps all physical memory at hhdm_offset
 /// - Kernel image: loaded at 0xffffffff80000000
-fn is_valid_address(addr: u64, count: usize) -> bool {
-    let end = addr.wrapping_add(count as u64);
-    let hhdm = mm::hhdm_offset();
+/// Higher-half load address of the kernel image. The same on both architectures —
+/// both linker scripts place the image here.
+const KERNEL_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 
-    // Must be in the upper half (kernel space)
-    if addr < 0xffff_8000_0000_0000 {
+/// Whether `count` bytes starting at `addr` are all mapped, per the kernel page tables.
+///
+/// `count == 0` is rejected rather than treated as vacuously true: the range arithmetic
+/// below computes `end - 1`, which underflows for an empty range at address 0. The only
+/// caller clamps to `1..=256`, so this is a statement of the precondition rather than a
+/// reachable path.
+fn is_valid_address(addr: u64, count: usize) -> bool {
+    if count == 0 {
         return false;
     }
-
-    // HHDM region: hhdm_offset .. hhdm_offset + some physical memory limit.
-    // With 256 MiB QEMU memory, physical addresses go up to ~0x10000000.
-    // Be generous and allow up to 4 GiB above the HHDM base.
-    let hhdm_end = hhdm + 4 * 1024 * 1024 * 1024; // 4 GiB
-    if addr >= hhdm && end <= hhdm_end {
-        return true;
+    let end = addr.wrapping_add(count as u64);
+    if end < addr {
+        return false; // wrapped
     }
 
-    // Kernel image region: 0xffffffff80000000 .. 0xffffffff80000000 + 16 MiB
-    let kernel_base: u64 = 0xffff_ffff_8000_0000;
-    let kernel_end: u64 = kernel_base + 16 * 1024 * 1024;
-    if addr >= kernel_base && end <= kernel_end {
-        return true;
+    // Ask the page tables, rather than guessing from address ranges.
+    //
+    // This used to be a pair of hard-coded windows: "upper half, and either
+    // HHDM+4GiB or the kernel image". Both halves were wrong somewhere. The floor was
+    // x86's `0xffff_8000_0000_0000`, which sits *above* Limine's aarch64 HHDM base and
+    // so rejected that whole window; and the HHDM+4GiB span accepts addresses that are
+    // definitionally unmapped on QEMU `virt`, whose RAM starts a gigabyte up — so the
+    // very address the old error message advertised would hard-fault the kernel.
+    //
+    // `AddressSpace::translate` has existed since 7.1, and `cmd_pgtable` forty lines
+    // below already walks the tables. A heuristic was never necessary; it was just
+    // older than the walker.
+    let kernel_as = mm::page_table::kernel_address_space();
+    // Check every page the dump will touch, not just the first: a range can start on a
+    // mapped page and run off the end of it.
+    let first_page = addr & !(mm::PAGE_SIZE - 1);
+    let last_page = (end - 1) & !(mm::PAGE_SIZE - 1);
+    let mut page = first_page;
+    let mut ok = true;
+    loop {
+        if kernel_as.translate(mm::addr::VirtAddr::new(page)).is_none() {
+            ok = false;
+            break;
+        }
+        if page == last_page {
+            break;
+        }
+        page += mm::PAGE_SIZE;
     }
-
-    false
+    // Defensive, and currently a no-op — be precise, because the comment this was
+    // copied from is not.
+    //
+    // `AddressSpace` is a single `PhysAddr` and there is no `impl Drop` anywhere in the
+    // kernel, so dropping this handle does nothing and forgetting it does nothing
+    // either. `cmd_pgtable` below says dropping "would free the kernel PML4!", which is
+    // false today. The call is kept rather than deleted because the danger it guards is
+    // real *if* the type ever gains a `Drop` that tears down its root: this handle
+    // aliases the live kernel tables, so that day it would unmap the running kernel.
+    // Cheap insurance against a change that would otherwise be silently catastrophic.
+    core::mem::forget(kernel_as);
+    ok
 }
 
 /// Print a hex dump of memory in traditional format.
@@ -348,6 +444,8 @@ pub fn cmd_pgtable(args: &str) {
 }
 
 /// List all processes with PID, name, task count, capability count, and state.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_procs(_args: &str) {
     let procs = process::process_list();
 
@@ -368,6 +466,7 @@ pub fn cmd_procs(_args: &str) {
 ///
 /// Usage: `caps [pid]` — defaults to PID 0 (kernel process) if no PID given.
 /// Shows each capability's handle, type, rights, and parent relationship.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_caps(args: &str) {
     let args = args.trim();
     let pid_val = if args.is_empty() {
@@ -504,6 +603,7 @@ extern crate alloc;
 // volume; everything else routes to the overlay/SquashFS root.
 
 /// Resolve a shell path to (mount_id, path-within-mount).
+#[cfg(target_arch = "x86_64")]
 fn resolve_mount(path: &str) -> Option<(u64, alloc::string::String)> {
     use crate::fs;
     if path == "/data" {
@@ -516,11 +616,15 @@ fn resolve_mount(path: &str) -> Option<(u64, alloc::string::String)> {
 }
 
 /// `mount` — list mounted filesystems.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_mount(_args: &str) {
     crate::fs::print_mount_status();
 }
 
 /// `ls <path>` — list a directory's entries.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_ls(args: &str) {
     use crate::fs;
     let path = args.trim();
@@ -568,6 +672,8 @@ pub fn cmd_ls(args: &str) {
 }
 
 /// `cat <path>` — print a file's contents to serial.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_cat(args: &str) {
     use crate::fs;
     let path = args.trim();
@@ -613,6 +719,8 @@ pub fn cmd_cat(args: &str) {
 }
 
 /// `stat <path>` — show a file's size and type.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_stat(args: &str) {
     let path = args.trim();
     if path.is_empty() {
@@ -635,6 +743,8 @@ pub fn cmd_stat(args: &str) {
 }
 
 /// `write <path> <content>` — create and write a file.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_write(args: &str) {
     use crate::fs;
     let args = args.trim();
@@ -667,6 +777,8 @@ pub fn cmd_write(args: &str) {
 }
 
 /// `mkdir <path>` — create a directory.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_mkdir(args: &str) {
     let path = args.trim();
     if path.is_empty() {
@@ -692,6 +804,8 @@ pub fn cmd_mkdir(args: &str) {
 /// NIC's MAC and MTU, the IPv4 address/gateway/DNS the ring-3 stack acquired via
 /// DHCP, and the RX-overflow drop counter. The kernel does not parse packets — it
 /// only reports what the net server told it over `MSG_CONFIG`.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_ifconfig(_args: &str) {
     let st = crate::net::net_service::status();
     if !st.present {
@@ -744,6 +858,8 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 /// ephemeral local port, sends `msg`, and closes. Uses the kernel-internal
 /// socket ops (the shell runs in the kernel); userspace goes through the
 /// capability-checked syscalls instead.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_udpsend(args: &str) {
     use crate::net::socket;
 
@@ -798,6 +914,8 @@ pub fn cmd_udpsend(args: &str) {
 /// socket, connect (non-blocking; poll until established or refused), send a
 /// short request, and print whatever comes back. Uses the kernel-internal socket
 /// ops (the shell runs in the kernel).
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_tcpconnect(args: &str) {
     use crate::net::socket::{self, SockError};
 
@@ -923,6 +1041,8 @@ fn sock_state_name(state: u8) -> &'static str {
 /// socket table: each socket's id, transport, TCP state (or `-`/`icmp`), bound
 /// local port, and connected peer. The kernel only relays the listing — the
 /// socket state lives entirely in the net server.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_sockets(_args: &str) {
     use crate::net::socket;
     let list = match socket::ksocket_list() {
@@ -964,6 +1084,8 @@ pub fn cmd_sockets(_args: &str) {
 /// slirp proxies guest ICMP to host pings, which needs host raw-socket/ping
 /// privileges that may be unavailable — a timeout there is an environment limit,
 /// not a stack bug (`ifconfig` + `udpsend` still prove the stack is live).
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_ping(args: &str) {
     use crate::net::socket::{self, SockError};
 
@@ -1045,6 +1167,8 @@ fn now_ms() -> u64 {
 /// capability-isolated Linux container, waits for it to exit, and prints the exit
 /// code. State transitions Created → Running → Exited are recorded in the registry
 /// (`ps` shows them). Live registry pull for arbitrary images is deferred.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_run(args: &str) {
     use crate::container::registry::{self, ContainerState};
     let image = {
@@ -1090,6 +1214,8 @@ pub fn cmd_run(args: &str) {
 /// `ps` — list containers and their metadata (Docker-style, Phase 6.1). Shows all
 /// containers including exited ones (like `docker ps -a`), since a metadata row
 /// survives its process until removed.
+/// x86_64 only — the subsystem behind this command is deferred on aarch64.
+#[cfg(target_arch = "x86_64")]
 pub fn cmd_ps(_args: &str) {
     let list = crate::container::registry::list();
     if list.is_empty() {

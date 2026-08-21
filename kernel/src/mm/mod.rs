@@ -57,10 +57,11 @@ pub mod page_table;
 
 /// Shared-memory regions between processes.
 ///
-/// Still x86_64-only: it hands out `cap::CapType::SharedMemory` capabilities, and the
-/// capability system is part of the ring-3/EL0 surface deferred out of the aarch64
-/// port. Un-gate alongside `cap` when EL0 lands.
-#[cfg(target_arch = "x86_64")]
+/// Architecture-neutral since Phase 7.4. It was x86_64-only on the stated grounds that
+/// it hands out `cap::CapType::SharedMemory` capabilities and the capability system was
+/// deferred out of the aarch64 port — which stopped being true when 7.4 un-gated `cap`.
+/// The region itself is frame allocation plus HHDM access, both of which `mm` has
+/// provided on both architectures since 7.1.
 pub mod shared;
 
 extern crate alloc;

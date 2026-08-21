@@ -221,10 +221,13 @@ impl AuditRingBuffer {
         entry.seq = self.next_seq;
         self.next_seq += 1;
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            entry.timestamp = crate::arch::time::tick_count();
-        }
+        // Arch-neutral. `arch::time::tick_count` is the 7.0a facade and has been backed
+        // by the generic-timer ISR on aarch64 since 7.2 — this gate was more 7.0a
+        // residue, and it left every aarch64 audit entry stamped 0. That is not
+        // cosmetic for a tamper-evident security log, and it also made
+        // `test_audit`'s "timestamps must be non-decreasing" assertion unfalsifiable:
+        // with every value 0, the comparison it makes can never be true.
+        entry.timestamp = crate::arch::time::tick_count();
 
         // Write at the current position, wrapping around if necessary
         self.entries[self.write_pos] = entry;

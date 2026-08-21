@@ -25,7 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // Build constants
@@ -358,29 +358,128 @@ fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
         format!("virtio-blk-pci,drive={id},disable-legacy=on"),
     ]
 }
+/// `cargo xtask test --arch aarch64` — run the kernel suite on QEMU `virt`.
+///
+/// Mirrors [`cmd_test`], with one structural difference: how the verdict gets out.
+///
+/// x86_64 writes to QEMU's `isa-debug-exit` device and the result arrives as a process
+/// exit code, which is unambiguous and needs no parsing. The `virt` machine has no such
+/// device — aarch64 has no I/O ports for one to live behind — so the kernel prints a
+/// sentinel line and then powers the machine off through PSCI.
+///
+/// That gives four outcomes rather than two, and the extra two are the useful ones:
+///
+/// | What happened                        | Verdict                             |
+/// |--------------------------------------|-------------------------------------|
+/// | PASS sentinel, QEMU exits            | pass                                |
+/// | FAIL sentinel, QEMU exits            | fail — the `[FAIL]` lines say which |
+/// | QEMU exits, no sentinel              | fail — the kernel died mid-suite    |
+/// | no exit before the deadline          | fail — hang                         |
+///
+/// Without the PSCI shutdown the third and fourth rows collapse into one another, and
+/// a kernel that panicked halfway through looks exactly like a kernel that hung.
+fn cmd_test_aarch64(root: &Path, target: &str) {
+    /// Printed by `test_runner` when every test that ran, passed. Must match
+    /// `AARCH64_PASS_SENTINEL` in `kernel/src/test_runner.rs` exactly — both sides
+    /// spell out the whole line rather than matching a prefix, so a drift is a hard
+    /// failure here rather than a silently weaker check.
+    const PASS: &str = "[test] RESULT: ALL TESTS PASSED";
+    /// Printed when at least one test failed. Matches `AARCH64_FAIL_SENTINEL`.
+    const FAIL: &str = "[test] RESULT: FAILURES PRESENT";
 
-/// Refuse `xtask test --arch aarch64`.
-///
-/// `create_iso` now builds a real arm64 image, but the *test harness* is still
-/// x86-only: it launches `qemu-system-aarch64` with `-M q35`, x86 VirtIO disk args
-/// and the `isa-debug-exit` device, none of which exist on `virt`. Without this
-/// check the command builds an aarch64 kernel and then issues a nonsense QEMU
-/// invocation. Running the suite on aarch64 is Phase 7.4 work (it needs the
-/// serial-sentinel exit contract, since `isa-debug-exit` is x86-only).
-///
-/// `iso`/`run --arch aarch64` are both supported and are not routed here.
-fn reject_aarch64_test(target: &str) {
-    if target != "aarch64-unknown-none-softfloat" {
+    println!("Building ThemeliOS kernel (test mode) for {target}...");
+
+    // Clean cached artifacts so build.rs re-runs and the ULID is fresh, matching the
+    // amd64 path.
+    let _ = Command::new("cargo")
+        .current_dir(root)
+        .args(["clean", "--package", "themelios", "--target", target])
+        .status();
+
+    let status = Command::new("cargo")
+        .current_dir(root)
+        .args([
+            "build",
+            "--package", "themelios",
+            "--target", target,
+            "--features", "test",
+            BUILD_STD,
+            BUILD_STD_FEATURES,
+        ])
+        .status()
+        .expect("Failed to execute cargo build");
+    if !status.success() {
+        eprintln!("aarch64 test build failed!");
+        process::exit(1);
+    }
+
+    let kernel = root.join(format!("target/{target}/debug/themelios"));
+    let limine_dir = ensure_limine(root);
+    let (esp, code, vars) = prepare_aarch64_boot(root, &kernel, &limine_dir);
+
+    let serial_log = root.join("target/aarch64-test-serial.log");
+    let _ = fs::remove_file(&serial_log);
+
+    println!("Running the suite on QEMU virt (headless)...");
+    let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
+    cmd.args(["-display", "none"]);
+    cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+
+    let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
+
+    // Poll for exit rather than blocking on it, so a hung kernel is bounded. The suite
+    // itself takes a couple of seconds; the budget is generous because a CI runner
+    // building nothing but still emulating every instruction is slow, and the cost of
+    // being wrong here is a spurious red build.
+    let deadline = Duration::from_secs(120);
+    let start = Instant::now();
+    let mut exited = false;
+    while start.elapsed() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    if !exited {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+
+    let serial = fs::read_to_string(&serial_log).unwrap_or_default();
+    println!("--- aarch64 serial output ---\n{serial}\n-----------------------------");
+
+    // Order matters: check for the failure sentinel first. A run that prints FAIL has
+    // reported its own verdict, and that is more specific than anything inferred.
+    if serial.contains(FAIL) {
+        eprintln!("aarch64 suite FAILED — see the [FAIL] lines above.");
+        process::exit(1);
+    }
+    if serial.contains(PASS) {
+        if !exited {
+            // The suite passed but PSCI did not stop the machine. Worth saying out
+            // loud: the tests are fine and the shutdown path is not.
+            eprintln!(
+                "aarch64 suite passed, but QEMU did not exit within {}s — PSCI \
+                 SYSTEM_OFF appears not to have taken effect.",
+                deadline.as_secs()
+            );
+            process::exit(1);
+        }
+        println!("aarch64 suite passed.");
         return;
     }
-    eprintln!("Error: `xtask test` cannot run the suite on aarch64 yet.");
-    eprintln!(
-        "The harness is x86-only: -M q35, x86 VirtIO disk args and isa-debug-exit.\n\
-         An aarch64 suite needs the serial-sentinel exit contract (Phase 7.4)."
-    );
-    eprintln!("To boot aarch64 today:   cargo xtask run --arch aarch64");
-    eprintln!("To smoke-test aarch64:   cargo xtask arm64-smoke");
-    eprintln!("To build an arm64 ISO:   cargo xtask iso --arch aarch64");
+    if exited {
+        eprintln!(
+            "aarch64 suite FAILED: QEMU exited without printing a verdict — the kernel \
+             died partway through the suite (look for a panic or an exception above)."
+        );
+    } else {
+        eprintln!(
+            "aarch64 suite FAILED: no verdict and no exit within {}s — the kernel hung.",
+            deadline.as_secs()
+        );
+    }
     process::exit(1);
 }
 
@@ -872,11 +971,14 @@ fn cmd_arm64_smoke(_args: &[String]) {
     let _ = fs::remove_file(&serial_log);
 
     println!("Booting aarch64 kernel on QEMU virt (headless)...");
+    let sock = root.join("target/aarch64-smoke.sock");
     let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
-    cmd.args(["-display", "none"]);
-    cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+    cmd.args(["-display", "none", "-monitor", "none"]);
+    cmd.arg("-chardev")
+        .arg(format!("socket,id=s0,path={},server=on,wait=off", sock.display()));
+    cmd.args(["-serial", "chardev:s0"]);
 
-    await_aarch64_banner(cmd, &serial_log, "ESP");
+    await_aarch64_banner(cmd, &sock, &serial_log, "ESP");
 }
 
 /// `cargo xtask arm64-iso-smoke` — build the **arm64 ISO** and boot *it* on QEMU
@@ -928,10 +1030,13 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
     // that xorriso's `-efi-boot-part` embedded in the image.
     cmd.arg("-drive")
         .arg(format!("file={},format=raw,if=virtio,readonly=on", iso.display()));
-    cmd.args(["-display", "none"]);
-    cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
+    let sock = root.join("target/aarch64-iso-smoke.sock");
+    cmd.args(["-display", "none", "-monitor", "none"]);
+    cmd.arg("-chardev")
+        .arg(format!("socket,id=s0,path={},server=on,wait=off", sock.display()));
+    cmd.args(["-serial", "chardev:s0"]);
 
-    await_aarch64_banner(cmd, &serial_log, "ISO");
+    await_aarch64_banner(cmd, &sock, &serial_log, "ISO");
 }
 
 /// Run `cmd` (a configured headless `qemu-system-aarch64`) and wait for the kernel's
@@ -942,22 +1047,29 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
 /// the captured serial for the marker and kill QEMU once we see it. Absence of the
 /// marker within the window is a failure. `what` names the boot medium in the
 /// pass/fail message so the two smokes are distinguishable in CI logs.
-fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
+fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: &str) {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    let _ = fs::remove_file(sock);
     let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
 
     // The success sentinel, which advances with each sub-phase to the *last* thing the
-    // boot path proves — currently the scheduler self-test, which runs after the memory
-    // bring-up, the paging self-test, and the exception/GIC/timer self-tests.
+    // boot path proves — currently the shell's own banner, printed by the shell task
+    // rather than by `shell::init`, so reaching it proves the task was actually
+    // scheduled and not merely spawned.
     //
     // It is deliberately never left pointing at an earlier milestone. Every marker so
-    // far (the 7.0b banner, then the 7.1 paging sentinel, then the 7.2 timer sentinel)
-    // prints before the work the next sub-phase adds, so leaving it behind would let
-    // that work break while the smoke saw its marker and stopped looking.
-    const MARKER: &str = "Phase 7.3 scheduler reached; self-test passed.";
+    // far (the 7.0b banner, the 7.1 paging sentinel, the 7.2 timer sentinel, the 7.3
+    // scheduler sentinel) prints before the work the next sub-phase adds, so leaving it
+    // behind would let that work break while the smoke saw its marker and stopped
+    // looking. 7.4 nearly shipped having broken exactly that rule.
+    const MARKER: &str = "ThemeliOS debug shell";
 
-    // Failure signatures. Without these the only failure mode is "marker never
-    // appeared", which costs the full timeout and reports nothing useful. A panic or a
-    // self-test failure is terminal — stop immediately and say which it was.
+    // Failure signatures, checked before the marker on every poll. Without these the
+    // only failure mode is "marker never appeared", which costs the full timeout and
+    // reports nothing useful.
     const FAILURES: &[&str] = &[
         "KERNEL PANIC",
         "Phase 7.1 MMU/paging FAILED self-test",
@@ -972,48 +1084,165 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
         "!!! aarch64 EXCEPTION !!!",
     ];
 
-    let mut found = false;
-    let mut failure: Option<String> = None;
-    // ~40 s budget. Phase 7.1 does materially more work before the sentinel than 7.0b
-    // did (memory-map scan, frame bitmap, heap, page-table clone), and CI runners are
-    // slower than a dev box.
-    for _ in 0..80 {
-        thread::sleep(Duration::from_millis(500));
-        if let Ok(s) = fs::read_to_string(serial_log) {
-            if let Some(f) = FAILURES.iter().find(|f| s.contains(**f)) {
-                failure = Some((*f).to_string());
-                break;
-            }
-            if s.contains(MARKER) {
-                found = true;
-                break;
-            }
+    // Connect to QEMU's serial socket. It is created with `server=on,wait=off`, so the
+    // listener may not exist for a moment after spawn.
+    let mut stream = None;
+    for _ in 0..100 {
+        thread::sleep(Duration::from_millis(100));
+        if let Ok(s) = UnixStream::connect(sock) {
+            stream = Some(s);
+            break;
         }
         if let Ok(Some(_)) = child.try_wait() {
-            break; // QEMU exited early (unexpected — the kernel idles after the test)
+            break;
         }
     }
+    let Some(stream) = stream else {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("arm64 {what} smoke FAILED: QEMU never opened its serial socket.");
+        process::exit(1);
+    };
+
+    // Drain the socket on a background thread. A reader thread rather than polling a
+    // file because the socket is bidirectional — being able to type back is the point.
+    // Accumulate *bytes*, decode once at the end. Decoding each 4 KiB read separately
+    // destroys any multi-byte sequence that straddles a read boundary — the kernel's
+    // help text is full of em-dashes, and an earlier version of this turned them into
+    // replacement characters in the log it printed.
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let reader = {
+        let captured = Arc::clone(&captured);
+        let mut rx = stream.try_clone().expect("clone serial socket");
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = rx.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                captured.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        })
+    };
+
+    // Matching is done on a lossy view; every marker and failure signature is ASCII, so
+    // this cannot change a verdict, and it keeps the byte log faithful for humans.
+    let seen = |needle: &str| {
+        String::from_utf8_lossy(&captured.lock().unwrap()).contains(needle)
+    };
+    let hit_failure = || {
+        let bytes = captured.lock().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        FAILURES.iter().find(|f| s.contains(**f)).map(|f| (*f).to_string())
+    };
+
+    // Kept so the write half can be dropped before draining the reader.
+    let stream_tx = stream.try_clone().expect("clone serial socket");
+
+    let mut found = false;
+    let mut failure: Option<String> = None;
+    let mut qemu_exited = false;
+    // ~40 s budget. CI runners are slower than a dev box, and the boot runs four
+    // self-tests before the shell starts.
+    for _ in 0..80 {
+        thread::sleep(Duration::from_millis(500));
+        if let Some(f) = hit_failure() {
+            failure = Some(f);
+            break;
+        }
+        if seen(MARKER) {
+            found = true;
+            break;
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            // QEMU exited on its own — the kernel should be idling at a shell prompt,
+            // so this is a death, not a completion. Recorded so the message below can
+            // say which, the way `cmd_test_aarch64` already does.
+            qemu_exited = true;
+            break;
+        }
+    }
+
+    // If the shell came up, type at it. This is what exercises the receive path — the
+    // PL011 RX interrupt, the GIC SPI route, the ring buffer, the wake, and the line
+    // editor — none of which booting alone touches.
+    //
+    // It is here because that gap let two real defects ship: a handler that buffered
+    // bytes without ever waking the shell, and an acknowledge ordering that could wedge
+    // the console permanently. Both were found by hand; neither survives this.
+    let mut answered = false;
+    if found && failure.is_none() {
+        let mut tx = stream;
+        let _ = tx.write_all(b"help\r");
+        let _ = tx.flush();
+        for _ in 0..40 {
+            thread::sleep(Duration::from_millis(250));
+            // Match a line unique to the command's *output*, not the echoed input, so
+            // this proves the shell dispatched the command rather than merely echoing.
+            if seen("show memory statistics") {
+                answered = true;
+                break;
+            }
+            if let Some(f) = hit_failure() {
+                failure = Some(f);
+                break;
+            }
+        }
+    }
+
+    // Close the write half, then let the reader drain what QEMU already sent before
+    // killing it. Snapshotting straight after `kill()` loses whatever was still sitting
+    // in the socket buffer — worst precisely when it matters, since a panic emitted
+    // just before the deadline is the tail of the log.
+    drop(stream_tx);
     let _ = child.kill();
     let _ = child.wait();
+    let _ = reader.join();
 
-    let serial = fs::read_to_string(serial_log).unwrap_or_default();
+    let serial = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+    // Keep writing the log file: CI and humans both go looking for it.
+    let _ = fs::write(serial_log, &serial);
     println!("--- aarch64 serial output ({what}) ---\n{serial}\n-----------------------------");
+
+    // Re-check the failure signatures against the *complete* log. The polling above
+    // only sampled every 500 ms and stopped at the deadline, so a panic landing in the
+    // final interval — or in the bytes drained after the kill — would otherwise be
+    // reported as "sentinel not seen", while the panic sits in the log just printed.
+    let failure = failure.or_else(|| {
+        FAILURES.iter().find(|f| serial.contains(**f)).map(|f| (*f).to_string())
+    });
 
     if let Some(f) = failure {
         eprintln!("arm64 {what} smoke FAILED: kernel reported '{f}' (see serial above).");
         process::exit(1);
     }
-    if found {
-        println!(
-            "arm64 {what} smoke passed: booted, switched to kernel page tables, and \
-             passed the paging, exception, timer and scheduler self-tests on QEMU virt."
-        );
-    } else {
+    if !found {
+        if qemu_exited {
+            eprintln!(
+                "arm64 {what} smoke FAILED: QEMU exited before the shell came up, with \
+                 no failure signature in the log — the kernel died early."
+            );
+        } else {
+            eprintln!(
+                "arm64 {what} smoke FAILED: sentinel '{MARKER}' not seen within the \
+                 window, and QEMU was still running — the kernel hung."
+            );
+        }
+        process::exit(1);
+    }
+    if !answered {
         eprintln!(
-            "arm64 {what} smoke FAILED: sentinel '{MARKER}' not seen within the window."
+            "arm64 {what} smoke FAILED: the shell started but did not answer a typed \
+             command — serial input is not reaching it (check the PL011 receive \
+             interrupt, the GIC SPI route, and that the handler wakes the shell task)."
         );
         process::exit(1);
     }
+    println!(
+        "arm64 {what} smoke passed: booted, switched to kernel page tables, passed the \
+         paging, exception, timer and scheduler self-tests, started the shell, and \
+         answered a typed command on QEMU virt."
+    );
 }
 
 /// Locate the aarch64 UEFI firmware pair (CODE, VARS) across common distro/macOS
@@ -1346,8 +1575,13 @@ fn cmd_test(args: &[String]) {
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
-    // The suite harness is x86-only; refuse before doing any work.
-    reject_aarch64_test(target);
+    // aarch64 runs the same suite but cannot report its verdict the same way: the
+    // `virt` machine has no `isa-debug-exit`, so the result comes off the serial
+    // console. Different enough in its mechanics to warrant its own function.
+    if target == "aarch64-unknown-none-softfloat" {
+        cmd_test_aarch64(&root, target);
+        return;
+    }
 
     println!("Building ThemeliOS kernel (test mode) for {target}...");
 

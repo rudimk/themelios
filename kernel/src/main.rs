@@ -135,21 +135,18 @@ mod sched;
 /// Interactive debug shell.
 /// Runs as a scheduler task, provides commands for inspecting memory,
 /// tasks, and kernel state at runtime via the serial console.
-#[cfg(target_arch = "x86_64")]
 mod shell;
 
 /// Automated test harness.
 /// When built with `--features test`, the kernel runs self-tests instead of
 /// the interactive shell and exits QEMU with a pass/fail exit code.
 #[cfg(feature = "test")]
-#[cfg(target_arch = "x86_64")]
 mod test_runner;
 
 /// Capability system.
 /// The core security primitive of ThemeliOS. All resource access is mediated
 /// by unforgeable capability tokens — processes can only use resources they've
 /// been explicitly granted access to.
-#[cfg(target_arch = "x86_64")]
 mod cap;
 
 /// Process abstraction.
@@ -158,18 +155,35 @@ mod cap;
 #[cfg(target_arch = "x86_64")]
 mod process;
 
+/// Process identity, without a process table.
+///
+/// The full `process` module — the table, address spaces, CSpace ownership, the
+/// embedded-server plumbing — is ring-3 machinery and stays x86_64-only until the EL0
+/// port. But `ProcessId` is just a newtype, and both `cap` and `audit` need it to say
+/// *who* performed an operation. On aarch64 the honest answer is always the kernel:
+/// there is exactly one process until EL0 lands, and `sched::current_process_id`
+/// returns `ProcessId::KERNEL` to say so.
+///
+/// Exposing the identity type without the table keeps the capability system and the
+/// audit log genuinely portable, rather than stubbing them out and losing the
+/// architecture's flagship test on half its targets.
+#[cfg(not(target_arch = "x86_64"))]
+mod process {
+    #[path = "pid.rs"]
+    pub mod pid;
+    pub use pid::ProcessId;
+}
+
 /// Inter-process communication.
 /// Message passing between processes. Since ThemeliOS is a microkernel,
 /// IPC is the backbone — drivers, filesystems, and services all communicate
 /// through IPC channels.
-#[cfg(target_arch = "x86_64")]
 mod ipc;
 
 /// Audit logging.
 /// A tamper-evident ring buffer recording all security-relevant kernel
 /// operations: capability create/grant/revoke, IPC send/receive, and
 /// syscall invocations. Kernel-internal only in Phase 2.
-#[cfg(target_arch = "x86_64")]
 mod audit;
 
 /// Device drivers.
@@ -198,7 +212,6 @@ mod linux;
 /// Dependency-light (alloc-only) so it can lift into a ring-3 `oci-server`. Used
 /// by the Phase 5.5 container runtime.
 #[allow(dead_code)] // a complete tar/JSON reader; callers use a subset
-#[cfg(target_arch = "x86_64")]
 mod oci;
 
 /// Container runtime (Phase 5.5): unpack an image, assemble its rootfs, and launch
@@ -211,7 +224,6 @@ mod container;
 /// so it lifts into the ring-3 `api-server`; the registry client reuses the shared
 /// helpers for its response parsing.
 #[allow(dead_code)] // request parser + helpers; the api-server (6.5) uses the full surface
-#[cfg(target_arch = "x86_64")]
 mod http;
 
 /// Container management ABI (Phase 6.3): the capability-guarded ring-0 surface the
@@ -595,11 +607,7 @@ fn kmain_x86_64() -> ! {
         // The main task (bootstrap, task 0) enters an idle loop. The timer will
         // preempt it and schedule other tasks. The shell task handles input.
         loop {
-            #[cfg(target_arch = "x86_64")]
             crate::arch::irq::halt();
-
-            #[cfg(not(target_arch = "x86_64"))]
-            core::hint::spin_loop();
         }
     }
 }
@@ -636,6 +644,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     println!("!!! KERNEL PANIC !!!");
     println!("{}", info);
 
+    // In test mode on aarch64, stop the machine rather than halting on it.
+    //
+    // The suite reports its verdict over the serial console and relies on PSCI to power
+    // off afterwards, which is what lets the harness tell "the kernel died partway
+    // through" (QEMU exits, no verdict printed) from "the kernel hung" (no exit at
+    // all). A panic that halts forever collapses those two back together: the harness
+    // waits out its full deadline and reports a hang, when what actually happened is
+    // right there in the log above.
+    //
+    // Only in test mode. Interactively, halting is the better behaviour — it leaves the
+    // machine inspectable from QEMU's monitor instead of tearing it down.
+    #[cfg(all(feature = "test", target_arch = "aarch64"))]
+    crate::arch::aarch64::psci::shutdown_or_hang();
+
+    #[cfg(not(all(feature = "test", target_arch = "aarch64")))]
     hcf();
 }
 

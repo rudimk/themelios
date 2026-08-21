@@ -83,7 +83,6 @@ use crate::sync::InterruptMutex;
 
 pub mod task;
 
-#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessId;
 use crate::arch::context::{self, TaskContext};
 use task::{Task, TaskId, TaskState, TOTAL_STACK_PAGES};
@@ -239,7 +238,6 @@ pub fn set_current_fs_base(fs_base: u64) {
             task.fs_base = fs_base;
         }
     }
-    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall::write_fs_base(fs_base);
 }
 
@@ -425,11 +423,8 @@ pub fn schedule() {
             // they never enter `syscall_entry`, and the next ring-3 switch sets it.)
             let next_stack_top = sched.tasks[next_id].as_ref().unwrap().kernel_stack_top;
             if next_stack_top != 0 {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
-                    crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
-                }
+                crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
+                crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
             }
         }
 
@@ -446,7 +441,9 @@ pub fn schedule() {
             let next_pid = sched.tasks[next_id].as_ref().unwrap().process_id;
             if current_pid != next_pid {
                 if let Some(pml4_phys) = crate::process::process_pml4(next_pid) {
-                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: `pml4_phys` is the process's own root, produced by
+                    // `process_pml4`; the kernel half is shared across all address
+                    // spaces, so the currently-executing code stays mapped.
                     unsafe { crate::arch::x86_64::cpu::write_cr3(pml4_phys); }
                 }
             }
@@ -582,8 +579,21 @@ pub fn current_task_id() -> TaskId {
         .current_id
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Get the current task's process ID.
+///
+/// On aarch64 this is always [`ProcessId::KERNEL`], and that is a statement of fact
+/// rather than a placeholder: the port is ring-0 only, so every task belongs to the
+/// kernel process and `Task` carries no `process_id` field to read. The capability
+/// system and the audit log both attribute operations to a process, and answering
+/// "the kernel" is correct there — where it stops being correct is the moment EL0
+/// lands, at which point `Task::process_id` un-gates and this reads it like x86 does.
+#[cfg(target_arch = "aarch64")]
+pub fn current_process_id() -> ProcessId {
+    ProcessId::KERNEL
+}
+
+/// Get the current task's process ID.
+#[cfg(target_arch = "x86_64")]
 pub fn current_process_id() -> ProcessId {
     let guard = SCHEDULER.lock();
     let sched = guard.as_ref().expect("Scheduler not initialized");

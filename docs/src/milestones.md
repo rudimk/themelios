@@ -11,7 +11,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **4** | VirtIO net driver, TCP/IP stack | Complete |
 | **5** | OCI container support | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Management API (Docker-compatible) | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
-| **7** | aarch64 port | In progress |
+| **7** | aarch64 port | Complete (ring-0 core) |
 | **8** | Hyperscaler support (AWS, GCP, Azure) | Not started |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node | Not started |
@@ -163,7 +163,7 @@ container mutation crosses into the kernel through the capability-checked, audit
 - Broader Engine API surface (networks, volumes, images, events, stats)
 - Configuration injection at boot time beyond `ServerBootInfo`
 
-## Phase 7 — aarch64 port (In progress)
+## Phase 7 — aarch64 port (Complete — ring-0 core)
 
 **Goal**: Port all Phase 0 and Phase 1 functionality to aarch64 (ARM64), enabling ThemeliOS to run on ARM-based hardware and cloud instances (e.g., AWS Graviton).
 
@@ -176,8 +176,19 @@ container mutation crosses into the kernel through the capability-checked, audit
 - Kernel heap (architecture-independent, just works)
 - Scheduler and context switch for aarch64 (different register set, different calling convention)
 - Serial debug shell (architecture-independent, just works)
-- `cargo xtask run --arch aarch64` boots and passes all tests
-- Automated tests on aarch64 QEMU in CI
+- `cargo xtask run --arch aarch64` boots to an interactive (reduced) shell
+- `cargo xtask test --arch aarch64` runs the portable suite in CI
+
+**Delivered**: a ring-0 kernel core on QEMU `virt` — see the
+[aarch64 chapter](./aarch64.md) for the architectural differences that shaped it.
+The aarch64 suite reports **16 passed, 0 failed, 38 skipped** of the same 54 tests
+amd64 runs; skipped tests name the deferred subsystem rather than reporting a
+vacuous pass. The shell offers 8 of the 25 commands — those whose subsystems the
+port actually has.
+
+**Deferred** (documented): EL0/ring-3 and everything downstream of it — VirtIO-PCI,
+storage, networking, containers, the management API — plus GICv3 (needed for
+Graviton) and MMIO ECAM for PCI enumeration.
 
 **Scope note**: Phase 7 delivers a **ring-0 kernel core** on aarch64 — boot, memory,
 scheduling, and a reduced in-kernel serial shell. EL0/ring-3 userspace, storage,
@@ -194,7 +205,7 @@ milestone does not imply "containers on ARM".
 | 7.1 | MMU / paging on kernel-owned tables | Complete |
 | 7.2 | Exceptions + GIC + timer tick | Complete |
 | 7.3 | Scheduler context switch + preemption | Complete |
-| 7.4 | Shell, portable tests on aarch64 CI, finalize | Not started |
+| 7.4 | Shell, portable tests on aarch64 CI, finalize | Complete |
 
 ## Phase 8 — Hyperscaler support (Not started)
 
