@@ -1106,8 +1106,12 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
 
     // Drain the socket on a background thread. A reader thread rather than polling a
     // file because the socket is bidirectional — being able to type back is the point.
-    let captured = Arc::new(Mutex::new(String::new()));
-    {
+    // Accumulate *bytes*, decode once at the end. Decoding each 4 KiB read separately
+    // destroys any multi-byte sequence that straddles a read boundary — the kernel's
+    // help text is full of em-dashes, and an earlier version of this turned them into
+    // replacement characters in the log it printed.
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let reader = {
         let captured = Arc::clone(&captured);
         let mut rx = stream.try_clone().expect("clone serial socket");
         thread::spawn(move || {
@@ -1116,22 +1120,28 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
                 if n == 0 {
                     break;
                 }
-                captured
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+                captured.lock().unwrap().extend_from_slice(&buf[..n]);
             }
-        });
-    }
+        })
+    };
 
-    let seen = |needle: &str| captured.lock().unwrap().contains(needle);
+    // Matching is done on a lossy view; every marker and failure signature is ASCII, so
+    // this cannot change a verdict, and it keeps the byte log faithful for humans.
+    let seen = |needle: &str| {
+        String::from_utf8_lossy(&captured.lock().unwrap()).contains(needle)
+    };
     let hit_failure = || {
-        let s = captured.lock().unwrap();
+        let bytes = captured.lock().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
         FAILURES.iter().find(|f| s.contains(**f)).map(|f| (*f).to_string())
     };
 
+    // Kept so the write half can be dropped before draining the reader.
+    let stream_tx = stream.try_clone().expect("clone serial socket");
+
     let mut found = false;
     let mut failure: Option<String> = None;
+    let mut qemu_exited = false;
     // ~40 s budget. CI runners are slower than a dev box, and the boot runs four
     // self-tests before the shell starts.
     for _ in 0..80 {
@@ -1145,7 +1155,11 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
             break;
         }
         if let Ok(Some(_)) = child.try_wait() {
-            break; // QEMU exited early — the kernel should idle at the shell prompt
+            // QEMU exited on its own — the kernel should be idling at a shell prompt,
+            // so this is a death, not a completion. Recorded so the message below can
+            // say which, the way `cmd_test_aarch64` already does.
+            qemu_exited = true;
+            break;
         }
     }
 
@@ -1176,20 +1190,44 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
         }
     }
 
+    // Close the write half, then let the reader drain what QEMU already sent before
+    // killing it. Snapshotting straight after `kill()` loses whatever was still sitting
+    // in the socket buffer — worst precisely when it matters, since a panic emitted
+    // just before the deadline is the tail of the log.
+    drop(stream_tx);
     let _ = child.kill();
     let _ = child.wait();
+    let _ = reader.join();
 
-    let serial = captured.lock().unwrap().clone();
+    let serial = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
     // Keep writing the log file: CI and humans both go looking for it.
     let _ = fs::write(serial_log, &serial);
     println!("--- aarch64 serial output ({what}) ---\n{serial}\n-----------------------------");
+
+    // Re-check the failure signatures against the *complete* log. The polling above
+    // only sampled every 500 ms and stopped at the deadline, so a panic landing in the
+    // final interval — or in the bytes drained after the kill — would otherwise be
+    // reported as "sentinel not seen", while the panic sits in the log just printed.
+    let failure = failure.or_else(|| {
+        FAILURES.iter().find(|f| serial.contains(**f)).map(|f| (*f).to_string())
+    });
 
     if let Some(f) = failure {
         eprintln!("arm64 {what} smoke FAILED: kernel reported '{f}' (see serial above).");
         process::exit(1);
     }
     if !found {
-        eprintln!("arm64 {what} smoke FAILED: sentinel '{MARKER}' not seen within the window.");
+        if qemu_exited {
+            eprintln!(
+                "arm64 {what} smoke FAILED: QEMU exited before the shell came up, with \
+                 no failure signature in the log — the kernel died early."
+            );
+        } else {
+            eprintln!(
+                "arm64 {what} smoke FAILED: sentinel '{MARKER}' not seen within the \
+                 window, and QEMU was still running — the kernel hung."
+            );
+        }
         process::exit(1);
     }
     if !answered {

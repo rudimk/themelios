@@ -607,11 +607,7 @@ fn kmain_x86_64() -> ! {
         // The main task (bootstrap, task 0) enters an idle loop. The timer will
         // preempt it and schedule other tasks. The shell task handles input.
         loop {
-            #[cfg(target_arch = "x86_64")]
             crate::arch::irq::halt();
-
-            #[cfg(not(target_arch = "x86_64"))]
-            core::hint::spin_loop();
         }
     }
 }

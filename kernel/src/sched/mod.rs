@@ -238,7 +238,6 @@ pub fn set_current_fs_base(fs_base: u64) {
             task.fs_base = fs_base;
         }
     }
-    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall::write_fs_base(fs_base);
 }
 
@@ -424,11 +423,8 @@ pub fn schedule() {
             // they never enter `syscall_entry`, and the next ring-3 switch sets it.)
             let next_stack_top = sched.tasks[next_id].as_ref().unwrap().kernel_stack_top;
             if next_stack_top != 0 {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
-                    crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
-                }
+                crate::arch::x86_64::gdt::set_tss_rsp0(next_stack_top);
+                crate::arch::x86_64::syscall::set_kernel_stack(next_stack_top);
             }
         }
 
@@ -445,7 +441,9 @@ pub fn schedule() {
             let next_pid = sched.tasks[next_id].as_ref().unwrap().process_id;
             if current_pid != next_pid {
                 if let Some(pml4_phys) = crate::process::process_pml4(next_pid) {
-                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: `pml4_phys` is the process's own root, produced by
+                    // `process_pml4`; the kernel half is shared across all address
+                    // spaces, so the currently-executing code stays mapped.
                     unsafe { crate::arch::x86_64::cpu::write_cr3(pml4_phys); }
                 }
             }

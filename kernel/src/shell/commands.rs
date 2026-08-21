@@ -268,14 +268,27 @@ pub fn cmd_peek(args: &str) {
     // range. A page fault will still crash the kernel, so we do our best.
     if !is_valid_address(addr, count) {
         println!("Address {:#x} is not mapped (checked against the page tables).", addr);
-        // Point at the HHDM base rather than claiming a range: the walk above is the
-        // authority now, and an advertised window is exactly what previously named
-        // addresses that would fault. `pgtable <addr>` shows why a given address fails.
-        println!(
-            "  Physical memory is reachable through the HHDM at {:#x}; try `pgtable {:#x}`.",
-            mm::hhdm_offset(),
-            addr
-        );
+        // Name an address that actually works, not the HHDM base.
+        //
+        // Two versions of this message have now pointed at somewhere unusable: first a
+        // hard-coded `hhdm..hhdm+4GiB` window, then the bare HHDM base — which is just
+        // as unmapped on QEMU `virt`, where RAM starts a gigabyte up. Deriving the
+        // suggestion from a frame the allocator actually owns means it cannot be wrong
+        // on a machine whose memory does not start at zero.
+        match mm::frame::allocate_frame() {
+            Some(probe) => {
+                let example = probe.as_u64() + mm::hhdm_offset();
+                mm::frame::deallocate_frame(probe);
+                println!(
+                    "  Physical memory is reachable through the HHDM — e.g. {:#x}. \
+                     `pgtable {:#x}` shows why this address is not.",
+                    example, addr
+                );
+            }
+            None => {
+                println!("  `pgtable {:#x}` shows why this address is not mapped.", addr);
+            }
+        }
         return;
     }
 
@@ -293,7 +306,16 @@ pub fn cmd_peek(args: &str) {
 /// both linker scripts place the image here.
 const KERNEL_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 
+/// Whether `count` bytes starting at `addr` are all mapped, per the kernel page tables.
+///
+/// `count == 0` is rejected rather than treated as vacuously true: the range arithmetic
+/// below computes `end - 1`, which underflows for an empty range at address 0. The only
+/// caller clamps to `1..=256`, so this is a statement of the precondition rather than a
+/// reachable path.
 fn is_valid_address(addr: u64, count: usize) -> bool {
+    if count == 0 {
+        return false;
+    }
     let end = addr.wrapping_add(count as u64);
     if end < addr {
         return false; // wrapped
@@ -328,8 +350,16 @@ fn is_valid_address(addr: u64, count: usize) -> bool {
         }
         page += mm::PAGE_SIZE;
     }
-    // `kernel_address_space()` hands back a lightweight handle over the live tables;
-    // dropping it would tear them down. Same treatment as `cmd_pgtable`.
+    // Defensive, and currently a no-op — be precise, because the comment this was
+    // copied from is not.
+    //
+    // `AddressSpace` is a single `PhysAddr` and there is no `impl Drop` anywhere in the
+    // kernel, so dropping this handle does nothing and forgetting it does nothing
+    // either. `cmd_pgtable` below says dropping "would free the kernel PML4!", which is
+    // false today. The call is kept rather than deleted because the danger it guards is
+    // real *if* the type ever gains a `Drop` that tears down its root: this handle
+    // aliases the live kernel tables, so that day it would unmap the running kernel.
+    // Cheap insurance against a change that would otherwise be silently catastrophic.
     core::mem::forget(kernel_as);
     ok
 }

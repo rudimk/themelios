@@ -228,7 +228,28 @@ static SKIPPED: &[SkippedTest] = &[];
 /// Called from `kmain` when the kernel is built with `--features test`.
 /// Does not return: x86_64 exits QEMU through `isa-debug-exit`; aarch64 prints a
 /// sentinel and powers the machine off through PSCI.
+/// Size of the suite, independent of architecture.
+///
+/// `SKIPPED` is a hand-maintained parallel list to the `#[cfg]` gates on `TESTS`, and
+/// nothing but care keeps them in step: gate a test without adding a skip and the run
+/// quietly prints `53 total`; un-gate one without removing its skip and it prints `55`
+/// while also running the test. Both are exactly the kind of drift this file's own doc
+/// comment calls out as needing to be a checkable fact rather than an intention.
+const SUITE_SIZE: usize = 54;
+
 pub fn run_tests() -> ! {
+    // Fail loudly at the top rather than printing a plausible wrong total at the
+    // bottom. This runs before any test, so a mis-edit of the tables is reported as
+    // itself instead of as a suspicious count nobody compares across the two CI jobs.
+    assert!(
+        TESTS.len() + SKIPPED.len() == SUITE_SIZE,
+        "suite size drift: {} running + {} skipped != {} — a TESTS entry was gated or \
+         un-gated without updating SKIPPED",
+        TESTS.len(),
+        SKIPPED.len(),
+        SUITE_SIZE
+    );
+
     println!();
     println!("========================================");
     println!("  ThemeliOS Test Suite");
@@ -1319,6 +1340,19 @@ fn test_audit() -> Result<(), &'static str> {
         if pair[1].seq <= pair[0].seq {
             return Err("audit: sequence numbers not monotonically increasing");
         }
+    }
+
+    // Timestamps must be *stamped*, not merely non-decreasing.
+    //
+    // The ordering check below cannot catch an unstamped log: these four events happen
+    // microseconds apart, well inside one 10 ms tick, so every timestamp is equal on a
+    // healthy run and `later < earlier` is never true. That is exactly the state
+    // aarch64 shipped in — `entry.timestamp` was assigned under
+    // `#[cfg(target_arch = "x86_64")]`, so every entry read 0 and this loop passed
+    // while the audit log carried no time at all. A tamper-evident record with no
+    // timestamps is worth failing over, and only this check would notice.
+    if entries.iter().all(|e| e.timestamp == 0) {
+        return Err("audit: every entry has timestamp 0 — the log is not being stamped");
     }
 
     // Timestamps must be non-decreasing (they could be equal within the same tick)
