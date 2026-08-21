@@ -181,7 +181,7 @@ container mutation crosses into the kernel through the capability-checked, audit
 
 **Delivered**: a ring-0 kernel core on QEMU `virt` — see the
 [aarch64 chapter](./aarch64.md) for the architectural differences that shaped it.
-The aarch64 suite reports **14 passed, 0 failed, 40 skipped** of the same 54 tests
+The aarch64 suite reports **16 passed, 0 failed, 38 skipped** of the same 54 tests
 amd64 runs; skipped tests name the deferred subsystem rather than reporting a
 vacuous pass. The shell offers 8 of the 25 commands — those whose subsystems the
 port actually has.

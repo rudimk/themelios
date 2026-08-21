@@ -46,6 +46,15 @@ pub struct BitmapFrameAllocator {
     bitmap_len: usize,
     /// Total number of frames tracked (= highest_phys_addr / PAGE_SIZE).
     frame_count: usize,
+    /// Frames the memory map reported as usable RAM.
+    ///
+    /// Distinct from `frame_count`, which is the *span* of the bitmap: it runs from
+    /// physical 0 to the highest usable address, so on any machine whose RAM does not
+    /// start at 0 it also covers unbacked holes. QEMU `virt` puts RAM at 0x4000_0000,
+    /// so a 512 MiB guest has a `frame_count` covering 1.5 GiB and `frame_count -
+    /// free_count` reports a gigabyte of phantom "used" memory. Reporting needs the
+    /// usable total, not the span.
+    usable_count: usize,
     /// Number of currently free frames.
     free_count: usize,
 }
@@ -108,6 +117,7 @@ impl BitmapFrameAllocator {
             bitmap_len,
             frame_count,
             free_count: 0,
+            usable_count: 0,
         };
 
         // --- Verify kernel frames are not USABLE ---
@@ -159,6 +169,11 @@ impl BitmapFrameAllocator {
             .iter()
             .map(|byte| byte.count_ones() as usize)
             .sum();
+
+        // Nothing has been handed out yet, so every frame that is free right now is a
+        // frame the memory map called usable. Capturing it here is what lets `mem`
+        // report against real RAM rather than against the bitmap's address span.
+        allocator.usable_count = allocator.free_count;
 
         allocator
     }
@@ -311,8 +326,18 @@ impl BitmapFrameAllocator {
     }
 
     /// Get the total number of frames tracked by this allocator.
+    ///
+    /// This is the bitmap's *span*, holes included — see [`usable_frame_count`] for
+    /// the amount of real RAM.
+    ///
+    /// [`usable_frame_count`]: Self::usable_frame_count
     pub fn total_frame_count(&self) -> usize {
         self.frame_count
+    }
+
+    /// Frames backed by real RAM, per the bootloader's memory map.
+    pub fn usable_frame_count(&self) -> usize {
+        self.usable_count
     }
 
     /// Mark a range of physical frames as free (reclaimable).
@@ -413,6 +438,15 @@ pub fn free_frame_count() -> usize {
         .as_ref()
         .expect("Frame allocator not initialized")
         .free_frame_count()
+}
+
+/// Frames backed by real RAM, per the bootloader's memory map.
+pub fn usable_frame_count() -> usize {
+    FRAME_ALLOCATOR
+        .lock()
+        .as_ref()
+        .expect("Frame allocator not initialized")
+        .usable_frame_count()
 }
 
 /// Get the total number of physical frames tracked by the allocator.

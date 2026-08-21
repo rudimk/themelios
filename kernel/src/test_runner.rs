@@ -31,12 +31,19 @@ struct TestCase {
 /// A test that this architecture cannot run, and why.
 ///
 /// These exist so that a test which does not run says so. The alternative — and what
-/// this file did before aarch64 could run any tests at all — is a
-/// `#[cfg(not(target_arch = "x86_64"))]` stub returning `Ok(())`, which reports `[PASS]`
-/// for a function whose entire body is `Ok(())`. Thirty-nine of those would have made
-/// an aarch64 run print "54 passed, 0 failed" while asserting almost nothing, which is
-/// worse than running no tests: a green suite that proves nothing is a suite nobody
-/// checks.
+/// this file did before aarch64 could run any tests at all — was a
+/// `#[cfg(not(target_arch = "x86_64"))]` stub returning `Ok(())`, which reports
+/// `[PASS]` for a function whose entire body is `Ok(())`. Thirty-nine of those would
+/// have made an aarch64 run print "54 passed, 0 failed" while asserting almost nothing,
+/// which is worse than running no tests: a green suite that proves nothing is a suite
+/// nobody checks.
+///
+/// All of them are deleted. That is worth stating as a checkable fact rather than an
+/// intention, because the first version of this change *left three behind*: their
+/// `TESTS` entries were un-gated while their implementations stayed x86-gated, so the
+/// table bound the stub and three of the "14 real tests" were eight bytes of
+/// `mov x0, xzr; ret`. `grep -c 'cfg(not(target_arch = "x86_64"))'` over this file
+/// should find nothing but this comment.
 struct SkippedTest {
     name: &'static str,
     why: &'static str,
@@ -120,7 +127,6 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_linux_fs",         func: test_linux_fs },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_linux_threads",    func: test_linux_threads },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_oci_unpack",       func: test_oci_unpack },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_container_run",    func: test_container_run },
@@ -131,7 +137,6 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_sha256",           func: test_sha256 },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_registry_pull",    func: test_registry_pull },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_registry_hardening", func: test_registry_hardening },
     TestCase { name: "test_http_request",      func: test_http_request },
     TestCase { name: "test_json_serialize",    func: test_json_serialize },
@@ -182,15 +187,19 @@ static SKIPPED: &[SkippedTest] = &[
     SkippedTest { name: "test_tcp_client", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_elf_exec", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_linux_exec", why: "the Linux personality needs ring-3" },
-    SkippedTest { name: "test_path_resolve", why: "the Linux personality needs ring-3" },
+    SkippedTest {
+        name: "test_path_resolve",
+        why: "path clamping is portable, but `mod linux` is still x86_64-gated",
+    },
     SkippedTest { name: "test_linux_fs", why: "the Linux personality needs ring-3" },
     SkippedTest { name: "test_linux_threads", why: "the Linux personality needs ring-3" },
-    SkippedTest { name: "test_oci_unpack", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_container_run", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_container_isolation", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_container_confinement", why: "containers need ring-3 and the storage stack" },
-    SkippedTest { name: "test_registry_pull", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_registry_hardening", why: "the network stack rides on VirtIO-PCI" },
+    SkippedTest {
+        name: "test_registry_pull",
+        why: "uses a mock transport, not the NIC — blocked on the embedded ring-3 payload",
+    },
     SkippedTest { name: "test_container_registry", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_container_logs", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_management_capability", why: "containers need ring-3 and the storage stack" },
@@ -203,7 +212,8 @@ static SKIPPED: &[SkippedTest] = &[];
 /// Run all tests and stop the machine with a verdict the harness can read.
 ///
 /// Called from `kmain` when the kernel is built with `--features test`.
-/// This function does not return — it terminates QEMU via `exit_qemu()`.
+/// Does not return: x86_64 exits QEMU through `isa-debug-exit`; aarch64 prints a
+/// sentinel and powers the machine off through PSCI.
 pub fn run_tests() -> ! {
     println!();
     println!("========================================");
@@ -266,8 +276,9 @@ pub fn run_tests() -> ! {
     // distinguish "died mid-suite" (QEMU exits, no sentinel) from "hung" (no exit at
     // all) — without it both present identically, as a timeout.
     //
-    // The sentinel is printed *before* the shutdown for the obvious reason, and the
-    // PL011 writes are synchronous, so the line is on the wire before PSCI is called.
+    // The sentinel is printed *before* the shutdown for the obvious reason. That it
+    // reaches the wire rests on a QEMU implementation detail rather than on the driver
+    // flushing — see `psci::system_off`.
     #[cfg(target_arch = "aarch64")]
     {
         if failed == 0 {
@@ -1438,12 +1449,6 @@ fn test_pci_scan() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets — PCI enumeration is x86-specific in Phase 3
-/// (aarch64 uses memory-mapped ECAM, deferred to Phase 7).
-#[cfg(not(target_arch = "x86_64"))]
-fn test_pci_scan() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_virtio_transport — VirtIO PCI transport (Phase 3.1)
@@ -1499,11 +1504,6 @@ fn test_virtio_transport() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_virtio_transport() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Fault-injection for the VirtIO queue-failure paths.
 ///
@@ -1517,11 +1517,6 @@ fn test_virtio_queue_failure() -> Result<(), &'static str> {
     crate::drivers::virtio::test_queue_failure_paths()
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_virtio_queue_failure() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_virtio_blk — VirtIO block driver round-trip (Phase 3.2)
@@ -1618,11 +1613,6 @@ fn test_virtio_blk() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_virtio_blk() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_shared_memory — Shared memory regions (Phase 3.3)
@@ -1783,11 +1773,6 @@ fn test_block_server_ipc() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_block_server_ipc() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_server_spawn — Userspace server framework (Phase 3.4)
@@ -1855,11 +1840,6 @@ fn test_server_spawn() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_server_spawn() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_squashfs_server — SquashFS filesystem server (Phase 3.5)
@@ -2080,11 +2060,6 @@ fn test_squashfs_server() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_squashfs_server() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_overlay_server — Overlay filesystem server (Phase 3.6)
@@ -2303,11 +2278,6 @@ fn test_overlay_server() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_overlay_server() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_ext2_read — ext2 server read path (Phase 3.7, step 1)
@@ -2493,11 +2463,6 @@ fn test_ext2_read() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_ext2_read() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_ext2_write — ext2 server write path (Phase 3.7, step 2)
@@ -2685,11 +2650,6 @@ fn test_ext2_write() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_ext2_write() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_vfs_capability — VFS dispatch + capability gating (Phase 3.8)
@@ -2805,11 +2765,6 @@ fn test_vfs_capability() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_vfs_capability() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_fs_syscalls — FS syscalls from ring 3 (Phase 3.8, step 2)
@@ -2902,11 +2857,6 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
     }
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_fs_syscalls() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_virtio_net — VirtIO-net driver TX/RX round-trip (Phase 4.0)
@@ -2991,11 +2941,6 @@ fn test_virtio_net() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_virtio_net() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_net_service — kernel net service frame bridge (Phase 4.1)
@@ -3099,11 +3044,6 @@ fn test_net_service() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_net_service() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_net_server_stack — ring-3 smoltcp stack round-trip (Phase 4.2)
@@ -3230,11 +3170,6 @@ fn test_net_server_stack() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_net_server_stack() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_net_icmp_echo — ring-3 smoltcp answers ICMP echo (Phase 4.3)
@@ -3400,11 +3335,6 @@ fn test_net_icmp_echo() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_net_icmp_echo() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_dhcp — DHCPv4 address acquisition end to end (Phase 4.4)
@@ -3502,11 +3432,6 @@ fn test_dhcp() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_dhcp() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  Socket API tests (Phase 4.5)
@@ -3699,11 +3624,6 @@ fn test_socket_capability() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_socket_capability() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Test the `sockets` listing path (`OP_SOCK_LIST`) and the ICMP socket /
 /// ping-send plumbing (`OP_SOCK_PING`), both introduced in sub-phase 4.7.
@@ -3767,11 +3687,6 @@ fn test_socket_list() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_socket_list() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Test the Phase 5.0 ELF loader end to end: load the embedded `elf-smoke` ELF
 /// into a fresh process, build its initial stack with a known argv, map a result
@@ -3847,11 +3762,6 @@ fn test_elf_exec() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_elf_exec() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Test the Phase 5.1 Linux syscall personality end to end: load the `linux-smoke`
 /// ELF, mark the process `Personality::Linux`, run it, and verify it self-checked
@@ -3916,11 +3826,6 @@ fn test_linux_exec() -> Result<(), &'static str> {
     }
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_linux_exec() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Unit-test the security-critical Linux path resolver (Phase 5.2): `..` must be
 /// clamped at the root so a container path can never escape its rootfs.
@@ -3950,11 +3855,6 @@ fn test_path_resolve() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_path_resolve() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Test the Phase 5.2 Linux filesystem syscalls end to end: stage a file on an
 /// ext2 mount, use it as a Linux process's container rootfs, and run `fs-smoke`,
@@ -4074,11 +3974,6 @@ fn test_linux_fs() -> Result<(), &'static str> {
     }
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_linux_fs() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Test the Phase 5.3 threads + futex path end to end: run `threads-smoke`, which
 /// `clone`s a thread (sharing the address space, with its own TLS), has the child
@@ -4135,11 +4030,6 @@ fn test_linux_threads() -> Result<(), &'static str> {
     }
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_linux_threads() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Build one 512-byte USTAR header for `name`/`size`/`typeflag` (test helper).
 fn tar_header(name: &str, size: usize, typeflag: u8) -> [u8; 512] {
@@ -4187,7 +4077,6 @@ fn make_tar(entries: &[(&str, &[u8], u8)]) -> alloc::vec::Vec<u8> {
 /// Deterministic and self-contained — no `docker`, no disk. Exercises the tar
 /// reader, the JSON parser, and the layer/whiteout assembly that the ring-3
 /// `oci-server` will use in 5.5.
-#[cfg(target_arch = "x86_64")]
 fn test_oci_unpack() -> Result<(), &'static str> {
     use crate::oci;
 
@@ -4258,11 +4147,6 @@ fn test_oci_unpack() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_oci_unpack() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Bring up an ext2 server on the ext2 disk and register it as a VFS mount,
 /// returning the mount id. Shared by the FS/container tests.
@@ -4391,11 +4275,6 @@ fn test_container_run() -> Result<(), &'static str> {
     }
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_container_run() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Container isolation is *enforced*, not incidental (Phase 5.7). Runs the
 /// `isolation-smoke` probe as a container `/init` over a bundle that also stages
@@ -4477,11 +4356,6 @@ fn test_container_isolation() -> Result<(), &'static str> {
     }
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_container_isolation() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Per-container rootfs confinement (Phase 6.1b). Proves both halves of the
 /// boundary against a container confined to `/c/conftest` on a mount that also
@@ -4577,15 +4451,9 @@ fn test_container_confinement() -> Result<(), &'static str> {
     }
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_container_confinement() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Test SHA-256 against known FIPS 180-4 vectors (used for registry blob digest
 /// verification, Phase 5.6).
-#[cfg(target_arch = "x86_64")]
 fn test_sha256() -> Result<(), &'static str> {
     use crate::oci::sha256;
     if sha256::hex(&sha256::sha256(b"")) != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
@@ -4608,11 +4476,6 @@ fn test_sha256() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_sha256() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Wrap `data` in a minimal RFC-1952 gzip member (test helper).
 ///
@@ -4766,7 +4629,6 @@ fn image_bad_layer(blob: &[u8]) -> alloc::vec::Vec<u8> {
 ///   the kernel stack.
 /// - **Content-Length overflow** (`Content-Length: <usize::MAX>`) must return
 ///   `None`, not panic on `body_start + n` (debug-build overflow check).
-#[cfg(target_arch = "x86_64")]
 fn test_registry_hardening() -> Result<(), &'static str> {
     use crate::oci::{json, registry};
     use alloc::vec::Vec;
@@ -4801,22 +4663,9 @@ fn test_registry_hardening() -> Result<(), &'static str> {
     }
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_sha256_stub() {}
-#[cfg(not(target_arch = "x86_64"))]
-fn test_registry_pull() -> Result<(), &'static str> {
-    Ok(())
-}
-#[cfg(not(target_arch = "x86_64"))]
-fn test_registry_hardening() -> Result<(), &'static str> {
-    Ok(())
-}
-
 /// HTTP request parser (Phase 6.0): parse a GET with a Docker version prefix +
 /// query and a POST with a JSON body, then confirm hostile/malformed inputs fail
 /// closed (return `None`, never panic/hang).
-#[cfg(target_arch = "x86_64")]
 fn test_http_request() -> Result<(), &'static str> {
     use crate::http;
     use alloc::string::String;
@@ -4899,15 +4748,9 @@ fn test_http_request() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_http_request() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// JSON serializer (Phase 6.0): exact compact output, correct escaping, and a
 /// parse → serialize round-trip (used to build Docker Engine API responses).
-#[cfg(target_arch = "x86_64")]
 fn test_json_serialize() -> Result<(), &'static str> {
     use crate::oci::json::{self, Value};
     use alloc::string::String;
@@ -4952,11 +4795,6 @@ fn test_json_serialize() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_json_serialize() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Container metadata registry (Phase 6.1): create two containers, verify the
 /// table + id-prefix/name lookup + metadata, drive the state machine, run one
@@ -5068,11 +4906,6 @@ fn test_container_registry() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_container_registry() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Per-container stdout/stderr capture (Phase 6.2). Runs the demo container (whose
 /// `/init`, linux-smoke, writes `"linux-smoke ok\n"` to fd 1), then reads the
@@ -5164,11 +4997,6 @@ fn test_container_logs() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_container_logs() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Management ABI capability gate (Phase 6.3). Proves the security property the
 /// sub-phase adds: the container control surface is *ambient-authority-free*. A
@@ -5336,11 +5164,6 @@ fn test_management_capability() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_management_capability() -> Result<(), &'static str> {
-    Ok(())
-}
 
 /// Build a minimal DNS A-record query for "example.com" (29 bytes).
 #[cfg(target_arch = "x86_64")]
@@ -5432,11 +5255,6 @@ fn test_udp_echo() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_udp_echo() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_tcp_client — outbound TCP connect through the socket API (Phase 4.6)
@@ -5561,11 +5379,6 @@ fn test_tcp_client() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_tcp_client() -> Result<(), &'static str> {
-    Ok(())
-}
 
 // ============================================================
 //  test_api_server — ring-3 Docker Engine API over TCP (Phase 6.5)
@@ -5782,9 +5595,4 @@ fn test_api_server() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stub for non-x86_64 targets.
-#[cfg(not(target_arch = "x86_64"))]
-fn test_api_server() -> Result<(), &'static str> {
-    Ok(())
-}
 

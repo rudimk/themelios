@@ -219,15 +219,6 @@ pub fn enable_intid(intid: u32) {
     println!("[gic] INTID {} enabled (priority 0x80)", intid);
 }
 
-/// Handle one hardware interrupt: claim it, route it, complete it.
-///
-/// Called from the IRQ vector slot. The value read from `IAR` is passed straight to
-/// `EOIR` — see the acknowledge/EOI discipline in the module docs; completing with a
-/// different value, or not at all, wedges the controller.
-///
-/// Returns `true` if the interrupt was the scheduling timer, meaning the caller should
-/// consider preempting the interrupted task. The decision is *reported* rather than
-/// acted on here so that the caller can schedule after the EOI has been issued.
 /// Interrupt ID of the PL011 UART on QEMU `virt`: **SPI 1**, so INTID 33.
 ///
 /// SPIs are numbered from 32, and the `virt` device tree describes the UART's
@@ -238,6 +229,17 @@ pub fn enable_intid(intid: u32) {
 /// `enable_intid` handles.
 pub const UART_INTID: u32 = 33;
 
+/// Handle one hardware interrupt: claim it, route it, complete it.
+///
+/// Called from the IRQ vector slot. The value read from `IAR` is passed straight to
+/// `EOIR` — see the acknowledge/EOI discipline in the module docs; completing with a
+/// different value, or not at all, wedges the controller.
+///
+/// Returns `true` when the interrupt is one the caller should consider rescheduling
+/// after — the scheduling timer, or serial input that has just woken the shell. The
+/// decision is *reported* rather than acted on here so the caller can schedule strictly
+/// after the EOI has been issued: a GICv2 CPU interface delivers nothing while an
+/// interrupt is active.
 pub fn dispatch_irq() -> bool {
     let iar = gicc_read(GICC_IAR);
     let intid = iar & IAR_INTID_MASK;

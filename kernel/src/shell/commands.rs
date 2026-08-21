@@ -14,6 +14,9 @@ use crate::mm;
 use crate::println;
 use crate::sched;
 use crate::sched::task::TaskState;
+/// x86_64 only: aarch64 has `ProcessId` but no process table, and every command
+/// that reaches for one is gated out.
+#[cfg(target_arch = "x86_64")]
 use crate::process;
 /// The process table's per-process state enum — x86_64 only, like the table itself.
 #[cfg(target_arch = "x86_64")]
@@ -74,15 +77,19 @@ pub fn cmd_help(_args: &str) {
 /// Print memory statistics: frame allocator and heap usage.
 pub fn cmd_mem(_args: &str) {
     let free_frames = mm::frame::free_frame_count();
-    let total_frames = mm::frame::total_frame_count();
-    let used_frames = total_frames - free_frames;
+    // Report against *usable* RAM, not the bitmap's address span. The span runs from
+    // physical 0 to the top of usable memory, so on a machine whose RAM does not start
+    // at 0 it counts the hole below as "used": QEMU `virt` puts RAM at 0x4000_0000, and
+    // a 512 MiB guest previously reported "1037 MiB used".
+    let usable_frames = mm::frame::usable_frame_count();
+    let used_frames = usable_frames.saturating_sub(free_frames);
 
     let free_mib = (free_frames as u64 * mm::PAGE_SIZE) / (1024 * 1024);
     let used_mib = (used_frames as u64 * mm::PAGE_SIZE) / (1024 * 1024);
 
     println!("Memory:");
-    println!("  Frames: {} free / {} total ({} MiB free, {} MiB used)",
-        free_frames, total_frames, free_mib, used_mib);
+    println!("  Frames: {} free / {} usable ({} MiB free, {} MiB used)",
+        free_frames, usable_frames, free_mib, used_mib);
     println!("  Heap:   {} used, {} free (of {} KiB total)",
         mm::heap::used(), mm::heap::free(), mm::heap::total_size() / 1024);
     let growth = mm::heap::growth_count();
@@ -253,7 +260,14 @@ pub fn cmd_peek(args: &str) {
     // range. A page fault will still crash the kernel, so we do our best.
     if !is_valid_address(addr, count) {
         println!("Address {:#x} is not in a known mapped range.", addr);
-        println!("Valid ranges: HHDM (0xffff800000000000+), kernel image (0xffffffff80000000+)");
+        // Report the *live* HHDM base: it differs per architecture (0xffff8000…
+        // on x86_64, 0xffff0000… on aarch64), and printing a constant told the
+        // reader a range that was wrong for the machine they were on.
+        println!(
+            "Valid ranges: HHDM ({:#x}+4GiB), kernel image ({:#x}+16MiB)",
+            mm::hhdm_offset(),
+            KERNEL_IMAGE_BASE
+        );
         return;
     }
 
@@ -267,12 +281,24 @@ pub fn cmd_peek(args: &str) {
 /// so we use a conservative heuristic based on known memory layout:
 /// - HHDM region: maps all physical memory at hhdm_offset
 /// - Kernel image: loaded at 0xffffffff80000000
+/// Higher-half load address of the kernel image. The same on both architectures —
+/// both linker scripts place the image here.
+const KERNEL_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
+
 fn is_valid_address(addr: u64, count: usize) -> bool {
     let end = addr.wrapping_add(count as u64);
     let hhdm = mm::hhdm_offset();
 
-    // Must be in the upper half (kernel space)
-    if addr < 0xffff_8000_0000_0000 {
+    // Must be in the upper half (kernel space).
+    //
+    // The floor is derived from the live HHDM base rather than hard-coded to x86's
+    // 0xffff_8000_0000_0000. Limine's aarch64 HHDM sits at 0xffff_0000_0000_0000 —
+    // *below* that constant — so the hard-coded version rejected the entire aarch64
+    // HHDM window and made the branch below it unreachable, leaving `peek` able to
+    // read only the kernel image on that architecture. Inspecting physical memory
+    // through the HHDM is the command's main use.
+    let upper_half_floor = hhdm.min(KERNEL_IMAGE_BASE);
+    if addr < upper_half_floor {
         return false;
     }
 
@@ -284,8 +310,8 @@ fn is_valid_address(addr: u64, count: usize) -> bool {
         return true;
     }
 
-    // Kernel image region: 0xffffffff80000000 .. 0xffffffff80000000 + 16 MiB
-    let kernel_base: u64 = 0xffff_ffff_8000_0000;
+    // Kernel image region: 16 MiB from the higher-half load address.
+    let kernel_base: u64 = KERNEL_IMAGE_BASE;
     let kernel_end: u64 = kernel_base + 16 * 1024 * 1024;
     if addr >= kernel_base && end <= kernel_end {
         return true;

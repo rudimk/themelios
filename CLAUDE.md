@@ -238,14 +238,17 @@ Detailed plan in `.sisyphus/plans/phase7-aarch64.md` (local, gitignored).
   un-gated; `cap`/`audit`/`ipc`/`http`/`oci`/`mm::shared` un-gated for aarch64 (all
   `alloc`-only; `cap`+`audit` needed only `ProcessId`, so aarch64 gets the 41-line
   identity newtype without the 712-line process table and `current_process_id` answers
-  `ProcessId::KERNEL`). **aarch64 suite: 14 passed / 0 failed / 40 skipped of 54** —
-  skipped tests name the deferred subsystem instead of the 39 `Ok(())` stubs that
-  would have reported a vacuous "54 passed". **Exit contract** (the plan's riskiest
+  `ProcessId::KERNEL`). **aarch64 suite: 16 passed / 0 failed / 38 skipped of 54** —
+  skipped tests name the deferred subsystem, and all 39 `Ok(())` stubs — which would
+  have reported a vacuous "54 passed" — are deleted (Momus caught three still live: the
+  `TESTS` entry un-gated but the impl still x86-gated, so the table bound the stub). **Exit contract** (the plan's riskiest
   unknown): no `isa-debug-exit` on `virt`, so a serial sentinel carries the verdict and
   **PSCI `SYSTEM_OFF`** (HVC conduit) stops the machine — which is what distinguishes
-  "died mid-suite" from "hung"; all four rows verified by fault injection. **Shell**:
-  PL011 RX via `IMSC` `RXIM`+**`RTIM`** (timeout is load-bearing — typing never reaches
-  the 8-char FIFO trigger), UART on **SPI 1 = INTID 33**, 8 of 25 commands with the
+  "died mid-suite" from "hung"; all four rows verified by hand during development, by injecting the matching fault. **Shell**:
+  PL011 RX via `IMSC` `RXIM`+`RTIM` (the timeout matters on real parts; QEMU hard-codes
+  `read_trigger=1` and never raises `INT_RT`, so `RXIM` alone carries it there), acked
+  **before** draining — the reverse order can wedge the console permanently, since QEMU
+  raises RX only on the FIFO's 0→1 transition, UART on **SPI 1 = INTID 33**, 8 of 25 commands with the
   rest `#[cfg]`'d out of dispatcher, impls *and* help text. Three defects the tests
   caught: `test_page_tables` assumed 1 MiB is RAM (true on a PC, an unbacked hole on
   `virt`); the suite ran with interrupts in whatever state boot left them, enabled only

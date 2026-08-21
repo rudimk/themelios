@@ -38,10 +38,17 @@ const INT_RX: u32 = 1 << 4;
 /// `IMSC`/`MIS`/`ICR` bit 6: receive *timeout* — characters are sitting in the FIFO but
 /// it never filled to the trigger level.
 ///
-/// Both are needed, and forgetting the timeout is the classic PL011 bug. Interactive
-/// typing almost never reaches the FIFO trigger level (default: 1/2 full, eight
-/// characters), so with only `INT_RX` enabled the first seven keystrokes sit in the
-/// FIFO with no interrupt raised, and the shell appears dead until the eighth arrives.
+/// Enabled because real PL011 hardware needs it: the RX interrupt fires at the
+/// FIFO trigger level (1/8 to 7/8 full, per `IFLS`), so on a part configured for
+/// anything above 1 the early characters of a short burst — which is what interactive
+/// typing is — sit unannounced until the timeout fires.
+///
+/// It is **not** what makes input work on QEMU, and an earlier version of this comment
+/// claimed it was. QEMU 8.2.2 hard-codes `read_trigger = 1` and never raises `INT_RT`
+/// at all (`hw/char/pl011.c`: `pl011_set_read_trigger` has the IFLS path `#if 0`'d,
+/// and `INT_RT` appears only in the mask tables). So on the one platform this port
+/// currently runs on, `INT_RX` alone delivers every keystroke and this bit is
+/// inert — correct for portability, but carrying its own weight nowhere yet.
 const INT_RX_TIMEOUT: u32 = 1 << 6;
 
 /// A PL011 instance addressed by a **mapped virtual** base address.
@@ -168,16 +175,33 @@ pub fn handle_receive_interrupt() -> usize {
         return 0;
     };
 
+    // Acknowledge at the source *before* draining, not after. The opposite order can
+    // wedge the console permanently, which is worth spelling out because it is not the
+    // intuitive one.
+    //
+    // Checked against QEMU 8.2.2 `hw/char/pl011.c` rather than reasoned about:
+    //   - `read_trigger` is hard-coded to 1 (`pl011_set_read_trigger`, with the
+    //     IFLS-derived path `#if 0`'d out).
+    //   - `pl011_put_fifo` raises RX with `if (read_count == read_trigger)` — an
+    //     equality, so the interrupt is raised only on the *empty → non-empty*
+    //     transition, not whenever data is present.
+    //
+    // Ack-after-drain therefore has this failure: a byte landing between the last
+    // `getc` (which saw the FIFO empty) and the `ICR` write takes `read_count` 0 → 1
+    // and sets RX; our ack then clears it. `read_count` never returns to 0, so the
+    // equality never holds again and RX is never re-raised — and QEMU never raises the
+    // receive *timeout* either (`INT_RT` is defined and masked but never OR'd into
+    // `int_level`). The console is dead for the rest of the boot, not one byte behind.
+    //
+    // Acking first has no such window: anything arriving from here on either gets read
+    // by the loop below, or lands after it and re-raises RX on the 0 → 1 transition.
+    uart.ack_rx();
+
     let mut taken = 0;
     while let Some(byte) = uart.getc() {
         crate::shell::input::push_byte(byte);
         taken += 1;
     }
-
-    // Acknowledge at the source *after* draining. Clearing first would leave a window
-    // where a character arriving between the clear and the last read is consumed here
-    // but leaves no pending interrupt behind.
-    uart.ack_rx();
     drop(guard);
 
     // Waking is a separate step from buffering, and forgetting it is silent: the bytes

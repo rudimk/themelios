@@ -36,10 +36,21 @@
 //! EL3 firmware in some configurations, where `SMC` is the conduit instead.
 //!
 //! Rather than depend on a boot-time DTB parse we do not otherwise need, [`system_off`]
-//! tries `HVC` and then `SMC`. That is safe because a PSCI call which is not handled
-//! simply *returns* (with `NOT_SUPPORTED`), and an `HVC` on a machine with no EL2
-//! handler raises an exception the Phase 7.2 vectors report rather than executing
-//! garbage. Getting it wrong is diagnosable; guessing silently is not.
+//! issues `HVC` and then `SMC`. On QEMU `virt` the first never returns, which is the
+//! point.
+//!
+//! Be exact about what the second instruction is worth, because an earlier version of
+//! this comment oversold it. It covers one case: a platform whose PSCI implementation
+//! *returns* `NOT_SUPPORTED` from the HVC conduit. It does **not** cover a machine
+//! where `HVC` is undefined — that raises a synchronous exception, and the Phase 7.2
+//! handler ends an unrecognised syndrome at `panic!`, so control never reaches the
+//! `SMC`. There, the fallback is dead code.
+//!
+//! Worse, in a `--features test` build that panic calls [`shutdown_or_hang`], which
+//! calls back into here — unbounded recursion through the exception path. Neither is
+//! reachable on `virt` (QEMU intercepts PSCI-over-HVC regardless of EL2), but the
+//! reasoning originally written here did not hold, and a platform that genuinely needs
+//! the `SMC` conduit will need a DTB parse rather than this.
 
 use core::arch::asm;
 
@@ -59,12 +70,21 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 ///
 /// Stops the machine. Every caller must be prepared for execution to end here — in
 /// particular, anything that must reach the serial console has to have been flushed
-/// already. The PL011 writes in this kernel are synchronous (each character is polled
-/// out before the next), so output ordering is guaranteed by the time this is called.
+/// already. Ordering output before this call is necessary but, on real hardware, not
+/// sufficient: `Pl011::putc` polls the TX FIFO for *space* before writing, never for a
+/// character having left, and nothing drains `FR.BUSY`/`FR.TXFE` before the power-off.
+/// On QEMU it holds because `pl011_write` forwards `DR` to the chardev immediately; on
+/// a real part the tail of a line could be cut. A prior version of this comment called
+/// the writes "synchronous", which they are not.
 pub unsafe fn system_off() {
-    // SAFETY: `HVC`/`SMC` with a PSCI function ID in x0. An unimplemented conduit
-    // either returns an error code in x0 or raises a synchronous exception, which the
-    // installed vectors report — neither corrupts state. x0-x3 are caller-saved.
+    // SAFETY: `HVC`/`SMC` with a PSCI function ID in x0. A conduit that is implemented
+    // but does not recognise the call returns an error in x0; one that is not
+    // implemented raises a synchronous exception the installed vectors report. Neither
+    // corrupts state.
+    //
+    // The clobber list covers x0-x3, which is the SMCCC 1.1 contract. Under SMCCC 1.0 a
+    // callee may clobber x4-x17 and `in(reg)` can allocate the ID register there —
+    // harmless only because a successful call never returns.
     unsafe {
         asm!(
             "mov x0, {id}",

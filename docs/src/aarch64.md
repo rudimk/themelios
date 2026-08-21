@@ -8,7 +8,7 @@ ThemeliOS targets x86_64 first and aarch64 second. This chapter describes what t
 
 The port covers boot, memory management on kernel-owned page tables, exceptions, interrupts, a preemptive scheduler, and an interactive shell. It does **not** cover ring-3, VirtIO-PCI, filesystems, networking or containers. "aarch64 support" here does not mean "containers on ARM".
 
-That boundary is visible in the test suite rather than left to prose: an aarch64 run reports **14 passed, 0 failed, 40 skipped**, and each skipped test names the subsystem that explains it. The total is 54 on both architectures, so the two runs are directly comparable.
+That boundary is visible in the test suite rather than left to prose: an aarch64 run reports **16 passed, 0 failed, 38 skipped**, and each skipped test names the subsystem that explains it. The total is 54 on both architectures, so the two runs are directly comparable.
 
 | Subsystem | x86_64 | aarch64 |
 |---|---|---|
@@ -73,9 +73,11 @@ The first switch to a task arrives out of the timer's IRQ handler, carrying the 
 
 A GICv2 CPU interface delivers nothing while an interrupt is active. Since `schedule()` switches stacks and does not return until the task runs again, scheduling before `GICC_EOIR` would leave the interrupt active for that whole period and the next tick would never arrive.
 
-### The receive-timeout interrupt is not optional
+### Acknowledge the UART *before* draining it
 
-Enabling only the PL011's `RXIM` looks correct and produces a dead console: interactive typing never reaches the FIFO trigger level of eight characters, so the first seven keystrokes raise no interrupt at all. `RTIM` — the receive *timeout* — is what makes a single keystroke visible.
+The intuitive order — drain the FIFO, then clear the interrupt — can wedge the console permanently on QEMU. Its PL011 model (`hw/char/pl011.c`) hard-codes the receive trigger to 1 and raises RX with `if (read_count == read_trigger)`: an *equality*, so the interrupt fires only on the empty→non-empty transition. A byte landing between the last read and the `ICR` write therefore sets RX, our acknowledge clears it, and `read_count` never returns to zero — so the equality never holds again. QEMU never raises the receive *timeout* either (`INT_RT` is defined and masked but never asserted), so nothing rescues it. The console is dead for the rest of the boot.
+
+Acknowledging first has no such window. `RTIM` is enabled anyway, because real PL011 parts trigger at a configurable FIFO level and need the timeout to deliver the tail of a short burst — but it is inert on the one platform this port currently runs on, and an earlier version of this chapter claimed the opposite as an observed fact.
 
 ## Stopping the machine
 

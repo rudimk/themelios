@@ -1045,14 +1045,22 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
 
     // The success sentinel, which advances with each sub-phase to the *last* thing the
-    // boot path proves — currently the scheduler self-test, which runs after the memory
-    // bring-up, the paging self-test, and the exception/GIC/timer self-tests.
+    // boot path proves — currently shell startup, which runs after the memory bring-up,
+    // the paging self-test, the exception/GIC/timer self-tests and the scheduler one.
     //
     // It is deliberately never left pointing at an earlier milestone. Every marker so
-    // far (the 7.0b banner, then the 7.1 paging sentinel, then the 7.2 timer sentinel)
-    // prints before the work the next sub-phase adds, so leaving it behind would let
-    // that work break while the smoke saw its marker and stopped looking.
-    const MARKER: &str = "Phase 7.3 scheduler reached; self-test passed.";
+    // far (the 7.0b banner, the 7.1 paging sentinel, the 7.2 timer sentinel, the 7.3
+    // scheduler sentinel) prints before the work the next sub-phase adds, so leaving it
+    // behind would let that work break while the smoke saw its marker and stopped
+    // looking.
+    //
+    // 7.4 nearly shipped having broken that rule: the shell is the only new thing in
+    // the boot path, and the suite run by `xtask test --arch aarch64` builds with
+    // `--features test`, which takes the other branch and never starts a shell at all.
+    // With the marker left at 7.3, nothing in CI would have executed `shell::init` —
+    // and two real defects in the receive path were found by hand precisely because
+    // nothing was executing it.
+    const MARKER: &str = "Shell initialized";
 
     // Failure signatures. Without these the only failure mode is "marker never
     // appeared", which costs the full timeout and reports nothing useful. A panic or a
@@ -1104,8 +1112,9 @@ fn await_aarch64_banner(mut cmd: Command, serial_log: &Path, what: &str) {
     }
     if found {
         println!(
-            "arm64 {what} smoke passed: booted, switched to kernel page tables, and \
-             passed the paging, exception, timer and scheduler self-tests on QEMU virt."
+            "arm64 {what} smoke passed: booted, switched to kernel page tables, passed \
+             the paging, exception, timer and scheduler self-tests, and started the \
+             shell on QEMU virt."
         );
     } else {
         eprintln!(

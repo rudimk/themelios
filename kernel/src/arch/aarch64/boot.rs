@@ -279,7 +279,7 @@ pub fn kmain_aarch64(
         );
     }
     crate::println!("[boot] PL011 mapped + serial online");
-    crate::println!("[boot] Phase 7.0b boot-to-banner reached; idling.");
+    crate::println!("[boot] Phase 7.0b boot-to-banner reached.");
 
     // Install exception vectors before anything that can fault. Until this runs, a
     // data abort branches to whatever VBAR_EL1 held at handoff and the kernel dies
@@ -379,9 +379,9 @@ pub fn kmain_aarch64(
     // `shell::init` routes the UART's SPI through the GIC, and `enable_intid` asserts
     // interrupts are masked — it does an unsynchronised read-modify-write of the
     // distributor's priority and target registers, which is sound single-threaded and
-    // a race otherwise. Interrupts are live by this point (they have to be: the
-    // scheduler drain above needs them), so mask across the call rather than moving it
-    // earlier, which would put shell startup before the drain it must not disturb.
+    // a race otherwise. Interrupts are live by this point, so mask across the call.
+    // (The drain above does not itself require them — `yield_now` masks internally and
+    // works either way; the unmask simply precedes both branches.)
     //
     // The shell task then blocks until a keystroke wakes it, costing nothing while idle.
     #[cfg(not(feature = "test"))]
@@ -922,10 +922,11 @@ fn bring_up_memory(hhdm: u64, k: KernelAddr, entries: &[&limine::memory_map::Ent
     let free = crate::mm::frame::free_frame_count();
     let total = crate::mm::frame::total_frame_count();
     crate::println!(
-        "[mm] Frame allocator: {} free / {} total ({} MiB usable)",
+        "[mm] Frame allocator: {} free / {} usable ({} MiB), bitmap spans {} frames",
         free,
-        total,
-        (free as u64 * crate::mm::PAGE_SIZE) / (1024 * 1024)
+        crate::mm::frame::usable_frame_count(),
+        (free as u64 * crate::mm::PAGE_SIZE) / (1024 * 1024),
+        total
     );
 
     // The critical moment: build our own L0 tree from Limine's kernel-half mappings
