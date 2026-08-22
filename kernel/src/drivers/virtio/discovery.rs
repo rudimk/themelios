@@ -3,8 +3,9 @@
 //! "Which VirtIO devices does this machine have?" is a question with the same *answer
 //! shape* on every platform and a completely different *mechanism* on each. On x86_64
 //! it is a PCI configuration-space walk driven through the `0xCF8`/`0xCFC` I/O ports;
-//! on aarch64 `virt` it is a scan of the 32 fixed MMIO slots [`crate::platform`]
-//! describes, each with a `DeviceID` register. There is no port I/O on aarch64 at all,
+//! on aarch64 `virt` it is a scan of the MMIO slot bank [`crate::platform`] describes
+//! (32 slots on the machines we launch), each with a `DeviceID` register at a fixed
+//! offset. There is no port I/O on aarch64 at all,
 //! and virtio-mmio has no PCI class code, so the *predicate* differs and not merely the
 //! enumeration.
 //!
@@ -32,7 +33,7 @@
 //! meet: discovery is the only place that knows *how* a device was found, so it is the
 //! only place that can say which transport speaks to it.
 //!
-//! The per-transport handle lives in the private [`Handle`] enum, so no caller outside
+//! The per-transport handle lives in a private `Handle` enum, so no caller outside
 //! this module can see — or grow a dependency on — how a device was reached.
 //!
 //! ## Order is stable per platform, and the two platforms disagree
@@ -161,9 +162,9 @@ impl VirtioKind {
 
 /// A VirtIO device the platform has presented to us.
 ///
-/// Deliberately opaque: the transport handle inside is not part of the public surface,
-/// so a caller cannot accidentally grow a dependency on PCI. Drivers reach it through
-/// the crate-private [`VirtioDevice::pci`].
+/// Deliberately opaque: the `Handle` inside is private, so a caller cannot grow a
+/// dependency on how the device was found. Drivers reach the device only through
+/// [`VirtioDevice::open_transport`], which hands back a `Box<dyn VirtioTransport>`.
 #[derive(Debug, Clone)]
 pub struct VirtioDevice {
     kind: VirtioKind,
@@ -247,7 +248,7 @@ fn enumerate() -> Vec<VirtioDevice> {
 /// inferred "the first disk" from a slot index would pick the wrong one, and on the amd64
 /// harness's layout that is the difference between the scratch disk and the ext2 volume.
 ///
-/// A populated slot is mapped once, here, and the mapping travels in the [`Handle`] — so
+/// A populated slot is mapped once, here, and the mapping travels in the `Handle` — so
 /// a device is mapped exactly once no matter how many times it is opened.
 ///
 /// A legacy slot is reported and skipped rather than silently omitted: the difference
@@ -261,6 +262,11 @@ fn enumerate() -> Vec<VirtioDevice> {
     let mut found = Vec::new();
     let mut legacy = 0usize;
     let mut empty = 0usize;
+    // Every slot lands in exactly one bucket, and the summary line below adds them up
+    // against the bank size. An `Err(_) => {}` arm here would let a slot vanish from the
+    // accounting entirely — the same silent omission this function goes out of its way to
+    // avoid for legacy slots.
+    let mut unrecognised = 0usize;
 
     for dev in crate::platform::info().virtio_mmio {
         // One page covers a 0x200-byte slot window.
@@ -283,7 +289,10 @@ fn enumerate() -> Vec<VirtioDevice> {
             }
             Ok(SlotProbe::Empty) => empty += 1,
             Err(VirtioError::LegacyTransport) => legacy += 1,
-            Err(_) => {}
+            Err(e) => {
+                unrecognised += 1;
+                crate::println!("[virtio]   slot @ {:#x}: unrecognised ({:?})", dev.base, e);
+            }
         }
     }
 
@@ -293,12 +302,21 @@ fn enumerate() -> Vec<VirtioDevice> {
              start QEMU with `-global virtio-mmio.force-legacy=false`"
         );
     }
+    let scanned = crate::platform::info().virtio_mmio.len();
     crate::println!(
-        "[virtio] scanned {} mmio slots: {} device(s), {} empty, {} legacy",
-        crate::platform::info().virtio_mmio.len(),
+        "[virtio] scanned {} mmio slots: {} device(s), {} empty, {} legacy, {} unrecognised",
+        scanned,
         found.len(),
         empty,
-        legacy
+        legacy,
+        unrecognised
+    );
+    // The buckets are exhaustive by construction; asserting it means a future arm that
+    // forgets to count cannot quietly shrink the total.
+    debug_assert_eq!(
+        found.len() + empty + legacy + unrecognised,
+        scanned,
+        "virtio-mmio slot accounting does not sum to the bank size"
     );
     found
 }

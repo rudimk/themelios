@@ -153,7 +153,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Complete (ring-0 core; EL0/storage/net/containers deferred) |
-| **8** | aarch64 parity (EL0, storage, net, containers) | Planned |
+| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.3 done) |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -168,8 +168,8 @@ narrative per commit._
 
 **Phase 8 — aarch64 parity: IN PROGRESS.** ✅ 8.spike (EL0 round trip proven), ✅ 8.1
 (arch-neutral discovery seam + `PlatformInfo`), ✅ 8.2 (`VirtioTransport` trait + PCI impl
-extracted); next is 8.3 (virtio-mmio on aarch64 — the first sub-phase that moves the
-ratchet, retiring 8). Plan in
+extracted), ✅ 8.3 (virtio-mmio — the first sub-phase to move the ratchet, retiring
+**seven** skips, not the eight the plan projected); next is 8.4 (EL0). Plan in
 `.sisyphus/plans/phase8-aarch64-parity.md` (v2, after five adversarial review passes — nine
 v1 claims and fourteen v2 claims were false, and the sub-phase order is reversed from v1).
 **Ten sub-phases plus a spike**, taking aarch64 from the Phase 7 ring-0 core to full amd64
@@ -187,10 +187,14 @@ of Phase 8's virtio work runs on any of them, and that `qemu-system-aarch64 -M s
 the cheap genericity test.
 
 Parity has one measurable definition — `test_runner`'s `SKIPPED` list empty on both
-architectures, i.e. 54/54 running on each. It is **16 running / 38 skipped** on aarch64
-today. Three of the 38 cannot be retired by porting (`test_pci_scan`, `test_syscall`,
-`test_linux_exec`'s TLS assertion) and are retired by reframing, each decided in the
-sub-phase that owns it.
+architectures, i.e. 55/55 running on each. It is **23 running / 32 skipped** on aarch64
+today (16/39 before 8.3). Three of the 32 cannot be retired by porting (`test_pci_scan`,
+`test_syscall`, `test_linux_exec`'s TLS assertion) and are retired by reframing, each
+decided in the sub-phase that owns it.
+
+Note the denominator: this block previously read "54/54" and "16 running / 38 skipped",
+which was wrong on both counts — `SUITE_SIZE` has been 55, and 16 + 38 does not reach it.
+The passing count was right; the skip count was not.
 
 **Phase 7 — aarch64 port: COMPLETE (ring-0 core).** A ring-0 kernel-core port to QEMU `virt`
 (ARM64); EL0/userspace, storage, networking and containers on ARM are a separate,
@@ -273,7 +277,8 @@ parity — see above.**
   un-gated; `cap`/`audit`/`ipc`/`http`/`oci`/`mm::shared` un-gated for aarch64 (all
   `alloc`-only; `cap`+`audit` needed only `ProcessId`, so aarch64 gets the 41-line
   identity newtype without the 712-line process table and `current_process_id` answers
-  `ProcessId::KERNEL`). **aarch64 suite: 16 passed / 0 failed / 38 skipped of 54** —
+  `ProcessId::KERNEL`). **aarch64 suite at the close of 7.4: 16 passed / 0 failed /
+  39 skipped of 55** —
   skipped tests name the deferred subsystem, and all 39 `Ok(())` stubs — which would
   have reported a vacuous "54 passed" — are deleted (Momus caught three still live: the
   `TESTS` entry un-gated but the impl still x86-gated, so the table bound the stub). **Exit contract** (the plan's riskiest

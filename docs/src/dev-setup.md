@@ -166,9 +166,10 @@ is two things to keep in sync, and the failure mode is quiet: a command that sil
 ignores an unrecognised flag builds the *default* architecture and reports success. One
 spelling, and an unknown flag is an error.
 
-Omitting `--arch` selects **amd64**, because that is the primary target and the one CI
-gates on. That default is a convenience, not a recommendation — when you are working
-across both architectures, name it on both sides:
+Omitting `--arch` selects **amd64**, because that is the primary target. It is not the
+only gated one — CI runs the full suite on both architectures, plus three arm64 boot
+smokes, and the release job requires all of them. The default is a convenience, not a
+recommendation: when you are working across both architectures, name it on both sides:
 
 ```bash
 cargo xtask test --arch amd64
@@ -200,8 +201,13 @@ at the ThemeliOS debug shell; type `help` for commands. Press **Ctrl+A, X** to e
 
 The two are not equivalent in what they can reach: amd64 boots the full stack (storage,
 networking, containers, the management API), while arm64 is a ring-0 kernel-core port —
-memory, scheduling, interrupts, VirtIO and the shell. Commands whose subsystem is not
-yet ported are absent from the arm64 shell rather than present and broken.
+memory, scheduling, interrupts, VirtIO device discovery and the shell. Commands whose
+subsystem is not yet ported are absent from the arm64 shell rather than present and
+broken; the filesystem, socket and container commands all still need ring 3 (EL0), which
+lands in 8.4/8.5.
+
+Both architectures are launched with three VirtIO disks and a NIC attached, so `discovery`
+finds the same device set the test suite does.
 
 ### Run the test suite
 

@@ -339,8 +339,10 @@ pub fn kmain_aarch64(
 
     // --- Phase 8.3: VirtIO over virtio-mmio ---
     //
-    // After the scheduler, because discovery allocates; before the test suite and the
-    // shell, because both expect the device list to be populated.
+    // Placed here because it must precede the test suite and the shell, both of which
+    // expect the device list to be populated, and because `mm::mmio::map` needs the page
+    // tables and heap `bring_up_memory` installs. It does *not* depend on the scheduler;
+    // sitting after the 7.3 self-test is only so the boot log reads in phase order.
     crate::drivers::virtio::discovery::init();
     crate::println!(
         "[virtio] discovery: {}",

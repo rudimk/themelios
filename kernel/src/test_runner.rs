@@ -213,20 +213,21 @@ static SKIPPED: &[SkippedTest] = &[
 #[cfg(not(target_arch = "aarch64"))]
 static SKIPPED: &[SkippedTest] = &[];
 
+/// Size of the suite, independent of architecture.
+///
+/// `SKIPPED` is a hand-maintained parallel list to the `#[cfg]` gates on `TESTS`, and
+/// nothing but care keeps them in step: gate a test without adding a skip and the totals
+/// would read `54 total`; un-gate one without removing its skip and they would read `56`
+/// while also running the test. Neither can actually reach the totals line — the assertion
+/// at the top of [`run_tests`] fires first — which is the point: the drift is reported as
+/// itself rather than as a plausible wrong number nobody compares across the two CI jobs.
+const SUITE_SIZE: usize = 55;
+
 /// Run all tests and stop the machine with a verdict the harness can read.
 ///
 /// Called from `kmain` when the kernel is built with `--features test`.
 /// Does not return: x86_64 exits QEMU through `isa-debug-exit`; aarch64 prints a
 /// sentinel and powers the machine off through PSCI.
-/// Size of the suite, independent of architecture.
-///
-/// `SKIPPED` is a hand-maintained parallel list to the `#[cfg]` gates on `TESTS`, and
-/// nothing but care keeps them in step: gate a test without adding a skip and the run
-/// quietly prints `53 total`; un-gate one without removing its skip and it prints `55`
-/// while also running the test. Both are exactly the kind of drift this file's own doc
-/// comment calls out as needing to be a checkable fact rather than an intention.
-const SUITE_SIZE: usize = 55;
-
 pub fn run_tests() -> ! {
     // Fail loudly at the top rather than printing a plausible wrong total at the
     // bottom. This runs before any test, so a mis-edit of the tables is reported as

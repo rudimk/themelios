@@ -170,12 +170,21 @@ pub enum VirtioError {
     /// This kernel speaks only the modern (1.0+) interface.
     LegacyTransport,
 
+    /// A virtio-mmio slot reported a `Version` newer than the spec defines (0x2, 0x3).
+    ///
+    /// Distinct from [`LegacyTransport`](Self::LegacyTransport) on purpose: the operator
+    /// advice differs completely. Legacy means "pass `force-legacy=false`"; this means the
+    /// device speaks a revision this kernel predates, and the spec's instruction is to
+    /// ignore it.
+    UnknownVersion(u32),
+
     /// The device did not come out of reset: `Status` never read back `0`.
     ///
-    /// The spec (§4.1.4.3.2 for PCI, §4.2.3.1 for mmio) makes the reset *asynchronous* —
-    /// writing `0` requests it, and the driver must wait for the register to read `0`
-    /// before touching anything else. A device still tearing down its old queue state
-    /// will accept the subsequent handshake writes and then discard them.
+    /// Whether a driver must wait for that is transport- and version-dependent:
+    /// virtio-PCI (§4.1.4.3.2) and virtio-mmio `Version` 0x3 (§4.2.2.2) require the wait;
+    /// virtio-mmio `Version` 0x2 (§4.2.2.1) requires the device to finish resetting
+    /// *within* the write, which is what QEMU implements. So this error is unreachable on
+    /// QEMU-mmio and live on the other two.
     ResetTimeout,
 
     /// A device-config read ran past the end of the config region.

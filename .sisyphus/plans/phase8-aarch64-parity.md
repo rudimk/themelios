@@ -1061,17 +1061,27 @@ The 39 entries, assigned. This table is the phase's progress bar and must sum to
 |-----------|--------:|--------:|----------:|
 | (today)   |       — |      16 |        39 |
 | ✅ 8.1 discovery seam (amd64) | 0 | 16 | 39 |
-| 8.2 transport trait (amd64) | 0 | 16 | 39 |
-| **8.3 virtio-mmio** | **8** | 24 | 31 |
-| 8.4 user AS + SVC + EL0 | 3 | 27 | 28 |
-| 8.5 libthemelios + smokes | 4 | 31 | 24 |
-| 8.6 storage | 6 | 37 | 18 |
-| 8.7 networking | 7 | 44 | 11 |
-| 8.8 Linux dispatcher (amd64) | 0 | 44 | 11 |
-| 8.9 aarch64 Linux table | 4 | 48 | 7 |
-| **8.10 containers + mgmt** | **7** | **55** | **0** |
+| ✅ 8.2 transport trait (amd64) | 0 | 16 | 39 |
+| ✅ **8.3 virtio-mmio** | **7** | **23** | **32** |
+| 8.4 user AS + SVC + EL0 | 3 | 26 | 29 |
+| 8.5 libthemelios + smokes | 4 | 30 | 25 |
+| 8.6 storage | 6 | 36 | 19 |
+| 8.7 networking | 7 | 43 | 12 |
+| 8.8 Linux dispatcher (amd64) | 0 | 43 | 12 |
+| 8.9 aarch64 Linux table | 4 | 47 | 8 |
+| **8.10 containers + mgmt** | **8** | **55** | **0** |
 
-`8 + 3 + 4 + 6 + 7 + 4 + 7 = 39`. ✓
+`7 + 3 + 4 + 6 + 7 + 4 + 8 = 39`. ✓
+
+**8.3 retired 7, not the 8 projected.** The eighth was `test_pci_scan`, which this
+sub-phase was supposed to retire "by reframing" — and did not. Reframing it is not a
+porting task at all: the test cannot run on aarch64 (there is no port I/O), so retiring it
+means deciding whether the parity denominator is the suite size or the suite minus tests
+that are inherently single-architecture. That is a question about what parity *means*, and
+answering it while adding a transport would have buried it. Moved to **8.10**, the parity
+gate, which is where the denominator has to be settled anyway — it is now the sub-phase
+that must retire all three reframing cases, not just two. The row above is the measured
+result, not the projection.
 
 **The suite grew from 54 to 55 in 8.1**, which added `test_virtio_discovery` — the
 committed baseline asserting that the discovery seam returns the same devices in the same

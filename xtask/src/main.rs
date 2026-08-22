@@ -648,7 +648,6 @@ fn virtio_net_args(id: &str) -> Vec<String> {
 
 /// Host TCP port forwarded to the guest's TCP listener (guest port 7) during
 /// `cargo xtask test`, for the Phase 6.5 `test_api_server` HTTP round-trip.
-/// Host port the TCP/api-server tests forward to the guest.
 ///
 /// Overridable via `THEMELIOS_TEST_PORT`, because the default is a *fixed* port and QEMU
 /// refuses to start when it is already bound: `Could not set up host forwarding rule`.
@@ -1009,23 +1008,6 @@ fn cmd_image(_args: &[String]) {
 // ISO image creation
 // ============================================================================
 
-/// Create a bootable ISO image containing the kernel and Limine bootloader.
-///
-/// The ISO is a hybrid BIOS + UEFI image:
-/// - BIOS boot: uses Limine's El Torito boot sector (limine-bios-cd.bin)
-/// - UEFI boot: uses Limine's UEFI CD image (limine-uefi-cd.bin)
-///
-/// This means the same ISO works on both legacy BIOS and modern UEFI systems.
-///
-/// Directory structure inside the ISO:
-/// ```
-/// /boot/limine/limine-bios.sys    — Limine BIOS second-stage loader
-/// /boot/limine/limine-bios-cd.bin — BIOS El Torito boot image
-/// /boot/limine/limine-uefi-cd.bin — UEFI El Torito boot image
-/// /boot/limine/limine.conf        — Bootloader configuration
-/// /boot/themelios                  — The kernel ELF binary
-/// /EFI/BOOT/BOOTX64.EFI          — UEFI fallback bootloader
-/// ```
 /// Boot the aarch64 kernel on QEMU `virt` via Limine/UEFI (Phase 7).
 ///
 /// `virt` has no BIOS, so this is UEFI-only: assemble an EFI System Partition (ESP)
@@ -1040,6 +1022,20 @@ fn run_aarch64(root: &Path, kernel: &Path, limine_dir: &Path, display: bool) {
     println!("Press Ctrl+A, X to exit QEMU.\n");
 
     let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
+
+    // Attach the same devices the test path does. Without them an interactive arm64 boot
+    // reports `0 device(s), 32 empty` and the shell has nothing to inspect — which made
+    // 8.3's "VirtIO works on arm64" true only of `cargo xtask test`, a distinction the
+    // docs did not draw. Cheap, and it means the shell and the suite see the same machine.
+    let scratch = ensure_scratch_disk(root);
+    let filler_a = ensure_filler_disk(root, "themelios-arm64-filler-a.img");
+    let filler_b = ensure_filler_disk(root, "themelios-arm64-filler-b.img");
+    cmd.args(virtio_disk_args_mmio(&scratch, "blkscratch", false));
+    cmd.args(virtio_disk_args_mmio(&filler_a, "blkfilla", true));
+    cmd.args(virtio_disk_args_mmio(&filler_b, "blkfillb", false));
+    cmd.args(virtio_net_args_mmio("net0", None));
+    cmd.args(virtio_mmio_modern_args());
+
     cmd.args(["-serial", "stdio"]);
     if !display {
         cmd.args(["-display", "none"]);
@@ -1449,6 +1445,27 @@ fn find_aavmf() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
+/// Create a bootable ISO image containing the kernel and Limine bootloader.
+///
+/// The layout differs by architecture, because the firmware does:
+///
+/// - **amd64** — a hybrid BIOS + UEFI image. A BIOS El Torito boot sector
+///   (`limine-bios-cd.bin`) plus `limine-bios.sys` and a `limine bios-install` pass, *and*
+///   a UEFI El Torito image (`limine-uefi-cd.bin`) carrying `BOOTX64.EFI`. The same ISO
+///   boots on legacy BIOS and on UEFI.
+/// - **arm64** — UEFI only, carrying `BOOTAA64.EFI`. QEMU `virt` and arm64 platforms
+///   generally have no BIOS, so there is no BIOS scaffolding to add.
+///
+/// Directory structure inside the ISO (amd64; arm64 omits the three BIOS entries and
+/// swaps `BOOTX64.EFI` for `BOOTAA64.EFI`):
+/// ```text
+/// /boot/limine/limine-bios.sys    — Limine BIOS second-stage loader
+/// /boot/limine/limine-bios-cd.bin — BIOS El Torito boot image
+/// /boot/limine/limine-uefi-cd.bin — UEFI El Torito boot image
+/// /boot/limine/limine.conf        — Bootloader configuration
+/// /boot/themelios                 — The kernel ELF binary
+/// /EFI/BOOT/BOOTX64.EFI           — UEFI fallback bootloader
+/// ```
 fn create_iso(root: &Path, kernel_path: &Path, limine_dir: &Path, target: &str) -> PathBuf {
     // aarch64 `virt` (and arm64 platforms generally) are UEFI-only: there is no BIOS,
     // so no BIOS El Torito image, no `limine-bios.sys`, and no `bios-install` pass.

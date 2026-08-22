@@ -5,10 +5,18 @@
 //!
 //! ## How it differs from virtio-PCI
 //!
-//! **No enumeration, no capability walk.** A `virt` machine has a fixed bank of 32 slots
-//! at `0x0a00_0000`, 0x200 bytes apart, described by [`crate::platform`]. Every register
-//! is at a fixed offset from its slot base — there is no BAR to program and no vendor
+//! **No enumeration, no capability walk.** A `virt` machine presents a bank of slots at
+//! `0x0a00_0000`, 0x200 bytes apart, described by [`crate::platform`]. Every register is
+//! at a fixed offset from its slot base — there is no BAR to program and no vendor
 //! capability chain to follow.
+//!
+//! The bank is **32 slots by default, not by definition**: `virt` exposes a
+//! `virtio-mmio-transports` machine property, and a machine built with fewer would leave
+//! the tail of [`crate::platform`]'s hard-coded 32-entry list pointing at unassigned
+//! physical memory. `virt` does not set `ignore_memory_transaction_failures`, so probing
+//! one would be an external abort, which 7.2's handler treats as fatal. Nothing `xtask`
+//! launches does that; a platform-described bank size is what eventually removes the
+//! assumption.
 //!
 //! **One shared doorbell.** `QueueNotify` (0x050) serves every queue, where virtio-PCI
 //! gives each queue its own. This is why [`super::transport::Notifier`] resolves an
@@ -28,13 +36,39 @@
 //! a 16-bit doorbell write would make every kick a no-op and every request time out.
 //!
 //! That is why this module has its own [`r32`]/[`w32`] rather than using the parent
-//! module's six-width helpers, and why they assert alignment: `mm::mmio::map` produces
-//! Device-`nGnRnE` memory on aarch64, where an unaligned access raises an Alignment fault
-//! that Phase 7.2's handler treats as fatal. The same access is silently fine on x86.
+//! module's six-width helpers.
 //!
-//! Device *config* space (`0x100` and above) is the exception — 1, 2 and 4 byte accesses
-//! are all legal there, and an 8-byte access **calls `abort()` in QEMU**, which is why
-//! [`VirtioTransport::config_read_raw`] copies bytes.
+//! Alignment matters for a second reason: `mm::mmio::map` produces Device-`nGnRnE` memory
+//! on aarch64, where an unaligned access raises an Alignment fault that Phase 7.2's
+//! handler treats as fatal, while the same access is silently fine on x86. The register
+//! *offsets* are all module constants and all 4-aligned, so asserting on them proves
+//! nothing — the value that can actually be misaligned is the slot **base**, which comes
+//! from the platform table by way of `mm::mmio::map` (whose result carries the physical
+//! address's page offset). That is what [`MmioTransport::new`] checks.
+//!
+//! ## Device config space has the opposite rule: match the field, don't narrow
+//!
+//! Config space (`0x100` and above) accepts 1, 2 and 4 byte accesses. It is tempting to
+//! conclude that byte-at-a-time is therefore "always safe", and this module did until
+//! review caught it. The spec says otherwise — §4.2.2.2 driver requirements:
+//!
+//! > *the driver MUST use 8 bit wide accesses for 8 bit wide fields, 16 bit wide and
+//! > aligned accesses for 16 bit wide fields and 32 bit wide and aligned accesses for 32
+//! > and 64 bit wide fields.*
+//!
+//! So virtio-blk's 64-bit `capacity` must be read as two 32-bit accesses and virtio-net's
+//! `mtu` as one 16-bit access, while its 6-byte MAC — six 8-bit fields — is correctly read
+//! a byte at a time. Reading `capacity` as eight byte loads happens to work on QEMU, which
+//! dispatches each one independently, and is exactly the kind of thing that stops working
+//! on a device that latches a wide field. Hence [`VirtioTransport::config_read_u32`] and
+//! [`VirtioTransport::config_read_u16`] alongside the byte-wise
+//! [`VirtioTransport::config_read_raw`].
+//!
+//! An 8-byte access is a different matter: it does *not* abort QEMU, as an earlier version
+//! of this comment claimed. `virtio_mem_ops` declares no `impl` access sizes, so
+//! `access_with_adjusted_size` defaults `access_size_max` to 4 and splits the access into
+//! two 4-byte handler calls — the `default: abort()` arm is unreachable from a guest. It
+//! is avoided because the spec forbids it, not because QEMU punishes it.
 
 use crate::mm::addr::{PhysAddr, VirtAddr};
 
@@ -68,9 +102,18 @@ const CONFIG: u64 = 0x100;
 /// `"virt"` little-endian — every slot answers this, populated or not.
 const MAGIC: u32 = 0x7472_6976;
 
-/// The version this kernel speaks. QEMU defaults to **1** (legacy) unless the machine is
-/// given `-global virtio-mmio.force-legacy=false`.
+/// The lowest non-legacy `Version`. QEMU reports **1** (legacy) unless the machine is
+/// given `-global virtio-mmio.force-legacy=false`, and **2** when it is.
 const VERSION_MODERN: u32 = 2;
+
+/// The highest `Version` the spec defines. §4.2.2.2: *"The driver MUST ignore a device
+/// whose `Version` is neither 0x2 nor 0x3."*
+///
+/// QEMU only ever reports 2, so 3 is unreachable here today — but treating it as legacy
+/// (which is what checking `!= 2` did) would tell an operator to pass
+/// `force-legacy=false` at a device where that is not the problem, which is worse than
+/// not recognising it at all.
+const VERSION_MAX: u32 = 3;
 
 /// A slot's whole register window on QEMU `virt` is 0x200 bytes, so device-config space is
 /// the 256 bytes from `0x100`. Bounding reads against this is what stops an over-long
@@ -143,8 +186,11 @@ impl MmioTransport {
         if device_id == 0 {
             return Ok(SlotProbe::Empty);
         }
-        if version != VERSION_MODERN {
+        if version < VERSION_MODERN {
             return Err(VirtioError::LegacyTransport);
+        }
+        if version > VERSION_MAX {
+            return Err(VirtioError::UnknownVersion(version));
         }
         Ok(SlotProbe::Device(device_id))
     }
@@ -154,6 +200,17 @@ impl MmioTransport {
     /// # Safety
     /// `base` must be a mapped window for a slot that probed as [`SlotProbe::Device`].
     pub unsafe fn new(base: VirtAddr) -> Self {
+        // The one alignment that is not a compile-time constant. Every register offset in
+        // this module is 4-aligned by construction, so a misaligned access can only come
+        // from a misaligned base — and on Device-`nGnRnE` memory that is a fatal
+        // Alignment fault at the first register touch, several frames away from the
+        // platform table that actually got it wrong.
+        debug_assert_eq!(
+            base.as_u64() % 4,
+            0,
+            "virtio-mmio slot base {:#x} is not 4-aligned",
+            base.as_u64()
+        );
         Self { base }
     }
 
@@ -260,17 +317,32 @@ impl VirtioTransport for MmioTransport {
     }
 
     fn config_read_raw(&self, offset: usize, out: &mut [u8]) {
-        // Byte at a time. Config space permits 1/2/4-byte accesses — and an 8-byte access
-        // aborts QEMU outright — so the narrow form is the one that is always correct.
+        // Byte at a time, which is correct *for byte-wide fields* — virtio-net's MAC is
+        // six of them. Wider fields must not come through here; see `config_read_u16` /
+        // `config_read_u32` and the module docs on the spec's access-width rule.
         for (i, byte) in out.iter_mut().enumerate() {
-            // SAFETY: `read_config` bounded `offset + out.len()` by `config_len`, which is
-            // the size of the config region inside this slot's mapped window.
+            // SAFETY: bounded against `config_len` by the caller-facing `read_config`,
+            // and re-checked there, so `offset + i` is inside this slot's config region.
             *byte = unsafe {
                 core::ptr::read_volatile(
                     (self.base.as_u64() + CONFIG + (offset + i) as u64) as *const u8,
                 )
             };
         }
+    }
+
+    fn config_read_u16(&self, offset: usize) -> u16 {
+        debug_assert_eq!(offset % 2, 0, "unaligned 16-bit config read at +{offset:#x}");
+        // SAFETY: bounds and alignment are established by `read_config_u16`; config space
+        // permits 16-bit accesses and the spec requires one for a 16-bit field.
+        unsafe { core::ptr::read_volatile((self.base.as_u64() + CONFIG + offset as u64) as *const u16) }
+    }
+
+    fn config_read_u32(&self, offset: usize) -> u32 {
+        debug_assert_eq!(offset % 4, 0, "unaligned 32-bit config read at +{offset:#x}");
+        // SAFETY: as above, at 32 bits — the width the spec mandates for 32- and 64-bit
+        // fields (a 64-bit field being read as two of these).
+        unsafe { core::ptr::read_volatile((self.base.as_u64() + CONFIG + offset as u64) as *const u32) }
     }
 
     fn config_generation(&self) -> u32 {
