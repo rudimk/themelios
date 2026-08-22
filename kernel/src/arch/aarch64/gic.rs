@@ -47,9 +47,9 @@ use crate::mm::addr::PhysAddr;
 use crate::println;
 
 /// Physical base of the GICv2 distributor on QEMU `virt`.
-const GICD_PHYS: u64 = 0x0800_0000;
+
 /// Physical base of the GICv2 CPU interface on QEMU `virt`.
-const GICC_PHYS: u64 = 0x0801_0000;
+
 /// Size of each register block.
 const GIC_BLOCK_SIZE: usize = 0x1_0000;
 
@@ -141,8 +141,16 @@ fn gicc_write(off: usize, val: u32) {
 /// cached and reordered, and the symptom would be exactly the "configured correctly,
 /// no interrupts ever arrive" failure described above.
 pub fn init() {
-    let gicd = crate::mm::mmio::map(PhysAddr::new(GICD_PHYS), GIC_BLOCK_SIZE);
-    let gicc = crate::mm::mmio::map(PhysAddr::new(GICC_PHYS), GIC_BLOCK_SIZE);
+    // Bases come from the platform description, not from constants beside this driver:
+    // the point of `platform` is that a discovery phase can supply different ones
+    // without editing the GIC code. Panics loudly on a platform whose controller is not
+    // a GICv2, rather than silently mapping whatever happened to be in a const.
+    let (gicd_phys, gicc_phys) = match crate::platform::info().intc {
+        crate::platform::InterruptController::GicV2 { gicd, gicc } => (gicd, gicc),
+        other => panic!("aarch64 GIC driver on a non-GICv2 platform: {:?}", other),
+    };
+    let gicd = crate::mm::mmio::map(PhysAddr::new(gicd_phys), GIC_BLOCK_SIZE);
+    let gicc = crate::mm::mmio::map(PhysAddr::new(gicc_phys), GIC_BLOCK_SIZE);
     GICD_VIRT.store(gicd.as_u64(), Ordering::Relaxed);
     GICC_VIRT.store(gicc.as_u64(), Ordering::Relaxed);
 
@@ -227,7 +235,10 @@ pub fn enable_intid(intid: u32) {
 ///
 /// Unlike the timer's PPI, an SPI is shared and must be *targeted* at a CPU, which
 /// `enable_intid` handles.
-pub const UART_INTID: u32 = 33;
+#[inline]
+pub fn uart_intid() -> u32 {
+    crate::platform::info().uart.irq
+}
 
 /// Handle one hardware interrupt: claim it, route it, complete it.
 ///
@@ -253,13 +264,13 @@ pub fn dispatch_irq() -> bool {
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let mut reschedule = false;
-    if intid == UART_INTID {
+    if intid == uart_intid() {
         // Serial input. The shell task is woken from inside the drain, so a keystroke
         // is a scheduling event as much as a timer tick is — but the reschedule still
         // happens after the EOI below, for the same reason.
         let taken = super::serial::handle_receive_interrupt();
         reschedule = taken > 0;
-    } else if intid == super::timer::TIMER_INTID {
+    } else if intid == super::timer::timer_intid() {
         super::timer::handle_tick();
         // The timer is the preemption source: tell the caller a time slice expired.
         // Reported rather than acted on here so the scheduling happens *after* the
