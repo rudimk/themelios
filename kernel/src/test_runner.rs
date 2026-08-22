@@ -20,6 +20,8 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "x86_64")]
+use crate::drivers::virtio::{self, VirtioKind};
 use crate::println;
 
 /// A single test case: a name for reporting and a function to execute.
@@ -75,6 +77,8 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_audit",           func: test_audit },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
+    #[cfg(target_arch = "x86_64")]
+    TestCase { name: "test_virtio_discovery", func: test_virtio_discovery },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_pci_scan",        func: test_pci_scan },
     #[cfg(target_arch = "x86_64")]
@@ -177,6 +181,10 @@ static SKIPPED: &[SkippedTest] = &[
     },
     SkippedTest { name: "test_process", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_userspace_init", why: "ring-3/EL0 is deferred on aarch64" },
+    SkippedTest {
+        name: "test_virtio_discovery",
+        why: "the discovery seam has no aarch64 provider until virtio-mmio lands (8.3)",
+    },
     SkippedTest { name: "test_pci_scan", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
     SkippedTest { name: "test_virtio_transport", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
     SkippedTest { name: "test_virtio_queue_failure", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
@@ -235,7 +243,7 @@ static SKIPPED: &[SkippedTest] = &[];
 /// quietly prints `53 total`; un-gate one without removing its skip and it prints `55`
 /// while also running the test. Both are exactly the kind of drift this file's own doc
 /// comment calls out as needing to be a checkable fact rather than an intention.
-const SUITE_SIZE: usize = 54;
+const SUITE_SIZE: usize = 55;
 
 pub fn run_tests() -> ! {
     // Fail loudly at the top rather than printing a plausible wrong total at the
@@ -1467,6 +1475,59 @@ fn test_userspace_init() -> Result<(), &'static str> {
 ///    bridge and other Q35 defaults)
 /// 2. A VirtIO device (vendor 0x1AF4) is present — QEMU is launched with a
 ///    VirtIO disk attached
+
+/// Device discovery returns the expected set, in the expected order.
+///
+/// The committed baseline for sub-phase 8.1. That change replaced eighteen open-coded
+/// PCI walks (`devices_by_vendor` + a class-code filter) with `virtio::devices_of_kind`,
+/// and its entire claim was that the *same devices arrive in the same order*. A green
+/// suite alone does not show that: most tests take the first device of a kind and would
+/// pass just as happily against a reordered or truncated list.
+///
+/// So this asserts the set itself. The amd64 harness attaches three block devices (the
+/// SquashFS root, the ext2 data volume, and a scratch disk) and one NIC, in that order,
+/// and `virtio_disk_args` documents that the order fixes PCI slot assignment.
+///
+/// The order matters beyond this sub-phase: on QEMU `virt`, `-device` arguments map to
+/// virtio-mmio slots with *decreasing* base addresses, so command-line order and
+/// discovery order run opposite ways. Whatever 8.3 does about that, it has to face this
+/// assertion rather than quietly inherit a different set.
+#[cfg(target_arch = "x86_64")]
+fn test_virtio_discovery() -> Result<(), &'static str> {
+    use crate::drivers::virtio::{self, VirtioKind};
+
+    let devs = virtio::devices();
+    if devs.len() != 4 {
+        return Err("expected exactly 4 VirtIO devices (3 block + 1 net)");
+    }
+
+    let kinds: alloc::vec::Vec<VirtioKind> = devs.iter().map(|d| d.kind()).collect();
+    let expected = [
+        VirtioKind::Block,
+        VirtioKind::Block,
+        VirtioKind::Block,
+        VirtioKind::Net,
+    ];
+    if kinds != expected {
+        return Err("VirtIO discovery returned an unexpected kind sequence");
+    }
+
+    // The by-kind helpers must agree with the full enumeration, since the call sites
+    // 8.1 rewrote use them rather than `devices()`.
+    if virtio::devices_of_kind(VirtioKind::Block).len() != 3 {
+        return Err("devices_of_kind(Block) disagrees with devices()");
+    }
+    if virtio::devices_of_kind(VirtioKind::Net).len() != 1 {
+        return Err("devices_of_kind(Net) disagrees with devices()");
+    }
+    match virtio::first_of_kind(VirtioKind::Block) {
+        Some(d) if d.kind() == VirtioKind::Block => {}
+        _ => return Err("first_of_kind(Block) did not return a block device"),
+    }
+
+    Ok(())
+}
+
 /// 3. The VirtIO device has at least one implemented BAR with a non-zero size
 #[cfg(target_arch = "x86_64")]
 fn test_pci_scan() -> Result<(), &'static str> {
@@ -1515,19 +1576,13 @@ fn test_pci_scan() -> Result<(), &'static str> {
 /// signal that 3.1 works before the block read/write path (3.2) is built.
 #[cfg(target_arch = "x86_64")]
 fn test_virtio_transport() -> Result<(), &'static str> {
-    use crate::drivers::pci;
     use crate::drivers::virtio::VirtioTransport;
 
-    // VirtIO mass-storage device = PCI class 0x01 (the attached virtio-blk).
-    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let blk = virtio_devs
-        .iter()
-        .find(|d| d.class == 0x01)
-        .ok_or("no VirtIO block device on the PCI bus")?;
+    let blk = virtio::first_of_kind(VirtioKind::Block).ok_or("no VirtIO block device")?;
 
     // Discover register regions, map them, reset, ACK + DRIVER.
     let transport =
-        VirtioTransport::init(blk).map_err(|_| "VirtioTransport::init failed")?;
+        VirtioTransport::init_for(&blk).map_err(|_| "VirtioTransport::init failed")?;
 
     // Negotiate features — we want nothing device-specific here, just the
     // mandatory VERSION_1 bit.
@@ -1585,12 +1640,9 @@ fn test_virtio_blk() -> Result<(), &'static str> {
     use crate::drivers::virtio::blk::VirtioBlk;
 
     // Find and initialise the virtio-blk device.
-    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let dev = virtio_devs
-        .iter()
-        .find(|d| d.class == 0x01)
+        let dev = virtio::first_of_kind(VirtioKind::Block)
         .ok_or("no VirtIO block device on the PCI bus")?;
-    let blk = VirtioBlk::init_from_pci(dev).map_err(|_| "VirtioBlk init failed")?;
+    let blk = VirtioBlk::init(&dev).map_err(|_| "VirtioBlk init failed")?;
 
     // Register it and fetch it back through the registry.
     let index = block::register("virtio-blk0", Box::new(blk));
@@ -1741,17 +1793,13 @@ fn test_shared_memory() -> Result<(), &'static str> {
 fn test_block_server_ipc() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::ipc::{self, IpcMessage};
     use crate::sched;
 
     // Bring up and register a block device for the server to drive.
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let dev = devs
-        .iter()
-        .find(|d| d.class == 0x01)
-        .ok_or("no VirtIO block device")?;
-    let blk = VirtioBlk::init_from_pci(dev).map_err(|_| "device init failed")?;
+    let dev = virtio::first_of_kind(VirtioKind::Block).ok_or("no VirtIO block device")?;
+    let blk = VirtioBlk::init(&dev).map_err(|_| "device init failed")?;
     let idx = block::register("virtio-blk-srv", Box::new(blk));
 
     // Start the server (spawns its task) and let it reach its receive loop.
@@ -1915,10 +1963,9 @@ fn test_squashfs_server() -> Result<(), &'static str> {
 
     // --- Locate the SquashFS disk by probing each VirtIO-blk device's block 0
     //     for the "hsqs" magic (0x73717368). ---
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let mut sqfs_index = None;
-    for dev in devs.iter().filter(|d| d.class == 0x01) {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+        let mut sqfs_index = None;
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -2138,10 +2185,9 @@ fn test_overlay_server() -> Result<(), &'static str> {
     const STATUS_OK: u64 = 0;
 
     // --- Locate the SquashFS disk and bring up the lower (SquashFS) server. ---
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let mut sqfs_index = None;
-    for dev in devs.iter().filter(|d| d.class == 0x01) {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+        let mut sqfs_index = None;
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -2348,10 +2394,9 @@ fn test_ext2_read() -> Result<(), &'static str> {
 
     // --- Locate the ext2 disk: superblock magic 0xEF53 at byte 1080 (sector 2,
     //     offset 56). ---
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let mut ext2_index = None;
-    for dev in devs.iter().filter(|d| d.class == 0x01) {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+        let mut ext2_index = None;
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -2532,10 +2577,9 @@ fn test_ext2_write() -> Result<(), &'static str> {
     const STATUS_OK: u64 = 0;
 
     // Bring up the ext2 server on the ext2 disk.
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let mut ext2_index = None;
-    for dev in devs.iter().filter(|d| d.class == 0x01) {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+        let mut ext2_index = None;
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -2710,10 +2754,9 @@ fn test_vfs_capability() -> Result<(), &'static str> {
     use crate::sched;
 
     // Bring up a SquashFS server and register it as a mount.
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let mut sqfs_index = None;
-    for dev in devs.iter().filter(|d| d.class == 0x01) {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+        let mut sqfs_index = None;
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -2827,10 +2870,9 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
     use crate::sched;
 
     // SquashFS mount (lower-level data plane already proven; reused here).
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let mut sqfs_index = None;
-    for dev in devs.iter().filter(|d| d.class == 0x01) {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+        let mut sqfs_index = None;
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -2916,12 +2958,9 @@ fn test_virtio_net() -> Result<(), &'static str> {
     use crate::sched;
 
     // Find the VirtIO network device (vendor 0x1AF4, PCI class 0x02 = network).
-    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let dev = virtio_devs
-        .iter()
-        .find(|d| d.class == 0x02)
-        .ok_or("no VirtIO network device on the PCI bus")?;
-    let nic = VirtioNet::init_from_pci(dev).map_err(|_| "VirtioNet init failed")?;
+        let dev = virtio::first_of_kind(VirtioKind::Net)
+        .ok_or("no VirtIO network device")?;
+    let nic = VirtioNet::init(&dev).map_err(|_| "VirtioNet init failed")?;
 
     // Register it and fetch it back through the registry.
     let index = device::register("virtio-net0", Box::new(nic));
@@ -3004,12 +3043,9 @@ fn test_net_service() -> Result<(), &'static str> {
     // Bring up a fresh NIC and start the net service on it. (Re-initialising the
     // VirtIO device resets it cleanly; any driver from an earlier test is
     // orphaned but unused.)
-    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let dev = virtio_devs
-        .iter()
-        .find(|d| d.class == 0x02)
-        .ok_or("no VirtIO network device on the PCI bus")?;
-    let nic = VirtioNet::init_from_pci(dev).map_err(|_| "VirtioNet init failed")?;
+        let dev = virtio::first_of_kind(VirtioKind::Net)
+        .ok_or("no VirtIO network device")?;
+    let nic = VirtioNet::init(&dev).map_err(|_| "VirtioNet init failed")?;
     let mac = nic.mac();
     let index = device::register("virtio-net-svc", Box::new(nic));
     let handle = net_service::start(index).ok_or("net_service start failed")?;
@@ -3396,12 +3432,9 @@ fn test_dhcp() -> Result<(), &'static str> {
     use crate::sched;
 
     // Bring up a fresh NIC and start the real net service on it.
-    let virtio_devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let dev = virtio_devs
-        .iter()
-        .find(|d| d.class == 0x02)
-        .ok_or("no VirtIO network device on the PCI bus")?;
-    let nic = VirtioNet::init_from_pci(dev).map_err(|_| "VirtioNet init failed")?;
+        let dev = virtio::first_of_kind(VirtioKind::Net)
+        .ok_or("no VirtIO network device")?;
+    let nic = VirtioNet::init(&dev).map_err(|_| "VirtioNet init failed")?;
     let mac = nic.mac();
     let index = device::register("virtio-net-dhcp", Box::new(nic));
     let handle = net_service::start(index).ok_or("net_service start failed")?;
@@ -3539,12 +3572,9 @@ fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u
     use crate::process::{self, embedded};
     use crate::sched;
 
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let dev = devs
-        .iter()
-        .find(|d| d.class == 0x02)
+        let dev = virtio::first_of_kind(VirtioKind::Net)
         .ok_or("no VirtIO network device on the PCI bus")?;
-    let nic = VirtioNet::init_from_pci(dev).map_err(|_| "VirtioNet init failed")?;
+    let nic = VirtioNet::init(&dev).map_err(|_| "VirtioNet init failed")?;
     let mac = nic.mac();
     let index = device::register(nic_name, Box::new(nic));
     let handle = net_service::start(index).ok_or("net_service start failed")?;
@@ -3905,10 +3935,9 @@ fn test_linux_fs() -> Result<(), &'static str> {
     const CONTENT: &[u8] = b"THEMELIOS_FS_OK\n"; // 16 bytes staged at /hello.txt
 
     // --- Bring up an ext2 server on the ext2 disk and register it as a mount ---
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
     let mut ext2_index = None;
-    for dev in devs.iter().filter(|d| d.class == 0x01) {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -4185,10 +4214,9 @@ fn bring_up_ext2_mount(block_name: &'static str, ep_name: &'static str) -> Resul
     use crate::process::server::{spawn_server, ServerConfig};
     use crate::sched;
 
-    let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-    let mut ext2_index = None;
-    for dev in devs.iter().filter(|d| d.class == 0x01) {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+        let mut ext2_index = None;
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };

@@ -413,7 +413,8 @@ pub fn data_mount() -> Option<u64> {
 pub fn boot_storage() {
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::virtio::{self, VirtioKind};
+    use crate::drivers::{block, block_server};
     use crate::mm::shared::SharedRegion;
     use crate::process::embedded;
     use crate::process::server::{spawn_server, ServerConfig};
@@ -427,11 +428,8 @@ pub fn boot_storage() {
     // Classify each VirtIO block device by probing its on-disk magic.
     let mut squashfs_idx: Option<usize> = None;
     let mut ext2_idx: Option<usize> = None;
-    for dev in pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID)
-        .iter()
-        .filter(|d| d.class == 0x01)
-    {
-        let blk = match VirtioBlk::init_from_pci(dev) {
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
             Err(_) => continue,
         };
