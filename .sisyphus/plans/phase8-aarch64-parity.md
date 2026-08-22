@@ -65,14 +65,18 @@ should perform, not assumptions the plan may make.
 - **The `#[cfg(target_arch = "x86_64")]` gate appears in 14 files — but that is a count
   of gate *sites*, not of gated *code*, and it is the wrong size signal.** `main.rs:155-236`
   is a module ladder gating out `process`, `drivers`, `fs`, `net`, `linux`, `container`,
-  `mgmt`: **24 files, ~8,355 lines, 26% of the 31,670-line kernel**, none carrying a
-  `cfg` of its own. Size estimates must be against the 8.4 kLoC, not the 14 files.
+  `mgmt`: **24 files, ~8,314 lines, 26% of the 31,670-line kernel**, almost none carrying a
+  `cfg` of its own — the three exceptions are `drivers/mod.rs:46,55` (gating `pub mod pci`
+  and `pub mod virtio`) and `net/mod.rs:81` (gating the body of `boot_net`), which matter
+  because they are the seams 8.3 widens. Size estimates must be against the 8.4 kLoC, not the 14 files.
 - **There is no `arch::syscall` and no `arch::cpu` facade.** `arch/` contains exactly
   `context.rs, irq.rs, mod.rs, paging.rs, serial.rs, time.rs`. `linux/thread.rs:24` is an
   *unconditional* `use crate::arch::x86_64::syscall::{copy_from_user, copy_to_user,
   SyscallFrame}`, and `:184`/`:204` call `arch::x86_64::cpu::swapgs()` directly — same in
   `linux/fs.rs` and `linux/syscall.rs`. **These are not `cfg`'d; there is nothing to
-  un-gate.** A facade of ~15 items across 5 consumer files must be *created*
+  un-gate.** A facade of ~15 items across **7** consumer files must be *created* —
+  `sched/mod.rs`, `linux/{fs,thread,syscall}.rs`, `test_runner.rs`, `drivers/pci/mod.rs`,
+  `main.rs` — covering
   (`SyscallFrame`, `copy_from_user`, `copy_to_user`, `user_range_ok`, `write_fs_base`,
   `set_kernel_stack`, `refresh_kernel_gs_base`, `swapgs`, `write_cr3`, `set_tss_rsp0`,
   `int3`, `exit_qemu`, `SYS_MGMT`, `init`, `test_syscall_round_trip`).
@@ -141,9 +145,11 @@ should perform, not assumptions the plan may make.
   **18 `pci::devices_by_vendor` call sites** — 16 in `test_runner.rs`, plus `net/mod.rs:90`
   and `fs/mod.rs:430` — together with **15 class-code filters** (all in `test_runner.rs`)
   and **18 `init_from_pci` calls**. Within `test_runner.rs` the idiom is 16 calls + 15
-  filters = **31 lines**, which is where the "31" comes from; the total call-site count
-  across the tree is 36. `main.rs:497` calls `pci::scan()` separately. **virtio-mmio has
-  no vendor ID and no class code** (it has a `DeviceID` register), so the discovery
+  filters = **31 lines spread over 15 test bodies** — "31" counts *sites*, not tests; the
+  total call-site count across the tree is 36. `main.rs:497` calls `pci::scan()` separately. **virtio-mmio has
+  no PCI vendor/device pair and no class code** — it has a `DeviceID` register at offset
+  `0x008` (and a `VendorID` at `0x00C`, which QEMU answers for populated *and* empty slots,
+  so it is a sanity check rather than a filter) — so the discovery
   *predicate* changes, not just the enumeration. Mapping those test bodies to sub-phases:
   six belong to tests **8.3** retires, six to **8.6**, one to **8.7** (`test_dhcp`), one to
   **8.9** (`test_linux_fs`), plus the `bring_up_ext2_mount` helper — **8.10 retires none
@@ -193,7 +199,7 @@ should perform, not assumptions the plan may make.
   with x86 `SYS_CLONE`=56, and a missed arm falls through to `_ => return None`.
 - **The dispatcher is written in x86 register names**: **76** `frame.r{ax,di,si,dx,10,8}`
   references across `linux/` (77 if `frame.rcx` is counted).
-- `linux/elf.rs:172` rejects anything but `EM_X86_64` (0x3e). `EM_AARCH64` = 183 = **0xB7**
+- `linux/elf.rs:173` rejects anything but `EM_X86_64` (0x3e, defined at `:40`). `EM_AARCH64` = 183 = **0xB7**
   (`include/uapi/linux/elf-em.h`).
 - **aarch64 Linux syscall numbers verified** against `include/uapi/asm-generic/unistd.h`:
   exit=93, exit_group=94, clone=220, futex=98, openat=56, write=64, writev=66, mmap=222
@@ -421,7 +427,16 @@ storage and networking.
 
 #### 8.3 — virtio-mmio on aarch64
 
-Deliver: the mmio transport implementation (modern/v2 register layout); MMIO mapping via
+Deliver: **the module un-gating this sub-phase depends on, which must be scoped here rather
+than assumed** — `mod drivers` un-gated for aarch64 (`main.rs:191`), and `mod net`
+un-gated *partially*: `net::device` (`net/mod.rs:38`) and `net::net_service` (`:42`) are
+ring-0 (`net_service.rs:224` is a `sched::spawn` task), while **`net::socket` (`:46`) stays
+x86-gated until 8.7** because it is the one submodule pulling in `crate::process`
+(`socket.rs:34`). Without this split, two of the seven tests below reference `crate::net`
+(`test_runner.rs:2915`, `:3000-3001`) and cannot compile — a dependency on 8.7, four
+sub-phases later.
+
+Then: the mmio transport implementation (modern/v2 register layout); MMIO mapping via
 `mm::mmio` (Device-`nGnRnE`, the 7.2 path); **scan all 32 slots, dispatch on `DeviceID`,
 never on slot index** — QEMU maps `-device` options to *decreasing* base addresses;
 `-global virtio-mmio.force-legacy=false` added to the aarch64 invocation, with v1 rejected
@@ -449,20 +464,26 @@ The first six need **no EL0 whatsoever** — `drivers::block_server` is an in-ke
 `sched::spawn` task (`block_server.rs:120,138`), not a ring-3 server, and none of the six
 references `spawn_server`/`embedded::`.
 **`test_pci_scan` cannot be ported** (no port I/O on aarch64) and is retired by
-*reframing*: an arch-neutral transport-discovery test with per-arch bodies. Its skip reason
-was also wrong — aarch64 *does* have PCI config space, via ECAM at `0x3f000000`, which 8.13
-implements. The accurate statement is "PCI configuration via the `0xCF8`/`0xCFC` port-I/O
-mechanism is x86-only."
+*reframing*: an arch-neutral transport-discovery test with per-arch bodies. Its existing skip
+reason is *"PCI enumeration is x86-only (aarch64 uses MMIO ECAM)"* — whose parenthetical
+already makes the right point, so it needs sharpening rather than replacing: it is the
+`0xCF8`/`0xCFC` **port-I/O mechanism** that is x86-only. aarch64 does have config space, via
+ECAM at `0x3f000000`, which 8.13 implements.
 **Acceptance:** the seven run and pass on aarch64. Plus, per the Phase 7.2 lesson that one
 tick would pass a dead timer: **(a)** a test reads back the leaf descriptor covering the
 virtqueue region and asserts `AttrIndx` equals the intended MAIR index, printing both —
 this fails the moment the attribute drifts, TCG or not; **(b)** boot emits a
 `dma: coherent|maintained` line so 8.15 has something to grep rather than rediscover.
-Falsifiability: point the base at a **hole** (`0x0a00_0000 - 0x1000`) and assert discovery
-reports zero devices and fails closed with a named message. *Not* "one slot off" — on
-`virt` that lands on another populated slot whose magic still reads `virt`, so the mutation
-would pass and prove nothing. Separately assert the magic/version/device-id triple is
-genuinely checked, by counting the empty slots traversed during a normal boot.
+Falsifiability: *not* "one slot off" — **every one of the 32 slots returns valid magic**,
+populated or not (`virtio-mmio.c:95-114` answers `VIRT_MAGIC` with `DeviceID == 0` for empty
+slots), so that mutation lands on a readable slot and proves nothing. Point the base instead
+at an **unmapped address** and assert the run goes red. Note what that actually produces:
+`virt` does not set `ignore_memory_transaction_failures`, so a Device-`nGnRnE` read of a hole
+raises a synchronous external abort, which 7.2's reporter treats as fatal. The run fails —
+satisfying decision 10 — but **via a fatal abort, not the named assertion**, so the mutation
+entry must say so, or the address must be mapped-but-empty to exercise the reporting path.
+Separately assert the magic/version/device-id triple is genuinely checked, by counting the
+empty slots traversed during a normal boot.
 **Riskiest unknown:** the coherence attribute is decided here but the flag that determines
 it (DT `dma-coherent`, which QEMU *does* emit on every `virtio_mmio@` node; ACPI `_CCA` on
 real hardware) is not read until 8.11. Either pull a minimal coherency probe forward, or
@@ -488,7 +509,7 @@ frames instead of leaking them; user leaf encoding (`AP[2]` inverted, `AP[1]` po
 `PXN`/`UXN` **same polarity as x86** — see grounding); ASID allocation, `TTBR0_EL1`
 activation, `TCR_EL1.EPD0` cleared, `TLBI ASIDE1IS` with the 7.1 barrier discipline;
 `verify_tcr` extended to T0SZ; the `arch::syscall` / `arch::cpu` **facades that do not
-exist** (~15 items, 5 consumers); an aarch64 `SyscallFrame`; `copy_from_user`/`copy_to_user`
+exist** (~15 items, 7 consumers); an aarch64 `SyscallFrame`; `copy_from_user`/`copy_to_user`
 bounded by `2^(64 - T0SZ)` per decision 4; the `0x400` sync slot decoding `EC = 0x15` into
 syscall dispatch, **keyed on slot first** so an EL1-originated `svc` stays fatal;
 `TPIDR_EL0` TLS; the `v0`-`v31` + `FPCR`/`FPSR` save area per decision 8; `sched`'s ring-3
@@ -550,17 +571,24 @@ There is no aarch64 counterpart to any of it. Retiring it means writing a *diffe
 under the same name* (`VBAR_EL1` installed, `ESR_EL1.EC == 0x15` decoded, dispatch on an
 aarch64 `SyscallFrame`), which needs its own mutation entry per decision 10.
 `test_path_resolve` (`test_runner.rs:3860-3883`) is pure string logic over
-`linux::fs::resolve_path` with a 10-case table — no ring-3, no ELF, no storage. A one-line
-`#[cfg]` split exposing `resolve_path` alone retires it here, and since it is a
-*container-escape* test, having it green early has real value.
+`linux::fs::resolve_path` with a 10-case table — no ring-3, no ELF, no storage. It is *not*
+a one-line `#[cfg]` split, though: `linux/fs.rs:13` unconditionally imports
+`arch::x86_64::syscall::{copy_from_user, copy_to_user, user_range_ok, SyscallFrame}`, so
+either `resolve_path` lifts out of that file or the facade lands first — and this sub-phase
+lands the facade, which is why the test belongs here. Since it is a *container-escape*
+test, having it green from the first EL0 sub-phase has real value.
 **Acceptance — v1's was impossible to perform.** v1 said "corrupt the ASID and show the
 test fails", but `test_shared_memory` never loads `TTBR0_EL1`, so no ASID is on that path
 and the mutation cannot fail. Instead: **install the user space in `TTBR0_EL1`; write a
 sentinel through user VA `A`; read it back through user VA `B` (same frame, different VA)
 and through the HHDM — three views, one frame, all agreeing. Then install a second space
 with a different frame at VA `A` and prove the read changes.** Falsifiability: (i) omit the
-`TLBI ASIDE1IS` on switch and show the second read returns the stale frame; (ii) give both
-spaces the same ASID and show the same. Per 8.spike(g), if PAN blocks EL1 from touching
+`TLBI ASIDE1IS` on switch **while reusing the previous ASID** — omitting the TLBI alone is
+architecturally harmless when the two spaces have *distinct* ASIDs (decision 5 pins nonzero
+per-space ASIDs, so the new ASID simply misses and the walker runs, and the test passes);
+(ii) force an ASID rollover so a recycled ASID is reused without invalidation and show the
+second read returns the stale frame. Only ASID *reuse* exercises the invalidation, which is
+the whole point of tagging. Per 8.spike(g), if PAN blocks EL1 from touching
 EL0 pages, this runs from EL0.
 Plus: an EL0 blob performing `SYS_DEBUG_PRINT` and `SYS_EXIT`; and a **soak with a
 predicate** — v1 said "≥1000 syscalls under preemption is clean", which 1000 syscalls with
@@ -588,7 +616,7 @@ decision 8); `xtask` target parameterization — noting v1's line references wer
 
 **And the thing that will silently produce a broken kernel if missed:** `build_servers`
 stages to `target/servers/*.bin` and `build_detached_elf` to `target/servers/*.elf` —
-**not arch-qualified** — and `kernel/src/process/embedded.rs:18-73` does **13 unconditional
+**not arch-qualified** — and `kernel/src/process/embedded.rs:18-73` does **14 unconditional
 `include_bytes!`** against those fixed paths. Parameterize the target without partitioning
 the staging directory and an arm64 kernel built after an amd64 build embeds **x86 blobs**,
 failing as an undefined-instruction abort at EL0, arbitrarily far from the cause. Deliver
@@ -596,7 +624,7 @@ per-arch staging dirs, `#[cfg]`'d `include_bytes!`, **and a build-time assertion
 staged blob's ELF machine matches the kernel's target.**
 Also: `cmd_build` calls `build_servers` unconditionally even for `--arch aarch64`
 (`main.rs:1394-1403`), and `cmd_test --arch aarch64` never builds servers at all
-(`:1586-1589` returns into `cmd_test_aarch64` before the call). Both need restructuring.
+(`the early return is at `:1581-1584`, before the `build_servers` call at `:1589`). Both need restructuring.
 
 **Retires (4):** `test_process`, `test_userspace_init`, `test_server_spawn`,
 `test_registry_pull`. v1 put `test_registry_pull` in the container sub-phase; it belongs
@@ -636,9 +664,14 @@ Also: **the arm64 CI job installs `qemu-system-arm qemu-efi-aarch64 xorriso`
 `:48-51`) — the moment `ensure_images` runs on the aarch64 path, the job dies on a missing
 binary.
 Note also that the ESP is already on the virtio-mmio bus (`if=virtio` binds to mmio on
-`virt`), so slot 0 of the window 8.3 enumerates is the boot FAT image — discovery must
-survive that, and the amd64 path's documented "order fixes PCI slot assignment" idiom
-(`:1523-1530`) has no mmio equivalent.
+`virt`, `main.rs:938`), so one slot of the window 8.3 enumerates is already the boot FAT
+image before any test disk is added. **It is the *highest* slot, not slot 0** — the ESP is
+the first (and currently only) virtio drive on the aarch64 command line, and per the
+reversal quoted in the grounding section, the first `-device`/`-drive` lands on the
+highest-addressed transport: `0x0a00_0000 + 31 * 0x200 = 0x0a003e00`, **slot 31**. This
+matters twice over: discovery must survive it, and the amd64 path's documented "order fixes
+PCI slot assignment" idiom (`:1523-1530`) has no mmio equivalent — on `virt` the ordering
+runs the other way, so a disk-ordering assumption ported from the amd64 path is inverted.
 
 **Retires (6):** `test_squashfs_server`, `test_overlay_server`, `test_ext2_read`,
 `test_ext2_write`, `test_vfs_capability`, `test_fs_syscalls`.
@@ -650,8 +683,11 @@ discipline is only *exercised* here, under load, and TCG will not expose a missi
 
 #### 8.7 — Networking on aarch64
 
-Un-gate `mod net`. Deliver: `net-server` at EL0 (smoltcp is already portable —
-`servers/smoltcp-gate` has compile-gated it since 7.0c); the socket syscalls; DHCP; the
+Un-gate the rest of `mod net` — 8.3 already took `net::device` and `net::net_service`, so
+what lands here is **`net::socket`** (`net/mod.rs:46`), the submodule that needs
+`crate::process`. Deliver: `net-server` at EL0 (smoltcp is already portable —
+`servers/smoltcp-gate` has compile-gated it since **Phase 4.7**, `ab26daf` — not 7.0c, which
+only fixed it for softfloat); the socket syscalls; DHCP; the
 shell's `ping`/`ifconfig`/`sockets`/`udpsend`/`tcpconnect`; the `virtio-net-device` and
 `hostfwd` plumbing on the aarch64 QEMU path plus the host-side peer thread the amd64 path
 has (`main.rs:1659-1672`).
@@ -726,7 +762,14 @@ network group but needs the management ABI *and* — its phase 3 is a live inbou
 `hostfwd 127.0.0.1:15007 → guest:7` with a host-side peer, `test_runner.rs:5399-5463` —
 8.7's xtask plumbing. Phases 1-2 are deterministic and in-process.)
 **Acceptance — the parity gate:** `SKIPPED` is **empty** on aarch64; **54 running, 0
-skipped on both architectures**; zero `#[cfg(target_arch)]` remaining in `shell/mod.rs`; a
+skipped on both architectures**; the six orphaned commands un-gated. **Not** "zero `#[cfg(target_arch)]` in `shell/mod.rs`":
+that file has **20** such sites, and the three in `shell::init()` (`:179`, `:184`, `:199` —
+per-arch UART RX-interrupt enable, interrupt-controller unmask, and the x86-only
+`process::assign_task_to_kernel`) are legitimately architecture-specific. Removing those
+needs an `arch::` facade no sub-phase schedules, so the criterion is **"the 17 command gates
+at `:77-110` are gone; the 3 in `init()` remain and are named here as deliberate"** —
+stating the exception now rather than silently weakening the gate later, which is the
+loophole this sub-phase claims to close; a
 container runs on an ARM node and `GET /containers/json` returns it. Update `CLAUDE.md`,
 `docs/src/milestones.md`, `docs/src/aarch64.md` **after** running it.
 **Loophole to close:** a skip can be retired by *weakening* the test — an early
@@ -745,15 +788,19 @@ container runs on an ARM node and `GET /containers/json` returns it. Update `CLA
 arriving through the **EFI configuration table**, which is where Limine's DTB request gets
 it. (3) **non-UEFI** — DTB in `x0`, no boot services, no Limine. Code shaped as "DTB always
 present, ACPI optional" inverts on case 1.
-**UNVERIFIED:** whether Limine's DTB request is ever populated on an ACPI-only machine.
-Assume not; fail closed.
+The Limine protocol settles what v2 first tagged UNVERIFIED here: *"If the DTB cannot be
+found, the response will **not** be generated"* (PROTOCOL.md, Device Tree Blob Feature). So
+on an ACPI-only machine there is simply no DTB response — fail closed on its absence, which
+is a documented state rather than an assumption.
 
 Deliver: a `Platform` provider interface with providers `Acpi` (RSDP from Limine's RSDP
 request), `DtFromEfi` (DTB from Limine's DTB request), selection ACPI-then-DT decided once
 at boot, and a node presenting neither **halting with a named message rather than falling
 back to constants**. Static ACPI tables consumed: RSDP/XSDT, **FADT** (PSCI conduit +
 reset), **MADT** (GIC version, distributor/redistributor bases, CPU list), **GTDT** (timer
-PPIs, `CNTFRQ` override), **MCFG** (ECAM), **SPCR** (UART **type** *and* base — SPCR
+PPIs plus the CntControlBase/CntReadBase frame addresses — note GTDT carries **no**
+frequency field; the frequency comes from `CNTFRQ_EL0` or from `CNTFID0` inside the
+memory-mapped frame GTDT points at, which is a second MMIO mapping, not a table read), **MCFG** (ECAM), **SPCR** (UART **type** *and* base — SPCR
 distinguishes PL011 / 16550 / SBSA Generic UART, so "UART" is at least two drivers),
 **IORT** (PCIe RequesterID → ITS DeviceID and SMMU StreamID — without it, MSI writes go to
 an ITS that has never heard of the device and **silently vanish**), **PPTT** (CPU topology,
@@ -764,9 +811,15 @@ gets dragged into an interpreter. A *required* device describable only from the 
 namespace is a hard failure with a named message, not a silent degradation.
 
 Also, three things v1 pinned that must instead be **read**:
-- **`TCR_EL1.IPS` from `ID_AA64MMFR0_EL1.PARange`**, not a constant. Not hypothetical:
-  `-machine virt,highmem=on` puts the high PCIe window above 512 GiB, and a pinned IPS
-  truncates or faults there.
+- **`TCR_EL1.IPS` checked against `ID_AA64MMFR0_EL1.PARange` — *verified*, not written.**
+  The distinction matters and v2's first wording got it wrong by saying "from … not a
+  constant", which reads as an instruction to *set* it. Phase 7.1 pinned that `MAIR_EL1` and
+  `TCR_EL1` are **adopted and verified, never rewritten** (`paging.rs:317-330`), and `IPS` is
+  a single field governing *both* translation regimes — writing it under a live `TTBR1`
+  is exactly the hazard `verify_tcr` exists to prevent. So: read `PARange`, read `IPS`,
+  and **halt with a named message if the firmware's `IPS` cannot address it**. Not
+  hypothetical — the high PCIe window on `virt` sits above 512 GiB, and too small an `IPS`
+  faults there.
 - **Verify `ID_AA64MMFR0_EL1.TGran4`** and halt with a named message otherwise. Two
   instructions, converting "4 KiB is available everywhere, probably" into a checked fact.
   **UNVERIFIED** whether any target of interest lacks it — which is the reason to check.
@@ -790,14 +843,16 @@ difference between a scoped port and an unbounded one.
 |---|---|
 | `-M virt,gic-version=2,acpi=off` | the DT path is real (QEMU emits DT, no ACPI) |
 | `-M virt,gic-version=3` | ACPI path, GICv3, ECAM |
-| `-M virt,gic-version=3,highmem=on -m 16G` | `PARange`-derived IPS; high MMIO window |
+| `-M virt,gic-version=3 -m 16G` | `IPS`-vs-`PARange` check; high MMIO window (`highmem` is already the `virt` default, `virt.c:4368` — the RAM size is what moves the window) |
 | `-M virt,virtualization=on` | EL2 present — the condition that made 7.2 choose `CNTV` |
 | `-cpu cortex-a53 / neoverse-n1 / max` | no implicit CPU-feature assumptions |
 | **`-M sbsa-ref`** | **the genericity test** |
 
 **`sbsa-ref` is the cheap, concrete answer to "runs on an arbitrary SystemReady node"**:
-GICv3, ACPI, TF-A + EDK2 firmware, PCIe with E1000E/AHCI, **no virtio-mmio at all**, an
-entirely different memory map — and it costs a firmware image, not hardware. Its
+GICv3 + ITS, ACPI, TF-A + EDK2 firmware, an E1000E on **PCIe** and an AHCI controller on
+the **system bus** (`sbsa-ref.c:593` creates `sysbus-ahci` at `0x6010_0000` with a wired
+SPI — storage there is an ACPI/DT-described MMIO device, not a PCIe enumeration target),
+**no virtio-mmio at all**, and an entirely different memory map (RAM at `0x100_0000_0000`) — and it costs a firmware image, not hardware. Its
 expectation is scoped honestly: boot + discovery + UART + timer + GIC + the device-free
 portion of the suite. It has no virtio, so storage and networking stay skipped **there**
 with a written reason (a per-machine skip list, not a per-arch one).
@@ -922,14 +977,24 @@ that was the Xen-era x86 path. **So none of the three clouds runs a single line 
 | Platform | NIC | Block | Discovery | Interrupts |
 |---|---|---|---|---|
 | QEMU `virt` | virtio-net-mmio/pci | virtio-blk | DT or ACPI | GICv2/v3 |
-| QEMU `sbsa-ref` | E1000E | AHCI | ACPI | GICv3 |
+| QEMU `sbsa-ref` | E1000E (PCIe) | AHCI (**sysbus**, not PCIe) | ACPI | GICv3 + ITS |
 | AWS Graviton | **ENA** (PCIe) | **NVMe** | ACPI | GICv3 + ITS |
 | GCP Axion/T2A | **gVNIC** (PCIe) | **NVMe** | ACPI | GICv3 + ITS |
-| Azure Cobalt | **MANA**, fallback **NetVSC/VMBus** | NVMe | ACPI | GICv3 + ITS |
+| Azure Cobalt | **MANA**, fallback **NetVSC/VMBus** | NVMe **or SCSI-over-VMBus** — see below | ACPI | GICv3 + ITS |
 | Bare-metal SBSA | vendor PCIe NIC | NVMe | ACPI | GICv3 + ITS |
 
+**The Azure block row is the one entry not verified, and it is load-bearing.** Microsoft's
+Dpsv6 (Cobalt 100) size page lists *Local Storage: None* and names no disk controller;
+Azure presents remote disks as **either** SCSI-over-VMBus **or** NVMe depending on the VM's
+`DiskControllerType`, and only the "d" variants require NVMe, for *local* storage. So the
+minimum-set claim below holds for AWS, GCP and bare-metal SBSA but **may not hold for
+Azure** — if Azure turns out to need SCSI-over-VMBus, that is a second block driver and a
+whole paravirtual bus, not a row in a table. **8.15 must pick its one cloud before relying
+on this**, and picking AWS or GCP sidesteps the question entirely.
+
 **The minimum device set for "runs on any ARM node" is NVMe + the platform's UART + the
-generic timer.** Networking is per-platform and cannot be promised generically.
+generic timer** — with the Azure caveat above. Networking is per-platform and cannot be
+promised generically.
 
 Deliver: an **NVMe driver** (block), **one** cloud's NIC, and boot on a real instance of
 that cloud. **The other two clouds are deferred by name, each as one NIC-driver sub-phase.**
@@ -967,8 +1032,14 @@ deliberately corrupted signature is **rejected** — the second half is the test
 Consume the UEFI TCG2 event log; discover a TPM 2.0 via the ACPI **TPM2** table (CRB
 interface); extend PCRs. **Fail closed to "unmeasured" where no TPM is present.** vTPM and
 NitroTPM are *instances* of this, not the design — and v1's "vTPM/NitroTPM where available"
-was covering an unchecked gap: **NitroTPM is not supported on Graviton1/2 instances.**
-**UNVERIFIED:** the ACPI TPM2 `StartMethod` values for the ARM SMC-based CRB.
+was hedging over an availability question it never checked — but **v2's first attempt to
+correct it was itself wrong.** NitroTPM *is* supported on Graviton2 (M6g, M6gd, C6g, C6gd,
+C6gn, R6g, R6gd, T4g, Im4gn are all on AWS's supported-instance list); it is **Graviton1
+(A1)** that is absent. Corrected here rather than quietly, because a wrong "correction"
+carrying the authority of a correction is the worst failure mode this table exists to
+document.
+`StartMethod` for the ARM SMC-based CRB is `ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC = 11`
+(Linux `include/acpi/actbl3.h:467`; the FF-A variant is 15 at `:470`).
 **Acceptance:** PCR values are reproducible across two boots of the same image and **differ**
 after a deliberate one-byte image change.
 
@@ -1118,3 +1189,34 @@ Two more findings had no v1 counterpart because v1 did not mention the subject: 
 ITS** (without which PCIe MSI-X cannot be delivered, making v1's ECAM sub-phase depend on
 its successor) and **virtqueue barriers** (a larger TCG blind spot than the coherence issue
 v1 did flag).
+
+### Corrections from v2
+
+A fourth and fifth review pass audited v2 itself — one checking whether each v1 finding
+landed correctly, one reading v2 cold against primary sources. **The pattern persisted**, so
+v2 gets its own table. This is the point of keeping these: the lesson is not "v1 was
+careless", it is that *every* pass of confident technical prose carries errors at roughly
+this rate, and only mechanical verification finds them.
+
+| # | v2 claimed | Actually |
+|---|---|---|
+| 13 | "**NitroTPM is not supported on Graviton1/2**" — offered as a *correction* of v1's hedge | Supported on Graviton**2** (M6g, C6g, R6g, T4g, Im4gn …); only Graviton**1** (A1) is absent. **A wrong correction, carrying a correction's authority** |
+| 14 | The ESP occupies "**slot 0** of the window 8.3 enumerates" | **Slot 31.** It is the first virtio drive, and v2 quotes QEMU's "*decreasing* base addresses" two sections earlier — an internal contradiction against a source in the same file |
+| 15 | 8.3 retires `test_virtio_net` + `test_net_service` | Both need `mod net`, which v2 un-gated in **8.7** — a sub-phase depending on one four later. Fixed by scoping the `device`/`net_service` split into 8.3 |
+| 16 | 8.4 falsification: "omit the `TLBI ASIDE1IS` and show a stale frame" | **Cannot fail.** Decision 5 pins distinct per-space ASIDs, so the new ASID simply misses and the walker runs. Only ASID *reuse* exercises invalidation — the exact defect decision 10 exists to catch, inside the flagship acceptance criterion |
+| 17 | "virtio-mmio has **no vendor ID**" | It has `VendorID` at `0x00C`; QEMU answers it for populated *and* empty slots. The conclusion (the predicate changes) survives; the register exists |
+| 18 | GTDT carries a "`CNTFRQ` **override**" | GTDT has no frequency field. Frequency comes from `CNTFRQ_EL0` or `CNTFID0` in the frame GTDT *points at* — a second MMIO mapping, not a table read |
+| 19 | The 24 gated files carry "**none**" of their own `cfg`s | Three do: `drivers/mod.rs:46,55`, `net/mod.rs:81` — and they are precisely the seams 8.3 widens |
+| 20 | `embedded.rs` does "**13** unconditional `include_bytes!`" | **14** (7 `.bin`, 7 `.elf`) |
+| 21 | `sbsa-ref` has "PCIe with E1000E/**AHCI**" | AHCI is `sysbus-ahci` at `0x6010_0000` with a wired SPI — **not** a PCIe enumeration target. Only the NIC is PCIe |
+| 22 | Azure Cobalt block = "**NVMe**", underpinning "the minimum set is NVMe + UART + timer" | Unverified and possibly false — Azure presents remote disks as NVMe **or** SCSI-over-VMBus per `DiskControllerType`. Now flagged in place as the one unverified row, because the minimum-set conclusion rests on it |
+| 23 | `smoltcp-gate` "has compile-gated it since **7.0c**" | Phase **4.7** (`ab26daf`); 7.0c only fixed it for softfloat |
+| 24 | 8.10: "**zero** `#[cfg(target_arch)]` remaining in `shell/mod.rs`" | 20 sites exist; 3 in `shell::init()` are legitimately arch-specific and no sub-phase schedules the facade to remove them. The criterion would have been silently weakened at the parity gate — the loophole 8.10 claims to close |
+| 25 | Two `UNVERIFIED` tags (Limine DTB on ACPI-only; ARM SMC CRB `StartMethod`) | Both are single lookups. Limine PROTOCOL.md: no DTB → no response. `actbl3.h:467`: `StartMethod` 11. **A lazy UNVERIFIED is a defect, not humility** |
+| 26 | 8.11: "`TCR_EL1.IPS` **from** `ID_AA64MMFR0_EL1.PARange`, not a constant" | Reads as an instruction to *write* IPS, contradicting 7.1's standing "`TCR_EL1` is adopted and verified, **never rewritten**". IPS governs both regimes; it must be *checked*, not set |
+
+Smaller count and line-number slips corrected at the same time: 76 register references not
+77, 18 `devices_by_vendor` call sites (31 *lines* over 15 test bodies, not 31 tests), 7
+facade consumers not 5, `elf.rs:173` not `:172`, `cmd_test`'s early return at `:1581-1584`,
+`highmem` already being the `virt` default, and `test_pci_scan`'s existing skip reason
+already carrying the right parenthetical.
