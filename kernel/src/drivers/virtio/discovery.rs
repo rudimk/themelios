@@ -51,10 +51,14 @@
 //! already wrong there. Selecting by [`VirtioKind`] rather than by index is the habit
 //! that survives the move.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::drivers::pci::{self, PciDevice};
+
+use super::transport::VirtioTransport;
+use super::{PciTransport, VirtioError};
 
 /// What a discovered VirtIO device *is*, independent of how it was found.
 ///
@@ -212,6 +216,19 @@ pub fn init() {
         })
         .collect();
     *slot = Some(found);
+}
+
+impl VirtioDevice {
+    /// Open this device's transport, ready for the feature handshake.
+    ///
+    /// **This is the seam 8.3 extends.** Discovery is the only place that knows *how* a
+    /// device was found, so it is the only place that can say which transport speaks to
+    /// it: a PCI function gets a [`PciTransport`], and an mmio slot will get an
+    /// `MmioTransport`. Drivers receive a `Box<dyn VirtioTransport>` and never learn
+    /// which, which is what lets `blk.rs` and `net.rs` contain no reference to PCI at all.
+    pub fn open_transport(&self) -> Result<Box<dyn VirtioTransport>, VirtioError> {
+        Ok(Box::new(PciTransport::init(&self.pci)?))
+    }
 }
 
 /// Every VirtIO device on this machine, in a stable order.

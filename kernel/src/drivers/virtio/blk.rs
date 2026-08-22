@@ -33,7 +33,6 @@ use alloc::boxed::Box;
 use core::ptr::write_volatile;
 
 use crate::drivers::block::{BlockDevice, BlockError};
-use crate::drivers::pci::PciDevice;
 use crate::mm::addr::PhysAddr;
 use crate::mm::frame;
 use crate::sync::InterruptMutex;
@@ -70,8 +69,11 @@ const DESC_STATUS: u16 = 2;
 /// drive the single hardware queue safely.
 struct Inner {
     /// The VirtIO transport (kept alive; holds the MMIO mappings).
+    ///
+    /// A trait object, so this driver names no transport in particular: 8.3's virtio-mmio
+    /// implementation drops in here without the driver changing.
     #[allow(dead_code)]
-    transport: VirtioTransport,
+    transport: Box<dyn VirtioTransport>,
     /// The request virtqueue (queue 0).
     queue: Virtqueue,
     /// Physical address of the 16-byte request header DMA buffer.
@@ -106,16 +108,7 @@ impl VirtioBlk {
             "VirtioBlk::init handed a {} device",
             dev.kind().name()
         );
-        Self::init_from_pci(dev.pci())
-    }
-
-    /// Initialise a VirtIO block device from a discovered PCI function.
-    ///
-    /// Brings the transport up (handshake + feature negotiation + queue 0),
-    /// reads the device capacity, allocates the header/status/bounce DMA
-    /// buffers, and signals DRIVER_OK. The returned driver is ready for I/O.
-    pub fn init_from_pci(dev: &PciDevice) -> Result<Self, VirtioError> {
-        let transport = VirtioTransport::init(dev)?;
+        let transport = dev.open_transport()?;
         // We need no device-specific feature bits for basic R/W — just the
         // mandatory VERSION_1 negotiated by the transport.
         transport.negotiate_features(0)?;

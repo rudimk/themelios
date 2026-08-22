@@ -30,8 +30,9 @@
 //! no offload features, so on TX we zero the header, and on RX we skip it — the
 //! `NetDevice` trait only ever exposes the pure Ethernet frame.
 
+use alloc::boxed::Box;
+
 use super::discovery::{VirtioDevice, VirtioKind};
-use crate::drivers::pci::PciDevice;
 use crate::mm::addr::PhysAddr;
 use crate::mm::frame;
 use crate::net::device::{NetDevice, NetError};
@@ -75,8 +76,11 @@ const CFG_MTU: u64 = 10; // mtu: u16
 /// methods can drive the two hardware queues safely.
 struct Inner {
     /// The VirtIO transport (kept alive; holds the MMIO mappings).
+    ///
+    /// A trait object, so this driver names no transport in particular: 8.3's virtio-mmio
+    /// implementation drops in here without the driver changing.
     #[allow(dead_code)]
-    transport: VirtioTransport,
+    transport: Box<dyn VirtioTransport>,
     /// The receive virtqueue (queue 0).
     rx_queue: Virtqueue,
     /// The transmit virtqueue (queue 1).
@@ -110,16 +114,7 @@ impl VirtioNet {
             "VirtioNet::init handed a {} device",
             dev.kind().name()
         );
-        Self::init_from_pci(dev.pci())
-    }
-
-    /// Initialise a VirtIO network device from a discovered PCI function.
-    ///
-    /// Brings the transport up (handshake + feature negotiation + both queues),
-    /// reads the MAC/MTU, allocates the RX/TX DMA buffers, pre-posts the receive
-    /// buffers, and signals DRIVER_OK. The returned driver is ready for I/O.
-    pub fn init_from_pci(dev: &PciDevice) -> Result<Self, VirtioError> {
-        let transport = VirtioTransport::init(dev)?;
+        let transport = dev.open_transport()?;
         // Request MAC and MTU reporting; we negotiate no offload/mergeable
         // features, so every frame fits in one buffer with a 12-byte header.
         let feats = transport.negotiate_features(VIRTIO_NET_F_MAC | VIRTIO_NET_F_MTU)?;
