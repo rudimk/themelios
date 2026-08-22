@@ -521,25 +521,56 @@ and consumed most of one reviewer's verification budget.
 scan is free to differ from amd64's PCI order. `platform::info().virtio_mmio` is the
 aarch64 slot list, already populated. `discovery::init()` needs an aarch64 body.
 
-#### 8.2 — `VirtioTransport` → trait, PCI impl extracted
+#### 8.2 — `VirtioTransport` → trait, PCI impl extracted — **DONE ✅**
 
-Amd64-only, **zero intended behavior change**. Deliver: the existing concrete
-`VirtioTransport` (`virtio/mod.rs:616`) becomes a trait; the PCI implementation is
-extracted behind it; the 14 `COMMON_*` offsets (`mod.rs:84-97`) move into the PCI impl;
-**`notify` is hoisted out of `Virtqueue`** (`mod.rs:263`, `:365`, `:483`, doorbell computed
-`:802-808`) into the transport, since mmio has one shared `QueueNotify` where PCI has a
-per-queue doorbell. Trait surface: discovery + device-type predicate, reset, status,
-feature negotiation, queue configuration, notify, device config, `set_driver_ok`.
+Amd64-only, zero behaviour change. Delivered:
 
-**Not in the surface:** ISR/interrupt acknowledgement. `VirtioTransport.isr` is
-`#[allow(dead_code)]` and the stack polls (`mod.rs:817` sets MSI-X to NO_VECTOR).
+- **`virtio::transport`** — the `VirtioTransport` trait plus `Notifier`. The trait carries
+  *primitives* (status, features, `num_queues`, `queue_max_size`, `configure_queue`,
+  `queue_notifier`, `device_config`); the spec sequencing built on them
+  (`negotiate_features`, `setup_queue`, `set_driver_ok`, `add_status`) is identical on
+  every transport and lives once as provided methods. `negotiate_features` keeps the
+  original body exactly, `STATUS_FAILED` on both error paths included.
+- **`virtio::pci_transport`** — `PciTransport`, the `virtio_pci_common_cfg` offsets and the
+  capability-layout constants, all moved out of `mod.rs`. Those offsets described one
+  transport's register layout while sitting at module scope where they read as shared
+  vocabulary; keeping them beside the only code entitled to use them is what stops 8.3
+  inheriting them by accident. `mod.rs` drops ~900 → 594 lines and now holds the virtqueue
+  and the shared MMIO helpers, which *is* what every transport has in common.
+- **`notify` hoisted out of `Virtqueue`** — the stated riskiest unknown. `Virtqueue` held a
+  raw doorbell address computed the PCI way; it now holds a `Notifier` the transport
+  resolved. Both transports write the queue index to an MMIO register and differ only in
+  *which* address, so `Notifier` is a resolved address plus the act of ringing it.
+  Deliberately not a trait — there is no third behaviour to abstract over.
+- **`VirtioDevice::open_transport()`** — the seam 8.3 extends. Discovery is the only place
+  that knows how a device was found, so it is the only place that can say which transport
+  speaks to it. Drivers get a `Box<dyn VirtioTransport>` and never learn which.
+
+**Interrupt acknowledgement is deliberately not in the trait.** The stack polls, and the
+PCI transport's ISR byte has never been read by anything. An `ack_interrupt` would be an
+interface with no callers on either side, and 8.3 would have to implement it for mmio to
+satisfy a contract nothing exercises.
 
 **Retires (0).**
-**Acceptance:** amd64 suite green; `blk.rs`/`net.rs` contain zero references to `pci`.
-Falsifiability: stub one trait method to return a wrong queue size and show storage tests
-go red — proving the trait is actually on the path and not shadowed.
-**Riskiest unknown:** the `Virtqueue` notify hoist. It touches the hot path of working
-storage and networking.
+**Acceptance — met.** amd64 **55/0/0**; aarch64 **16 passed, 39 skipped, 55 total**; arm64
+smoke green. **`blk.rs` and `net.rs` contain zero occurrences of `pci`/`Pci`** — the stated
+criterion, and not reachable while the drivers still constructed their own transport, which
+is why `init_from_pci` was folded into `init` and `open_transport` introduced.
+**Falsifiability:** stubbing `queue_max_size` to return 8 reddens `test_virtio_net`,
+`test_net_service` and `test_api_server` — the net path pre-posts more RX descriptors than
+that. Storage survives a short queue, which is itself informative: the block path's bounce
+buffer means it needs few descriptors.
+
+**One defect found and fixed en route**, in 8.1's own work: `ensure_scratch_disk` wrote the
+new signature only when the image was *absent*, so a scratch image created before 8.1 was
+never signed, and any tree that had run the suite earlier failed the two destructive block
+tests with "no scratch disk found" — a confusing failure whose cause is a stale file. The
+guard now checks for the signature rather than for existence.
+
+**Notes for 8.3:** implement `VirtioTransport` for an `MmioTransport` in a new
+`mmio_transport.rs`, and extend `open_transport()` to return it on aarch64. Nothing above
+the transport should need to change — `blk.rs`, `net.rs`, `Virtqueue` and
+`test_virtio_transport` are all transport-agnostic as of this sub-phase.
 
 #### 8.3 — virtio-mmio on aarch64
 

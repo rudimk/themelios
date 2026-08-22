@@ -159,7 +159,9 @@ line when finishing a sub-phase. Detailed per-sub-phase checklists live in
 narrative per commit._
 
 **Phase 8 — aarch64 parity: IN PROGRESS.** ✅ 8.spike (EL0 round trip proven), ✅ 8.1
-(arch-neutral discovery seam + `PlatformInfo`); next is 8.2 (transport trait). Plan in
+(arch-neutral discovery seam + `PlatformInfo`), ✅ 8.2 (`VirtioTransport` trait + PCI impl
+extracted); next is 8.3 (virtio-mmio on aarch64 — the first sub-phase that moves the
+ratchet, retiring 8). Plan in
 `.sisyphus/plans/phase8-aarch64-parity.md` (v2, after five adversarial review passes — nine
 v1 claims and fourteen v2 claims were false, and the sub-phase order is reversed from v1).
 **Ten sub-phases plus a spike**, taking aarch64 from the Phase 7 ring-0 core to full amd64
