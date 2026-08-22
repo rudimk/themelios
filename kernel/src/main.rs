@@ -174,6 +174,11 @@ mod process {
     pub use pid::ProcessId;
 }
 
+/// Platform description — where this machine's fixed devices are and how they
+/// interrupt. One hard-coded provider per architecture today; a discovery phase adds
+/// ACPI and device-tree providers behind the same call without touching any driver.
+mod platform;
+
 /// Inter-process communication.
 /// Message passing between processes. Since ThemeliOS is a microkernel,
 /// IPC is the backbone — drivers, filesystems, and services all communicate
@@ -495,6 +500,15 @@ fn kmain_x86_64() -> ! {
     // scheduler or interrupts, so we do it here.
     #[cfg(target_arch = "x86_64")]
     drivers::pci::scan();
+
+    // Report what device discovery found, in discovery order. This is the human-readable
+    // half of 8.1's acceptance criterion: the seam must return the same devices, in the
+    // same order, as the PCI walk it replaced. Printed rather than only asserted, so a
+    // change in the set is visible in CI logs even where no test happens to cover it.
+    #[cfg(target_arch = "x86_64")]
+    println!("[platform] {}", platform::info().name);
+    #[cfg(target_arch = "x86_64")]
+    println!("[virtio] discovery: {}", drivers::virtio::discovery::describe());
 
     // --- Scheduler initialization ---
     //
