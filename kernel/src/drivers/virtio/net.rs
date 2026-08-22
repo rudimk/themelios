@@ -39,7 +39,7 @@ use crate::net::device::{NetDevice, NetError};
 use crate::sync::InterruptMutex;
 
 use super::{
-    mmio_read_u16, mmio_read_u8, VirtioError, VirtioTransport, VirtqDesc, Virtqueue,
+    VirtioError, VirtioTransport, VirtqDesc, Virtqueue,
     VIRTQ_DESC_F_WRITE,
 };
 
@@ -104,9 +104,8 @@ pub struct VirtioNet {
 impl VirtioNet {
     /// Bring up a net device found by [`crate::drivers::virtio::discovery`].
     ///
-    /// The transport-neutral entry point. Callers hand over a [`VirtioDevice`] and never
-    /// name PCI; when 8.2 turns the transport into a trait, only this function's body
-    /// changes, not the eighteen sites that call it.
+    /// The transport-neutral entry point: the caller hands over a [`VirtioDevice`] and
+    /// discovery decides which transport speaks to it, so this driver names none.
     pub fn init(dev: &VirtioDevice) -> Result<Self, VirtioError> {
         debug_assert_eq!(
             dev.kind(),
@@ -123,19 +122,18 @@ impl VirtioNet {
         let rx_queue = transport.setup_queue(0)?;
         let tx_queue = transport.setup_queue(1)?;
 
-        // Read MAC and MTU from the device-specific config region.
-        let cfg = transport
-            .device_config()
-            .ok_or(VirtioError::MissingCapability)?;
+        // Read MAC and MTU from the device-specific config region, through the transport.
+        //
+        // The MAC is six separate byte reads, which is exactly the shape a device-side
+        // update can tear; taking them under one generation check is the reason
+        // `read_config` exists. Valid because we negotiated `VIRTIO_NET_F_MAC`.
         let mut mac = [0u8; 6];
-        for (i, b) in mac.iter_mut().enumerate() {
-            // SAFETY: device config is a mapped MMIO region; MAC is 6 bytes at
-            // offset 0 (valid because we negotiated VIRTIO_NET_F_MAC).
-            *b = unsafe { mmio_read_u8(cfg, CFG_MAC + i as u64) };
-        }
+        transport.read_config(CFG_MAC as usize, &mut mac)?;
+
         let mtu = if feats & VIRTIO_NET_F_MTU != 0 {
-            // SAFETY: MTU is a u16 at config offset 10 when F_MTU is negotiated.
-            unsafe { mmio_read_u16(cfg, CFG_MTU) as usize }
+            let mut buf = [0u8; 2];
+            transport.read_config(CFG_MTU as usize, &mut buf)?;
+            u16::from_le_bytes(buf) as usize
         } else {
             DEFAULT_MTU
         };

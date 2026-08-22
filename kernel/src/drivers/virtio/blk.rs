@@ -38,7 +38,7 @@ use crate::mm::frame;
 use crate::sync::InterruptMutex;
 
 use super::{
-    mmio_read_u32, VirtioError, VirtioTransport, Virtqueue, VirtqDesc, VIRTQ_DESC_F_NEXT,
+    VirtioError, VirtioTransport, Virtqueue, VirtqDesc, VIRTQ_DESC_F_NEXT,
     VIRTQ_DESC_F_WRITE,
 };
 
@@ -98,9 +98,8 @@ impl VirtioBlk {
 
     /// Bring up a block device found by [`crate::drivers::virtio::discovery`].
     ///
-    /// The transport-neutral entry point. Callers hand over a [`VirtioDevice`] and never
-    /// name PCI; when 8.2 turns the transport into a trait, only this function's body
-    /// changes, not the eighteen sites that call it.
+    /// The transport-neutral entry point: the caller hands over a [`VirtioDevice`] and
+    /// discovery decides which transport speaks to it, so this driver names none.
     pub fn init(dev: &VirtioDevice) -> Result<Self, VirtioError> {
         debug_assert_eq!(
             dev.kind(),
@@ -115,13 +114,13 @@ impl VirtioBlk {
         let queue = transport.setup_queue(0)?;
 
         // Read capacity (u64, in 512-byte sectors) from device config offset 0.
-        let cfg = transport
-            .device_config()
-            .ok_or(VirtioError::MissingCapability)?;
-        // SAFETY: device config is a mapped MMIO region; capacity is at offset 0.
-        let cap_low = unsafe { mmio_read_u32(cfg, 0) } as u64;
-        let cap_high = unsafe { mmio_read_u32(cfg, 4) } as u64;
-        let capacity_sectors = (cap_high << 32) | cap_low;
+        //
+        // Through the transport rather than a raw pointer: the two halves are taken under
+        // one device-config generation check, so a device that resizes mid-read cannot
+        // hand back a capacity assembled from two different values. Reading it as bytes
+        // rather than as one 8-byte access also matters — virtio-mmio permits 1, 2 and 4
+        // byte accesses to config space and aborts QEMU on anything wider.
+        let capacity_sectors = transport.config_u64(0)?;
 
         // Allocate DMA buffers. The header (16 B) and status (1 B) share one
         // frame; the bounce buffer gets its own contiguous run.

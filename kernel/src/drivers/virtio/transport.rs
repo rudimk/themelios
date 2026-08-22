@@ -11,7 +11,7 @@
 //! had leaked into two places it does not belong:
 //!
 //! - `VirtioTransport` was a concrete struct holding five PCI-derived `VirtAddr`s.
-//! - [`super::Virtqueue`] held its own doorbell address, so the queue — a data structure
+//! - [`Virtqueue`] held its own doorbell address, so the queue — a data structure
 //!   the spec defines without reference to any transport — knew how PCI computes one.
 //!
 //! virtio-mmio, which is how QEMU's aarch64 `virt` machine presents VirtIO, has neither
@@ -33,6 +33,24 @@
 //! and inventing one would mean 8.3 implementing it for mmio to satisfy a contract
 //! nothing exercises.
 //!
+//! ## This surface was validated against the second implementation, not derived from the first
+//!
+//! The trait's first draft was written by reading the virtio-PCI code, and review found
+//! four places where that produced a PCI shape under a neutral name: a 16-bit doorbell
+//! write (virtio-mmio's `QueueNotify` is 32-bit, and QEMU *silently drops* narrower
+//! accesses), a `num_queues` method with no mmio register behind it at all, a
+//! `device_config()` returning a raw pointer with neither a length nor a generation
+//! counter, and byte-wide status accesses that mmio would discard.
+//!
+//! The surface below was then checked by drafting a throwaway `MmioTransport` against it
+//! and compiling it — the technique 8.spike used, which 8.2 should have repeated from the
+//! start. Every method maps to a real register: `status` to `Status` (0x070) as a 32-bit
+//! access, `queue_max_size` to `QueueSel`/`QueueNumMax`, `configure_queue` to the split
+//! low/high ring pairs plus `QueueNum`/`QueueReady`, `queue_notifier` to the shared
+//! `QueueNotify` at 32 bits, and `num_queues` to no register at all — which is why it is a
+//! provided method that probes rather than a required one. The draft needed no change to
+//! this file, which is the evidence the shape is right.
+//!
 //! ## Notification
 //!
 //! [`Notifier`] is the one piece of per-queue state the transport hands to a queue. Both
@@ -50,7 +68,27 @@ use super::{
     VIRTIO_F_VERSION_1,
 };
 
-/// A resolved doorbell: where to write, to tell the device a queue has work.
+/// Access width of a doorbell register.
+///
+/// **Not cosmetic.** QEMU's virtio-mmio model rejects any access to a control register
+/// (offset < `0x100`) whose size is not 4 bytes: `virtio_mmio.c` logs
+/// `"wrong size access to register!"` and then *drops the write* — no fault, no
+/// diagnostic the guest can see. A 16-bit write to the 32-bit `QueueNotify` (0x050)
+/// would therefore turn every kick into a silent no-op, the device would never see any
+/// work, and `submit_and_wait` would spin to its bound and permanently fail the queue.
+///
+/// virtio-PCI's per-queue doorbell genuinely is 16 bits, so the width is a property of
+/// the transport and has to travel with the address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // U32 is constructed only by a virtio-mmio transport (8.3)
+pub enum NotifyWidth {
+    /// 16-bit — virtio-PCI's per-queue notify doorbell.
+    U16,
+    /// 32-bit — virtio-mmio's shared `QueueNotify` register.
+    U32,
+}
+
+/// A resolved doorbell: where to write, how wide, to tell the device a queue has work.
 ///
 /// Produced by [`VirtioTransport::queue_notifier`] at queue-setup time and held by the
 /// [`Virtqueue`]. The queue rings it without knowing whether the address is one of many
@@ -58,30 +96,62 @@ use super::{
 #[derive(Debug, Clone, Copy)]
 pub struct Notifier {
     addr: VirtAddr,
+    width: NotifyWidth,
 }
 
 impl Notifier {
     /// Build a notifier for an already-resolved doorbell address.
     ///
-    /// Only transport implementations call this — resolving the address is precisely the
-    /// part that differs between them.
-    pub fn at(addr: VirtAddr) -> Self {
-        Self { addr }
+    /// Only transport implementations call this — resolving the address *and knowing the
+    /// register's width* are both precisely the parts that differ between them.
+    pub fn at(addr: VirtAddr, width: NotifyWidth) -> Self {
+        Self { addr, width }
     }
 
     /// Ring the doorbell for `queue_index`.
     ///
-    /// The value written is the queue index in both transports: virtio-PCI expects the
-    /// *vqn* at the queue's own doorbell, and virtio-mmio expects it at the shared
-    /// `QueueNotify`. The caller is responsible for the release barrier beforehand — the
-    /// device must not observe this write before the ring updates it announces.
+    /// The value written is the queue index on both transports: virtio-PCI expects the
+    /// *vqn* at the queue's own doorbell, virtio-mmio at the shared `QueueNotify`. Only
+    /// the width differs, and getting it wrong is silent — see [`NotifyWidth`].
+    ///
+    /// The caller is responsible for the release barrier beforehand: the device must not
+    /// observe this write before the ring updates it announces.
     pub fn ring(self, queue_index: u16) {
         // SAFETY: `addr` is a doorbell register mapped by the transport that produced
-        // this notifier, and the device's contract is a 16-bit write of the queue index.
+        // this notifier, written at the width that transport documents.
         unsafe {
-            core::ptr::write_volatile(self.addr.as_u64() as *mut u16, queue_index);
+            match self.width {
+                NotifyWidth::U16 => {
+                    core::ptr::write_volatile(self.addr.as_u64() as *mut u16, queue_index)
+                }
+                NotifyWidth::U32 => {
+                    core::ptr::write_volatile(self.addr.as_u64() as *mut u32, queue_index as u32)
+                }
+            }
         }
     }
+}
+
+/// Proof that a particular queue is currently selected, plus what selecting it revealed.
+///
+/// Both transports address queue registers through a *selected queue*: virtio-PCI has
+/// `COMMON_QUEUE_SELECT`, virtio-mmio has `QueueSel` (0x030). So the statefulness is
+/// portable — but "call `queue_max_size` first, then these two, and do not interleave"
+/// was an ordering contract stated only in prose, with the affected methods taking an
+/// `index` they ignored.
+///
+/// That is a trap for a second implementation rather than a defect in the first: nothing
+/// in-tree gets the order wrong today, but a virtio-mmio implementation would plausibly
+/// *use* its `index` argument, giving the two impls different sensitivity to call order —
+/// the classic shape of "works on amd64, corrupts on arm64". Making selection return a
+/// token the dependent methods consume turns the contract into something the compiler
+/// enforces, and costs no MMIO access at all.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectedQueue {
+    /// The queue this token selected.
+    pub index: u16,
+    /// The largest size the device supports for it; `0` means the queue does not exist.
+    pub max_size: u16,
 }
 
 /// The register interface of a VirtIO device.
@@ -106,42 +176,112 @@ pub trait VirtioTransport: Send {
     /// Write the 64-bit driver feature bits (the subset we accept).
     fn write_driver_features(&self, features: u64);
 
-    /// How many virtqueues this device has.
-    fn num_queues(&self) -> u16;
+    /// The device-specific configuration region's size in bytes; `0` when absent.
+    fn config_len(&self) -> usize;
 
-    /// Select queue `index` and report the largest size the device supports for it.
+    /// Copy `out.len()` bytes out of device-config space starting at `offset`.
     ///
-    /// Returns `0` when the queue does not exist. Selection is a side effect the
-    /// subsequent [`configure_queue`](Self::configure_queue) and
-    /// [`queue_notifier`](Self::queue_notifier) rely on, which is why they are documented
-    /// as a sequence rather than independent calls.
-    fn queue_max_size(&self, index: u16) -> u16;
+    /// Implementations must use only the access widths their transport permits.
+    /// virtio-mmio allows 1, 2 and 4 bytes in config space — and **`abort()`s QEMU** on an
+    /// 8-byte access, which is why no `u64` helper reaches this directly.
+    fn config_read_raw(&self, offset: usize, out: &mut [u8]);
 
-    /// Program the currently selected queue's size and ring addresses, then enable it.
+    /// The device-config generation counter, or `0` on a transport without one.
     ///
-    /// Must follow a [`queue_max_size`](Self::queue_max_size) call for the same `index`.
+    /// virtio-mmio exposes it at `0x0fc` and virtio-PCI in its common config. It is how a
+    /// driver detects that a multi-access config read was torn by a concurrent device-side
+    /// update. Defaulting to `0` makes [`read_config`](Self::read_config)'s generation
+    /// check trivially succeed on a transport that has none, rather than forcing every
+    /// implementation to invent one.
+    fn config_generation(&self) -> u32 {
+        0
+    }
+
+    /// Select queue `index`, and report what that revealed.
+    ///
+    /// The returned [`SelectedQueue`] is the only way to reach
+    /// [`configure_queue`](Self::configure_queue) and
+    /// [`queue_notifier`](Self::queue_notifier), so the ordering they depend on cannot be
+    /// got wrong.
+    fn select_queue(&self, index: u16) -> SelectedQueue;
+
+    /// Program the selected queue's size and ring addresses, then enable it.
     fn configure_queue(
         &self,
-        index: u16,
+        queue: &SelectedQueue,
         size: u16,
         desc: PhysAddr,
         avail: PhysAddr,
         used: PhysAddr,
     );
 
-    /// Resolve the doorbell for the currently selected queue.
+    /// Resolve the doorbell for the selected queue.
     ///
-    /// Must follow a [`queue_max_size`](Self::queue_max_size) call for the same `index`:
     /// virtio-PCI reads a per-queue `queue_notify_off` register whose value depends on
-    /// which queue is selected.
-    fn queue_notifier(&self, index: u16) -> Notifier;
+    /// which queue is selected, which is why this takes the token rather than an index.
+    fn queue_notifier(&self, queue: &SelectedQueue) -> Notifier;
 
-    /// The device-specific configuration region, if this device has one.
-    ///
-    /// Block devices report capacity here; network devices report MAC and MTU.
-    fn device_config(&self) -> Option<VirtAddr>;
 
     // --- Provided: spec sequencing, identical on every transport -------------------
+
+    /// How many virtqueues this device has.
+    ///
+    /// **Probing is the default because virtio-mmio has no such register.** virtio-PCI
+    /// answers in one read (`COMMON_NUM_QUEUES`) and overrides this; the mmio register
+    /// map has `QueueNumMax` *per selected queue* and nothing that reports a count, so the
+    /// only portable answer is to select upward until a queue reports size 0.
+    ///
+    /// Because the probe selects queues as a side effect, callers must not assume a queue
+    /// stays selected across it — which is why [`queue_notifier`](Self::queue_notifier)
+    /// and [`configure_queue`](Self::configure_queue) take a fresh token.
+    #[allow(dead_code)] // live only under `--features test`
+    fn num_queues(&self) -> u16 {
+        const MAX_PROBED_QUEUES: u16 = 64;
+        let mut n = 0;
+        while n < MAX_PROBED_QUEUES && self.select_queue(n).max_size != 0 {
+            n += 1;
+        }
+        n
+    }
+
+    /// Read device-config bytes under a generation check, so a multi-access read cannot
+    /// tear against a concurrent device-side update.
+    ///
+    /// The device may change its config while we read it — capacity on a resizable disk,
+    /// link state on a NIC. Both transports expose a generation counter for exactly this;
+    /// neither this kernel nor its predecessor had ever consulted one, because
+    /// `device_config()` handed drivers a raw pointer and there was nowhere to put the
+    /// check. Bounds are enforced here too: on virtio-mmio the config region is the tail
+    /// of a `0x200`-byte slot window, so an over-long read walks into the *next device's
+    /// registers*.
+    fn read_config(&self, offset: usize, out: &mut [u8]) -> Result<(), VirtioError> {
+        const CONFIG_READ_RETRIES: usize = 8;
+
+        let end = offset.checked_add(out.len()).ok_or(VirtioError::ConfigOutOfRange)?;
+        if end > self.config_len() {
+            return Err(VirtioError::ConfigOutOfRange);
+        }
+        for _ in 0..CONFIG_READ_RETRIES {
+            let before = self.config_generation();
+            self.config_read_raw(offset, out);
+            if self.config_generation() == before {
+                return Ok(());
+            }
+        }
+        Err(VirtioError::ConfigUnstable)
+    }
+
+    /// Read a little-endian `u64` from device config.
+    ///
+    /// Assembled from bytes rather than issued as an 8-byte access: virtio-mmio permits
+    /// only 1-, 2- and 4-byte accesses to config space and **`abort()`s QEMU** on anything
+    /// wider. Both halves come from one generation-checked read, so the two words cannot
+    /// be torn relative to each other.
+    fn config_u64(&self, offset: usize) -> Result<u64, VirtioError> {
+        let mut buf = [0u8; 8];
+        self.read_config(offset, &mut buf)?;
+        Ok(u64::from_le_bytes(buf))
+    }
 
     /// Set additional status bits without disturbing the ones already set.
     fn add_status(&self, bits: u8) {
@@ -187,17 +327,17 @@ pub trait VirtioTransport: Send {
     /// addresses and enable it. Resolving the notifier happens while the queue is still
     /// selected, for the reason given on [`queue_notifier`](Self::queue_notifier).
     fn setup_queue(&self, index: u16) -> Result<Virtqueue, VirtioError> {
-        let max_size = self.queue_max_size(index);
-        if max_size == 0 {
+        let selected = self.select_queue(index);
+        if selected.max_size == 0 {
             return Err(VirtioError::QueueUnavailable);
         }
-        let size = max_size.min(MAX_QUEUE_SIZE);
+        let size = selected.max_size.min(MAX_QUEUE_SIZE);
 
-        let notifier = self.queue_notifier(index);
+        let notifier = self.queue_notifier(&selected);
         let queue = Virtqueue::new(size, index, notifier)?;
 
         self.configure_queue(
-            index,
+            &selected,
             size,
             queue.desc_phys,
             queue.avail_phys,

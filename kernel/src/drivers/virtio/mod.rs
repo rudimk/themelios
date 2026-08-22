@@ -1,79 +1,71 @@
-//! # VirtIO PCI transport and split virtqueue
+//! # VirtIO core: the split virtqueue and the pieces every transport shares
 //!
-//! VirtIO is the paravirtualised device standard QEMU/KVM (and the cloud
-//! hypervisors we target) use for block, network, and console devices. Rather
-//! than emulating real hardware register-by-register, the guest and host agree
-//! on a small, efficient ring-buffer protocol. This module implements the parts
-//! that are **common to every VirtIO device type**:
+//! VirtIO is the paravirtualised device standard QEMU/KVM and the cloud hypervisors use
+//! for block, network and console devices. Rather than emulating real hardware
+//! register-by-register, guest and host agree on a ring-buffer protocol.
 //!
-//! - **Transport discovery**: finding a device's register regions by walking
-//!   its PCI vendor capabilities (the modern, VirtIO 1.0+ interface).
-//! - **Device initialisation handshake**: the status-bit sequence that brings a
-//!   device from reset to "driver OK".
-//! - **Feature negotiation**: agreeing on an optional feature set.
-//! - **Split virtqueue**: the descriptor table + available ring + used ring
-//!   data structure through which buffers are handed to and returned from the
-//!   device.
+//! This module holds what is **common to every transport**:
 //!
-//! The device-specific driver (e.g. `blk.rs` for the block device) builds on
-//! top of this: it negotiates its own feature bits, reads its device-specific
-//! config, and submits request descriptor chains to a virtqueue.
+//! - **[`Virtqueue`]** — the descriptor table, available ring and used ring through which
+//!   buffers are handed to and returned from the device. The spec defines this structure
+//!   without reference to any transport, and as of 8.2 the code matches: the queue holds a
+//!   [`Notifier`] the transport resolved, not a doorbell address it computed itself.
+//! - **Status bits, feature bits and errors** — spec-level vocabulary.
+//! - **MMIO access helpers** — see the warning below.
 //!
-//! ## Modern (1.0+) vs legacy
+//! What is *not* here, and used to be: the virtio-PCI register layout, capability
+//! discovery and the init handshake all live in [`pci_transport`], because they describe
+//! one transport and mean nothing to another. [`transport`] holds the interface itself.
 //!
-//! We speak the modern interface exclusively. A modern VirtIO device advertises
-//! up to five register regions through PCI vendor-specific capabilities, each
-//! tagged with a `cfg_type`:
+//! ## A warning about the MMIO helpers
 //!
-//! | cfg_type | region        | purpose                                  |
-//! |----------|---------------|------------------------------------------|
-//! | 1        | common config | device/driver features, status, queues   |
-//! | 2        | notify        | "kick" doorbell — tell the device to run |
-//! | 3        | ISR           | interrupt-status byte (read to ack INTx) |
-//! | 4        | device config | device-type-specific config (e.g. capacity)|
+//! [`mmio_read_u8`] … [`mmio_write_u64`] offer six access widths at arbitrary offsets.
+//! That is the *virtio-PCI* access model. **virtio-mmio permits exactly one width for
+//! control registers — 32 bits** — and QEMU's model logs `"wrong size access to
+//! register!"` and then *drops the write* (or returns zero) for anything else, with no
+//! fault the guest can observe. A virtio-mmio implementation must therefore use its own
+//! 32-bit-only accessors and must not reach for these, whatever their neutral-looking
+//! names suggest.
 //!
-//! Each capability names a BAR and an offset within it; we map those MMIO
-//! windows uncached (see `mm::mmio`) and access them with volatile reads/writes.
+//! Alignment matters too: `mm::mmio::map` produces Device-`nGnRnE` memory on aarch64,
+//! where an unaligned access raises an Alignment fault that Phase 7.2's handler treats as
+//! fatal. The same call is silently fine on x86.
 //!
 //! ## Polling, not interrupts
 //!
-//! Phase 3 uses **synchronous polling**: after kicking the device we spin on the
-//! used ring's index until our buffer comes back. This keeps the block path
-//! simple and deterministic. Interrupt-driven completion (MSI-X) is a later
-//! optimisation; the VirtIO spec explicitly permits polling.
+//! The stack polls: after kicking a device we spin on the used ring's index until our
+//! buffer returns. The spec explicitly permits this. Two things say so to the device — the
+//! `VIRTQ_AVAIL_F_NO_INTERRUPT` flag set in every avail ring here, which is the
+//! transport-neutral form, and virtio-PCI's MSI-X NO_VECTOR, which is not.
 //!
-//! That spin is **bounded**, and giving up is not recoverable. Callers hold the
-//! device lock with interrupts disabled for the whole poll, so an unbounded wait
-//! freezes the entire kernel rather than just the calling task. When the bound is
-//! reached the chain is still device-owned, so the queue disables itself
-//! permanently instead of reusing descriptors the device may still touch — see
-//! [`Virtqueue::fail`] and [`MAX_COMPLETION_SPINS`].
+//! That spin is **bounded**, and giving up is not recoverable: callers hold the device
+//! lock with interrupts disabled for the whole poll, so an unbounded wait freezes the
+//! kernel rather than the calling task. When the bound is reached the chain is still
+//! device-owned, so the queue disables itself permanently instead of reusing descriptors
+//! the device may still touch — see [`Virtqueue::fail`] and [`MAX_COMPLETION_SPINS`].
 
 /// Arch-neutral device discovery — "which VirtIO devices does this machine have?"
 ///
-/// Answers that question without the caller naming PCI, so the eighteen call sites that
-/// used to walk PCI config space directly survive the move to virtio-mmio (8.3). The
-/// register-level transport stays PCI-shaped until 8.2.
+/// Answers that without the caller naming a bus, and decides which transport speaks to
+/// each device it finds.
 pub mod discovery;
 
 /// The transport interface every VirtIO driver speaks, and the doorbell it hands to a
-/// queue. `PciTransport` below implements it; 8.3 adds a virtio-mmio implementation.
+/// queue.
 pub mod transport;
 
-pub use transport::{Notifier, VirtioTransport};
-
-/// The virtio-PCI (modern, 1.0+) transport implementation, and the `virtio_pci_common_cfg`
-/// register offsets that only it may use.
+/// The virtio-PCI (modern, 1.0+) transport implementation, and the
+/// `virtio_pci_common_cfg` register offsets that only it may use.
 pub mod pci_transport;
 
+pub use discovery::{devices_of_kind, first_of_kind, VirtioKind};
 pub use pci_transport::PciTransport;
-
-pub use discovery::{devices_of_kind, first_of_kind, VirtioDevice, VirtioKind};
+pub use transport::{Notifier, VirtioTransport};
 
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::mm::addr::{PhysAddr, VirtAddr};
-use crate::mm::{frame, mmio, PAGE_SIZE};
+use crate::mm::{frame, PAGE_SIZE};
 
 pub mod blk;
 pub mod net;
@@ -151,6 +143,17 @@ pub enum VirtioError {
     FeatureNegotiationFailed,
     /// The selected virtqueue does not exist (queue size reported as 0).
     QueueUnavailable,
+
+    /// A device-config read ran past the end of the config region.
+    ///
+    /// On virtio-mmio that region is the tail of a fixed-size slot window, so an
+    /// over-long read would reach the adjacent device's registers.
+    ConfigOutOfRange,
+
+    /// A device-config read could not be taken without the generation counter moving.
+    ///
+    /// The device kept changing its configuration underneath us; retrying did not help.
+    ConfigUnstable,
     /// Out of physical frames for the virtqueue rings.
     OutOfMemory,
     /// The device signalled an error during initialisation.
@@ -265,6 +268,21 @@ pub struct Virtqueue {
 // Used ring:       { flags: u16, idx: u16, ring: [{id:u32,len:u32}; size], avail_event: u16 }
 
 const RING_FLAGS: u64 = 0;
+
+/// `VIRTQ_AVAIL_F_NO_INTERRUPT` — set in the available ring's flags to tell the device
+/// not to raise a used-buffer interrupt for this queue.
+///
+/// This whole stack polls. On virtio-PCI that intent is expressed by writing NO_VECTOR to
+/// the queue's MSI-X vector register — but that register does not exist on virtio-mmio,
+/// whose interrupt is a platform-wired level-triggered line. `alloc_zeroed` leaves this
+/// flags word at 0, which means *"interrupt me on every used buffer"*, so on mmio the
+/// device would assert its line on every completion and hold it until an `InterruptACK`
+/// that nothing ever writes.
+///
+/// The avail ring's flags word is the transport-neutral way to say "do not interrupt me",
+/// so it is set here, where the ring is built, rather than in a transport that may or may
+/// not have a vector register.
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 const RING_IDX: u64 = 2;
 const RING_ENTRIES: u64 = 4;
 
@@ -284,6 +302,13 @@ impl Virtqueue {
         let desc_phys = alloc_zeroed(desc_bytes).ok_or(VirtioError::OutOfMemory)?;
         let avail_phys = alloc_zeroed(avail_bytes).ok_or(VirtioError::OutOfMemory)?;
         let used_phys = alloc_zeroed(used_bytes).ok_or(VirtioError::OutOfMemory)?;
+
+        // Say "do not interrupt me" in the ring itself, not just in a PCI register.
+        // SAFETY: the avail ring was just allocated and zeroed; RING_FLAGS is its first
+        // u16 and the device has not been told about the queue yet.
+        unsafe {
+            mmio_write_u16(avail_phys.to_virt(), RING_FLAGS, VIRTQ_AVAIL_F_NO_INTERRUPT);
+        }
 
         Ok(Self {
             size,
@@ -529,7 +554,7 @@ pub fn test_queue_failure_paths() -> Result<(), &'static str> {
             used_phys: used,
             // A scratch page standing in for a doorbell: this fake queue is never
             // attached to a device, so the write lands harmlessly in RAM.
-            notify: Notifier::at(doorbell.to_virt()),
+            notify: Notifier::at(doorbell.to_virt(), transport::NotifyWidth::U16),
             last_used_idx: 0,
             failed: false,
         })

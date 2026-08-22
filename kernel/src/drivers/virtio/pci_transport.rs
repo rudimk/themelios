@@ -1,6 +1,6 @@
 //! # virtio-PCI (modern) transport
 //!
-//! The VirtIO 1.0+ PCI transport: the implementation of [`super::transport::VirtioTransport`]
+//! The VirtIO 1.0+ PCI transport: the implementation of [`crate::drivers::virtio::transport::VirtioTransport`]
 //! used on x86_64, where VirtIO devices arrive as PCI functions.
 //!
 //! ## What makes this transport distinctive
@@ -13,33 +13,28 @@
 //!
 //! **The doorbell is per queue**, at `notify_base + queue_notify_off * notify_off_multiplier`,
 //! where `queue_notify_off` is a register of the *selected* queue. virtio-mmio has a single
-//! shared `QueueNotify`. This difference is why [`super::transport::Notifier`] exists: the
+//! shared `QueueNotify`. This difference is why [`crate::drivers::virtio::transport::Notifier`] exists: the
 //! transport resolves an address and the virtqueue merely rings it.
 //!
 //! ## Why the offsets live here
 //!
 //! The `COMMON_*` constants below are byte offsets into `struct virtio_pci_common_cfg`
-//! (VirtIO 1.x spec). They were module-level constants in `virtio/mod.rs` until 8.2, which
-//! made them look like shared vocabulary — they are not. They describe one transport's
+//! (VirtIO 1.x spec). They were module-level constants in `virtio/mod.rs`, which made them
+//! look like shared vocabulary — they are not. They describe one transport's
 //! register layout and mean nothing to virtio-mmio, whose registers are at entirely
 //! different offsets with different widths. Keeping them beside the only code that may
 //! use them is what stops 8.3 from accidentally inheriting them.
 
-use alloc::boxed::Box;
 
 use crate::drivers::pci::PciDevice;
 use crate::mm::addr::{PhysAddr, VirtAddr};
 use crate::mm::mmio;
 
-use super::discovery::VirtioDevice;
-use super::transport::{Notifier, VirtioTransport};
+use super::transport::{Notifier, NotifyWidth, SelectedQueue, VirtioTransport};
 use super::{
     mmio_read_u16, mmio_read_u32, mmio_read_u8, mmio_write_u16, mmio_write_u32, mmio_write_u64,
     mmio_write_u8, VirtioError, STATUS_ACKNOWLEDGE, STATUS_DRIVER,
 };
-
-
-/// `cfg_type` values identifying each VirtIO register region.
 
 // --- VirtIO PCI capability layout (fields relative to the capability offset) ---
 
@@ -54,6 +49,7 @@ const VIRTIO_CAP_LENGTH: u8 = 12;
 /// Offset of the 32-bit `notify_off_multiplier` (only in the notify capability).
 const VIRTIO_CAP_NOTIFY_MULT: u8 = 16;
 
+/// `cfg_type` values identifying each VirtIO register region.
 const CFG_TYPE_COMMON: u8 = 1;
 const CFG_TYPE_NOTIFY: u8 = 2;
 const CFG_TYPE_ISR: u8 = 3;
@@ -70,6 +66,7 @@ const COMMON_DRIVER_FEATURE_SELECT: u64 = 0x08; // u32
 const COMMON_DRIVER_FEATURE: u64 = 0x0C; // u32
 const COMMON_NUM_QUEUES: u64 = 0x12; // u16 (read-only)
 const COMMON_DEVICE_STATUS: u64 = 0x14; // u8
+const COMMON_CONFIG_GENERATION: u64 = 0x15; // u8
 const COMMON_QUEUE_SELECT: u64 = 0x16; // u16
 const COMMON_QUEUE_SIZE: u64 = 0x18; // u16
 const COMMON_QUEUE_MSIX_VECTOR: u64 = 0x1A; // u16
@@ -81,7 +78,7 @@ const COMMON_QUEUE_DEVICE: u64 = 0x30; // u64 (used ring)
 
 /// A VirtIO device's discovered register regions and negotiated state.
 ///
-/// Constructed by `VirtioTransport::init`, which walks the PCI capabilities,
+/// Constructed by [`PciTransport::init`], which walks the PCI capabilities,
 /// maps the MMIO regions, and runs the initialisation handshake up to (but not
 /// including) `DRIVER_OK`. The device-specific driver then negotiates features,
 /// sets up virtqueues, and finally calls `set_driver_ok`.
@@ -97,22 +94,15 @@ pub struct PciTransport {
     isr: VirtAddr,
     /// Device-specific config MMIO region (e.g. block capacity), if present.
     device_cfg: Option<VirtAddr>,
+    /// Size of the device-config region in bytes.
+    ///
+    /// `init` reads this from the capability and used to discard it, so `device_config()`
+    /// handed drivers an unbounded pointer. Keeping it lets `read_config` reject an
+    /// over-long read instead of walking off the end of the mapping.
+    device_cfg_len: usize,
 }
 
 impl PciTransport {
-    /// Bring up the transport for a device found by [`discovery`].
-    ///
-    /// The transport-neutral entry point, mirroring `VirtioBlk::init`. Only the
-    /// transport self-test calls this directly; 8.2 replaces the body when
-    /// `VirtioTransport` becomes a trait with a virtio-mmio implementation.
-    // Only the transport self-test drives the transport directly; the block and net
-    // drivers go through their own `init`. Kept because that test is the one place the
-    // transport layer is exercised in isolation, and 8.2 replaces this body wholesale.
-    #[allow(dead_code)]
-    pub fn init_for(dev: &VirtioDevice) -> Result<Self, VirtioError> {
-        Self::init(dev.pci())
-    }
-
     /// Discover and reset a VirtIO PCI device, leaving it ready for feature
     /// negotiation.
     ///
@@ -130,6 +120,7 @@ impl PciTransport {
         let mut notify_off_multiplier: u32 = 0;
         let mut isr: Option<VirtAddr> = None;
         let mut device_cfg: Option<VirtAddr> = None;
+        let mut device_cfg_len: usize = 0;
 
         for cap in dev.capabilities() {
             // Only vendor-specific capabilities describe VirtIO regions.
@@ -158,7 +149,10 @@ impl PciTransport {
                         dev.read_config_u32(cap.offset + VIRTIO_CAP_NOTIFY_MULT);
                 }
                 CFG_TYPE_ISR => isr = Some(mapped),
-                CFG_TYPE_DEVICE => device_cfg = Some(mapped),
+                CFG_TYPE_DEVICE => {
+                    device_cfg = Some(mapped);
+                    device_cfg_len = region_len as usize;
+                }
                 _ => {}
             }
         }
@@ -173,6 +167,7 @@ impl PciTransport {
             notify_off_multiplier,
             isr,
             device_cfg,
+            device_cfg_len,
         };
 
         // Reset: write 0 to the status register and wait for it to read back 0.
@@ -230,17 +225,16 @@ impl VirtioTransport for PciTransport {
         unsafe { mmio_read_u16(self.common, COMMON_NUM_QUEUES) }
     }
 
-    fn queue_max_size(&self, index: u16) -> u16 {
-        // Selecting the queue is a side effect the caller depends on: `queue_notifier`
-        // and `configure_queue` both address "the selected queue".
+    fn select_queue(&self, index: u16) -> SelectedQueue {
         // SAFETY: queue_select and queue_size are common-config registers.
-        unsafe {
+        let max_size = unsafe {
             mmio_write_u16(self.common, COMMON_QUEUE_SELECT, index);
             mmio_read_u16(self.common, COMMON_QUEUE_SIZE)
-        }
+        };
+        SelectedQueue { index, max_size }
     }
 
-    fn queue_notifier(&self, _index: u16) -> Notifier {
+    fn queue_notifier(&self, _queue: &SelectedQueue) -> Notifier {
         // virtio-PCI gives each queue its own doorbell:
         //   notify_base + queue_notify_off * notify_off_multiplier
         // `queue_notify_off` is a register of the *selected* queue, which is why this
@@ -249,19 +243,34 @@ impl VirtioTransport for PciTransport {
         // is resolved here rather than in `Virtqueue`.
         // SAFETY: queue_notify_off is a common-config register.
         let notify_off = unsafe { mmio_read_u16(self.common, COMMON_QUEUE_NOTIFY_OFF) };
-        Notifier::at(VirtAddr::new(
-            self.notify_base.as_u64() + (notify_off as u64) * (self.notify_off_multiplier as u64),
-        ))
+        Notifier::at(
+            VirtAddr::new(
+                self.notify_base.as_u64()
+                    + (notify_off as u64) * (self.notify_off_multiplier as u64),
+            ),
+            // virtio-PCI's per-queue doorbell is a 16-bit register.
+            NotifyWidth::U16,
+        )
     }
 
     fn configure_queue(
         &self,
-        _index: u16,
+        queue: &SelectedQueue,
         size: u16,
         desc: PhysAddr,
         avail: PhysAddr,
         used: PhysAddr,
     ) {
+        // The token proves the right queue is selected; assert the size we were handed
+        // actually fits it, which is the one thing the token cannot encode.
+        debug_assert!(
+            size <= queue.max_size,
+            "queue {} programmed with size {} > device maximum {}",
+            queue.index,
+            size,
+            queue.max_size
+        );
+
         // Program the queue: size, ring physical addresses, disable MSI-X
         // (0xFFFF = NO_VECTOR — we poll), then enable.
         // SAFETY: all are common-config registers for the selected queue.
@@ -275,7 +284,29 @@ impl VirtioTransport for PciTransport {
         }
     }
 
-    fn device_config(&self) -> Option<VirtAddr> {
-        self.device_cfg
+    fn config_len(&self) -> usize {
+        self.device_cfg_len
+    }
+
+    fn config_read_raw(&self, offset: usize, out: &mut [u8]) {
+        let Some(base) = self.device_cfg else {
+            // `read_config` bounds-checks against `config_len`, which is 0 without a
+            // region, so this is unreachable rather than a silent zero-fill.
+            debug_assert!(out.is_empty(), "config read with no device-config region");
+            return;
+        };
+        // Byte-at-a-time. virtio-PCI permits wider accesses here, but the narrow form is
+        // the one both transports allow, and device config is read once at init — there
+        // is nothing to gain from a faster path that only works on one transport.
+        for (i, byte) in out.iter_mut().enumerate() {
+            // SAFETY: `read_config` has already bounded `offset + out.len()` by
+            // `config_len`, which is the length of this mapped region.
+            *byte = unsafe { mmio_read_u8(base, (offset + i) as u64) };
+        }
+    }
+
+    fn config_generation(&self) -> u32 {
+        // SAFETY: config_generation is a common-config register.
+        unsafe { mmio_read_u8(self.common, COMMON_CONFIG_GENERATION) as u32 }
     }
 }
