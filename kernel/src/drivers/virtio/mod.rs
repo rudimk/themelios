@@ -56,7 +56,7 @@
 /// register-level transport stays PCI-shaped until 8.2.
 pub mod discovery;
 
-pub use discovery::{devices, devices_of_kind, first_of_kind, VirtioDevice, VirtioKind};
+pub use discovery::{devices_of_kind, first_of_kind, VirtioDevice, VirtioKind};
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -642,6 +642,10 @@ impl VirtioTransport {
     /// The transport-neutral entry point, mirroring `VirtioBlk::init`. Only the
     /// transport self-test calls this directly; 8.2 replaces the body when
     /// `VirtioTransport` becomes a trait with a virtio-mmio implementation.
+    // Only the transport self-test drives the transport directly; the block and net
+    // drivers go through their own `init`. Kept because that test is the one place the
+    // transport layer is exercised in isolation, and 8.2 replaces this body wholesale.
+    #[allow(dead_code)]
     pub fn init_for(dev: &VirtioDevice) -> Result<Self, VirtioError> {
         Self::init(dev.pci())
     }

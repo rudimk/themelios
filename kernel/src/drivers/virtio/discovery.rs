@@ -164,10 +164,12 @@ impl VirtioDevice {
 
     /// The underlying PCI handle.
     ///
-    /// Crate-private on purpose. Only the VirtIO drivers call this, and only until 8.2
-    /// replaces it with a transport trait — at which point this method disappears
-    /// rather than gaining an aarch64 sibling.
-    pub(crate) fn pci(&self) -> &PciDevice {
+    /// Scoped to `crate::drivers::virtio` on purpose — **not** `pub(crate)`. The kernel
+    /// is a binary crate, so `pub(crate)` is effectively fully public and the "no caller
+    /// outside the drivers can see PCI" property would be a convention rather than a
+    /// compiler guarantee. This restricts it to the three intended callers. It disappears
+    /// in 8.2 when the transport becomes a trait, rather than gaining an aarch64 sibling.
+    pub(in crate::drivers::virtio) fn pci(&self) -> &PciDevice {
         &self.pci
     }
 }

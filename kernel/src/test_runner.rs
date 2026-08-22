@@ -1464,17 +1464,8 @@ fn test_userspace_init() -> Result<(), &'static str> {
 }
 
 // ============================================================
-//  test_pci_scan — PCI bus enumeration (Phase 3.0)
+//  VirtIO discovery + PCI bus enumeration (Phase 3.0; seam rebuilt in 8.1)
 // ============================================================
-
-/// Test PCI bus enumeration.
-///
-/// The scan already ran during boot (in `kmain`), so the global registry is
-/// populated. This verifies:
-/// 1. At least one PCI device was discovered (QEMU always exposes a host
-///    bridge and other Q35 defaults)
-/// 2. A VirtIO device (vendor 0x1AF4) is present — QEMU is launched with a
-///    VirtIO disk attached
 
 /// Magic in sector 0 of the scratch disk, written by `xtask::ensure_scratch_disk`.
 ///
@@ -1540,22 +1531,21 @@ fn open_scratch_disk() -> Result<crate::drivers::virtio::blk::VirtioBlk, &'stati
 /// their disk by signature (see `open_scratch_disk`).
 #[cfg(target_arch = "x86_64")]
 fn test_virtio_discovery() -> Result<(), &'static str> {
-    let devs = virtio::devices();
+    let devs = virtio::discovery::devices();
 
     let blocks = devs.iter().filter(|d| d.kind() == VirtioKind::Block).count();
     let nets = devs.iter().filter(|d| d.kind() == VirtioKind::Net).count();
     let others = devs.len() - blocks - nets;
 
-    // The harness attaches a scratch disk, the SquashFS root, the ext2 data volume, and
-    // one NIC.
-    if blocks != 3 {
-        return Err("expected exactly 3 VirtIO block devices");
-    }
-    if nets != 1 {
-        return Err("expected exactly 1 VirtIO network device");
-    }
-    if others != 0 {
-        return Err("unexpected VirtIO device of an unknown kind");
+    // The harness attaches, in command-line order: the scratch disk, the SquashFS root,
+    // the ext2 data volume, and one NIC (`xtask::cmd_test`). Only the multiset is
+    // asserted — see the note above on why the sequence is not.
+    if blocks != 3 || nets != 1 || others != 0 {
+        // Print what was actually found before failing. A bare "expected 3 block + 1 net"
+        // tells a maintainer who added a disk what was expected but not what is there,
+        // which invites editing the constant rather than reading why it moved.
+        crate::println!("  [discovery] found: {}", virtio::discovery::describe());
+        return Err("VirtIO device set is not 3 block + 1 net (observed set printed above)");
     }
 
     // The by-kind helpers must agree with the full enumeration: those are what the
@@ -1581,8 +1571,22 @@ fn test_virtio_discovery() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Test PCI bus enumeration.
+///
+/// The scan already ran during boot (in `kmain`), so the global registry is populated.
+/// This verifies:
+/// 1. At least one PCI device was discovered (QEMU always exposes a host bridge and
+///    other Q35 defaults)
+/// 2. A VirtIO device (vendor 0x1AF4) is present — QEMU is launched with a VirtIO disk
+/// 3. The VirtIO device has at least one implemented BAR with a non-zero size
+///
+/// This is the one test that legitimately still speaks PCI: it tests the *bus walk*,
+/// not the VirtIO seam above it, and it is the only remaining caller of
+/// `devices_by_vendor` and the only reader of `dev.bars`. 8.3 reframes it, since aarch64
+/// has no port-I/O config mechanism to walk.
 #[cfg(target_arch = "x86_64")]
 fn test_pci_scan() -> Result<(), &'static str> {
+    // This test walks the bus itself, so it is the one place that still names PCI.
     use crate::drivers::pci;
 
     // QEMU's Q35 machine always exposes at least the host bridge and an ISA
@@ -1687,9 +1691,8 @@ fn test_virtio_queue_failure() -> Result<(), &'static str> {
 fn test_virtio_blk() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use alloc::vec;
-    use crate::drivers::{block, pci};
+    use crate::drivers::{block};
     use crate::drivers::block::BlockError;
-    use crate::drivers::virtio::blk::VirtioBlk;
 
     // The scratch disk, identified by its signature — this test writes, so it must not
     // take whichever block device happens to enumerate first.
@@ -1843,7 +1846,6 @@ fn test_shared_memory() -> Result<(), &'static str> {
 #[cfg(target_arch = "x86_64")]
 fn test_block_server_ipc() -> Result<(), &'static str> {
     use alloc::boxed::Box;
-    use crate::drivers::virtio::blk::VirtioBlk;
     use crate::drivers::{block, block_server};
     use crate::ipc::{self, IpcMessage};
     use crate::sched;
@@ -1999,7 +2001,7 @@ fn test_squashfs_server() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::ipc::{self, IpcMessage};
     use crate::mm::shared::SharedRegion;
     use crate::process::embedded;
@@ -2015,7 +2017,7 @@ fn test_squashfs_server() -> Result<(), &'static str> {
 
     // --- Locate the SquashFS disk by probing each VirtIO-blk device's block 0
     //     for the "hsqs" magic (0x73717368). ---
-        let mut sqfs_index = None;
+    let mut sqfs_index = None;
     for dev in virtio::devices_of_kind(VirtioKind::Block) {
         let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
@@ -2220,7 +2222,7 @@ fn test_overlay_server() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::ipc::{self, IpcMessage};
     use crate::mm::shared::SharedRegion;
     use crate::process::embedded;
@@ -2237,7 +2239,7 @@ fn test_overlay_server() -> Result<(), &'static str> {
     const STATUS_OK: u64 = 0;
 
     // --- Locate the SquashFS disk and bring up the lower (SquashFS) server. ---
-        let mut sqfs_index = None;
+    let mut sqfs_index = None;
     for dev in virtio::devices_of_kind(VirtioKind::Block) {
         let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
@@ -2431,7 +2433,7 @@ fn test_ext2_read() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::ipc::{self, IpcMessage};
     use crate::mm::shared::SharedRegion;
     use crate::process::embedded;
@@ -2446,7 +2448,7 @@ fn test_ext2_read() -> Result<(), &'static str> {
 
     // --- Locate the ext2 disk: superblock magic 0xEF53 at byte 1080 (sector 2,
     //     offset 56). ---
-        let mut ext2_index = None;
+    let mut ext2_index = None;
     for dev in virtio::devices_of_kind(VirtioKind::Block) {
         let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
@@ -2611,7 +2613,7 @@ fn test_ext2_write() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::ipc::{self, IpcMessage};
     use crate::mm::shared::SharedRegion;
     use crate::process::embedded;
@@ -2629,7 +2631,7 @@ fn test_ext2_write() -> Result<(), &'static str> {
     const STATUS_OK: u64 = 0;
 
     // Bring up the ext2 server on the ext2 disk.
-        let mut ext2_index = None;
+    let mut ext2_index = None;
     for dev in virtio::devices_of_kind(VirtioKind::Block) {
         let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
@@ -2797,7 +2799,7 @@ fn test_vfs_capability() -> Result<(), &'static str> {
     use crate::cap::{Capability, CapHandle, CapRights, CapType};
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::fs::{self, FsError};
     use crate::ipc;
     use crate::mm::shared::SharedRegion;
@@ -2806,7 +2808,7 @@ fn test_vfs_capability() -> Result<(), &'static str> {
     use crate::sched;
 
     // Bring up a SquashFS server and register it as a mount.
-        let mut sqfs_index = None;
+    let mut sqfs_index = None;
     for dev in virtio::devices_of_kind(VirtioKind::Block) {
         let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
@@ -2913,7 +2915,7 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::fs;
     use crate::ipc;
     use crate::mm::shared::SharedRegion;
@@ -2922,7 +2924,7 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
     use crate::sched;
 
     // SquashFS mount (lower-level data plane already proven; reused here).
-        let mut sqfs_index = None;
+    let mut sqfs_index = None;
     for dev in virtio::devices_of_kind(VirtioKind::Block) {
         let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
@@ -3004,13 +3006,12 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
 fn test_virtio_net() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use alloc::vec;
-    use crate::drivers::pci;
     use crate::drivers::virtio::net::VirtioNet;
     use crate::net::device;
     use crate::sched;
 
-    // Find the VirtIO network device (vendor 0x1AF4, PCI class 0x02 = network).
-        let dev = virtio::first_of_kind(VirtioKind::Net)
+    // Find the VirtIO network device through the transport-neutral seam.
+    let dev = virtio::first_of_kind(VirtioKind::Net)
         .ok_or("no VirtIO network device")?;
     let nic = VirtioNet::init(&dev).map_err(|_| "VirtioNet init failed")?;
 
@@ -3085,7 +3086,6 @@ fn test_virtio_net() -> Result<(), &'static str> {
 fn test_net_service() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::arch::time as idt;
-    use crate::drivers::pci;
     use crate::drivers::virtio::net::VirtioNet;
     use crate::ipc::{self, IpcMessage};
     use crate::net::device::{self, NetDevice};
@@ -3095,7 +3095,7 @@ fn test_net_service() -> Result<(), &'static str> {
     // Bring up a fresh NIC and start the net service on it. (Re-initialising the
     // VirtIO device resets it cleanly; any driver from an earlier test is
     // orphaned but unused.)
-        let dev = virtio::first_of_kind(VirtioKind::Net)
+    let dev = virtio::first_of_kind(VirtioKind::Net)
         .ok_or("no VirtIO network device")?;
     let nic = VirtioNet::init(&dev).map_err(|_| "VirtioNet init failed")?;
     let mac = nic.mac();
@@ -3475,7 +3475,6 @@ fn test_net_icmp_echo() -> Result<(), &'static str> {
 #[cfg(target_arch = "x86_64")]
 fn test_dhcp() -> Result<(), &'static str> {
     use alloc::boxed::Box;
-    use crate::drivers::pci;
     use crate::drivers::virtio::net::VirtioNet;
     use crate::net::{self, device, net_service};
     use crate::net::device::NetDevice;
@@ -3484,7 +3483,7 @@ fn test_dhcp() -> Result<(), &'static str> {
     use crate::sched;
 
     // Bring up a fresh NIC and start the real net service on it.
-        let dev = virtio::first_of_kind(VirtioKind::Net)
+    let dev = virtio::first_of_kind(VirtioKind::Net)
         .ok_or("no VirtIO network device")?;
     let nic = VirtioNet::init(&dev).map_err(|_| "VirtioNet init failed")?;
     let mac = nic.mac();
@@ -3614,7 +3613,6 @@ fn wait_ticks(timeout_ticks: u64, mut ready: impl FnMut() -> bool) -> bool {
 #[cfg(target_arch = "x86_64")]
 fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u64, &'static str> {
     use alloc::boxed::Box;
-    use crate::drivers::pci;
     use crate::drivers::virtio::net::VirtioNet;
     use crate::mm::addr::VirtAddr;
     use crate::mm::shared::SharedRegion;
@@ -3624,8 +3622,8 @@ fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u
     use crate::process::{self, embedded};
     use crate::sched;
 
-        let dev = virtio::first_of_kind(VirtioKind::Net)
-        .ok_or("no VirtIO network device on the PCI bus")?;
+    let dev = virtio::first_of_kind(VirtioKind::Net)
+        .ok_or("no VirtIO network device")?;
     let nic = VirtioNet::init(&dev).map_err(|_| "VirtioNet init failed")?;
     let mac = nic.mac();
     let index = device::register(nic_name, Box::new(nic));
@@ -3973,7 +3971,7 @@ fn test_linux_fs() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::ipc;
     use crate::linux::elf::{self, SliceSource};
     use crate::mm::addr::VirtAddr;
@@ -4259,14 +4257,14 @@ fn bring_up_ext2_mount(block_name: &'static str, ep_name: &'static str) -> Resul
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
-    use crate::drivers::{block, block_server, pci};
+    use crate::drivers::{block, block_server};
     use crate::ipc;
     use crate::mm::shared::SharedRegion;
     use crate::process::embedded;
     use crate::process::server::{spawn_server, ServerConfig};
     use crate::sched;
 
-        let mut ext2_index = None;
+    let mut ext2_index = None;
     for dev in virtio::devices_of_kind(VirtioKind::Block) {
         let blk = match VirtioBlk::init(&dev) {
             Ok(b) => b,
