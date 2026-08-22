@@ -137,12 +137,17 @@ should perform, not assumptions the plan may make.
 - **Driver-level PCI entanglement is shallow: 3 sites, 2 types.** `virtio/blk.rs:35,101`
   and `virtio/net.rs:33,105` (`use pci::PciDevice`, `init_from_pci`), `virtio/mod.rs:642,651`.
   After `VirtioTransport::init`, both drivers are fully transport-agnostic.
-- **The blast radius is the callers: ~35 sites, 31 of them in `test_runner.rs`** — using
-  `pci::devices_by_vendor(VIRTIO_VENDOR_ID)` + a PCI class filter. Production sites:
-  `net/mod.rs:90-95`, `fs/mod.rs:430-434`, `main.rs:497`. **virtio-mmio has no vendor ID
-  and no class code** (it has a `DeviceID` register), so the discovery *predicate*
-  changes, not just the enumeration. Those 31 test bodies are exactly the tests 8.6–8.10
-  must retire.
+- **The blast radius is the callers, and the figure needs its derivation shown:**
+  **18 `pci::devices_by_vendor` call sites** — 16 in `test_runner.rs`, plus `net/mod.rs:90`
+  and `fs/mod.rs:430` — together with **15 class-code filters** (all in `test_runner.rs`)
+  and **18 `init_from_pci` calls**. Within `test_runner.rs` the idiom is 16 calls + 15
+  filters = **31 lines**, which is where the "31" comes from; the total call-site count
+  across the tree is 36. `main.rs:497` calls `pci::scan()` separately. **virtio-mmio has
+  no vendor ID and no class code** (it has a `DeviceID` register), so the discovery
+  *predicate* changes, not just the enumeration. Mapping those test bodies to sub-phases:
+  six belong to tests **8.3** retires, six to **8.6**, one to **8.7** (`test_dhcp`), one to
+  **8.9** (`test_linux_fs`), plus the `bring_up_ext2_mount` helper — **8.10 retires none
+  of them.**
 - **`notify` is not a transport method.** It lives in `Virtqueue` (`mod.rs:263` field,
   write sites `:365`, `:483`) as a PCI-shaped per-queue doorbell computed at `:802-808`
   from `notify_base + notify_off * multiplier`. virtio-mmio has one shared `QueueNotify`.
@@ -186,8 +191,8 @@ should perform, not assumptions the plan may make.
   262=>newfstatat, 267=>readlinkat`. Twelve more hard-coded x86_64 numbers, 12 more arms.
   Magic numbers are strictly worse than named constants here — aarch64 `openat`=56 collides
   with x86 `SYS_CLONE`=56, and a missed arm falls through to `_ => return None`.
-- **The dispatcher is written in x86 register names**: 77 `frame.r{ax,di,si,dx,10,8}`
-  references across `linux/`.
+- **The dispatcher is written in x86 register names**: **76** `frame.r{ax,di,si,dx,10,8}`
+  references across `linux/` (77 if `frame.rcx` is counted).
 - `linux/elf.rs:172` rejects anything but `EM_X86_64` (0x3e). `EM_AARCH64` = 183 = **0xB7**
   (`include/uapi/linux/elf-em.h`).
 - **aarch64 Linux syscall numbers verified** against `include/uapi/asm-generic/unistd.h`:
@@ -241,8 +246,13 @@ should perform, not assumptions the plan may make.
    timestamp-less audit log all passed.
 6. **Claims are checked before they are written.** Phase 7's other failure was branches
    making false claims about themselves in code comments, `CLAUDE.md`, docs and PR bodies,
-   three separate times. **v1 of this plan then did it nine more times.** See decision 10
-   for the mechanical half.
+   three separate times. **v1 of this plan then did it nine more times, and v2 shipped a
+   pointer here to a decision that did not cover this invariant — the miniature form of the
+   same failure.** Decision 13 makes the *tracker* half mechanical (generated, `--check`ed
+   in CI), which is where all three Phase 7 instances landed. The rest — claims in code
+   comments, plan prose and PR bodies — has **no gate and cannot be given one**; it is a
+   review-time discipline, and naming it as such is more honest than pointing at a
+   mechanism that does not reach it.
 7. **Atomic commits.** One idea per commit.
 8. **Amd64-only refactors land alone.** Three sub-phases (8.1, 8.2, 8.8) change *working
    amd64 code* with zero intended behavior change. Each ships by itself so "amd64 green"
@@ -260,7 +270,7 @@ should perform, not assumptions the plan may make.
    uniformly. Dispatch keys on the **vector slot** first, then `EC`.
 3. **VirtIO transport = virtio-mmio first, PCIe ECAM later.** mmio needs no config-space
    enumeration, no BAR programming, no MSI-X — and MSI-X on real hardware needs the GICv3
-   ITS, which is four sub-phases away (see 8.12/8.13). **The QEMU invocation must pass
+   ITS, which does not land until 8.12/8.13. **The QEMU invocation must pass
    `-global virtio-mmio.force-legacy=false`**; without it QEMU offers version 1.
    Implement modern (v2) and reject v1 with a named message *that points at the missing
    flag*, so the failure is self-diagnosing.
@@ -299,6 +309,16 @@ should perform, not assumptions the plan may make.
     `SUITE_SIZE` is; and a CI job that runs each mutation and **fails if the run is green**.
     "Demonstrated falsifiable" becomes a compile-time count plus a CI matrix. Scoped to
     Phase 8 un-skips; not retrofitted.
+11. **Device *discovery* is deferred to 8.11; device *description* is not.** v1's decision
+    was "hard-code until 8.8, the constants are stable and known." **The constants were
+    never the debt — the shape is.** Discovery yields `(compatible, base, size, irq)` tuples
+    and a device *list*; hard-coded init functions take no arguments and know their own
+    IRQ. Deferring the shape means 8.11 rewrites every driver signature *after* 19+ tests
+    have frozen it. So: **8.1 lands `PlatformInfo { uart, gic, virtio_slots: &[PlatformDevice] }`
+    with one hard-coded provider per architecture, and every driver takes its base and IRQ
+    from it**; 8.3 populates the aarch64 provider with the QEMU-`virt` table. 8.11 then adds
+    real providers instead of performing a cross-cutting refactor. Cost today: one struct
+    and one call site per driver.
 12. **Virtqueue rings and buffers are Normal memory; only the MMIO register window is
     Device.** v1 said "Normal Non-cacheable **or Device** for the rings." **Device is wrong
     and would be a bug TCG also hides:** Device memory permits only naturally-aligned
@@ -311,15 +331,16 @@ should perform, not assumptions the plan may make.
     *discoverable* — QEMU emits DT `dma-coherent` on every `virtio_mmio@` node, and ACPI
     `_CCA` carries it on real hardware — so this is a value to read (8.11), not a decision
     to guess, and 8.3 states its interim assumption explicitly.
-11. **Device *discovery* is deferred to 8.11; device *description* is not.** v1's decision
-    was "hard-code until 8.8, the constants are stable and known." **The constants were
-    never the debt — the shape is.** Discovery yields `(compatible, base, size, irq)` tuples
-    and a device *list*; hard-coded init functions take no arguments and know their own
-    IRQ. Deferring the shape means 8.11 rewrites every driver signature *after* 19+ tests
-    have frozen it. So: **8.3 lands `PlatformInfo { uart, gic, virtio_slots: &[PlatformDevice] }`
-    with exactly one provider — a hard-coded QEMU-`virt` table — and every driver takes its
-    base and IRQ from it.** 8.11 adds providers instead of performing a cross-cutting
-    refactor. Cost today: one struct and one call site per driver.
+13. **Tracker claims are generated, not typed.** Invariant 6 says claims get checked before
+    they are written; decision 10 makes that mechanical for *tests*, but nothing made it
+    mechanical for the *trackers* — which is where all three Phase 7 false claims actually
+    landed. So: `cargo xtask status` writes a fenced block into `CLAUDE.md`,
+    `docs/src/milestones.md` and `docs/src/aarch64.md` from the two CI runs' sentinel and
+    `platform:` lines (running/skipped per arch, GIC version, firmware source), and CI runs
+    `xtask status --check`, failing if regenerating changes a byte. Then "aarch64 is a
+    first-class target" cannot be written before it is true, because the number beside it is
+    produced by the run rather than typed by the author. Lands with the parity gate (8.10),
+    which is the first claim it would have to defend.
 
 ## Sub-phases
 
@@ -409,7 +430,7 @@ the `virt` table; **the disk and NIC that the aarch64 QEMU invocation does not c
 have** (see 8.6's xtask note — `virtio-blk-device`/`virtio-net-device`, not the `-pci`
 variants the amd64 path uses).
 
-Also: **memory attributes for rings and buffers, per decision 12 below.** Rings are
+Also: **memory attributes for rings and buffers, per decision 12.** Rings are
 **Normal** memory — Normal Cacheable Inner-Shareable if the device is declared coherent,
 Normal **Non-Cacheable** Inner-Shareable if not. **Never Device.** Device memory permits
 only naturally-aligned accesses and has no defined exclusives/atomics; rings are ordinary
@@ -650,7 +671,8 @@ finally surface it. That would be a good outcome; budget for it landing here.
 #### 8.8 — Arch-neutral Linux dispatcher
 
 Amd64-only, **zero intended behavior change**, landing alone per invariant 8. Deliver: the
-77 `frame.r{ax,di,si,dx,10,8}` references across `linux/` renamed to `arg0..arg5`/`ret`;
+the 76 `frame.r{ax,di,si,dx,10,8}` references across `linux/` (77 with `frame.rcx`)
+renamed to `arg0..arg5`/`ret`;
 **both** syscall tables extracted — the 22 named constants in `linux/syscall.rs:32-61` and
 the **12 bare numeric literals in `linux/fs.rs:126-141`** that v1 did not know existed;
 `linux/elf.rs`'s machine check parameterized.
@@ -827,6 +849,15 @@ everything a non-hypervisor OS does.
 **Retires (0).**
 **Acceptance:** boots under `-M virt,gic-version=3`; the 7.2 tick self-test (five ticks, not
 one) passes **through the redistributor path**; an ITS-delivered MSI is counted.
+
+**Note the unreconciled seam with 8.2.** 8.2 deliberately leaves interrupt acknowledgement
+*out* of the `VirtioTransport` trait, because the virtio stack polls — correctly, as of
+today. But this sub-phase and 8.13 both require an MSI to be delivered and counted, and
+nothing in 8.1-8.10 gives any driver an interrupt path. So the MSI assertions here are
+**bare-GIC exercises against a synthetic device, not a driver milestone** — which is fine
+and is what they are scoped as. Converting the virtio stack from polling to
+interrupt-driven is **out of Phase 8 scope**; if it is ever wanted, it is its own
+sub-phase and it re-opens 8.2's trait surface.
 **Riskiest unknown:** silent GIC-version flips. `virt` selects GICv3 automatically at >8
 CPUs, so `-smp 16` changes the interrupt controller with no diagnostic — which is also why
 GICv3 is on the critical path for Graviton-class (16-64 vCPU) instances rather than being
@@ -844,7 +875,8 @@ MSI-X, which needs the ITS. As v1 drew it, the sub-phase depended on its success
 
 **Retires (0).**
 **Acceptance:** a virtio-PCI device on `-M virt` (ECAM path) passes the same transport tests
-as the mmio one; an MSI-X interrupt is delivered and counted.
+as the mmio one; an MSI-X interrupt is delivered and counted — again a bare-GIC exercise
+per 8.12's note, since the transport itself still polls.
 **Riskiest unknown:** IORT DeviceID mapping. A wrong mapping produces MSI writes that vanish
 silently — no fault, no interrupt, just a device that never completes.
 
@@ -982,15 +1014,18 @@ in its sequencing argument.
 ## Sequencing
 
 ```
-8.spike ─→ 8.1 ─→ 8.2 ─→ 8.3 ─→ 8.4 ─→ 8.5 ─┬─→ 8.6 ─┐
-                        (+7)         (+3)   (+4)     ├─→ 8.8 ─→ 8.9 ─→ 8.10  ← PARITY
-                                                └─→ 8.7 ─┘         (+4)   (+7)
-                                                    (+6/+7)
+8.spike --> 8.1 --> 8.2 --> 8.3 --> 8.4 --> 8.5 --+--> 8.6 --+
+                                                  |          |
+                                                  +--> 8.7 --+--> 8.9 --> 8.10   [PARITY]
 
-PARITY ─→ 8.11 ─→ 8.12 ─→ 8.13 ─→ 8.14 ─→ 8.15 ─→ 8.16 ─→ 8.17   ← ANY SR NODE
-        discovery  GICv3   ECAM    SMP    cloud   secure  measured
-                   + ITS   + MSI-X                 boot     boot
+[PARITY] --> 8.11 --> 8.12 --> 8.13 --> 8.14 --> 8.15 --> 8.16 --> 8.17   [ANY SR NODE]
+          discovery   GICv3    ECAM      SMP     cloud    secure  measured
+                      + ITS    + MSI-X                     boot     boot
 ```
+
+**8.8** (arch-neutral Linux dispatcher — amd64-only, retires nothing) is not drawn: it may
+land any time after 8.5 and must precede 8.9. Retirement counts are in the ratchet table
+above rather than on the diagram, so there is only one place for them to drift.
 
 8.6 and 8.7 are independent of each other after 8.5. 8.8 is an amd64-only refactor that can
 land any time after 8.5 and is drawn here only because 8.9 needs it.
