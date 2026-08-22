@@ -12,7 +12,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **5** | OCI container support | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Management API (Docker-compatible) | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port | Complete (ring-0 core) |
-| **8** | Hyperscaler support (AWS, GCP, Azure) | Not started |
+| **8** | aarch64 parity (EL0, storage, net, containers) | Planned |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -207,22 +207,50 @@ milestone does not imply "containers on ARM".
 | 7.3 | Scheduler context switch + preemption | Complete |
 | 7.4 | Shell, portable tests on aarch64 CI, finalize | Complete |
 
-## Phase 8 — Hyperscaler support (Not started)
+## Phase 8 — aarch64 parity (Planned)
 
-**Goal**: Boot and run on AWS, GCP, and Azure.
+**Goal**: Bring aarch64 from the Phase 7 ring-0 kernel core to full amd64 parity.
 
-**Deliverables**:
-- Instance metadata service (IMDS) clients for all three providers
-- Cloud-aware configuration injection at boot time
-- Machine image tooling (`cargo xtask image --cloud aws/gcp/azure`)
-- AMI creation for AWS (raw disk import via `aws ec2 import-image`)
-- GCP image creation (raw disk tarball + `gcloud compute images create`)
-- Azure VHD image creation
-- UEFI Secure Boot chain verification and kernel image signing
-- Measured boot (TPM support)
-- Boot validation on each provider's compute instances
-- GitHub Actions workflow to build downloadable QEMU ISOs (x86_64, aarch64)
-- GitHub Actions workflows to build and publish cloud-specific machine images
+Phase 7 delivered a *kernel core* on ARM: paging, exceptions, the GIC, the timer, the
+scheduler, and an in-kernel shell. What it did not deliver is everything above EL1 —
+userspace, storage, networking, containers, the management API. Phase 8 closes that gap.
+
+Parity has one measurable definition: the kernel's 54-test suite currently runs **54/54 on
+amd64 and 16/54 on aarch64**, with 38 tests carrying written skip reasons. Parity is that
+skip list reaching zero. Every sub-phase names which entries it retires, and three of the
+38 cannot be retired by porting at all — they are retired by reframing, with the decision
+made in the sub-phase that owns each.
+
+**Ten sub-phases plus a throwaway spike**:
+- **8.1–8.3 — VirtIO transport.** An arch-neutral device-discovery seam, then a
+  `VirtioTransport` trait with the PCI implementation extracted (both amd64-only refactors
+  with no intended behaviour change, each landing alone so "amd64 stays green" is a
+  checkable claim about one change), then virtio-mmio on QEMU `virt` — rings as Normal
+  memory, never Device, with explicit virtqueue barriers.
+- **8.4–8.5 — EL0.** User address spaces on `TTBR0_EL1`, SVC syscall entry, the drop to
+  EL0, per-task `SP_EL0`/`TPIDR_EL0`/FPSIMD state, `copy_from_user`/`copy_to_user`; then
+  `libthemelios`, six hand-written `_start` routines rewritten in aarch64 assembly, and the
+  server toolchain.
+- **8.6–8.7 — storage and networking** un-gated on aarch64.
+- **8.8–8.9 — the Linux personality** on the aarch64 syscall table (`asm-generic/unistd.h`),
+  which is a second table rather than a tweak.
+- **8.10 — containers and the management API** — the parity gate.
+
+The transport work goes first, ahead of EL0, even though EL0 holds the larger unknown: the
+spike retires that unknown, while the transport refactor touches *working* amd64 storage
+and networking and is best landed against a small tree with a clean bisect target.
+
+**Real ARM server hardware is deliberately not planned here.** Platform discovery, GICv3
+and its ITS, PCIe ECAM and MSI-X, SMP, cloud NICs and NVMe, secure boot and measured boot
+form their own phase, to be written when parity lands. Review of the draft found its error
+density concentrated in exactly that material — speculation about hardware nobody will
+touch for ten sub-phases — and a plan that is wrong is worse than one that says "not
+planned". What survived verification is kept as a seed list, including two findings worth
+recording now: **none of the three clouds runs virtio** (AWS Graviton is ENA + NVMe, GCP Arm
+VMs are gVNIC + NVMe with virtio-net explicitly unsupported, Azure Cobalt is MANA over
+VMBus), so none of Phase 8's virtio work runs on any of them; and `qemu-system-aarch64
+-M sbsa-ref` — GICv3, ACPI, TF-A + EDK2 firmware, no virtio at all, an entirely different
+memory map — is a genericity test costing a firmware image rather than hardware.
 
 ## Phase 9 — Testing and benchmarks (Not started)
 
