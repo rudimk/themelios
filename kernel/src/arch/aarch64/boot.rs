@@ -49,7 +49,12 @@
 use core::arch::asm;
 
 /// PL011 MMIO base on QEMU `virt`.
-const PL011_PHYS: u64 = 0x0900_0000;
+/// Physical base of the PL011, taken from the platform description rather than
+/// declared here. Kept as a named binding so the two use sites below read unchanged.
+#[inline]
+fn pl011_phys() -> u64 {
+    crate::platform::info().uart.base
+}
 
 // --- Page-table constants (4 KiB granule, 48-bit VA, 4-level) ---
 /// Mask selecting the output-address bits [47:12] of a descriptor.
@@ -248,10 +253,10 @@ pub fn kmain_aarch64(
 
     // Map the PL011 at its HHDM address (upper-half, currently unmapped) and install
     // the serial writer there.
-    let uart_va = hhdm + PL011_PHYS;
+    let uart_va = hhdm + pl011_phys();
     // SAFETY: `uart_va` is a TTBR1 address Limine left unmapped (device MMIO hole);
     // hhdm direct-maps RAM incl. the page tables we walk.
-    unsafe { map_device_page(k, hhdm, uart_va, PL011_PHYS) };
+    unsafe { map_device_page(k, hhdm, uart_va, pl011_phys()) };
     crate::arch::aarch64::serial::init(uart_va as usize);
 
     let current_el = {
@@ -279,6 +284,9 @@ pub fn kmain_aarch64(
         );
     }
     crate::println!("[boot] PL011 mapped + serial online");
+    // Name the platform the description came from. This is the line that makes a wrong
+    // provider obvious at a glance, and the one a discovery phase will change first.
+    crate::println!("[platform] {}", crate::platform::info().name);
     crate::println!("[boot] Phase 7.0b boot-to-banner reached.");
 
     // Install exception vectors before anything that can fault. Until this runs, a

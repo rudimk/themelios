@@ -8,8 +8,8 @@ class rather than a vendor.
 The single measurable definition of "parity" is already in the tree and already
 checked by CI:
 
-> `kernel/src/test_runner.rs` runs a **54-test** suite. On amd64, `SKIPPED` is empty and
-> all 54 run. On aarch64, **16 run and 38 are skipped**, each with a written reason.
+> `kernel/src/test_runner.rs` runs a **55-test** suite. On amd64, `SKIPPED` is empty and
+> all 55 run. On aarch64, **16 run and 39 are skipped**, each with a written reason.
 > **Parity is `SKIPPED.is_empty()` on both architectures.**
 
 Every sub-phase below states how many `SKIPPED` entries it retires, and *which ones*.
@@ -242,7 +242,7 @@ should perform, not assumptions the plan may make.
    gate. Phase 7 shipped an aarch64 fix that regressed x86's `mem` command; only the suite
    caught it.
 2. **The aarch64 suite is a gate too** (`cargo xtask test --arch aarch64`, live since
-   `fd65f0a`), and **`SUITE_SIZE = 54` is asserted at the top of `run_tests()`** so gate
+   `fd65f0a`), and **`SUITE_SIZE = 55` is asserted at the top of `run_tests()`** so gate
    drift is a loud failure, not a wrong total.
 3. **`SKIPPED` shrinks monotonically**, per the accounting table below.
 4. **Fresh branch + PR per sub-phase off latest `main`. Adversarial Momus review to
@@ -436,26 +436,90 @@ scheduler knows nothing about EL0 yet), and FPSIMD state across the boundary.
 
 ### Tier 1 — VirtIO transport (first, not fifth)
 
-#### 8.1 — Arch-neutral device discovery + `PlatformInfo`
+#### 8.1 — Arch-neutral device discovery + `PlatformInfo` — **DONE ✅**
 
-Amd64-only, **zero intended behavior change**. Deliver: `virtio::devices()` returning
-`(transport handle, device type)` replacing the `pci::devices_by_vendor` + class-filter
-idiom at ~35 call sites (31 in `test_runner.rs`, plus `net/mod.rs:90-95`,
-`fs/mod.rs:430-434`, `main.rs:497`); and `PlatformInfo` per decision 11 with one
-hard-coded provider each for x86 and QEMU `virt`.
+Amd64 call sites plus aarch64 constant plumbing; no behaviour change on either. (Not
+"amd64-only", as this entry first claimed — four aarch64 files changed, all of them
+no-ops.) Delivered:
 
-Wide but shallow, and it must land alone: a PR that moves 35 call sites *and* rewrites
-the register layer is not reviewable, and "amd64 green" would be a claim about two
-changes at once.
+- **`drivers::virtio::discovery`** — `VirtioKind`, an opaque `VirtioDevice`, and cached
+  `devices()` / `devices_of_kind()` / `first_of_kind()`, populated by `discovery::init()`
+  from `kmain`. `VirtioKind` is keyed on the **VirtIO device type** (spec §5), the one
+  numbering both transports carry.
+- **Transport-neutral driver entry points** — `VirtioBlk::init`, `VirtioNet::init`,
+  `VirtioTransport::init_for`. **Seventeen** call sites rewritten (15 in `test_runner.rs`,
+  plus `net/mod.rs` and `fs/mod.rs`); the only remaining `devices_by_vendor` caller is
+  `test_pci_scan`, which legitimately tests the PCI walk and is the one site reading
+  `dev.bars`.
+- **`crate::platform`** — `PlatformInfo` with one provider per architecture. The aarch64
+  UART base, GICD/GICC bases, UART INTID and timer PPI, **and x86's COM1 port**, are all
+  read from it. `[platform] …` printed at boot on both arches.
+- **`test_virtio_discovery`** — the committed baseline, plus `open_scratch_disk` in the
+  test suite.
 
-**Retires (0).**
-**Acceptance:** the amd64 suite is green and **the built kernel's behavior is unchanged
-by construction** — assert the same device set is discovered in the same order (print it
-and diff against a committed baseline). Falsifiability: reorder the returned device list
-and show the baseline diff fails.
-**Riskiest unknown:** whether any of the 31 test bodies depend on PCI-specific fields
-(BAR values, class codes) beyond identity. If so they need per-arch bodies, which is
-work 8.3 inherits.
+**Retires (0).** Suite 54 → 55.
+**Acceptance — met.** amd64 **55/0/0**; aarch64 **16 passed, 39 skipped, 55 total**; arm64
+smoke green.
+
+**Falsifiability — two demonstrations.** Breaking `devices_of_kind`'s filter reddens
+`test_virtio_discovery` alone, with "devices_of_kind(Block) disagrees with devices()".
+And reversing discovery order now leaves **all 55 green**, which is the point: see below.
+
+**Review found four defects in the first cut, all fixed here.** Recording them because
+two were the sub-phase's own claims about itself:
+
+1. **A latent data-corruption coupling, and a false claim about it.** The destructive
+   block tests took `first_of_kind(Block)` and relied on `xtask` attaching the scratch
+   image first. On aarch64 that inverts — QEMU `virt` maps `-device` arguments to
+   *decreasing* mmio slot addresses — so a kernel scanning upward would have written
+   `0xA5` into the ext2 volume's bitmaps, surfacing in 8.6/8.9/8.10 as ext2 bugs. Fixed by
+   signing sector 0 of the scratch image and probing for it, as the ext2 and SquashFS
+   tests already do. **And the original falsifiability write-up was wrong:** reversing
+   `devices()` reddened five tests, which this entry called proof that "the ordering is
+   load-bearing rather than incidental". Those tests select by content probe and are
+   order-independent; they failed because the reversal aimed a destructive write at the
+   wrong disk. Ordering was never a contract — it was a bug wearing one.
+2. **`test_virtio_discovery` asserted the sequence**, which is satisfiable on both arches
+   only by scanning slots *downward* — a QEMU-specific hack, and directly contrary to
+   8.3's instruction to treat slot index as meaningless. The assertion would have rewarded
+   the wrong implementation. Weakened to the multiset plus helper agreement, which is what
+   the seam actually owes its callers.
+3. **`VirtioKind` was keyed on the PCI class code.** Lossy (class `0x01` is *mass storage*,
+   so virtio-scsi and virtio-blk are indistinguishable — a live misclassification, since
+   `VirtioBlk::init` would have driven a SCSI device with its `debug_assert` passing) and
+   unportable (class and mmio `DeviceID` are unrelated schemes running opposite ways, so
+   `Other(n)` meant different devices per arch). Re-keyed on the device type.
+4. **`devices()` was uncached**, a contract only PCI can satisfy. On aarch64 it would map
+   32 MMIO windows per call through a bump allocator with no unmap.
+
+**Two shape corrections:** `PlatformInfo` gained `UartKind` (ACPI's SPCR names it, and it
+decides which driver binds), and `VirtioMmioWindow` was replaced by a `const fn`-built
+`&'static [PlatformDevice]` — restoring decision 11. The window's justification ("the form
+firmware actually reports it") was refuted by **this plan's own decision 12**: QEMU emits
+32 individual `virtio_mmio@` nodes, which is why it can set `dma-coherent` on every one.
+
+**The stated riskiest unknown resolved cleanly.** Exactly one call site depends on a
+PCI-specific field beyond identity (`test_pci_scan` reads `dev.bars`) — the test already
+earmarked for reframing in 8.3.
+
+**Two review passes, both REVISE, both applied.** One verified the zero-behaviour-change
+claim empirically — it diffed the amd64 guest serial output line by line against `main`
+and found the only differences are the three intended additions, with the PCI scan and
+every storage/net line byte-identical. It also counted every numeric claim and found them
+true. The other attacked whether the seam survives 8.3, and found the four defects above
+plus the shape corrections. Residue cleanup (13 dead `pci` imports, four sliced doc
+comments, two stale error strings, `pci()` narrowed from `pub(crate)` — which in a binary
+crate is effectively public — to `pub(in crate::drivers::virtio)`) landed with them.
+
+Two pieces of test infrastructure came out of it: the arm64 smoke now **asserts** the
+`[platform]` line rather than merely printing it, and the suite's hostfwd port is
+overridable with `THEMELIOS_TEST_PORT`. The fixed port made two concurrent runs collide
+and report as a test failure with no failing test — it cost time in this sub-phase twice
+and consumed most of one reviewer's verification budget.
+
+**Notes for 8.3:** discovery order is deliberately *not* asserted, so an ascending slot
+scan is free to differ from amd64's PCI order. `platform::info().virtio_mmio` is the
+aarch64 slot list, already populated. `discovery::init()` needs an aarch64 body.
 
 #### 8.2 — `VirtioTransport` → trait, PCI impl extracted
 
@@ -510,8 +574,10 @@ under TCG (effectively sequentially consistent) and is a classic silent corrupto
 out-of-order Neoverse. This is a larger TCG blind spot than coherence and v1 did not
 mention it at all.
 
-**Retires (7):** `test_virtio_transport`, `test_virtio_queue_failure`, `test_virtio_blk`,
-`test_block_server_ipc`, `test_virtio_net`, `test_net_service`, `test_pci_scan` (reframed).
+**Retires (8):** `test_virtio_discovery`, `test_virtio_transport`,
+`test_virtio_queue_failure`, `test_virtio_blk`, `test_block_server_ipc`, `test_virtio_net`,
+`test_net_service`, `test_pci_scan` (reframed). `test_virtio_discovery` is 8.1's baseline
+and comes back the moment the seam has an aarch64 provider.
 The first six need **no EL0 whatsoever** — `drivers::block_server` is an in-kernel
 `sched::spawn` task (`block_server.rs:120,138`), not a ring-3 server, and none of the six
 references `spawn_server`/`embedded::`.
@@ -521,7 +587,7 @@ reason is *"PCI enumeration is x86-only (aarch64 uses MMIO ECAM)"* — whose par
 already makes the right point, so it needs sharpening rather than replacing: it is the
 `0xCF8`/`0xCFC` **port-I/O mechanism** that is x86-only. aarch64 does have config space, via
 ECAM at `0x3f000000`, which the hardware phase would implement.
-**Acceptance:** the seven run and pass on aarch64. Plus, per the Phase 7.2 lesson that one
+**Acceptance:** the eight run and pass on aarch64. Plus, per the Phase 7.2 lesson that one
 tick would pass a dead timer: **(a)** a test reads back the leaf descriptor covering the
 virtqueue region and asserts `AttrIndx` equals the intended MAIR index, printing both —
 this fails the moment the attribute drifts, TCG or not; **(b)** boot emits a
@@ -828,7 +894,7 @@ commands still `#[cfg]`'d out, and the parity gate does not check parity.**
 network group but needs the management ABI *and* — its phase 3 is a live inbound smoke over
 `hostfwd 127.0.0.1:15007 → guest:7` with a host-side peer, `test_runner.rs:5399-5463` —
 8.7's xtask plumbing. Phases 1-2 are deterministic and in-process.)
-**Acceptance — the parity gate:** `SKIPPED` is **empty** on aarch64; **54 running, 0
+**Acceptance — the parity gate:** `SKIPPED` is **empty** on aarch64; **55 running, 0
 skipped on both architectures**; the six orphaned commands un-gated. **Not** "zero `#[cfg(target_arch)]` in `shell/mod.rs`":
 that file has **20** such sites, and the three in `shell::init()` (`:179`, `:184`, `:199` —
 per-arch UART RX-interrupt enable, interrupt-controller unmask, and the x86-only
@@ -919,25 +985,32 @@ checked. **A stub saying "not planned" is more accurate than a plan that is wron
 
 ## The ratchet — `SKIPPED` accounting
 
-The 38 entries, assigned. This table is the phase's progress bar and must sum to 38.
+The 39 entries, assigned. This table is the phase's progress bar and must sum to 39.
 
 | Sub-phase | Retires | Running | Remaining |
 |-----------|--------:|--------:|----------:|
-| (today)   |       — |      16 |        38 |
-| 8.1 discovery seam (amd64) | 0 | 16 | 38 |
-| 8.2 transport trait (amd64) | 0 | 16 | 38 |
-| **8.3 virtio-mmio** | **7** | 23 | 31 |
-| 8.4 user AS + SVC + EL0 | 3 | 26 | 28 |
-| 8.5 libthemelios + smokes | 4 | 30 | 24 |
-| 8.6 storage | 6 | 36 | 18 |
-| 8.7 networking | 7 | 43 | 11 |
-| 8.8 Linux dispatcher (amd64) | 0 | 43 | 11 |
-| 8.9 aarch64 Linux table | 4 | 47 | 7 |
-| **8.10 containers + mgmt** | **7** | **54** | **0** |
+| (today)   |       — |      16 |        39 |
+| ✅ 8.1 discovery seam (amd64) | 0 | 16 | 39 |
+| 8.2 transport trait (amd64) | 0 | 16 | 39 |
+| **8.3 virtio-mmio** | **8** | 24 | 31 |
+| 8.4 user AS + SVC + EL0 | 3 | 27 | 28 |
+| 8.5 libthemelios + smokes | 4 | 31 | 24 |
+| 8.6 storage | 6 | 37 | 18 |
+| 8.7 networking | 7 | 44 | 11 |
+| 8.8 Linux dispatcher (amd64) | 0 | 44 | 11 |
+| 8.9 aarch64 Linux table | 4 | 48 | 7 |
+| **8.10 containers + mgmt** | **7** | **55** | **0** |
 
-`7 + 3 + 4 + 6 + 7 + 4 + 7 = 38`. ✓
+`8 + 3 + 4 + 6 + 7 + 4 + 7 = 39`. ✓
 
-**Three of the 38 cannot be retired by porting** and are retired by *reframing*, each with
+**The suite grew from 54 to 55 in 8.1**, which added `test_virtio_discovery` — the
+committed baseline asserting that the discovery seam returns the same devices in the same
+order as the PCI walk it replaced. It is skipped on aarch64 until 8.3 gives the seam an
+aarch64 provider, which is why 8.3 now retires 8 rather than 7. `SUITE_SIZE` exists to
+catch *unintended* drift, not to forbid growth; both tables were updated together and the
+assertion passed on both architectures.
+
+**Three of the 39 cannot be retired by porting** and are retired by *reframing*, each with
 the decision made in the sub-phase that owns it rather than discovered at the parity gate:
 
 - **`test_pci_scan`** (8.3) — no port I/O on aarch64, ever. Becomes an arch-neutral

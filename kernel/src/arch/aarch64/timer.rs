@@ -29,7 +29,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::println;
 
 /// Interrupt ID of the EL1 virtual timer: PPI 27. Private to each core.
-pub const TIMER_INTID: u32 = 27;
+pub fn timer_intid() -> u32 {
+    crate::platform::info().timer_irq
+}
 
 /// Tick rate: one tick ≈ 10 ms, the same nominal rate as the x86 PIT so `arch::time`
 /// is comparable across architectures.
@@ -110,7 +112,7 @@ pub fn init() {
 
     // Route the timer's PPI through the interrupt controller before enabling the
     // timer, so the first expiry has somewhere to go.
-    super::gic::enable_intid(TIMER_INTID);
+    super::gic::enable_intid(timer_intid());
 
     // Arm the first deadline relative to now; every subsequent one is relative to the
     // previous deadline (see `handle_tick`).
@@ -119,7 +121,7 @@ pub fn init() {
 
     println!(
         "[timer] CNTV armed: {} Hz counter, reload {} → {} Hz tick (PPI {})",
-        freq, reload, TICK_HZ, TIMER_INTID
+        freq, reload, TICK_HZ, timer_intid()
     );
 }
 

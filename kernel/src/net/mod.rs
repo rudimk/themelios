@@ -80,19 +80,18 @@ pub const NET_ARG_DHCP: u64 = 1 << 48;
 pub fn boot_net() {
     #[cfg(target_arch = "x86_64")]
     {
-        use crate::drivers::pci;
         use crate::drivers::virtio::net::VirtioNet;
+        use crate::drivers::virtio::{self, VirtioKind};
         use crate::net::device::{self, NetDevice};
         use crate::process::embedded;
         use crate::process::server::{spawn_server, ServerConfig};
 
-        // Find the first VirtIO network device (vendor 0x1AF4, PCI class 0x02).
-        let devs = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID);
-        let nic_dev = match devs.iter().find(|d| d.class == 0x02) {
+        // Find the first VirtIO network device, without naming a bus.
+        let nic_dev = match virtio::first_of_kind(VirtioKind::Net) {
             Some(d) => d,
             None => return, // no NIC — nothing to bring up
         };
-        let nic = match VirtioNet::init_from_pci(nic_dev) {
+        let nic = match VirtioNet::init(&nic_dev) {
             Ok(n) => n,
             Err(_) => return,
         };

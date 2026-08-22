@@ -39,7 +39,16 @@ use crate::sync::InterruptMutex;
 
 /// Base I/O port address for COM1 (the first serial port).
 /// This is a standard x86 PC convention — COM1 is always at 0x3F8.
-const COM1_BASE: u16 = 0x3F8;
+/// COM1's I/O port, taken from the platform description rather than declared here.
+///
+/// The point of `crate::platform` is that a discovery phase can supply different values
+/// without editing drivers; a driver that keeps its own constant is not covered by that,
+/// and the description becomes a struct nothing reads. On x86 the "base" is a port
+/// number rather than an address — see `UartKind::X86Port`.
+#[inline]
+fn com1_base() -> u16 {
+    crate::platform::info().uart.base as u16
+}
 
 /// Register offsets from the base port address.
 /// Each register is one byte, accessed via I/O port reads/writes.
@@ -90,9 +99,15 @@ pub struct SerialPort {
 }
 
 impl SerialPort {
-    /// Create a new serial port handle for COM1 (0x3F8).
-    pub const fn com1() -> Self {
-        Self { base: COM1_BASE }
+    /// Create a new serial port handle for COM1.
+    ///
+    /// Not `const`: the port comes from `crate::platform`, and keeping *that* callable at
+    /// runtime is deliberate. A discovery phase has to compute `PlatformInfo` from parsed
+    /// ACPI or device-tree data, which a `const fn` could never return — so the accessor
+    /// must stay a normal function, and this constructor follows it. It has one caller,
+    /// at runtime, so nothing is lost.
+    pub fn com1() -> Self {
+        Self { base: com1_base() }
     }
 
     /// Initialize the UART hardware.

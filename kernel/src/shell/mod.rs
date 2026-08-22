@@ -187,7 +187,7 @@ pub fn init() {
         // An SPI, unlike the timer's PPI, is shared and must be targeted at a CPU;
         // `enable_intid` does that. It also asserts interrupts are masked, which they
         // are — `shell::init` runs from the boot path before the final unmask.
-        crate::arch::aarch64::gic::enable_intid(crate::arch::aarch64::gic::UART_INTID);
+        crate::arch::aarch64::gic::enable_intid(crate::arch::aarch64::gic::uart_intid());
     }
 
     // Spawn the shell task and register its ID for the receive-interrupt wakeup

@@ -30,6 +30,7 @@
 //! no offload features, so on TX we zero the header, and on RX we skip it — the
 //! `NetDevice` trait only ever exposes the pure Ethernet frame.
 
+use super::discovery::{VirtioDevice, VirtioKind};
 use crate::drivers::pci::PciDevice;
 use crate::mm::addr::PhysAddr;
 use crate::mm::frame;
@@ -97,6 +98,21 @@ pub struct VirtioNet {
 }
 
 impl VirtioNet {
+    /// Bring up a net device found by [`crate::drivers::virtio::discovery`].
+    ///
+    /// The transport-neutral entry point. Callers hand over a [`VirtioDevice`] and never
+    /// name PCI; when 8.2 turns the transport into a trait, only this function's body
+    /// changes, not the eighteen sites that call it.
+    pub fn init(dev: &VirtioDevice) -> Result<Self, VirtioError> {
+        debug_assert_eq!(
+            dev.kind(),
+            VirtioKind::Net,
+            "VirtioNet::init handed a {} device",
+            dev.kind().name()
+        );
+        Self::init_from_pci(dev.pci())
+    }
+
     /// Initialise a VirtIO network device from a discovered PCI function.
     ///
     /// Brings the transport up (handshake + feature negotiation + both queues),
