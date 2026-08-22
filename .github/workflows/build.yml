@@ -51,7 +51,7 @@ jobs:
           sudo apt-get install -y qemu-system-x86 xorriso squashfs-tools e2fsprogs
 
       - name: Run kernel tests
-        run: cargo xtask test
+        run: cargo xtask test --arch amd64
 
   arm64:
     name: aarch64 — build + boot + test suite (QEMU virt)
@@ -113,7 +113,7 @@ jobs:
         run: cargo xtask arm64-iso-smoke
 
       - name: Run the kernel test suite on QEMU virt
-        run: cargo xtask test --arch aarch64
+        run: cargo xtask test --arch arm64
 
   release:
     name: Release ISOs (amd64 + aarch64)
@@ -154,10 +154,10 @@ jobs:
           sudo apt-get install -y qemu-system-x86 xorriso squashfs-tools e2fsprogs
 
       - name: Build release ISO (amd64)
-        run: cargo xtask iso
+        run: cargo xtask iso --arch amd64
 
       - name: Build release ISO (aarch64)
-        run: cargo xtask iso --arch aarch64
+        run: cargo xtask iso --arch arm64
 
       - name: Extract build ULID
         id: ulid
