@@ -94,11 +94,6 @@ impl VirtioBlk {
     /// Maximum sectors transferable in one request (bounce buffer capacity).
     const BOUNCE_SECTORS: usize = BOUNCE_FRAMES * 4096 / SECTOR_SIZE;
 
-    /// Initialise a VirtIO block device from a discovered PCI function.
-    ///
-    /// Brings the transport up (handshake + feature negotiation + queue 0),
-    /// reads the device capacity, allocates the header/status/bounce DMA
-    /// buffers, and signals DRIVER_OK. The returned driver is ready for I/O.
     /// Bring up a block device found by [`crate::drivers::virtio::discovery`].
     ///
     /// The transport-neutral entry point. Callers hand over a [`VirtioDevice`] and never
@@ -114,6 +109,11 @@ impl VirtioBlk {
         Self::init_from_pci(dev.pci())
     }
 
+    /// Initialise a VirtIO block device from a discovered PCI function.
+    ///
+    /// Brings the transport up (handshake + feature negotiation + queue 0),
+    /// reads the device capacity, allocates the header/status/bounce DMA
+    /// buffers, and signals DRIVER_OK. The returned driver is ready for I/O.
     pub fn init_from_pci(dev: &PciDevice) -> Result<Self, VirtioError> {
         let transport = VirtioTransport::init(dev)?;
         // We need no device-specific feature bits for basic R/W — just the

@@ -637,6 +637,15 @@ pub struct VirtioTransport {
 }
 
 impl VirtioTransport {
+    /// Bring up the transport for a device found by [`discovery`].
+    ///
+    /// The transport-neutral entry point, mirroring `VirtioBlk::init`. Only the
+    /// transport self-test calls this directly; 8.2 replaces the body when
+    /// `VirtioTransport` becomes a trait with a virtio-mmio implementation.
+    pub fn init_for(dev: &VirtioDevice) -> Result<Self, VirtioError> {
+        Self::init(dev.pci())
+    }
+
     /// Discover and reset a VirtIO PCI device, leaving it ready for feature
     /// negotiation.
     ///
@@ -648,15 +657,6 @@ impl VirtioTransport {
     ///
     /// The caller continues with `negotiate_features`, `setup_queue`, and
     /// `set_driver_ok`.
-    /// Bring up the transport for a device found by [`discovery`].
-    ///
-    /// The transport-neutral entry point, mirroring `VirtioBlk::init`. Only the
-    /// transport self-test calls this directly; 8.2 replaces the body when
-    /// `VirtioTransport` becomes a trait with a virtio-mmio implementation.
-    pub fn init_for(dev: &VirtioDevice) -> Result<Self, VirtioError> {
-        Self::init(dev.pci())
-    }
-
     pub fn init(dev: &super::pci::PciDevice) -> Result<Self, VirtioError> {
         let mut common: Option<VirtAddr> = None;
         let mut notify_base: Option<VirtAddr> = None;

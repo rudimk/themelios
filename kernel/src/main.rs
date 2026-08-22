@@ -501,6 +501,11 @@ fn kmain_x86_64() -> ! {
     #[cfg(target_arch = "x86_64")]
     drivers::pci::scan();
 
+    // Enumerate VirtIO devices once, into the discovery cache. Must follow `pci::scan()`,
+    // which builds the table this filters.
+    #[cfg(target_arch = "x86_64")]
+    drivers::virtio::discovery::init();
+
     // Report what device discovery found, in discovery order. This is the human-readable
     // half of 8.1's acceptance criterion: the seam must return the same devices, in the
     // same order, as the PCI walk it replaced. Printed rather than only asserted, so a

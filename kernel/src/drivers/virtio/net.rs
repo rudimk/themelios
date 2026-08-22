@@ -98,11 +98,6 @@ pub struct VirtioNet {
 }
 
 impl VirtioNet {
-    /// Initialise a VirtIO network device from a discovered PCI function.
-    ///
-    /// Brings the transport up (handshake + feature negotiation + both queues),
-    /// reads the MAC/MTU, allocates the RX/TX DMA buffers, pre-posts the receive
-    /// buffers, and signals DRIVER_OK. The returned driver is ready for I/O.
     /// Bring up a net device found by [`crate::drivers::virtio::discovery`].
     ///
     /// The transport-neutral entry point. Callers hand over a [`VirtioDevice`] and never
@@ -118,6 +113,11 @@ impl VirtioNet {
         Self::init_from_pci(dev.pci())
     }
 
+    /// Initialise a VirtIO network device from a discovered PCI function.
+    ///
+    /// Brings the transport up (handshake + feature negotiation + both queues),
+    /// reads the MAC/MTU, allocates the RX/TX DMA buffers, pre-posts the receive
+    /// buffers, and signals DRIVER_OK. The returned driver is ready for I/O.
     pub fn init_from_pci(dev: &PciDevice) -> Result<Self, VirtioError> {
         let transport = VirtioTransport::init(dev)?;
         // Request MAC and MTU reporting; we negotiate no offload/mergeable

@@ -52,45 +52,96 @@
 //! that survives the move.
 
 use alloc::vec::Vec;
+use spin::Mutex;
 
 use crate::drivers::pci::{self, PciDevice};
 
 /// What a discovered VirtIO device *is*, independent of how it was found.
 ///
-/// On PCI this is derived from the class code; on virtio-mmio it will come from the
-/// `DeviceID` register, whose values are the VirtIO device-type numbers rather than PCI
-/// classes. Callers care about neither — they ask for a kind.
+/// The discriminants are **VirtIO device types** (VirtIO spec §5), which is the one
+/// numbering both transports actually carry:
+///
+/// - virtio-mmio reports it directly in the `DeviceID` register at offset `0x008`.
+/// - Modern virtio-PCI encodes it as `device_id - 0x1040`.
+/// - Transitional virtio-PCI uses the legacy `0x1000..=0x103F` block, which needs a
+///   small table.
+///
+/// **Not the PCI class code**, which is what 8.1 first used and which is wrong twice
+/// over. It is lossy: class `0x01` is *mass storage*, so virtio-scsi (type 8) and
+/// virtio-blk (type 2) are indistinguishable, and `VirtioBlk::init` would happily drive
+/// a SCSI device — with the `debug_assert_eq!` on `kind()` passing, because the
+/// misclassification happened upstream of the assert. And it is not portable: a PCI
+/// class and an mmio `DeviceID` are unrelated numbering schemes running in opposite
+/// directions (class `0x01` is block and `0x02` is net; type 1 is *net* and 2 is
+/// *block*), so an `Other(n)` keyed on class would mean different devices on the two
+/// architectures — inside a type whose entire purpose is to be platform-neutral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioKind {
-    /// Block device (virtio-blk). PCI class `0x01` (mass storage).
-    Block,
-    /// Network interface (virtio-net). PCI class `0x02` (network controller).
+    /// virtio-net, device type 1.
     Net,
-    /// A VirtIO device this kernel has no driver for. Carries the raw
-    /// platform-specific type byte purely for diagnostics.
-    Other(u8),
+    /// virtio-blk, device type 2.
+    Block,
+    /// A VirtIO device type this kernel has no driver for. Carries the spec §5 type
+    /// number, which means the same thing on every transport.
+    Other(u32),
 }
+
+/// Base of the modern virtio-PCI device-ID range: `0x1040 + device_type`.
+const VIRTIO_PCI_MODERN_BASE: u16 = 0x1040;
+/// First and last device IDs of the transitional (legacy) virtio-PCI range.
+const VIRTIO_PCI_LEGACY_FIRST: u16 = 0x1000;
+const VIRTIO_PCI_LEGACY_LAST: u16 = 0x103F;
 
 impl VirtioKind {
     /// Human-readable name, for boot lines and test failures.
     pub fn name(self) -> &'static str {
         match self {
-            VirtioKind::Block => "block",
             VirtioKind::Net => "net",
+            VirtioKind::Block => "block",
+            // Named for the common types so a boot line stays readable when we meet a
+            // device we do not drive.
+            VirtioKind::Other(3) => "console",
+            VirtioKind::Other(4) => "rng",
+            VirtioKind::Other(5) => "balloon",
+            VirtioKind::Other(8) => "scsi",
+            VirtioKind::Other(9) => "9p",
             VirtioKind::Other(_) => "unknown",
         }
     }
 
-    /// Classify a PCI class code.
-    ///
-    /// x86-specific by nature: the aarch64 provider will classify a virtio-mmio
-    /// `DeviceID` instead, and the two numbering schemes are unrelated.
-    fn from_pci_class(class: u8) -> Self {
-        match class {
-            0x01 => VirtioKind::Block,
-            0x02 => VirtioKind::Net,
+    /// Classify a VirtIO device type (spec §5) — the arch-neutral form.
+    pub fn from_device_type(ty: u32) -> Self {
+        match ty {
+            1 => VirtioKind::Net,
+            2 => VirtioKind::Block,
             other => VirtioKind::Other(other),
         }
+    }
+
+    /// Classify a virtio-PCI function from its `device_id`.
+    ///
+    /// Handles both the modern (`0x1040 +`) and transitional (`0x1000..=0x103F`)
+    /// encodings. The harness launches every device with `disable-legacy=on`, so in
+    /// practice only the modern path runs — the legacy table is there so a device that
+    /// slips through is classified rather than silently mislabelled.
+    fn from_pci_device_id(device_id: u16) -> Self {
+        if device_id >= VIRTIO_PCI_MODERN_BASE {
+            return Self::from_device_type((device_id - VIRTIO_PCI_MODERN_BASE) as u32);
+        }
+        if (VIRTIO_PCI_LEGACY_FIRST..=VIRTIO_PCI_LEGACY_LAST).contains(&device_id) {
+            // Transitional IDs are not `base + type`; they are their own table.
+            return match device_id {
+                0x1000 => VirtioKind::Net,
+                0x1001 => VirtioKind::Block,
+                0x1002 => VirtioKind::Other(5), // balloon
+                0x1003 => VirtioKind::Other(3), // console
+                0x1004 => VirtioKind::Other(8), // scsi
+                0x1005 => VirtioKind::Other(4), // rng
+                0x1009 => VirtioKind::Other(9), // 9p
+                other => VirtioKind::Other(other as u32),
+            };
+        }
+        VirtioKind::Other(device_id as u32)
     }
 }
 
@@ -121,17 +172,60 @@ impl VirtioDevice {
     }
 }
 
-/// Every VirtIO device on this machine, in a stable order.
+/// The discovered device list, populated once by [`init`].
 ///
-/// See the module docs on why the order is part of the contract.
-pub fn devices() -> Vec<VirtioDevice> {
-    pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID)
+/// **Discovery is cached, and that is a portability requirement rather than an
+/// optimisation.** On x86 `pci::devices_by_vendor` is a filtered clone of a `Vec` that
+/// `pci::scan()` already built, so re-enumerating is nearly free and callers may treat
+/// it as such — `devices_of_kind` and `first_of_kind` both call `devices()`, and some
+/// tests call it several times.
+///
+/// virtio-mmio cannot honour that contract. Answering "what devices are there" means
+/// mapping and reading 32 MMIO windows, and `mm::mmio::map` is a bump allocator with no
+/// de-duplication and **no unmap** — every call burns fresh virtual address space and
+/// page-table frames. An uncached `devices()` would leak 32 mappings per call across
+/// every call site in the suite, and the symptom would be an exhausted allocator in a
+/// much later sub-phase, nowhere near the cause.
+///
+/// Caching here means each transport is enumerated exactly once, on either
+/// architecture, and gives an aarch64 implementation somewhere to keep the mapped
+/// address rather than re-deriving it.
+static DEVICES: Mutex<Option<Vec<VirtioDevice>>> = Mutex::new(None);
+
+/// Enumerate the platform's VirtIO devices, once.
+///
+/// Called from `kmain` after the bus/transport layer is ready — on x86 that means after
+/// `pci::scan()`, since this filters the table that populates. Idempotent: a second call
+/// is a no-op, so a test that runs before boot finished cannot double-enumerate.
+pub fn init() {
+    let mut slot = DEVICES.lock();
+    if slot.is_some() {
+        return;
+    }
+    let found: Vec<VirtioDevice> = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID)
         .into_iter()
         .map(|pci| VirtioDevice {
-            kind: VirtioKind::from_pci_class(pci.class),
+            kind: VirtioKind::from_pci_device_id(pci.device_id),
             pci,
         })
-        .collect()
+        .collect();
+    *slot = Some(found);
+}
+
+/// Every VirtIO device on this machine, in a stable order.
+///
+/// See the module docs on why the order is documented, and [`DEVICES`] on why the
+/// enumeration is cached. Enumerates on first use if [`init`] has not run, so a caller
+/// that arrives early still gets an answer rather than an empty list.
+pub fn devices() -> Vec<VirtioDevice> {
+    {
+        let slot = DEVICES.lock();
+        if let Some(devs) = slot.as_ref() {
+            return devs.clone();
+        }
+    }
+    init();
+    DEVICES.lock().as_ref().cloned().unwrap_or_default()
 }
 
 /// Every VirtIO device of one kind, in discovery order.
@@ -141,7 +235,10 @@ pub fn devices_of_kind(kind: VirtioKind) -> Vec<VirtioDevice> {
 
 /// The first VirtIO device of one kind, or `None`.
 ///
-/// The overwhelmingly common case: there is exactly one disk and one NIC.
+/// Convenient, and safe for anything read-only — but **never** use it to pick a target
+/// for a destructive operation. "First" is a property of this platform's enumeration
+/// order, not of the device, and the two disagree between architectures. A test that
+/// writes must identify its disk by content; see `open_scratch_disk` in the test suite.
 pub fn first_of_kind(kind: VirtioKind) -> Option<VirtioDevice> {
     devices().into_iter().find(|d| d.kind == kind)
 }
