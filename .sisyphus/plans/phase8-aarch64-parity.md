@@ -358,30 +358,79 @@ VirtIO transport work goes first, EL0 second. Rationale in the sequencing sectio
 
 ---
 
-### 8.spike — throwaway EL0 round-trip spike
+### 8.spike — throwaway EL0 round-trip spike — **DONE ✅**
 
-Mirrors `7.spike`: retire the highest-uncertainty item on a **throwaway branch** before
-merged work depends on it. This is what discharges "do the biggest unknown first" — *not*
-the ordering of the merged sub-phases.
+Ran on QEMU 8.2.2 `virt` (`-cpu cortex-a72`, AAVMF, Limine). Throwaway code, not committed.
+**All seven goals retired; every one answered as hoped, and the run surfaced three things
+the plan had wrong or unstated.** Findings below; sub-phase 8.4 is updated accordingly.
 
-- (a) Build a `TTBR0_EL1` tree, clear `EPD0`, map one page of hand-written EL0 code + one
-  stack page, `eret` into it with `SPSR_EL1.M = 0b0000` (EL0t); confirm it executes.
-- (b) From EL0, `svc #0` → confirm the `0x400` sync slot fires with `ESR_EL1.EC = 0x15`
-  and `SP_EL1` is the kernel stack.
-- (c) `eret` back and confirm the process continues — the full round trip.
-- (d) `TPIDR_EL0` readable/writable from EL0 and surviving a round trip.
-- (e) **Measure the vector-slot budget.** The SVC path needs a fuller register save than
-  the fatal reporter's, in 128 bytes of slot.
-- (f) **Confirm the `SPSR_EL1.M` hazard is real:** deliberately `eret` with `M = 0b0100`
-  and confirm it returns to **EL1**; deliberately `eret` with `M = 0b0001` (Reserved) and
-  confirm `PSTATE.IL` fires and the node halts. Both are the justification for 8.4's
-  validation step; confirm them before writing the code that assumes them.
-- (g) Confirm whether PAN prevents EL1 from touching EL0-accessible pages (this decides
-  whether 8.4's alias test must run from EL0).
+**Results — the round trip works, first try.**
 
-**Acceptance:** all seven answered, findings written back into this file. Throwaway.
-**Riskiest unknown:** (e) — whether SVC entry fits the slot budget or needs the common-body
-trampoline restructured.
+| Goal | Result |
+|---|---|
+| (a) `eret` into EL0 executes | **✅** first-trap `x0 = 0x5000_0001`, the payload's magic |
+| (b) slot + syndrome | **✅** vector tag **8**, `ESR_EL1.EC = 0x15`, `SPSR_EL1.M[3:0] = 0x0` (EL0t), `SP_EL0 = 0x411000` |
+| (c) full round trip | **✅** 2 `svc` traps taken and resumed |
+| (d) `TPIDR_EL0` | **✅** seeded `0x2200` at EL1, EL0 read/modified/wrote it, EL1 read back `0x2211` |
+| (e) vector-slot budget | **✅ not a constraint** — see below |
+| (f1) `SPSR_EL1.M` escalation | **✅ confirmed** — one field redirects `eret` from EL0 to EL1 |
+| (f2) reserved `M` → `PSTATE.IL` | **✅ confirmed** — node halts, exactly as predicted |
+| (g) PAN | **✅ absent on this CPU** — EL1 may read user VAs |
+
+**(e) is retired, not merely measured — the slot budget was never the risk.** The plan
+inherited "the SVC path needs a fuller register save … in 128 bytes of slot" from v1, but
+Phase 7.2 already solved this: each slot holds a **4-instruction, 16-byte trampoline**
+(`sub sp`, `stp x0/x1`, `mov x1, #tag`, `b aarch64_exc_common`) and the frame is built in
+the *shared body*. Verified by disassembly: all 16 slots at exact 128-byte spacing, tags
+0-15 in order, slot 8 at `+0x400`, **112 bytes spare per slot**. What SVC adds (`SP_EL0`,
+`TPIDR_EL0`) costs *frame* bytes, not slot bytes — the frame is 288 with ~8 spare, so it
+grows to 304. **The plan's stated riskiest unknown for this spike does not exist.**
+
+**(f2) confirms the mechanism precisely, including a number the review could not verify.**
+`eret` with `SPSR_EL1.M = 0b0001` produced:
+`ESR_EL1 = 0x3a00_0000` → **`EC = 0x0E`**, taken through **slot 4** (current EL, SP_ELx —
+i.e. **EL1 → EL1**), with `SPSR = 0x0010_03c5`: `M = 0b0101` (EL1h) and **bit 20,
+`PSTATE.IL`, set**. The PE stayed at EL1 on `SP_EL1` and the *next instruction fetch*
+faulted — which is exactly the mechanism the plan described from the ARM ARM pseudocode.
+The cold-read reviewer flagged `EC = 0x0E` as the one number they could not independently
+confirm; it is now confirmed empirically.
+*Small follow-on:* the kernel's `slot_name`/EC decoder prints `EC=0x0e (unclassified)`.
+8.4 should name it — an illegal-return bug is hard enough to reason about without the
+reporter shrugging at it.
+
+**(g) PAN is not implemented on `cortex-a72`** (`ID_AA64MMFR1_EL1.PAN = 0`, and
+`SCTLR_EL1.SPAN = 1`). An EL1 read through the *user* VA returned the same word as the HHDM
+read of the same frame. **So 8.4's alias test may run its checks from EL1.** Note this is a
+property of the *emulated CPU*, not of the port: PAN is armv8.1 and real server parts
+implement it, so anything that depends on EL1-touches-user-VA must be revisited when the
+hardware phase picks a real target. The kernel reaches user frames through the HHDM anyway,
+so nothing in the design depends on it.
+
+**Three findings the plan did not have:**
+
+1. **`ELR_EL1` points *after* the `svc`, not at it — measured delta = 4.** `brk` is the
+   opposite (`exceptions.rs` advances `frame.elr += 4` precisely because `ELR` points *at*
+   the trapping instruction). **The SVC path must NOT advance `ELR`**, and a copy-paste
+   from the `brk` arm would silently skip the instruction after every syscall. This is the
+   single most likely implementation slip in 8.4 and nothing in the plan warned about it.
+2. **The exception exit stub restores *all* of `x0`-`x30` from the frame — and on a
+   lower-EL exception that frame holds EL0's register values.** So control arriving back at
+   EL1 by `eret` comes with userspace's registers in every GPR, callee-saved included. The
+   spike's `enter_el0` had to be hand-written `naked` for this reason: a compiler-generated
+   frame cannot survive it, and `clobber_abi("C")` is insufficient because it covers only
+   caller-saved registers. **8.4's kernel-side syscall context must live somewhere other
+   than the GPRs** — which is the same conclusion the `SP_EL0`/`TPIDR_EL0` analysis reached
+   from a different direction, and is worth stating once as a general rule.
+3. **A genuinely empty `TTBR0_EL1` tree works, and `EPD0` is the live switch.** Building an
+   L0 from a zeroed frame (copying nothing, per decision 5) and clearing `TCR_EL1.EPD0`
+   moved TCR from `0x…2590` to `0x…2510` with the kernel continuing to run normally off
+   `TTBR1_EL1`. Confirms both halves of decision 5 and that the `EPD0` clear is not
+   disruptive to the live kernel regime.
+
+**Unchanged assumptions the spike did *not* test**, and which therefore remain open into
+8.4: ASID allocation and rollover (the spike used a single space and never switched),
+preemption during a syscall (DAIF was fully masked throughout — deliberately, since the
+scheduler knows nothing about EL0 yet), and FPSIMD state across the boundary.
 
 ---
 
@@ -516,7 +565,12 @@ activation, `TCR_EL1.EPD0` cleared, `TLBI ASIDE1IS` with the 7.1 barrier discipl
 `verify_tcr` extended to T0SZ; the `arch::syscall` / `arch::cpu` **facades that do not
 exist** (~15 items, 7 consumers); an aarch64 `SyscallFrame`; `copy_from_user`/`copy_to_user`
 bounded by `2^(64 - T0SZ)` per decision 4; the `0x400` sync slot decoding `EC = 0x15` into
-syscall dispatch, **keyed on slot first** so an EL1-originated `svc` stays fatal;
+syscall dispatch, **keyed on slot first** so an EL1-originated `svc` stays fatal, and
+**without advancing `ELR_EL1`** — 8.spike measured the delta as 4, i.e. `ELR` already
+points past the `svc`, the opposite of `brk`, whose arm in the same `match` does
+`frame.elr += 4`. Copying that line into the SVC arm would skip one instruction after
+every syscall. Also name `EC = 0x0E` (Illegal Execution State) in the decoder, which
+currently prints "unclassified" for the exact syndrome an illegal return produces;
 `TPIDR_EL0` TLS; the `v0`-`v31` + `FPCR`/`FPSR` save area per decision 8; `sched`'s ring-3
 fields un-`cfg`'d with aarch64 meanings.
 
@@ -538,6 +592,14 @@ fields un-`cfg`'d with aarch64 meanings.
   way about neighbouring registers — `exceptions.rs:204` says of `ELR_EL1`/`SPSR_EL1` that
   they are *"single system registers, not per-task storage."* The identical logic applies
   to `SP_EL0`, `ESR_EL1` and `FAR_EL1`.
+- **No kernel state may live in a GPR across the boundary — the general form of the two
+  bullets above.** 8.spike found that the exception exit stub restores *all* of `x0`-`x30`
+  from the frame, and on a lower-EL exception that frame holds **EL0's** values. So any
+  path that arrives back at EL1 through `eret` does so with userspace's registers in every
+  GPR, callee-saved included; `clobber_abi("C")` cannot express it (it covers only
+  caller-saved), and the spike's entry helper had to be hand-written `naked` as a result.
+  Kernel-side syscall context belongs in the task structure or the frame, never in a
+  register the exit path will overwrite.
 - **`TPIDR_EL0`** — the same fix applied to a second register. `TPIDR_EL1` was already
   structurally fixed in 7.3 (rewritten on every switch); `TPIDR_EL0` needs the same, and
   the current context switch (`context.rs`) saves x19-x30 only, 96 bytes, with neither
