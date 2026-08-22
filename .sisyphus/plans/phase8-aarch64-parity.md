@@ -8,8 +8,8 @@ class rather than a vendor.
 The single measurable definition of "parity" is already in the tree and already
 checked by CI:
 
-> `kernel/src/test_runner.rs` runs a **54-test** suite. On amd64, `SKIPPED` is empty and
-> all 54 run. On aarch64, **16 run and 38 are skipped**, each with a written reason.
+> `kernel/src/test_runner.rs` runs a **55-test** suite. On amd64, `SKIPPED` is empty and
+> all 55 run. On aarch64, **16 run and 39 are skipped**, each with a written reason.
 > **Parity is `SKIPPED.is_empty()` on both architectures.**
 
 Every sub-phase below states how many `SKIPPED` entries it retires, and *which ones*.
@@ -242,7 +242,7 @@ should perform, not assumptions the plan may make.
    gate. Phase 7 shipped an aarch64 fix that regressed x86's `mem` command; only the suite
    caught it.
 2. **The aarch64 suite is a gate too** (`cargo xtask test --arch aarch64`, live since
-   `fd65f0a`), and **`SUITE_SIZE = 54` is asserted at the top of `run_tests()`** so gate
+   `fd65f0a`), and **`SUITE_SIZE = 55` is asserted at the top of `run_tests()`** so gate
    drift is a loud failure, not a wrong total.
 3. **`SKIPPED` shrinks monotonically**, per the accounting table below.
 4. **Fresh branch + PR per sub-phase off latest `main`. Adversarial Momus review to
@@ -436,26 +436,47 @@ scheduler knows nothing about EL0 yet), and FPSIMD state across the boundary.
 
 ### Tier 1 — VirtIO transport (first, not fifth)
 
-#### 8.1 — Arch-neutral device discovery + `PlatformInfo`
+#### 8.1 — Arch-neutral device discovery + `PlatformInfo` — **DONE ✅**
 
-Amd64-only, **zero intended behavior change**. Deliver: `virtio::devices()` returning
-`(transport handle, device type)` replacing the `pci::devices_by_vendor` + class-filter
-idiom at ~35 call sites (31 in `test_runner.rs`, plus `net/mod.rs:90-95`,
-`fs/mod.rs:430-434`, `main.rs:497`); and `PlatformInfo` per decision 11 with one
-hard-coded provider each for x86 and QEMU `virt`.
+Amd64-only, zero behaviour change. Delivered:
 
-Wide but shallow, and it must land alone: a PR that moves 35 call sites *and* rewrites
-the register layer is not reviewable, and "amd64 green" would be a claim about two
-changes at once.
+- **`drivers::virtio::discovery`** — `VirtioKind`, an opaque `VirtioDevice`, and
+  `devices()` / `devices_of_kind()` / `first_of_kind()`. The `PciDevice` is still carried
+  inside (8.2's job to remove) but is `pub(crate)` and invisible to callers.
+- **Transport-neutral driver entry points** — `VirtioBlk::init`, `VirtioNet::init`,
+  `VirtioTransport::init_for`, each taking a `&VirtioDevice`. Eighteen call sites (16 in
+  `test_runner.rs`, plus `net/mod.rs` and `fs/mod.rs`) rewritten; the only remaining
+  `devices_by_vendor` caller is `test_pci_scan`, which legitimately tests the PCI walk.
+- **`crate::platform`** — `PlatformInfo` with one hard-coded provider per architecture, and
+  the aarch64 UART base, GICD/GICC bases, UART INTID and timer PPI all now *read from it*
+  rather than declared beside their drivers. A `[platform] …` line is printed at boot on
+  both arches.
+- **`test_virtio_discovery`** — the committed baseline.
 
-**Retires (0).**
-**Acceptance:** the amd64 suite is green and **the built kernel's behavior is unchanged
-by construction** — assert the same device set is discovered in the same order (print it
-and diff against a committed baseline). Falsifiability: reorder the returned device list
-and show the baseline diff fails.
-**Riskiest unknown:** whether any of the 31 test bodies depend on PCI-specific fields
-(BAR values, class codes) beyond identity. If so they need per-arch bodies, which is
-work 8.3 inherits.
+**Retires (0).** Suite 54 → 55.
+**Acceptance — met.** amd64 **55 passed, 0 failed, 0 skipped**, three consecutive clean
+runs; aarch64 **16 passed, 39 skipped, 55 total**; `[virtio] discovery: 4 device(s): block
+block block net` matches the harness's three disks and one NIC; `[platform] QEMU virt
+(aarch64, GICv2)` and `[platform] x86_64 PC (ports, 8259, PIT)` confirm both providers are
+live. **Falsifiability demonstrated:** reversing the order in `devices()` turns
+`test_virtio_discovery` red with "unexpected kind sequence" — and *also* reddens
+`test_ext2_read`, `test_ext2_write`, `test_linux_fs`, `test_container_run` and
+`test_container_isolation`, which proves the ordering is load-bearing rather than
+incidental.
+
+**The stated riskiest unknown resolved cleanly.** The question was whether any call site
+depends on PCI-specific fields beyond identity. Exactly **one** does — `test_pci_scan`
+reads `dev.bars` — and it is the test already earmarked for reframing in 8.3. Every other
+site used only `.class`. That is why the seam went in without per-arch test bodies.
+
+**Deviation from decision 11, recorded:** the sketch said `virtio_slots: &[PlatformDevice]`.
+The aarch64 provider would have had to spell out 32 entries differing only by arithmetic,
+so `PlatformInfo` carries a `VirtioMmioWindow { base, stride, count, first_irq }` instead —
+the form firmware actually reports, and the form 8.3 can scan directly.
+
+**Note for 8.3:** the discovery *order* is now asserted, and on QEMU `virt` command-line
+order maps to *decreasing* virtio-mmio base addresses. Whatever 8.3 does about that, it
+has to face `test_virtio_discovery` rather than quietly inherit a different set.
 
 #### 8.2 — `VirtioTransport` → trait, PCI impl extracted
 
@@ -510,8 +531,10 @@ under TCG (effectively sequentially consistent) and is a classic silent corrupto
 out-of-order Neoverse. This is a larger TCG blind spot than coherence and v1 did not
 mention it at all.
 
-**Retires (7):** `test_virtio_transport`, `test_virtio_queue_failure`, `test_virtio_blk`,
-`test_block_server_ipc`, `test_virtio_net`, `test_net_service`, `test_pci_scan` (reframed).
+**Retires (8):** `test_virtio_discovery`, `test_virtio_transport`,
+`test_virtio_queue_failure`, `test_virtio_blk`, `test_block_server_ipc`, `test_virtio_net`,
+`test_net_service`, `test_pci_scan` (reframed). `test_virtio_discovery` is 8.1's baseline
+and comes back the moment the seam has an aarch64 provider.
 The first six need **no EL0 whatsoever** — `drivers::block_server` is an in-kernel
 `sched::spawn` task (`block_server.rs:120,138`), not a ring-3 server, and none of the six
 references `spawn_server`/`embedded::`.
@@ -521,7 +544,7 @@ reason is *"PCI enumeration is x86-only (aarch64 uses MMIO ECAM)"* — whose par
 already makes the right point, so it needs sharpening rather than replacing: it is the
 `0xCF8`/`0xCFC` **port-I/O mechanism** that is x86-only. aarch64 does have config space, via
 ECAM at `0x3f000000`, which the hardware phase would implement.
-**Acceptance:** the seven run and pass on aarch64. Plus, per the Phase 7.2 lesson that one
+**Acceptance:** the eight run and pass on aarch64. Plus, per the Phase 7.2 lesson that one
 tick would pass a dead timer: **(a)** a test reads back the leaf descriptor covering the
 virtqueue region and asserts `AttrIndx` equals the intended MAIR index, printing both —
 this fails the moment the attribute drifts, TCG or not; **(b)** boot emits a
@@ -828,7 +851,7 @@ commands still `#[cfg]`'d out, and the parity gate does not check parity.**
 network group but needs the management ABI *and* — its phase 3 is a live inbound smoke over
 `hostfwd 127.0.0.1:15007 → guest:7` with a host-side peer, `test_runner.rs:5399-5463` —
 8.7's xtask plumbing. Phases 1-2 are deterministic and in-process.)
-**Acceptance — the parity gate:** `SKIPPED` is **empty** on aarch64; **54 running, 0
+**Acceptance — the parity gate:** `SKIPPED` is **empty** on aarch64; **55 running, 0
 skipped on both architectures**; the six orphaned commands un-gated. **Not** "zero `#[cfg(target_arch)]` in `shell/mod.rs`":
 that file has **20** such sites, and the three in `shell::init()` (`:179`, `:184`, `:199` —
 per-arch UART RX-interrupt enable, interrupt-controller unmask, and the x86-only
@@ -919,25 +942,32 @@ checked. **A stub saying "not planned" is more accurate than a plan that is wron
 
 ## The ratchet — `SKIPPED` accounting
 
-The 38 entries, assigned. This table is the phase's progress bar and must sum to 38.
+The 39 entries, assigned. This table is the phase's progress bar and must sum to 39.
 
 | Sub-phase | Retires | Running | Remaining |
 |-----------|--------:|--------:|----------:|
-| (today)   |       — |      16 |        38 |
-| 8.1 discovery seam (amd64) | 0 | 16 | 38 |
-| 8.2 transport trait (amd64) | 0 | 16 | 38 |
-| **8.3 virtio-mmio** | **7** | 23 | 31 |
-| 8.4 user AS + SVC + EL0 | 3 | 26 | 28 |
-| 8.5 libthemelios + smokes | 4 | 30 | 24 |
-| 8.6 storage | 6 | 36 | 18 |
-| 8.7 networking | 7 | 43 | 11 |
-| 8.8 Linux dispatcher (amd64) | 0 | 43 | 11 |
-| 8.9 aarch64 Linux table | 4 | 47 | 7 |
-| **8.10 containers + mgmt** | **7** | **54** | **0** |
+| (today)   |       — |      16 |        39 |
+| ✅ 8.1 discovery seam (amd64) | 0 | 16 | 39 |
+| 8.2 transport trait (amd64) | 0 | 16 | 39 |
+| **8.3 virtio-mmio** | **8** | 24 | 31 |
+| 8.4 user AS + SVC + EL0 | 3 | 27 | 28 |
+| 8.5 libthemelios + smokes | 4 | 31 | 24 |
+| 8.6 storage | 6 | 37 | 18 |
+| 8.7 networking | 7 | 44 | 11 |
+| 8.8 Linux dispatcher (amd64) | 0 | 44 | 11 |
+| 8.9 aarch64 Linux table | 4 | 48 | 7 |
+| **8.10 containers + mgmt** | **7** | **55** | **0** |
 
-`7 + 3 + 4 + 6 + 7 + 4 + 7 = 38`. ✓
+`8 + 3 + 4 + 6 + 7 + 4 + 7 = 39`. ✓
 
-**Three of the 38 cannot be retired by porting** and are retired by *reframing*, each with
+**The suite grew from 54 to 55 in 8.1**, which added `test_virtio_discovery` — the
+committed baseline asserting that the discovery seam returns the same devices in the same
+order as the PCI walk it replaced. It is skipped on aarch64 until 8.3 gives the seam an
+aarch64 provider, which is why 8.3 now retires 8 rather than 7. `SUITE_SIZE` exists to
+catch *unintended* drift, not to forbid growth; both tables were updated together and the
+assertion passed on both architectures.
+
+**Three of the 39 cannot be retired by porting** and are retired by *reframing*, each with
 the decision made in the sub-phase that owns it rather than discovered at the parity gate:
 
 - **`test_pci_scan`** (8.3) — no port I/O on aarch64, ever. Becomes an arch-neutral
