@@ -522,7 +522,22 @@ fn virtio_net_args(id: &str) -> Vec<String> {
 
 /// Host TCP port forwarded to the guest's TCP listener (guest port 7) during
 /// `cargo xtask test`, for the Phase 6.5 `test_api_server` HTTP round-trip.
-const TCP_TEST_HOST_PORT: u16 = 15007;
+/// Host port the TCP/api-server tests forward to the guest.
+///
+/// Overridable via `THEMELIOS_TEST_PORT`, because the default is a *fixed* port and QEMU
+/// refuses to start when it is already bound: `Could not set up host forwarding rule`.
+/// Two suite runs on one host therefore collide, and so does a run started while a
+/// previous QEMU is still shutting down — which reports as a test failure with no failing
+/// test, several minutes into the run. Both a parallel CI job and a second developer
+/// shell hit this.
+fn tcp_test_host_port() -> u16 {
+    match std::env::var("THEMELIOS_TEST_PORT") {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            panic!("THEMELIOS_TEST_PORT is set to {v:?}, which is not a port number")
+        }),
+        Err(_) => 15007,
+    }
+}
 /// Guest TCP port the api-server test listens on (reuses the existing hostfwd).
 const TCP_TEST_GUEST_PORT: u16 = 7;
 
@@ -581,7 +596,7 @@ fn spawn_tcp_test_peer() {
     }
 
     std::thread::spawn(|| {
-        let sa: SocketAddr = match format!("127.0.0.1:{TCP_TEST_HOST_PORT}").parse() {
+        let sa: SocketAddr = match format!("127.0.0.1:{}", tcp_test_host_port()).parse() {
             Ok(a) => a,
             Err(_) => return,
         };
@@ -1241,6 +1256,19 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
         eprintln!("arm64 {what} smoke FAILED: kernel reported '{f}' (see serial above).");
         process::exit(1);
     }
+    // The platform description is what every driver now takes its device bases and
+    // interrupt numbers from, so a wrong provider is a wrong machine. `platform.rs` calls
+    // this "the line that makes a wrong provider obvious" — which is only true if
+    // something looks at it.
+    const PLATFORM_LINE: &str = "[platform] QEMU virt (aarch64, GICv2)";
+    if !serial.contains(PLATFORM_LINE) {
+        eprintln!(
+            "arm64 {what} smoke FAILED: expected '{PLATFORM_LINE}' in the boot log — the \
+             platform provider is wrong or missing."
+        );
+        process::exit(1);
+    }
+
     if !found {
         if qemu_exited {
             eprintln!(
@@ -1692,7 +1720,7 @@ fn cmd_test(args: &[String]) {
     // rule maps host 127.0.0.1:TCP_TEST_HOST_PORT → guest :TCP_TEST_GUEST_PORT so
     // the host-side peer below can reach `test_tcp_server`'s listener.
     let hostfwd = format!(
-        "hostfwd=tcp:127.0.0.1:{TCP_TEST_HOST_PORT}-:{TCP_TEST_GUEST_PORT}"
+        "hostfwd=tcp:127.0.0.1:{}-:{TCP_TEST_GUEST_PORT}", tcp_test_host_port()
     );
     cmd.args(virtio_net_args_fwd("net0", Some(&hostfwd)));
 
