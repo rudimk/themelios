@@ -288,7 +288,8 @@ parity — see above.**
   PL011 RX via `IMSC` `RXIM`+`RTIM` (the timeout matters on real parts; QEMU hard-codes
   `read_trigger=1` and never raises `INT_RT`, so `RXIM` alone carries it there), acked
   **before** draining — the reverse order can wedge the console permanently, since QEMU
-  raises RX only on the FIFO's 0→1 transition, UART on **SPI 1 = INTID 33**, 8 of 25 commands with the
+  raises RX only on the FIFO's 0→1 transition, UART on **SPI 1 = INTID 33**, 8 of 25 commands (11 of 28
+  since `shutdown`/`reboot`/`exit` landed) with the
   rest `#[cfg]`'d out of dispatcher, impls *and* help text. Three defects the tests
   caught: `test_page_tables` assumed 1 MiB is RAM (true on a PC, an unbacked hole on
   `virt`); the suite ran with interrupts in whatever state boot left them, enabled only

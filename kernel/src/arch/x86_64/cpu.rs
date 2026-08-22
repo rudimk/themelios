@@ -96,6 +96,28 @@ pub unsafe fn outl(port: u16, value: u32) {
     }
 }
 
+/// Write a 16-bit (word) value to an x86 I/O port.
+///
+/// This executes the `out dx, ax` instruction. ACPI's power-management control
+/// registers are word-wide — `PM1a_CNT`, the register that requests a transition to
+/// soft-off, is the case this exists for (see [`super::power`]).
+///
+/// # Safety
+///
+/// Writing to an I/O port can have arbitrary side effects on hardware. The caller must
+/// ensure the port number is valid and the write is appropriate for the device there.
+#[inline(always)]
+pub unsafe fn outw(port: u16, value: u16) {
+    unsafe {
+        asm!(
+            "out dx, ax",
+            in("dx") port,
+            in("ax") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
 /// Read a 32-bit (double word) value from an x86 I/O port.
 ///
 /// This executes the `in eax, dx` instruction, which reads a 32-bit value
