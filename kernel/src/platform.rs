@@ -30,6 +30,31 @@
 //! arithmetic. [`VirtioMmioWindow`] says the same thing in the form firmware actually
 //! reports it, so 8.3 can scan it directly.
 
+// Each provider populates the whole struct, but each architecture reads only the parts
+// that apply to it: `GicV2` and the mmio bank are aarch64-only, `X86Port` is x86-only.
+// The unread remainder is the price of one shared description rather than two divergent
+// ones, which is the entire point of the module. Marked rather than papered over, so a
+// field that is dead on *both* architectures still shows up in review.
+#![allow(dead_code)]
+
+/// Which UART programming model a console needs.
+///
+/// The ACPI **SPCR** table names this, and it decides which driver binds: PL011, 16550
+/// and the SBSA Generic UART are not one driver. `PlatformInfo` carried only base/size/irq
+/// at first, which meant an ACPI provider would have had to discard the one field that
+/// answers the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UartKind {
+    /// ARM PL011.
+    Pl011,
+    /// NS16550-compatible, memory-mapped.
+    Ns16550,
+    /// SBSA Generic UART (a PL011 subset).
+    SbsaGeneric,
+    /// x86 port-I/O 8250/16550 — `base` is a port number, not an address.
+    X86Port,
+}
+
 /// A fixed device: where it is, how big its register window is, and how it interrupts.
 ///
 /// `base`/`size` are physical. A device that is not memory-mapped (an x86 port-I/O UART)
@@ -49,34 +74,34 @@ pub struct PlatformDevice {
 /// "This device does not interrupt, or is polled."
 pub const IRQ_NONE: u32 = u32::MAX;
 
-/// A contiguous bank of virtio-mmio transports.
+/// Build a bank of virtio-mmio transport descriptors at compile time.
 ///
-/// QEMU `virt` places 32 of them at a fixed stride with consecutive interrupts. Real
-/// SBSA-class hardware has none of these at all and puts VirtIO (when it has any) on
-/// PCIe, which is why this is an `Option` on [`PlatformInfo`] rather than a required
-/// field.
-#[derive(Debug, Clone, Copy)]
-pub struct VirtioMmioWindow {
-    /// Physical base of slot 0.
-    pub base: u64,
-    /// Bytes between consecutive slots.
-    pub stride: u64,
-    /// Number of slots in the bank.
-    pub count: usize,
-    /// Interrupt of slot 0; slot *n* is `first_irq + n`.
-    pub first_irq: u32,
-}
-
-impl VirtioMmioWindow {
-    /// Physical base of slot `n`, or `None` if out of range.
-    pub fn slot_base(&self, n: usize) -> Option<u64> {
-        (n < self.count).then(|| self.base + (n as u64) * self.stride)
+/// 8.1 first modelled this as a `VirtioMmioWindow { base, stride, count, first_irq }`,
+/// on the stated grounds that a window is "the form firmware actually reports". **That
+/// was wrong, and this plan's own decision 12 refutes it:** QEMU `virt` emits 32
+/// individual `virtio_mmio@<base>` device-tree nodes, each with its own `reg` and
+/// `interrupts` — which is why it can set `dma-coherent` on *every node*. A property
+/// emitted per node is evidence of a list. ACPI is no better: SR-class servers have no
+/// virtio-mmio at all, and the bindings that exist are per-device. No firmware anywhere
+/// produces a window.
+///
+/// The real objection to a list was ergonomic — nobody wants 32 near-identical struct
+/// literals. A `const fn` answers that: four authored numbers, a list-shaped field, and
+/// a device-tree provider drops straight in. It also stops silently asserting the two
+/// things a window bakes in — uniform stride, and interrupts both contiguous *and*
+/// co-ordered with bases — which hold on `virt` and are guaranteed nowhere else.
+const fn mmio_bank(base: u64, stride: u64, first_irq: u32) -> [PlatformDevice; 32] {
+    let mut bank = [PlatformDevice { base: 0, size: 0, irq: IRQ_NONE }; 32];
+    let mut i = 0;
+    while i < 32 {
+        bank[i] = PlatformDevice {
+            base: base + (i as u64) * stride,
+            size: stride,
+            irq: first_irq + i as u32,
+        };
+        i += 1;
     }
-
-    /// Interrupt number of slot `n`, or `None` if out of range.
-    pub fn slot_irq(&self, n: usize) -> Option<u32> {
-        (n < self.count).then(|| self.first_irq + n as u32)
-    }
+    bank
 }
 
 /// What kind of interrupt controller this platform has.
@@ -93,14 +118,17 @@ pub enum InterruptController {
 pub struct PlatformInfo {
     /// Name for the boot log — this is the field that makes a wrong provider obvious.
     pub name: &'static str,
-    /// The console UART.
+    /// The console UART: where it is, and which programming model it needs.
     pub uart: PlatformDevice,
+    /// Which UART driver the console needs — SPCR's field, in ACPI terms.
+    pub uart_kind: UartKind,
     /// The interrupt controller.
     pub intc: InterruptController,
     /// Interrupt the periodic timer raises.
     pub timer_irq: u32,
-    /// The virtio-mmio bank, if this platform has one.
-    pub virtio_mmio: Option<VirtioMmioWindow>,
+    /// The virtio-mmio transports, if this platform has any. Empty on PCI platforms,
+    /// where VirtIO is enumerated rather than described.
+    pub virtio_mmio: &'static [PlatformDevice],
 }
 
 /// This machine.
@@ -125,9 +153,10 @@ pub fn info() -> &'static PlatformInfo {
 static X86_64_PC: PlatformInfo = PlatformInfo {
     name: "x86_64 PC (ports, 8259, PIT)",
     uart: PlatformDevice { base: 0x3F8, size: 8, irq: 4 },
+    uart_kind: UartKind::X86Port,
     intc: InterruptController::Pic8259,
     timer_irq: 0,
-    virtio_mmio: None,
+    virtio_mmio: &[],
 };
 
 /// QEMU `virt` (aarch64), GICv2. Every address here was previously a `const` beside the
@@ -137,14 +166,15 @@ static QEMU_VIRT: PlatformInfo = PlatformInfo {
     name: "QEMU virt (aarch64, GICv2)",
     // PL011. SPI 1 -> INTID 33.
     uart: PlatformDevice { base: 0x0900_0000, size: 0x1000, irq: 33 },
+    uart_kind: UartKind::Pl011,
     intc: InterruptController::GicV2 { gicd: 0x0800_0000, gicc: 0x0801_0000 },
     // CNTV virtual timer, PPI 27.
     timer_irq: 27,
     // 32 transports at 0x200 stride; SPI 16..47 -> INTID 48..79.
-    virtio_mmio: Some(VirtioMmioWindow {
-        base: 0x0a00_0000,
-        stride: 0x200,
-        count: 32,
-        first_irq: 48,
-    }),
+    virtio_mmio: &VIRT_MMIO_BANK,
 };
+
+/// QEMU `virt`'s 32 virtio-mmio transports: `0x0a00_0000`, 0x200 stride, SPI 16..47
+/// (INTID 48..79). Four authored numbers; the list is expanded at compile time.
+#[cfg(target_arch = "aarch64")]
+static VIRT_MMIO_BANK: [PlatformDevice; 32] = mmio_bank(0x0a00_0000, 0x200, 48);

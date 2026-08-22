@@ -46,11 +46,10 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::mm::addr::PhysAddr;
 use crate::println;
 
-/// Physical base of the GICv2 distributor on QEMU `virt`.
-
-/// Physical base of the GICv2 CPU interface on QEMU `virt`.
-
 /// Size of each register block.
+///
+/// The distributor and CPU-interface *bases* now come from `crate::platform`; only the
+/// window size is still a property of the GICv2 architecture rather than the board.
 const GIC_BLOCK_SIZE: usize = 0x1_0000;
 
 // --- Distributor register offsets ---
