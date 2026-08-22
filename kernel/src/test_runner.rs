@@ -1632,13 +1632,17 @@ fn test_pci_scan() -> Result<(), &'static str> {
 /// signal that 3.1 works before the block read/write path (3.2) is built.
 #[cfg(target_arch = "x86_64")]
 fn test_virtio_transport() -> Result<(), &'static str> {
+    // The trait is in scope for its methods; the concrete transport is never named —
+    // which is the point of 8.2. When 8.3 adds virtio-mmio, this test exercises it with
+    // no change beyond being un-skipped.
     use crate::drivers::virtio::VirtioTransport;
 
     let blk = virtio::first_of_kind(VirtioKind::Block).ok_or("no VirtIO block device")?;
 
-    // Discover register regions, map them, reset, ACK + DRIVER.
-    let transport =
-        VirtioTransport::init_for(&blk).map_err(|_| "VirtioTransport::init failed")?;
+    // Open the transport through the discovery seam, then reset / ACK + DRIVER.
+    let transport = blk
+        .open_transport()
+        .map_err(|_| "opening the VirtIO transport failed")?;
 
     // Negotiate features — we want nothing device-specific here, just the
     // mandatory VERSION_1 bit.

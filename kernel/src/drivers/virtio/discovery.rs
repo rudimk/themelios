@@ -25,16 +25,14 @@
 //!
 //! ## What this module is and is not
 //!
-//! It is **discovery only**. The register-level transport — feature negotiation, queue
-//! configuration, the notify doorbell — is still PCI-shaped and still lives in
-//! [`super::VirtioTransport`]; turning that into a trait with two implementations is
-//! sub-phase 8.2's job. Keeping the two apart is deliberate: this change moves ~18 call
-//! sites and touches working amd64 storage and networking, and rewriting the register
-//! layer in the same commit would make "amd64 is unchanged" a claim about two things at
-//! once instead of one.
+//! It is **discovery only** — which devices exist, not how to talk to them. The register
+//! interface is [`crate::drivers::virtio::transport::VirtioTransport`], a trait with one
+//! implementation per transport, and [`VirtioDevice::open_transport`] is where the two
+//! meet: discovery is the only place that knows *how* a device was found, so it is the
+//! only place that can say which transport speaks to it.
 //!
-//! Accordingly [`VirtioDevice`] still *carries* a `PciDevice` today. What matters is
-//! that no caller outside this module and the drivers can see it.
+//! [`VirtioDevice`] still carries a `PciDevice` today; 8.3 makes that a per-transport
+//! handle. What matters now is that no caller outside this module can see it.
 //!
 //! ## Ordering is part of the contract
 //!
@@ -51,10 +49,14 @@
 //! already wrong there. Selecting by [`VirtioKind`] rather than by index is the habit
 //! that survives the move.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::drivers::pci::{self, PciDevice};
+
+use super::transport::VirtioTransport;
+use super::{PciTransport, VirtioError};
 
 /// What a discovered VirtIO device *is*, independent of how it was found.
 ///
@@ -162,16 +164,6 @@ impl VirtioDevice {
         self.kind
     }
 
-    /// The underlying PCI handle.
-    ///
-    /// Scoped to `crate::drivers::virtio` on purpose — **not** `pub(crate)`. The kernel
-    /// is a binary crate, so `pub(crate)` is effectively fully public and the "no caller
-    /// outside the drivers can see PCI" property would be a convention rather than a
-    /// compiler guarantee. This restricts it to the three intended callers. It disappears
-    /// in 8.2 when the transport becomes a trait, rather than gaining an aarch64 sibling.
-    pub(in crate::drivers::virtio) fn pci(&self) -> &PciDevice {
-        &self.pci
-    }
 }
 
 /// The discovered device list, populated once by [`init`].
@@ -212,6 +204,19 @@ pub fn init() {
         })
         .collect();
     *slot = Some(found);
+}
+
+impl VirtioDevice {
+    /// Open this device's transport, ready for the feature handshake.
+    ///
+    /// **This is the seam 8.3 extends.** Discovery is the only place that knows *how* a
+    /// device was found, so it is the only place that can say which transport speaks to
+    /// it: a PCI function gets a [`PciTransport`], and an mmio slot will get an
+    /// `MmioTransport`. Drivers receive a `Box<dyn VirtioTransport>` and never learn
+    /// which, which is what lets `blk.rs` and `net.rs` contain no reference to PCI at all.
+    pub fn open_transport(&self) -> Result<Box<dyn VirtioTransport>, VirtioError> {
+        Ok(Box::new(PciTransport::init(&self.pci)?))
+    }
 }
 
 /// Every VirtIO device on this machine, in a stable order.

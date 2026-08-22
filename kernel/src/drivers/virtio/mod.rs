@@ -1,109 +1,74 @@
-//! # VirtIO PCI transport and split virtqueue
+//! # VirtIO core: the split virtqueue and the pieces every transport shares
 //!
-//! VirtIO is the paravirtualised device standard QEMU/KVM (and the cloud
-//! hypervisors we target) use for block, network, and console devices. Rather
-//! than emulating real hardware register-by-register, the guest and host agree
-//! on a small, efficient ring-buffer protocol. This module implements the parts
-//! that are **common to every VirtIO device type**:
+//! VirtIO is the paravirtualised device standard QEMU/KVM and the cloud hypervisors use
+//! for block, network and console devices. Rather than emulating real hardware
+//! register-by-register, guest and host agree on a ring-buffer protocol.
 //!
-//! - **Transport discovery**: finding a device's register regions by walking
-//!   its PCI vendor capabilities (the modern, VirtIO 1.0+ interface).
-//! - **Device initialisation handshake**: the status-bit sequence that brings a
-//!   device from reset to "driver OK".
-//! - **Feature negotiation**: agreeing on an optional feature set.
-//! - **Split virtqueue**: the descriptor table + available ring + used ring
-//!   data structure through which buffers are handed to and returned from the
-//!   device.
+//! This module holds what is **common to every transport**:
 //!
-//! The device-specific driver (e.g. `blk.rs` for the block device) builds on
-//! top of this: it negotiates its own feature bits, reads its device-specific
-//! config, and submits request descriptor chains to a virtqueue.
+//! - **[`Virtqueue`]** — the descriptor table, available ring and used ring through which
+//!   buffers are handed to and returned from the device. The spec defines this structure
+//!   without reference to any transport, and as of 8.2 the code matches: the queue holds a
+//!   [`Notifier`] the transport resolved, not a doorbell address it computed itself.
+//! - **Status bits, feature bits and errors** — spec-level vocabulary.
+//! - **MMIO access helpers** — see the warning below.
 //!
-//! ## Modern (1.0+) vs legacy
+//! What is *not* here, and used to be: the virtio-PCI register layout, capability
+//! discovery and the init handshake all live in [`pci_transport`], because they describe
+//! one transport and mean nothing to another. [`transport`] holds the interface itself.
 //!
-//! We speak the modern interface exclusively. A modern VirtIO device advertises
-//! up to five register regions through PCI vendor-specific capabilities, each
-//! tagged with a `cfg_type`:
+//! ## A warning about the MMIO helpers
 //!
-//! | cfg_type | region        | purpose                                  |
-//! |----------|---------------|------------------------------------------|
-//! | 1        | common config | device/driver features, status, queues   |
-//! | 2        | notify        | "kick" doorbell — tell the device to run |
-//! | 3        | ISR           | interrupt-status byte (read to ack INTx) |
-//! | 4        | device config | device-type-specific config (e.g. capacity)|
+//! [`mmio_read_u8`] … [`mmio_write_u64`] offer six access widths at arbitrary offsets.
+//! That is the *virtio-PCI* access model. **virtio-mmio permits exactly one width for
+//! control registers — 32 bits** — and QEMU's model logs `"wrong size access to
+//! register!"` and then *drops the write* (or returns zero) for anything else, with no
+//! fault the guest can observe. A virtio-mmio implementation must therefore use its own
+//! 32-bit-only accessors and must not reach for these, whatever their neutral-looking
+//! names suggest.
 //!
-//! Each capability names a BAR and an offset within it; we map those MMIO
-//! windows uncached (see `mm::mmio`) and access them with volatile reads/writes.
+//! Alignment matters too: `mm::mmio::map` produces Device-`nGnRnE` memory on aarch64,
+//! where an unaligned access raises an Alignment fault that Phase 7.2's handler treats as
+//! fatal. The same call is silently fine on x86.
 //!
 //! ## Polling, not interrupts
 //!
-//! Phase 3 uses **synchronous polling**: after kicking the device we spin on the
-//! used ring's index until our buffer comes back. This keeps the block path
-//! simple and deterministic. Interrupt-driven completion (MSI-X) is a later
-//! optimisation; the VirtIO spec explicitly permits polling.
+//! The stack polls: after kicking a device we spin on the used ring's index until our
+//! buffer returns. The spec explicitly permits this. Two things say so to the device — the
+//! `VIRTQ_AVAIL_F_NO_INTERRUPT` flag set in every avail ring here, which is the
+//! transport-neutral form, and virtio-PCI's MSI-X NO_VECTOR, which is not.
 //!
-//! That spin is **bounded**, and giving up is not recoverable. Callers hold the
-//! device lock with interrupts disabled for the whole poll, so an unbounded wait
-//! freezes the entire kernel rather than just the calling task. When the bound is
-//! reached the chain is still device-owned, so the queue disables itself
-//! permanently instead of reusing descriptors the device may still touch — see
-//! [`Virtqueue::fail`] and [`MAX_COMPLETION_SPINS`].
+//! That spin is **bounded**, and giving up is not recoverable: callers hold the device
+//! lock with interrupts disabled for the whole poll, so an unbounded wait freezes the
+//! kernel rather than the calling task. When the bound is reached the chain is still
+//! device-owned, so the queue disables itself permanently instead of reusing descriptors
+//! the device may still touch — see [`Virtqueue::fail`] and [`MAX_COMPLETION_SPINS`].
 
 /// Arch-neutral device discovery — "which VirtIO devices does this machine have?"
 ///
-/// Answers that question without the caller naming PCI, so the eighteen call sites that
-/// used to walk PCI config space directly survive the move to virtio-mmio (8.3). The
-/// register-level transport stays PCI-shaped until 8.2.
+/// Answers that without the caller naming a bus, and decides which transport speaks to
+/// each device it finds.
 pub mod discovery;
 
-pub use discovery::{devices_of_kind, first_of_kind, VirtioDevice, VirtioKind};
+/// The transport interface every VirtIO driver speaks, and the doorbell it hands to a
+/// queue.
+pub mod transport;
+
+/// The virtio-PCI (modern, 1.0+) transport implementation, and the
+/// `virtio_pci_common_cfg` register offsets that only it may use.
+pub mod pci_transport;
+
+pub use discovery::{devices_of_kind, first_of_kind, VirtioKind};
+pub use pci_transport::PciTransport;
+pub use transport::{Notifier, VirtioTransport};
 
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::mm::addr::{PhysAddr, VirtAddr};
-use crate::mm::{frame, mmio, PAGE_SIZE};
+use crate::mm::{frame, PAGE_SIZE};
 
 pub mod blk;
 pub mod net;
-
-// --- VirtIO PCI capability layout (fields relative to the capability offset) ---
-
-/// Offset of `cfg_type` within a VirtIO PCI capability (identifies the region).
-const VIRTIO_CAP_CFG_TYPE: u8 = 3;
-/// Offset of the `bar` index within a VirtIO PCI capability.
-const VIRTIO_CAP_BAR: u8 = 4;
-/// Offset of the 32-bit `offset` (within the BAR) field.
-const VIRTIO_CAP_OFFSET: u8 = 8;
-/// Offset of the 32-bit `length` field.
-const VIRTIO_CAP_LENGTH: u8 = 12;
-/// Offset of the 32-bit `notify_off_multiplier` (only in the notify capability).
-const VIRTIO_CAP_NOTIFY_MULT: u8 = 16;
-
-/// `cfg_type` values identifying each VirtIO register region.
-const CFG_TYPE_COMMON: u8 = 1;
-const CFG_TYPE_NOTIFY: u8 = 2;
-const CFG_TYPE_ISR: u8 = 3;
-const CFG_TYPE_DEVICE: u8 = 4;
-
-// --- Common configuration structure register offsets ---
-//
-// These are byte offsets into the "common config" MMIO region (cfg_type 1),
-// matching `struct virtio_pci_common_cfg` in the VirtIO 1.x spec.
-
-const COMMON_DEVICE_FEATURE_SELECT: u64 = 0x00; // u32
-const COMMON_DEVICE_FEATURE: u64 = 0x04; // u32 (read-only)
-const COMMON_DRIVER_FEATURE_SELECT: u64 = 0x08; // u32
-const COMMON_DRIVER_FEATURE: u64 = 0x0C; // u32
-const COMMON_NUM_QUEUES: u64 = 0x12; // u16 (read-only)
-const COMMON_DEVICE_STATUS: u64 = 0x14; // u8
-const COMMON_QUEUE_SELECT: u64 = 0x16; // u16
-const COMMON_QUEUE_SIZE: u64 = 0x18; // u16
-const COMMON_QUEUE_MSIX_VECTOR: u64 = 0x1A; // u16
-const COMMON_QUEUE_ENABLE: u64 = 0x1C; // u16
-const COMMON_QUEUE_NOTIFY_OFF: u64 = 0x1E; // u16 (read-only)
-const COMMON_QUEUE_DESC: u64 = 0x20; // u64
-const COMMON_QUEUE_DRIVER: u64 = 0x28; // u64 (available ring)
-const COMMON_QUEUE_DEVICE: u64 = 0x30; // u64 (used ring)
 
 // --- Device status bits (written to COMMON_DEVICE_STATUS) ---
 
@@ -178,6 +143,17 @@ pub enum VirtioError {
     FeatureNegotiationFailed,
     /// The selected virtqueue does not exist (queue size reported as 0).
     QueueUnavailable,
+
+    /// A device-config read ran past the end of the config region.
+    ///
+    /// On virtio-mmio that region is the tail of a fixed-size slot window, so an
+    /// over-long read would reach the adjacent device's registers.
+    ConfigOutOfRange,
+
+    /// A device-config read could not be taken without the generation counter moving.
+    ///
+    /// The device kept changing its configuration underneath us; retrying did not help.
+    ConfigUnstable,
     /// Out of physical frames for the virtqueue rings.
     OutOfMemory,
     /// The device signalled an error during initialisation.
@@ -268,8 +244,15 @@ pub struct Virtqueue {
     avail_phys: PhysAddr,
     /// Physical address of the used ring.
     used_phys: PhysAddr,
-    /// MMIO doorbell address: writing the queue index here kicks the device.
-    notify_addr: VirtAddr,
+    /// How to kick the device for this queue.
+    ///
+    /// Resolved by the transport at setup time. The queue deliberately does **not** know
+    /// how the address was arrived at: virtio-PCI computes one per queue from
+    /// `notify_base + queue_notify_off * multiplier`, while virtio-mmio uses one shared
+    /// register for every queue. A virtqueue is a spec-defined data structure with no
+    /// transport in it, and holding a raw PCI-derived address here was the last place
+    /// that was not true.
+    notify: Notifier,
     /// Last used-ring index we have observed (for polling completions).
     last_used_idx: u16,
     /// Set once this queue has desynchronised from the device — a submitted chain
@@ -285,6 +268,21 @@ pub struct Virtqueue {
 // Used ring:       { flags: u16, idx: u16, ring: [{id:u32,len:u32}; size], avail_event: u16 }
 
 const RING_FLAGS: u64 = 0;
+
+/// `VIRTQ_AVAIL_F_NO_INTERRUPT` — set in the available ring's flags to tell the device
+/// not to raise a used-buffer interrupt for this queue.
+///
+/// This whole stack polls. On virtio-PCI that intent is expressed by writing NO_VECTOR to
+/// the queue's MSI-X vector register — but that register does not exist on virtio-mmio,
+/// whose interrupt is a platform-wired level-triggered line. `alloc_zeroed` leaves this
+/// flags word at 0, which means *"interrupt me on every used buffer"*, so on mmio the
+/// device would assert its line on every completion and hold it until an `InterruptACK`
+/// that nothing ever writes.
+///
+/// The avail ring's flags word is the transport-neutral way to say "do not interrupt me",
+/// so it is set here, where the ring is built, rather than in a transport that may or may
+/// not have a vector register.
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 const RING_IDX: u64 = 2;
 const RING_ENTRIES: u64 = 4;
 
@@ -294,7 +292,7 @@ impl Virtqueue {
     /// Each of the three regions gets its own contiguous physical allocation
     /// (page-aligned, which satisfies all VirtIO alignment requirements) and is
     /// zeroed. Returns `OutOfMemory` if any allocation fails.
-    fn new(size: u16, index: u16, notify_addr: VirtAddr) -> Result<Self, VirtioError> {
+    fn new(size: u16, index: u16, notify: Notifier) -> Result<Self, VirtioError> {
         let n = size as usize;
         // Region sizes per the spec.
         let desc_bytes = 16 * n;
@@ -305,6 +303,13 @@ impl Virtqueue {
         let avail_phys = alloc_zeroed(avail_bytes).ok_or(VirtioError::OutOfMemory)?;
         let used_phys = alloc_zeroed(used_bytes).ok_or(VirtioError::OutOfMemory)?;
 
+        // Say "do not interrupt me" in the ring itself, not just in a PCI register.
+        // SAFETY: the avail ring was just allocated and zeroed; RING_FLAGS is its first
+        // u16 and the device has not been told about the queue yet.
+        unsafe {
+            mmio_write_u16(avail_phys.to_virt(), RING_FLAGS, VIRTQ_AVAIL_F_NO_INTERRUPT);
+        }
+
         Ok(Self {
             size,
             index,
@@ -314,7 +319,7 @@ impl Virtqueue {
             desc_phys,
             avail_phys,
             used_phys,
-            notify_addr,
+            notify,
             last_used_idx: 0,
             failed: false,
         })
@@ -370,9 +375,7 @@ impl Virtqueue {
         // 4. Barrier, then kick the device by writing the queue index to the
         // notify doorbell.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        unsafe {
-            write_volatile(self.notify_addr.as_u64() as *mut u16, self.index);
-        }
+        self.notify.ring(self.index);
 
         // 5. Poll the used ring until its index advances past what we last saw,
         // signalling the device has returned our chain — but never forever.
@@ -486,11 +489,7 @@ impl Virtqueue {
     /// Kick the device: tell it this queue has newly-available buffers to process.
     fn kick(&self) {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        // SAFETY: notify_addr is this queue's mapped MMIO doorbell; the value is
-        // the queue index (the vqn the device expects).
-        unsafe {
-            write_volatile(self.notify_addr.as_u64() as *mut u16, self.index);
-        }
+        self.notify.ring(self.index);
     }
 
     /// Non-blocking used-ring poll. If the device has returned a buffer since our
@@ -553,7 +552,9 @@ pub fn test_queue_failure_paths() -> Result<(), &'static str> {
             desc_phys: desc,
             avail_phys: avail,
             used_phys: used,
-            notify_addr: doorbell.to_virt(),
+            // A scratch page standing in for a doorbell: this fake queue is never
+            // attached to a device, so the write lands harmlessly in RAM.
+            notify: Notifier::at(doorbell.to_virt(), transport::NotifyWidth::U16),
             last_used_idx: 0,
             failed: false,
         })
@@ -616,243 +617,3 @@ fn alloc_zeroed(bytes: usize) -> Option<PhysAddr> {
     Some(phys)
 }
 
-/// A VirtIO device's discovered register regions and negotiated state.
-///
-/// Constructed by `VirtioTransport::init`, which walks the PCI capabilities,
-/// maps the MMIO regions, and runs the initialisation handshake up to (but not
-/// including) `DRIVER_OK`. The device-specific driver then negotiates features,
-/// sets up virtqueues, and finally calls `set_driver_ok`.
-pub struct VirtioTransport {
-    /// Common configuration MMIO region.
-    common: VirtAddr,
-    /// Notify region base MMIO address.
-    notify_base: VirtAddr,
-    /// Multiplier applied to a queue's `notify_off` to find its doorbell.
-    notify_off_multiplier: u32,
-    /// ISR status MMIO byte (read to acknowledge a legacy interrupt).
-    #[allow(dead_code)]
-    isr: VirtAddr,
-    /// Device-specific config MMIO region (e.g. block capacity), if present.
-    device_cfg: Option<VirtAddr>,
-}
-
-impl VirtioTransport {
-    /// Bring up the transport for a device found by [`discovery`].
-    ///
-    /// The transport-neutral entry point, mirroring `VirtioBlk::init`. Only the
-    /// transport self-test calls this directly; 8.2 replaces the body when
-    /// `VirtioTransport` becomes a trait with a virtio-mmio implementation.
-    // Only the transport self-test drives the transport directly; the block and net
-    // drivers go through their own `init`. Kept because that test is the one place the
-    // transport layer is exercised in isolation, and 8.2 replaces this body wholesale.
-    #[allow(dead_code)]
-    pub fn init_for(dev: &VirtioDevice) -> Result<Self, VirtioError> {
-        Self::init(dev.pci())
-    }
-
-    /// Discover and reset a VirtIO PCI device, leaving it ready for feature
-    /// negotiation.
-    ///
-    /// Steps:
-    /// 1. Walk the device's PCI vendor capabilities, mapping each register
-    ///    region (common / notify / ISR / device config) into uncached MMIO.
-    /// 2. Reset the device (write 0 to the status register).
-    /// 3. Set ACKNOWLEDGE then DRIVER status bits.
-    ///
-    /// The caller continues with `negotiate_features`, `setup_queue`, and
-    /// `set_driver_ok`.
-    pub fn init(dev: &super::pci::PciDevice) -> Result<Self, VirtioError> {
-        let mut common: Option<VirtAddr> = None;
-        let mut notify_base: Option<VirtAddr> = None;
-        let mut notify_off_multiplier: u32 = 0;
-        let mut isr: Option<VirtAddr> = None;
-        let mut device_cfg: Option<VirtAddr> = None;
-
-        for cap in dev.capabilities() {
-            // Only vendor-specific capabilities describe VirtIO regions.
-            if cap.id != super::pci::CAP_ID_VENDOR {
-                continue;
-            }
-            let cfg_type = dev.read_config_u8(cap.offset + VIRTIO_CAP_CFG_TYPE);
-            let bar_index = dev.read_config_u8(cap.offset + VIRTIO_CAP_BAR);
-            let region_offset = dev.read_config_u32(cap.offset + VIRTIO_CAP_OFFSET);
-            let region_len = dev.read_config_u32(cap.offset + VIRTIO_CAP_LENGTH);
-
-            // Resolve the BAR this region lives in to a physical base, then map
-            // the (offset, length) window uncached.
-            let bar = match dev.bar(bar_index) {
-                Some(b) if b.is_memory => b,
-                _ => continue, // skip I/O BARs and unimplemented slots
-            };
-            let region_phys = PhysAddr::new(bar.address + region_offset as u64);
-            let mapped = mmio::map(region_phys, region_len.max(4) as usize);
-
-            match cfg_type {
-                CFG_TYPE_COMMON => common = Some(mapped),
-                CFG_TYPE_NOTIFY => {
-                    notify_base = Some(mapped);
-                    notify_off_multiplier =
-                        dev.read_config_u32(cap.offset + VIRTIO_CAP_NOTIFY_MULT);
-                }
-                CFG_TYPE_ISR => isr = Some(mapped),
-                CFG_TYPE_DEVICE => device_cfg = Some(mapped),
-                _ => {}
-            }
-        }
-
-        let common = common.ok_or(VirtioError::MissingCapability)?;
-        let notify_base = notify_base.ok_or(VirtioError::MissingCapability)?;
-        let isr = isr.ok_or(VirtioError::MissingCapability)?;
-
-        let transport = Self {
-            common,
-            notify_base,
-            notify_off_multiplier,
-            isr,
-            device_cfg,
-        };
-
-        // Reset: write 0 to the status register and wait for it to read back 0.
-        transport.set_status(0);
-        // Acknowledge the device and announce we have a driver.
-        transport.set_status(STATUS_ACKNOWLEDGE);
-        transport.add_status(STATUS_DRIVER);
-
-        Ok(transport)
-    }
-
-    /// Read the current device status byte.
-    fn status(&self) -> u8 {
-        // SAFETY: common config is a mapped MMIO region with a status byte.
-        unsafe { mmio_read_u8(self.common, COMMON_DEVICE_STATUS) }
-    }
-
-    /// Overwrite the device status byte.
-    fn set_status(&self, value: u8) {
-        // SAFETY: writing the status register is the defined way to drive the
-        // init state machine.
-        unsafe { mmio_write_u8(self.common, COMMON_DEVICE_STATUS, value) }
-    }
-
-    /// OR additional bits into the device status byte.
-    fn add_status(&self, bits: u8) {
-        let cur = self.status();
-        self.set_status(cur | bits);
-    }
-
-    /// Read the 64-bit device feature bitmap (two 32-bit halves).
-    fn read_device_features(&self) -> u64 {
-        // SAFETY: feature select/read registers are in the common config.
-        unsafe {
-            mmio_write_u32(self.common, COMMON_DEVICE_FEATURE_SELECT, 0);
-            let low = mmio_read_u32(self.common, COMMON_DEVICE_FEATURE) as u64;
-            mmio_write_u32(self.common, COMMON_DEVICE_FEATURE_SELECT, 1);
-            let high = mmio_read_u32(self.common, COMMON_DEVICE_FEATURE) as u64;
-            (high << 32) | low
-        }
-    }
-
-    /// Write the 64-bit driver feature bitmap (the features we accept).
-    fn write_driver_features(&self, features: u64) {
-        // SAFETY: feature select/write registers are in the common config.
-        unsafe {
-            mmio_write_u32(self.common, COMMON_DRIVER_FEATURE_SELECT, 0);
-            mmio_write_u32(self.common, COMMON_DRIVER_FEATURE, features as u32);
-            mmio_write_u32(self.common, COMMON_DRIVER_FEATURE_SELECT, 1);
-            mmio_write_u32(self.common, COMMON_DRIVER_FEATURE, (features >> 32) as u32);
-        }
-    }
-
-    /// Negotiate features with the device.
-    ///
-    /// Always negotiates `VIRTIO_F_VERSION_1` (required for the modern
-    /// interface) plus whatever `wanted` device-specific bits the device also
-    /// offers. Sets FEATURES_OK and verifies the device accepts the set.
-    /// Returns the features actually negotiated.
-    pub fn negotiate_features(&self, wanted: u64) -> Result<u64, VirtioError> {
-        let device_features = self.read_device_features();
-
-        // We require VERSION_1; intersect the rest of what we want with what the
-        // device offers.
-        let negotiated = (device_features & (wanted | VIRTIO_F_VERSION_1))
-            | VIRTIO_F_VERSION_1;
-
-        // The device must offer VERSION_1, or it isn't a modern device.
-        if device_features & VIRTIO_F_VERSION_1 == 0 {
-            self.add_status(STATUS_FAILED);
-            return Err(VirtioError::FeatureNegotiationFailed);
-        }
-
-        self.write_driver_features(negotiated);
-        self.add_status(STATUS_FEATURES_OK);
-
-        // The device clears FEATURES_OK if it cannot support our selection.
-        if self.status() & STATUS_FEATURES_OK == 0 {
-            self.add_status(STATUS_FAILED);
-            return Err(VirtioError::FeatureNegotiationFailed);
-        }
-
-        Ok(negotiated)
-    }
-
-    /// Read the number of queues the device exposes.
-    #[allow(dead_code)]
-    pub fn num_queues(&self) -> u16 {
-        // SAFETY: num_queues is a read-only register in the common config.
-        unsafe { mmio_read_u16(self.common, COMMON_NUM_QUEUES) }
-    }
-
-    /// Set up virtqueue `index`, allocating its rings and programming the device.
-    ///
-    /// Selects the queue, reads its maximum size (capped to `MAX_QUEUE_SIZE`),
-    /// allocates the descriptor/available/used regions, programs their physical
-    /// addresses, computes the queue's notify doorbell, and enables the queue.
-    /// Returns the ready-to-use `Virtqueue`.
-    pub fn setup_queue(&self, index: u16) -> Result<Virtqueue, VirtioError> {
-        // Select the queue we want to configure.
-        // SAFETY: queue_select and friends are common-config registers.
-        unsafe {
-            mmio_write_u16(self.common, COMMON_QUEUE_SELECT, index);
-        }
-
-        let max_size = unsafe { mmio_read_u16(self.common, COMMON_QUEUE_SIZE) };
-        if max_size == 0 {
-            return Err(VirtioError::QueueUnavailable);
-        }
-        let size = max_size.min(MAX_QUEUE_SIZE);
-
-        // Compute this queue's notify doorbell address:
-        //   notify_base + queue_notify_off * notify_off_multiplier
-        let notify_off = unsafe { mmio_read_u16(self.common, COMMON_QUEUE_NOTIFY_OFF) };
-        let notify_addr = VirtAddr::new(
-            self.notify_base.as_u64()
-                + (notify_off as u64) * (self.notify_off_multiplier as u64),
-        );
-
-        let queue = Virtqueue::new(size, index, notify_addr)?;
-
-        // Program the queue: size, ring physical addresses, disable MSI-X
-        // (0xFFFF = NO_VECTOR — we poll), then enable.
-        // SAFETY: all are common-config registers for the selected queue.
-        unsafe {
-            mmio_write_u16(self.common, COMMON_QUEUE_SIZE, size);
-            mmio_write_u16(self.common, COMMON_QUEUE_MSIX_VECTOR, 0xFFFF);
-            mmio_write_u64(self.common, COMMON_QUEUE_DESC, queue.desc_phys.as_u64());
-            mmio_write_u64(self.common, COMMON_QUEUE_DRIVER, queue.avail_phys.as_u64());
-            mmio_write_u64(self.common, COMMON_QUEUE_DEVICE, queue.used_phys.as_u64());
-            mmio_write_u16(self.common, COMMON_QUEUE_ENABLE, 1);
-        }
-
-        Ok(queue)
-    }
-
-    /// Signal that the driver is fully set up — the device may now run.
-    pub fn set_driver_ok(&self) {
-        self.add_status(STATUS_DRIVER_OK);
-    }
-
-    /// Access the device-specific config region, if the device has one.
-    pub fn device_config(&self) -> Option<VirtAddr> {
-        self.device_cfg
-    }
-}
