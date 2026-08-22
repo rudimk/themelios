@@ -1476,48 +1476,94 @@ fn test_userspace_init() -> Result<(), &'static str> {
 /// 2. A VirtIO device (vendor 0x1AF4) is present — QEMU is launched with a
 ///    VirtIO disk attached
 
-/// Device discovery returns the expected set, in the expected order.
+/// Magic in sector 0 of the scratch disk, written by `xtask::ensure_scratch_disk`.
 ///
-/// The committed baseline for sub-phase 8.1. That change replaced eighteen open-coded
-/// PCI walks (`devices_by_vendor` + a class-code filter) with `virtio::devices_of_kind`,
-/// and its entire claim was that the *same devices arrive in the same order*. A green
-/// suite alone does not show that: most tests take the first device of a kind and would
-/// pass just as happily against a reordered or truncated list.
+/// Kept in sync with `SCRATCH_SIGNATURE` there.
+#[cfg(target_arch = "x86_64")]
+const SCRATCH_SIGNATURE: &[u8] = b"THEMELIOS-SCRATCH-V1";
+
+/// Find the scratch disk — the one block device these tests may destroy.
 ///
-/// So this asserts the set itself. The amd64 harness attaches three block devices (the
-/// SquashFS root, the ext2 data volume, and a scratch disk) and one NIC, in that order,
-/// and `virtio_disk_args` documents that the order fixes PCI slot assignment.
+/// Identifies it by **content**, never by position. The SquashFS root is found by its
+/// `hsqs` magic and the ext2 volume by 0xEF53; before 8.1 the scratch disk alone was
+/// found by being "the first block device", which silently coupled the kernel's
+/// discovery order to the order `xtask` passes `-device` arguments.
 ///
-/// The order matters beyond this sub-phase: on QEMU `virt`, `-device` arguments map to
-/// virtio-mmio slots with *decreasing* base addresses, so command-line order and
-/// discovery order run opposite ways. Whatever 8.3 does about that, it has to face this
-/// assertion rather than quietly inherit a different set.
+/// That coupling is not portable. QEMU `virt` maps `-device` arguments to virtio-mmio
+/// slots with *decreasing* base addresses, so a kernel scanning slots upward sees the
+/// scratch disk **last**, and "the first block device" becomes the ext2 data volume —
+/// at which point the sector-10 and sector-20 writes below land in ext2 metadata and
+/// the failures appear, several sub-phases later, as ext2 bugs.
+///
+/// Probing for a signature removes the coupling entirely: these tests are correct on any
+/// platform, in any enumeration order.
+#[cfg(target_arch = "x86_64")]
+fn open_scratch_disk() -> Result<crate::drivers::virtio::blk::VirtioBlk, &'static str> {
+    use crate::drivers::block::BlockDevice;
+    use crate::drivers::virtio::blk::VirtioBlk;
+
+    for dev in virtio::devices_of_kind(VirtioKind::Block) {
+        let blk = match VirtioBlk::init(&dev) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut sec0 = [0u8; 512];
+        if blk.read_blocks(0, &mut sec0).is_err() {
+            continue;
+        }
+        if sec0.starts_with(SCRATCH_SIGNATURE) {
+            return Ok(blk);
+        }
+    }
+    Err("no scratch disk found (sector 0 signature absent on every block device)")
+}
+
+/// Device discovery returns the expected *set* of devices, and the helpers agree.
+///
+/// The committed baseline for sub-phase 8.1, which replaced seventeen open-coded PCI
+/// walks with a seam. A green suite alone does not show the seam returns what the walk
+/// did: most tests take the first device of a kind and would pass against a truncated
+/// list.
+///
+/// **This asserts the multiset, deliberately not the sequence.** An earlier version
+/// pinned the order as `[block, block, block, net]`, which is what amd64's PCI walk
+/// yields — but QEMU `virt` maps `-device` arguments to virtio-mmio slots with
+/// *decreasing* base addresses, so a kernel scanning slots upward observes the reverse.
+/// A sequence assertion would therefore have been satisfiable on both architectures only
+/// by scanning slots downward, which is a QEMU-specific hack and is directly contrary to
+/// 8.3's instruction to treat slot index as meaningless. The assertion would have
+/// rewarded the wrong implementation.
+///
+/// Order is not a property the seam owes its callers in any case. What it owes them is
+/// that the set is complete and the by-kind helpers agree with the full enumeration —
+/// and, since 8.1, that no caller has to care about position: destructive tests find
+/// their disk by signature (see `open_scratch_disk`).
 #[cfg(target_arch = "x86_64")]
 fn test_virtio_discovery() -> Result<(), &'static str> {
-    use crate::drivers::virtio::{self, VirtioKind};
-
     let devs = virtio::devices();
-    if devs.len() != 4 {
-        return Err("expected exactly 4 VirtIO devices (3 block + 1 net)");
+
+    let blocks = devs.iter().filter(|d| d.kind() == VirtioKind::Block).count();
+    let nets = devs.iter().filter(|d| d.kind() == VirtioKind::Net).count();
+    let others = devs.len() - blocks - nets;
+
+    // The harness attaches a scratch disk, the SquashFS root, the ext2 data volume, and
+    // one NIC.
+    if blocks != 3 {
+        return Err("expected exactly 3 VirtIO block devices");
+    }
+    if nets != 1 {
+        return Err("expected exactly 1 VirtIO network device");
+    }
+    if others != 0 {
+        return Err("unexpected VirtIO device of an unknown kind");
     }
 
-    let kinds: alloc::vec::Vec<VirtioKind> = devs.iter().map(|d| d.kind()).collect();
-    let expected = [
-        VirtioKind::Block,
-        VirtioKind::Block,
-        VirtioKind::Block,
-        VirtioKind::Net,
-    ];
-    if kinds != expected {
-        return Err("VirtIO discovery returned an unexpected kind sequence");
-    }
-
-    // The by-kind helpers must agree with the full enumeration, since the call sites
-    // 8.1 rewrote use them rather than `devices()`.
-    if virtio::devices_of_kind(VirtioKind::Block).len() != 3 {
+    // The by-kind helpers must agree with the full enumeration: those are what the
+    // seventeen rewritten call sites actually use.
+    if virtio::devices_of_kind(VirtioKind::Block).len() != blocks {
         return Err("devices_of_kind(Block) disagrees with devices()");
     }
-    if virtio::devices_of_kind(VirtioKind::Net).len() != 1 {
+    if virtio::devices_of_kind(VirtioKind::Net).len() != nets {
         return Err("devices_of_kind(Net) disagrees with devices()");
     }
     match virtio::first_of_kind(VirtioKind::Block) {
@@ -1525,10 +1571,16 @@ fn test_virtio_discovery() -> Result<(), &'static str> {
         _ => return Err("first_of_kind(Block) did not return a block device"),
     }
 
+    // Classification is keyed on the VirtIO device type, not the PCI class code. A class
+    // code cannot tell virtio-blk from virtio-scsi (both are mass storage), so a
+    // regression here would silently hand a SCSI device to the block driver.
+    if virtio::devices_of_kind(VirtioKind::Other(8)).iter().count() != 0 {
+        return Err("a virtio-scsi device was discovered; the harness attaches none");
+    }
+
     Ok(())
 }
 
-/// 3. The VirtIO device has at least one implemented BAR with a non-zero size
 #[cfg(target_arch = "x86_64")]
 fn test_pci_scan() -> Result<(), &'static str> {
     use crate::drivers::pci;
@@ -1639,10 +1691,9 @@ fn test_virtio_blk() -> Result<(), &'static str> {
     use crate::drivers::block::BlockError;
     use crate::drivers::virtio::blk::VirtioBlk;
 
-    // Find and initialise the virtio-blk device.
-        let dev = virtio::first_of_kind(VirtioKind::Block)
-        .ok_or("no VirtIO block device on the PCI bus")?;
-    let blk = VirtioBlk::init(&dev).map_err(|_| "VirtioBlk init failed")?;
+    // The scratch disk, identified by its signature — this test writes, so it must not
+    // take whichever block device happens to enumerate first.
+    let blk = open_scratch_disk()?;
 
     // Register it and fetch it back through the registry.
     let index = block::register("virtio-blk0", Box::new(blk));
@@ -1797,9 +1848,10 @@ fn test_block_server_ipc() -> Result<(), &'static str> {
     use crate::ipc::{self, IpcMessage};
     use crate::sched;
 
-    // Bring up and register a block device for the server to drive.
-    let dev = virtio::first_of_kind(VirtioKind::Block).ok_or("no VirtIO block device")?;
-    let blk = VirtioBlk::init(&dev).map_err(|_| "device init failed")?;
+    // Bring up and register a block device for the server to drive. This test WRITEs
+    // through the server, so it takes the scratch disk by signature rather than the
+    // first block device by position — see `open_scratch_disk`.
+    let blk = open_scratch_disk()?;
     let idx = block::register("virtio-blk-srv", Box::new(blk));
 
     // Start the server (spawns its task) and let it reach its receive loop.

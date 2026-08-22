@@ -317,6 +317,13 @@ fn build_detached_elf(root: &Path, out_dir: &Path, name: &str) {
 ///
 /// The disk is created once and reused — it is only regenerated if missing, so
 /// repeated `cargo xtask run`/`test` invocations don't rewrite it.
+/// Magic in sector 0 of the scratch disk.
+///
+/// The kernel's destructive block tests probe for this before writing, so they can never
+/// target the SquashFS root or the ext2 data volume regardless of what order discovery
+/// returns devices in. Kept in sync with `SCRATCH_SIGNATURE` in `kernel/src/test_runner.rs`.
+const SCRATCH_SIGNATURE: &[u8] = b"THEMELIOS-SCRATCH-V1";
+
 fn ensure_scratch_disk(root: &Path) -> PathBuf {
     let disk_path = root.join("target/themelios-scratch.img");
 
@@ -324,8 +331,26 @@ fn ensure_scratch_disk(root: &Path) -> PathBuf {
         // 4 MiB of zeros. Enough for the driver to report a sane capacity and
         // for round-trip read/write sector tests in sub-phase 3.2.
         const SIZE_BYTES: usize = 4 * 1024 * 1024;
-        let zeros = vec![0u8; SIZE_BYTES];
-        fs::write(&disk_path, &zeros)
+        let mut img = vec![0u8; SIZE_BYTES];
+
+        // Signature in sector 0, so the destructive block tests can *identify* the
+        // disk they are licensed to overwrite instead of trusting enumeration order.
+        //
+        // Before 8.1 those tests took "the first block device" and relied on this
+        // image being attached first, which put it in the lowest PCI slot. That is a
+        // silent contract between the harness's argument order and the kernel's
+        // discovery order, and it does not survive aarch64: QEMU `virt` maps `-device`
+        // arguments to virtio-mmio slots with *decreasing* base addresses, so a kernel
+        // scanning slots upward finds this disk last and "the first block device"
+        // becomes the ext2 data volume. The writes below would then land in ext2's
+        // block/inode bitmaps, and the damage would surface several sub-phases later
+        // looking exactly like an ext2 bug.
+        //
+        // The other two images are already identified by content — SquashFS by `hsqs`,
+        // ext2 by 0xEF53 — so this simply gives the scratch disk the same property.
+        img[..SCRATCH_SIGNATURE.len()].copy_from_slice(SCRATCH_SIGNATURE);
+
+        fs::write(&disk_path, &img)
             .expect("Failed to create scratch disk image");
         println!("Created scratch VirtIO disk: {}", disk_path.display());
     }
