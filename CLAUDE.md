@@ -145,7 +145,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Complete (ring-0 core; EL0/storage/net/containers deferred) |
-| **8** | aarch64 parity (EL0, storage, net, containers), then any SystemReady ARM64 node | Planned |
+| **8** | aarch64 parity (EL0, storage, net, containers) | Planned |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -158,19 +158,22 @@ line when finishing a sub-phase. Detailed per-sub-phase checklists live in
 `.sisyphus/plans/` (tracked in git); the git commit history has the full
 narrative per commit._
 
-**Phase 8 — aarch64 parity, then any SystemReady ARM64 node: PLANNED, not started.** Plan in
-`.sisyphus/plans/phase8-aarch64-parity.md` (v2, after three adversarial review passes —
-nine v1 claims were false and the sub-phase order is reversed from v1). **Seventeen
-sub-phases plus a spike**: aarch64 from the Phase 7 ring-0 core to full amd64 parity
-(8.1–8.10), then onto real ARM server hardware (8.11–8.17). **This re-scopes the roadmap's
-Phase 8 label rather than renumbering.**
+**Phase 8 — aarch64 parity: PLANNED, not started.** Plan in
+`.sisyphus/plans/phase8-aarch64-parity.md` (v2, after five adversarial review passes — nine
+v1 claims and fourteen v2 claims were false, and the sub-phase order is reversed from v1).
+**Ten sub-phases plus a spike**, taking aarch64 from the Phase 7 ring-0 core to full amd64
+parity: VirtIO transport (8.1–8.3), EL0 (8.4–8.5), storage and networking (8.6–8.7), the
+Linux personality (8.8–8.9), containers and the management API (8.10).
 
-The target is a **conformance class, not a vendor**: a SystemReady SR/SBBR node (UEFI +
-ACPI static tables + GICv3 + PCIe + PSCI). Graviton, Ampere Altra, Grace and the Azure/GCP
-Arm VMs are instances of it. Genericity is checked, not asserted — every boot prints a
-`platform:` line and CI boots the same unmodified image on `-M virt` *and* `-M sbsa-ref`,
-asserting the two lines **differ**. Note that **none of the three clouds runs virtio**:
-all are ENA/gVNIC/MANA + NVMe, so the virtio tier is QEMU and bare-metal only.
+**Real ARM server hardware is deliberately NOT planned.** The roadmap's Phase 8 label
+originally read "hyperscaler"; that work — platform discovery, GICv3 + ITS, PCIe ECAM +
+MSI-X, SMP, cloud NICs and NVMe, secure boot, measured boot — gets its own phase, written
+when parity lands. It was cut because review found the error density concentrated exactly
+there, and a plan that is wrong is worse than a stub saying "not planned". What survived
+verification is kept as a seed list in the plan's Tier 5 stub — including that **none of
+the three clouds runs virtio** (AWS is ENA, GCP gVNIC, Azure MANA, all with NVMe), so none
+of Phase 8's virtio work runs on any of them, and that `qemu-system-aarch64 -M sbsa-ref` is
+the cheap genericity test.
 
 Parity has one measurable definition — `test_runner`'s `SKIPPED` list empty on both
 architectures, i.e. 54/54 running on each. It is **16 running / 38 skipped** on aarch64

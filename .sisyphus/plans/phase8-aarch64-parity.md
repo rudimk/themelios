@@ -1,4 +1,4 @@
-# Phase 8 — aarch64 parity, then any SystemReady ARM64 node (plan, Momus-reviewed)
+# Phase 8 — aarch64 parity (plan, Momus-reviewed)
 
 **Deliverable:** bring aarch64 from a *ring-0 kernel core* (where Phase 7 left it) to
 **full feature parity with amd64** — EL0 userspace, storage, networking, containers, the
@@ -42,16 +42,17 @@ Grace, and the Arm VM offerings of GCP and Azure are all *instances* of that cla
 The plan is written against the class. **Any sub-phase that names a vendor must say
 which class property it is exercising.** SystemReady **IR** (UEFI + devicetree) is a
 second, explicitly scoped class. Non-UEFI device-tree boot — stock Raspberry Pi
-firmware, raw U-Boot `booti` — is **out of scope by name** (see 8.11's note).
+firmware, raw U-Boot `booti` — is **out of scope by name** (see the Tier 5 stub).
 
 Genericity is not asserted in prose here. It is a CI matrix and a boot line — see
-**decision 9** and **8.11**.
+**decision 9** and the Tier 5 stub.
 
 ### How this relates to the roadmap's "Phase 8"
 
 `CLAUDE.md` labels Phase 8 **"Hyperscaler support (AWS, GCP, Azure), secure boot."**
 This plan **re-scopes** that entry rather than renumbering the roadmap: 8.1–8.10 are
-aarch64 parity, 8.11–8.17 are the real-hardware work the label names. Parity is not a
+aarch64 parity; the real-hardware work the label names is **not planned here** and gets
+its own phase when parity lands. Parity is not a
 detour — the hyperscaler items are dead weight until an ARM node can run a container.
 
 ## Grounding (verified against the tree at `4dcaa74`, plus primary sources)
@@ -276,7 +277,7 @@ should perform, not assumptions the plan may make.
    uniformly. Dispatch keys on the **vector slot** first, then `EC`.
 3. **VirtIO transport = virtio-mmio first, PCIe ECAM later.** mmio needs no config-space
    enumeration, no BAR programming, no MSI-X — and MSI-X on real hardware needs the GICv3
-   ITS, which does not land until 8.12/8.13. **The QEMU invocation must pass
+   ITS, which belongs to the unplanned hardware phase. **The QEMU invocation must pass
    `-global virtio-mmio.force-legacy=false`**; without it QEMU offers version 1.
    Implement modern (v2) and reject v1 with a named message *that points at the missing
    flag*, so the failure is self-diagnosing.
@@ -306,7 +307,7 @@ should perform, not assumptions the plan may make.
 9. **Genericity is a CI matrix and a boot line, not a prose claim.** Every boot prints one
    `platform:` line — firmware source (ACPI|DT), GIC version, UART type + base, CPU count,
    PA bits, timer frequency. CI boots the **same unmodified image** across the matrix in
-   8.11 and asserts both that the sentinel matches *and* that the `platform:` lines from
+   the hardware phase and asserts both that the sentinel matches *and* that the `platform:` lines from
    different machines **differ**. A kernel still secretly using hard-coded constants prints
    identical lines on two different machines, and that check catches it.
 10. **Falsifiability is mechanical.** A `--features mutate` table in `test_runner.rs`, one
@@ -315,14 +316,15 @@ should perform, not assumptions the plan may make.
     `SUITE_SIZE` is; and a CI job that runs each mutation and **fails if the run is green**.
     "Demonstrated falsifiable" becomes a compile-time count plus a CI matrix. Scoped to
     Phase 8 un-skips; not retrofitted.
-11. **Device *discovery* is deferred to 8.11; device *description* is not.** v1's decision
+11. **Device *discovery* is deferred to the hardware phase; device *description* is not.** v1's decision
     was "hard-code until 8.8, the constants are stable and known." **The constants were
     never the debt — the shape is.** Discovery yields `(compatible, base, size, irq)` tuples
     and a device *list*; hard-coded init functions take no arguments and know their own
-    IRQ. Deferring the shape means 8.11 rewrites every driver signature *after* 19+ tests
+    IRQ. Deferring the shape means the hardware phase rewrites every driver signature *after* 19+ tests
     have frozen it. So: **8.1 lands `PlatformInfo { uart, gic, virtio_slots: &[PlatformDevice] }`
     with one hard-coded provider per architecture, and every driver takes its base and IRQ
-    from it**; 8.3 populates the aarch64 provider with the QEMU-`virt` table. 8.11 then adds
+    from it**; 8.3 populates the aarch64 provider with the QEMU-`virt` table. The hardware
+    phase then adds
     real providers instead of performing a cross-cutting refactor. Cost today: one struct
     and one call site per driver.
 12. **Virtqueue rings and buffers are Normal memory; only the MMIO register window is
@@ -335,7 +337,8 @@ should perform, not assumptions the plan may make.
     Cacheable Inner-Shareable** for rings and buffers when the device is declared coherent,
     **Normal Non-Cacheable Inner-Shareable** when it is not. The coherent flag is
     *discoverable* — QEMU emits DT `dma-coherent` on every `virtio_mmio@` node, and ACPI
-    `_CCA` carries it on real hardware — so this is a value to read (8.11), not a decision
+    `_CCA` carries it on real hardware — so it is a value to read once discovery exists,
+    not a decision
     to guess, and 8.3 states its interim assumption explicitly.
 13. **Tracker claims are generated, not typed.** Invariant 6 says claims get checked before
     they are written; decision 10 makes that mechanical for *tests*, but nothing made it
@@ -350,8 +353,8 @@ should perform, not assumptions the plan may make.
 
 ## Sub-phases
 
-Seventeen sub-phases plus a spike. **The order is reversed from v1**: the VirtIO transport
-work goes first, EL0 second. Rationale in the sequencing section.
+Ten sub-phases plus a spike, ending at parity. **The order is reversed from v1**: the
+VirtIO transport work goes first, EL0 second. Rationale in the sequencing section.
 
 ---
 
@@ -468,12 +471,13 @@ references `spawn_server`/`embedded::`.
 reason is *"PCI enumeration is x86-only (aarch64 uses MMIO ECAM)"* — whose parenthetical
 already makes the right point, so it needs sharpening rather than replacing: it is the
 `0xCF8`/`0xCFC` **port-I/O mechanism** that is x86-only. aarch64 does have config space, via
-ECAM at `0x3f000000`, which 8.13 implements.
+ECAM at `0x3f000000`, which the hardware phase would implement.
 **Acceptance:** the seven run and pass on aarch64. Plus, per the Phase 7.2 lesson that one
 tick would pass a dead timer: **(a)** a test reads back the leaf descriptor covering the
 virtqueue region and asserts `AttrIndx` equals the intended MAIR index, printing both —
 this fails the moment the attribute drifts, TCG or not; **(b)** boot emits a
-`dma: coherent|maintained` line so 8.15 has something to grep rather than rediscover.
+`dma: coherent|maintained` line so the hardware phase has something to grep rather than
+rediscover.
 Falsifiability: *not* "one slot off" — **every one of the 32 slots returns valid magic**,
 populated or not (`virtio-mmio.c:95-114` answers `VIRT_MAGIC` with `DeviceID == 0` for empty
 slots), so that mutation lands on a readable slot and proves nothing. Point the base instead
@@ -486,8 +490,9 @@ Separately assert the magic/version/device-id triple is genuinely checked, by co
 empty slots traversed during a normal boot.
 **Riskiest unknown:** the coherence attribute is decided here but the flag that determines
 it (DT `dma-coherent`, which QEMU *does* emit on every `virtio_mmio@` node; ACPI `_CCA` on
-real hardware) is not read until 8.11. Either pull a minimal coherency probe forward, or
-state the hard-coded assumption **and** name the 8.11 task that replaces it. Do not let it
+real hardware) is not read until discovery exists, which Phase 8 does not build. Either
+pull a minimal coherency probe forward, or state the hard-coded assumption **and** record it
+in the Tier 5 stub as work that replaces it. Do not let it
 be a silent guess.
 
 ---
@@ -779,270 +784,75 @@ container runs on an ARM node and `GET /containers/json` returns it. Update `CLA
 
 ---
 
-### Tier 5 — any SystemReady ARM64 node
+### Tier 5 — real ARM server hardware — **NOT PLANNED**
 
-#### 8.11 — Platform discovery: ACPI, device tree, and the genericity matrix
+Phase 8 stops at parity. The hardware work — platform discovery, GICv3 + ITS, PCIe ECAM +
+MSI-X, SMP, a cloud NIC and NVMe, secure boot, measured boot — **is not planned here and
+gets its own phase, written when parity lands.**
 
-**Three cases, not two.** (1) **SR/SBBR** — UEFI + ACPI, and **no DT exists at all**
-(Graviton, Ampere servers, Grace, cloud Arm VMs). (2) **IR/EBBR** — UEFI + DT, the DTB
-arriving through the **EFI configuration table**, which is where Limine's DTB request gets
-it. (3) **non-UEFI** — DTB in `x0`, no boot services, no Limine. Code shaped as "DTB always
-present, ACPI optional" inverts on case 1.
-The Limine protocol settles what v2 first tagged UNVERIFIED here: *"If the DTB cannot be
-found, the response will **not** be generated"* (PROTOCOL.md, Device Tree Blob Feature). So
-on an ACPI-only machine there is simply no DTB response — fail closed on its absence, which
-is a documented state rather than an assumption.
+**Why it was cut rather than kept as a draft.** Five review passes went over this plan, and
+the defects they found were not evenly spread. The near-term grounding held up to
+line-level checking — the 53 syscall sites, the copy-loop/teardown analysis, the `SP_EL0`
+and `SPSR_EL1.M` race classes, `force-legacy=true`, the softfloat impossibility, the six
+no-EL0 tests, the polling virtio stack. The errors clustered almost entirely in this tier:
+a false NitroTPM support claim offered *as a correction*, a GTDT field that does not exist,
+`sbsa-ref`'s AHCI placed on PCIe when it sits on the system bus, an unverified Azure block
+device propping up a headline conclusion. Rows 13, 18, 21 and 22 of the v2 corrections
+table all come from here.
 
-Deliver: a `Platform` provider interface with providers `Acpi` (RSDP from Limine's RSDP
-request), `DtFromEfi` (DTB from Limine's DTB request), selection ACPI-then-DT decided once
-at boot, and a node presenting neither **halting with a named message rather than falling
-back to constants**. Static ACPI tables consumed: RSDP/XSDT, **FADT** (PSCI conduit +
-reset), **MADT** (GIC version, distributor/redistributor bases, CPU list), **GTDT** (timer
-PPIs plus the CntControlBase/CntReadBase frame addresses — note GTDT carries **no**
-frequency field; the frequency comes from `CNTFRQ_EL0` or from `CNTFID0` inside the
-memory-mapped frame GTDT points at, which is a second MMIO mapping, not a table read), **MCFG** (ECAM), **SPCR** (UART **type** *and* base — SPCR
-distinguishes PL011 / 16550 / SBSA Generic UART, so "UART" is at least two drivers),
-**IORT** (PCIe RequesterID → ITS DeviceID and SMMU StreamID — without it, MSI writes go to
-an ITS that has never heard of the device and **silently vanish**), **PPTT** (CPU topology,
-needed by 8.14), **TPM2** (for 8.17).
-**"Static tables only, no AML" holds** for SR-class servers — reset and poweroff come from
-PSCI declared in FADT's ARM boot flags, not AML, which is the usual reason a static-only OS
-gets dragged into an interpreter. A *required* device describable only from the DSDT
-namespace is a hard failure with a named message, not a silent degradation.
+That is the expected shape — it is speculation about hardware nobody will touch for ten
+sub-phases — but a plan gets read as though its parts are equally trustworthy. Shipping a
+detailed schedule for work this uncertain invites someone to act on numbers that were never
+checked. **A stub saying "not planned" is more accurate than a plan that is wrong.**
 
-Also, three things v1 pinned that must instead be **read**:
-- **`TCR_EL1.IPS` checked against `ID_AA64MMFR0_EL1.PARange` — *verified*, not written.**
-  The distinction matters and v2's first wording got it wrong by saying "from … not a
-  constant", which reads as an instruction to *set* it. Phase 7.1 pinned that `MAIR_EL1` and
-  `TCR_EL1` are **adopted and verified, never rewritten** (`paging.rs:317-330`), and `IPS` is
-  a single field governing *both* translation regimes — writing it under a live `TTBR1`
-  is exactly the hazard `verify_tcr` exists to prevent. So: read `PARange`, read `IPS`,
-  and **halt with a named message if the firmware's `IPS` cannot address it**. Not
-  hypothetical — the high PCIe window on `virt` sits above 512 GiB, and too small an `IPS`
-  faults there.
-- **Verify `ID_AA64MMFR0_EL1.TGran4`** and halt with a named message otherwise. Two
-  instructions, converting "4 KiB is available everywhere, probably" into a checked fact.
-  **UNVERIFIED** whether any target of interest lacks it — which is the reason to check.
-- **Cache line size from `CTR_EL0`, minimum across CPUs.** This is the real
-  heterogeneous-core hazard and it lands in 8.6's maintenance loops: a loop written against
-  the boot CPU's `DminLine` under-maintains on another core. Print `MIDR_EL1` per CPU so an
-  erratum report has something to name.
+**What survived verification and should seed the real plan** rather than be rediscovered:
 
-**Boot chain: UEFI only.** ThemeliOS targets SystemReady **SR** and **IR**. Limine on
-aarch64 is UEFI-only; that covers SR and — via U-Boot's UEFI implementation, which
-chainloads `BOOTAA64.EFI` and passes the DTB as an EFI config table — most EBBR boards.
-Platforms that boot only the raw Linux `Image` protocol (stock Raspberry Pi firmware,
-`booti` without U-Boot's EFI loader) are **out of scope for Phase 8** and would need a
-dedicated sub-phase: `ARM\x64` header, MMU-off entry, DTB in `x0`. Saying this is the
-difference between a scoped port and an unbounded one.
-
-**Retires (0).**
-**Acceptance — decision 9's matrix, booting the SAME unmodified image:**
-
-| Invocation | What it proves |
-|---|---|
-| `-M virt,gic-version=2,acpi=off` | the DT path is real (QEMU emits DT, no ACPI) |
-| `-M virt,gic-version=3` | ACPI path, GICv3, ECAM |
-| `-M virt,gic-version=3 -m 16G` | `IPS`-vs-`PARange` check; high MMIO window (`highmem` is already the `virt` default, `virt.c:4368` — the RAM size is what moves the window) |
-| `-M virt,virtualization=on` | EL2 present — the condition that made 7.2 choose `CNTV` |
-| `-cpu cortex-a53 / neoverse-n1 / max` | no implicit CPU-feature assumptions |
-| **`-M sbsa-ref`** | **the genericity test** |
-
-**`sbsa-ref` is the cheap, concrete answer to "runs on an arbitrary SystemReady node"**:
-GICv3 + ITS, ACPI, TF-A + EDK2 firmware, an E1000E on **PCIe** and an AHCI controller on
-the **system bus** (`sbsa-ref.c:593` creates `sysbus-ahci` at `0x6010_0000` with a wired
-SPI — storage there is an ACPI/DT-described MMIO device, not a PCIe enumeration target),
-**no virtio-mmio at all**, and an entirely different memory map (RAM at `0x100_0000_0000`) — and it costs a firmware image, not hardware. Its
-expectation is scoped honestly: boot + discovery + UART + timer + GIC + the device-free
-portion of the suite. It has no virtio, so storage and networking stay skipped **there**
-with a written reason (a per-machine skip list, not a per-arch one).
-CI asserts the sentinel matches on every row **and that the `platform:` lines from `virt`
-and `sbsa-ref` differ.** A kernel still secretly using constants prints identical lines on
-two different machines.
-**v1's falsification test did not test what it claimed:** `-machine virt,highmem=on` does
-**not** relocate `virt`'s low map — PL011 stays at `0x0900_0000`, GICD at `0x0800_0000`,
-virtio-mmio at `0x0a00_0000`. It adds a high window. A kernel hard-coding every low-map
-constant passes it unchanged. Keep it as the `PARange`/IPS row, which is what it actually
-exercises; the positive test is a *different machine model*.
-**Riskiest unknown:** ACPI scope discipline. A DT parser is a few hundred lines of
-well-specified big-endian walking; the risk is scope creep into AML. Hold the line at static
-tables and fail loudly.
-**UNVERIFIED:** whether any target's firmware leaves an SMMU enabled rather than in bypass
-(IORT names it) — worth a boot-time check rather than an assumption.
-
-#### 8.12 — GICv3 + ITS (still uniprocessor)
-
-Deliver: the system-register CPU interface (`ICC_SRE_EL1` — **written and read back to
-confirm it stuck**, since it may be RAZ/WI or trap unless a higher EL enabled
-`ICC_SRE_EL2/EL3`; `ICC_IAR1_EL1`, `ICC_EOIR1_EL1`, `ICC_PMR_EL1`, `ICC_IGRPEN1_EL1`),
-behind the existing `arch::irq` facade with runtime v2/v3 selection from 8.11.
-
-**Three things v1's register list omitted, without which no interrupt ever arrives:**
-- **`GICD_CTLR.ARE_NS`** — Affinity Routing must be enabled in the distributor before the
-  `ICC_*` interface routes anything. This is the missing step between `ICC_SRE_EL1.SRE=1`
-  and the first interrupt.
-- **`GICR_ISENABLER0` / `GICR_IGROUPR0`** at the redistributor's SGI frame
-  (`RD_base + 64 KiB`). In GICv3, SGI and **PPI** enable/group/priority/config moved off
-  `GICD_*` onto the per-CPU redistributor. **Phase 7.2's `CNTV` tick is PPI 27** — a
-  GICv2-shaped driver that keeps enabling INTID 27 through `GICD_ISENABLER` does nothing,
-  and the failure looks like "the timer stopped," not "the GIC is misprogrammed."
-- **`GICD_IROUTER<n>`** (offset 0x6000, 8 bytes per SPI) — with ARE=1, SPI targeting is by
-  affinity, not `GICD_ITARGETSR`.
-
-**And the ITS, which v1 did not mention at all.** On every Tier-5 platform the devices are
-PCIe and the interrupts are **MSI-X**, which on GICv3 means **LPIs via the ITS**: command
-queue, device table, collection table, `MAPD`/`MAPTI`/`INV`/`SYNC`, LPI property + pending
-tables, `GITS_TRANSLATER` doorbell, DeviceID from IORT. This is not an optimization —
-several PCIe endpoints do not wire legacy INTx at all, so "INTx for now" may not be
-available. GICv2m MSI frames are out of scope; a GICv2 platform with PCIe is unsupported
-and says so. A non-GIC interrupt controller (bare-metal Apple silicon uses AIC) fails loudly
-rather than mis-detecting.
-**GICv4's deferral is safe** and the plan should say *why* rather than just listing it: v4
-adds direct injection of virtual interrupts for a hypervisor, and is v3-compatible for
-everything a non-hypervisor OS does.
-
-**Retires (0).**
-**Acceptance:** boots under `-M virt,gic-version=3`; the 7.2 tick self-test (five ticks, not
-one) passes **through the redistributor path**; an ITS-delivered MSI is counted.
-
-**Note the unreconciled seam with 8.2.** 8.2 deliberately leaves interrupt acknowledgement
-*out* of the `VirtioTransport` trait, because the virtio stack polls — correctly, as of
-today. But this sub-phase and 8.13 both require an MSI to be delivered and counted, and
-nothing in 8.1-8.10 gives any driver an interrupt path. So the MSI assertions here are
-**bare-GIC exercises against a synthetic device, not a driver milestone** — which is fine
-and is what they are scoped as. Converting the virtio stack from polling to
-interrupt-driven is **out of Phase 8 scope**; if it is ever wanted, it is its own
-sub-phase and it re-opens 8.2's trait surface.
-**Riskiest unknown:** silent GIC-version flips. `virt` selects GICv3 automatically at >8
-CPUs, so `-smp 16` changes the interrupt controller with no diagnostic — which is also why
-GICv3 is on the critical path for Graviton-class (16-64 vCPU) instances rather than being
-an alternative to GICv2.
-
-#### 8.13 — PCIe ECAM + MSI-X
-
-Deliver: ECAM enumeration (MCFG from 8.11; `0x3f000000` on `virt`), BAR programming, MSI-X
-capability programming with DeviceIDs mapped through IORT, and a third `VirtioTransport`
-impl for virtio-PCI-on-ECAM.
-
-**This sub-phase is why 8.12 precedes it.** v1 put ECAM in the discovery sub-phase, *before*
-GICv3 — but ECAM gets you config space and BARs, not interrupts, and those devices are
-MSI-X, which needs the ITS. As v1 drew it, the sub-phase depended on its successor.
-
-**Retires (0).**
-**Acceptance:** a virtio-PCI device on `-M virt` (ECAM path) passes the same transport tests
-as the mmio one; an MSI-X interrupt is delivered and counted — again a bare-GIC exercise
-per 8.12's note, since the transport itself still polls.
-**Riskiest unknown:** IORT DeviceID mapping. A wrong mapping produces MSI writes that vanish
-silently — no fault, no interrupt, just a device that never completes.
-
-#### 8.14 — SMP
-
-Deliver: secondary bring-up via PSCI `CPU_ON` (the conduit is established —
-`arch/aarch64/psci.rs`); per-CPU `TPIDR_EL1` blocks for secondaries (the structure exists
-from 7.3); per-CPU redistributor init; SGI-based IPIs; **and a full audit of every
-`spin::Mutex` for multi-core soundness.** The kernel was written UP and its locks have only
-ever been contended by interrupts.
-
-**Retires (0).**
-**Acceptance — v1's repeated 7.3's exact mistake.** v1 said "4 CPUs come online and the
-scheduler distributes work across them; a soak run is clean" — no unit on "distributes," no
-predicate on "clean," the same shape as the loop-iteration fairness metric 7.3 had to throw
-away and re-measure in ticks of residency. Instead:
-(i) **per-CPU tick residency** in a stated band that **rejects `[all,0,0,0]`**;
-(ii) a task records `MPIDR_EL1` each timeslice and must be observed on ≥2 distinct CPUs;
-(iii) an SGI IPI counted at a **named** target CPU;
-(iv) a contended counter — 4 CPUs × 100k increments under `InterruptMutex` totalling
-**exactly 400,000**, the only assertion in the set a lock bug can actually fail;
-(v) **the harness asserts it launched with `-accel tcg,thread=multi`** — without it all
-vCPUs are time-sliced in one host thread and *no lock bug can appear at all*, so a kernel
-with zero SMP soundness passes.
-**Riskiest unknown:** the memory-ordering half of the lock audit is **not verifiable under
-TCG**. A missing acquire/release or `dmb` is invisible in a sequentially-consistent emulator
-and is a classic silent corruptor on out-of-order Neoverse. **UNVERIFIED** how faithfully
-MTTCG models ARM's weak ordering on an x86 host; treat as "it does not." This makes a
-**KVM-on-real-ARM run a gate in 8.15, not a bonus** — and it is worth pulling a KVM run
-forward as soon as any ARM runner is available, since it also covers 8.3's coherence choice
-and 8.6's barriers.
-
-#### 8.15 — One cloud, end to end
-
-**v1's 8.10 was five sub-phases wearing one number**, and its device list was wrong on every
-clause. Verified: **GCP Arm VMs** (T2A, C4A/Axion) support **gVNIC + NVMe only** — "Virtio-Net
-and SCSI interfaces are not supported on Arm VMs." **Azure Cobalt 100** uses **MANA**,
-falling back to **NetVSC over VMBus** — a whole paravirtual bus, not a PCI device — plus
-NVMe. **AWS Graviton** is ENA + NVMe (all Nitro); there is no "EBS-over-virtio" on Graviton,
-that was the Xen-era x86 path. **So none of the three clouds runs a single line of the
-8.1-8.7 virtio work.**
-
-| Platform | NIC | Block | Discovery | Interrupts |
-|---|---|---|---|---|
-| QEMU `virt` | virtio-net-mmio/pci | virtio-blk | DT or ACPI | GICv2/v3 |
-| QEMU `sbsa-ref` | E1000E (PCIe) | AHCI (**sysbus**, not PCIe) | ACPI | GICv3 + ITS |
-| AWS Graviton | **ENA** (PCIe) | **NVMe** | ACPI | GICv3 + ITS |
-| GCP Axion/T2A | **gVNIC** (PCIe) | **NVMe** | ACPI | GICv3 + ITS |
-| Azure Cobalt | **MANA**, fallback **NetVSC/VMBus** | NVMe **or SCSI-over-VMBus** — see below | ACPI | GICv3 + ITS |
-| Bare-metal SBSA | vendor PCIe NIC | NVMe | ACPI | GICv3 + ITS |
-
-**The Azure block row is the one entry not verified, and it is load-bearing.** Microsoft's
-Dpsv6 (Cobalt 100) size page lists *Local Storage: None* and names no disk controller;
-Azure presents remote disks as **either** SCSI-over-VMBus **or** NVMe depending on the VM's
-`DiskControllerType`, and only the "d" variants require NVMe, for *local* storage. So the
-minimum-set claim below holds for AWS, GCP and bare-metal SBSA but **may not hold for
-Azure** — if Azure turns out to need SCSI-over-VMBus, that is a second block driver and a
-whole paravirtual bus, not a row in a table. **8.15 must pick its one cloud before relying
-on this**, and picking AWS or GCP sidesteps the question entirely.
-
-**The minimum device set for "runs on any ARM node" is NVMe + the platform's UART + the
-generic timer** — with the Azure caveat above. Networking is per-platform and cannot be
-promised generically.
-
-Deliver: an **NVMe driver** (block), **one** cloud's NIC, and boot on a real instance of
-that cloud. **The other two clouds are deferred by name, each as one NIC-driver sub-phase.**
-Each of ENA / gVNIC / MANA+VMBus is comparable to Phase 3's whole storage bring-up; folding
-four drivers into one sub-phase is how an estimate becomes fiction.
-
-**Retires (0) — but this is where the phase's real deliverable lands.**
-**Acceptance — v1 had no verdict here, only a human saying it worked.**
-(a) The shipped ARM image runs the **same suite** and prints the **same sentinel** over the
-platform's serial console (EC2 serial console / cloud console output), so "it booted"
-becomes "54 passed, 0 skipped" — machine-checkable by the same grep the QEMU harness uses.
-(b) `cargo xtask cloud-smoke` provisions one instance, boots, greps the sentinel, destroys —
-nightly or manual, **never per-PR**.
-(c) A **committed hardware matrix table**: every platform ever booted, the date, the
-`platform:` line it printed, and the sentinel. That table is the honest substitute for CI
-coverage on hardware, and its staleness is visible.
-(d) **The KVM-on-ARM run from 8.14 is a gate here**, covering the memory-ordering and
-coherence questions TCG cannot answer.
-**Riskiest unknown:** the DMA-coherence and barrier decisions made back in 8.3/8.6. TCG
-never reproduces either, so 8.3-8.14 can all be green while both are wrong, surfacing here
-as corruption under load on real silicon — as far from its cause as a bug gets. Mitigations
-are (a) the `AttrIndx` assertion and `dma:` boot line from 8.3, and (b) pulling the KVM run
-as early as an ARM runner allows.
-
-#### 8.16 — UEFI Secure Boot and image signing
-
-Signed `BOOTAA64.EFI` → signed kernel; key generation, `db`/KEK enrolment, and the image
-packaging chain. Largely an image and key-management problem rather than kernel work, which
-is why it is its own sub-phase rather than a bullet.
-**Acceptance:** a signed image boots with Secure Boot enabled, and an image with a
-deliberately corrupted signature is **rejected** — the second half is the test.
-
-#### 8.17 — Measured boot
-
-Consume the UEFI TCG2 event log; discover a TPM 2.0 via the ACPI **TPM2** table (CRB
-interface); extend PCRs. **Fail closed to "unmeasured" where no TPM is present.** vTPM and
-NitroTPM are *instances* of this, not the design — and v1's "vTPM/NitroTPM where available"
-was hedging over an availability question it never checked — but **v2's first attempt to
-correct it was itself wrong.** NitroTPM *is* supported on Graviton2 (M6g, M6gd, C6g, C6gd,
-C6gn, R6g, R6gd, T4g, Im4gn are all on AWS's supported-instance list); it is **Graviton1
-(A1)** that is absent. Corrected here rather than quietly, because a wrong "correction"
-carrying the authority of a correction is the worst failure mode this table exists to
-document.
-`StartMethod` for the ARM SMC-based CRB is `ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC = 11`
-(Linux `include/acpi/actbl3.h:467`; the FF-A variant is 15 at `:470`).
-**Acceptance:** PCR values are reproducible across two boots of the same image and **differ**
-after a deliberate one-byte image change.
-
+- **Target a conformance class, not a vendor.** SystemReady SR/SBBR — UEFI + ACPI static
+  tables + GICv3 + PCIe + PSCI. Graviton, Ampere Altra/AmpereOne, Grace and the Azure/GCP
+  Arm VMs are instances of it. Graviton is the *least* informative single target, being the
+  textbook conformant case.
+- **None of the three clouds runs virtio** — verified against vendor docs. AWS Graviton is
+  ENA + NVMe; GCP Arm VMs are gVNIC + NVMe, with *"Virtio-Net and SCSI interfaces are not
+  supported"*; Azure Cobalt is MANA falling back to NetVSC over VMBus. **So none of Phase
+  8's virtio work runs on any of them** — the virtio tier is QEMU and bare-metal only, and
+  the hardware phase therefore contains four device drivers, each comparable to Phase 3's
+  entire storage bring-up. Azure's *block* device is the one item still unverified: Azure
+  presents remote disks as NVMe **or** SCSI-over-VMBus depending on `DiskControllerType`.
+- **`qemu-system-aarch64 -M sbsa-ref` is the cheap genericity test** — GICv3 + ITS, ACPI,
+  TF-A + EDK2 firmware, a PCIe NIC, **no virtio-mmio at all**, RAM at `0x100_0000_0000`.
+  Boot the same unmodified image there and on `-M virt`, have each print a `platform:` line
+  (firmware source, GIC version, UART type, CPU count, PA bits, timer frequency), and assert
+  the two lines **differ**. A kernel still using hard-coded constants prints identical lines
+  on two different machines. Costs a firmware image, not hardware.
+- **ECAM depends on the ITS, not the reverse.** PCIe devices are MSI-X, which on GICv3 means
+  LPIs through the ITS, with DeviceIDs mapped via the ACPI **IORT**. Any plan scheduling
+  ECAM enumeration before GICv3 has a sub-phase depending on its successor — v1 did.
+- **GICv3 is not optional at scale.** QEMU `virt` silently selects it above 8 vCPUs
+  (`GIC_NCPU` = 8), and Graviton instances are 16-64 vCPU.
+- **The GICv3 registers a GICv2-shaped driver will miss:** `GICD_CTLR.ARE_NS` (affinity
+  routing, before which the `ICC_*` interface routes nothing); `GICR_ISENABLER0` /
+  `GICR_IGROUPR0` at the redistributor SGI frame — **PPI enable moved off `GICD_*`, and
+  Phase 7.2's `CNTV` tick is PPI 27, so a v2-shaped driver silently loses the timer**; and
+  `GICD_IROUTER<n>`. `ICC_SRE_EL1` must be written *and read back*.
+- **"Static ACPI tables only, no AML" is sustainable** on SR-class servers, because reset
+  and poweroff come from PSCI declared in FADT's ARM boot flags — the usual reason a
+  static-only OS gets dragged into an interpreter. Tables needed: RSDP/XSDT, FADT, MADT,
+  GTDT, MCFG, SPCR (which names the UART *type* — PL011 / 16550 / SBSA Generic are not one
+  driver), IORT, PPTT, TPM2. GTDT carries **no** frequency field.
+- **Two things Phase 8 pins that the hardware phase must un-pin by *verifying*, never
+  writing:** `TCR_EL1.IPS` against `ID_AA64MMFR0_EL1.PARange` (7.1's standing rule is that
+  `TCR_EL1` is adopted and verified, never rewritten, and IPS governs both regimes) and
+  `ID_AA64MMFR0_EL1.TGran4`. Cache line size must come from `CTR_EL0`, **minimum across
+  CPUs** — the real heterogeneous-core hazard for 8.6's maintenance loops.
+- **TCG cannot answer the two questions that matter most.** It models no caches and is
+  effectively sequentially consistent, so 8.3's memory-attribute choice and 8.6's virtqueue
+  barriers can both be wrong while every test stays green. **A KVM run on a real ARM host is
+  the gate** — and it is worth pulling in as soon as an ARM runner exists, rather than
+  waiting for the hardware phase to discover it.
+- **Boot chain is UEFI-only.** Limine on aarch64 requires it; that covers SR and, via
+  U-Boot's UEFI implementation, most EBBR boards. Platforms booting only the raw Linux
+  `Image` protocol (stock Raspberry Pi firmware, `booti`) need a separate entry path and are
+  out of scope by name.
 ---
 
 ## The ratchet — `SKIPPED` accounting
@@ -1088,11 +898,10 @@ in its sequencing argument.
 8.spike --> 8.1 --> 8.2 --> 8.3 --> 8.4 --> 8.5 --+--> 8.6 --+
                                                   |          |
                                                   +--> 8.7 --+--> 8.9 --> 8.10   [PARITY]
-
-[PARITY] --> 8.11 --> 8.12 --> 8.13 --> 8.14 --> 8.15 --> 8.16 --> 8.17   [ANY SR NODE]
-          discovery   GICv3    ECAM      SMP     cloud    secure  measured
-                      + ITS    + MSI-X                     boot     boot
 ```
+
+Phase 8 ends at [PARITY]. Real ARM server hardware is a separate, **unplanned** phase — see
+the Tier 5 stub for what review established about it and why it is not scheduled here.
 
 **8.8** (arch-neutral Linux dispatcher — amd64-only, retires nothing) is not drawn: it may
 land any time after 8.5 and must precede 8.9. Retirement counts are in the ratchet table
@@ -1134,22 +943,29 @@ of them.
 
 ## Estimate
 
-**Seventeen sub-phases plus a spike**, each comparable to 7.1-7.4. Parity (8.1-8.10) is
-**ten**; any-SR-node (8.11-8.17) is **seven**. v1 said "11-14 sub-phases"; that was low
-because it folded four device drivers, a signing chain and a TPM path into one number, and
-because it did not know about the six hand-written `_start` routines or the second Linux
-syscall table.
+**Ten sub-phases plus a spike**, each comparable to 7.1-7.4, to reach parity.
+
+v1 estimated "11-14 sub-phases" for parity *and* hardware together. That was low on both
+halves: it did not know about the six hand-written x86 `_start` routines or the second
+Linux syscall table, and it folded four device drivers, a signing chain and a TPM path into
+a single hardware sub-phase. The honest position now is ten sub-phases for parity, which
+has been checked, and **no estimate at all for hardware**, which has not — the review found
+the error density concentrated exactly there, so a number would be false precision.
 
 ## Deferred (documented — out of Phase 8 scope)
 
-- **The second and third clouds** — one NIC-driver sub-phase each (gVNIC, MANA/VMBus).
+- **All real-hardware work** — platform discovery, GICv3 + ITS, PCIe ECAM + MSI-X, SMP,
+  cloud NICs, NVMe, secure boot, measured boot. Not deferred as individual items but as a
+  whole unplanned phase; see the Tier 5 stub.
 - **Non-UEFI boot** — the raw Linux `Image` protocol for stock Raspberry Pi firmware and
-  `booti`. A dedicated sub-phase if ever wanted.
-- **GICv2m MSI frames** — a GICv2 platform with PCIe is unsupported and says so.
+  `booti`. A separate entry path (`ARM\x64` header, MMU-off entry, DTB in `x0`) if ever
+  wanted.
+- **GICv2m MSI frames** — a GICv2 platform with PCIe would be unsupported.
 - **32-bit EL0 (AArch32).** The `0x600` vector group stays fatal.
-- **SMP on amd64.** x86 stays UP; 8.14's lock audit benefits it, but AP bring-up is separate.
+- **SMP, on either architecture.** Both stay UP through Phase 8; the multi-core lock audit
+  belongs to the hardware phase.
 - **Big-endian, 16 KiB/64 KiB granules, 52-bit VA (LPA2).** 4 KiB/48-bit is pinned — but
-  *verified* at boot (8.11), not assumed.
+  *verified* at boot by the hardware phase, not assumed.
 - **SVE/SME.** Not advertised in `HWCAP`; `CPACR_EL1.ZEN` left trapping.
 - **GICv4** — adds direct injection of virtual interrupts for a hypervisor; v3-compatible
   for everything a non-hypervisor OS does.
@@ -1213,7 +1029,7 @@ this rate, and only mechanical verification finds them.
 | 23 | `smoltcp-gate` "has compile-gated it since **7.0c**" | Phase **4.7** (`ab26daf`); 7.0c only fixed it for softfloat |
 | 24 | 8.10: "**zero** `#[cfg(target_arch)]` remaining in `shell/mod.rs`" | 20 sites exist; 3 in `shell::init()` are legitimately arch-specific and no sub-phase schedules the facade to remove them. The criterion would have been silently weakened at the parity gate — the loophole 8.10 claims to close |
 | 25 | Two `UNVERIFIED` tags (Limine DTB on ACPI-only; ARM SMC CRB `StartMethod`) | Both are single lookups. Limine PROTOCOL.md: no DTB → no response. `actbl3.h:467`: `StartMethod` 11. **A lazy UNVERIFIED is a defect, not humility** |
-| 26 | 8.11: "`TCR_EL1.IPS` **from** `ID_AA64MMFR0_EL1.PARange`, not a constant" | Reads as an instruction to *write* IPS, contradicting 7.1's standing "`TCR_EL1` is adopted and verified, **never rewritten**". IPS governs both regimes; it must be *checked*, not set |
+| 26 | The (now-cut) discovery sub-phase: "`TCR_EL1.IPS` **from** `ID_AA64MMFR0_EL1.PARange`, not a constant" | Reads as an instruction to *write* IPS, contradicting 7.1's standing "`TCR_EL1` is adopted and verified, **never rewritten**". IPS governs both regimes; it must be *checked*, not set |
 
 Smaller count and line-number slips corrected at the same time: 76 register references not
 77, 18 `devices_by_vendor` call sites (31 *lines* over 15 test bodies, not 31 tests), 7
