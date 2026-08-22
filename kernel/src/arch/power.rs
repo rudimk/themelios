@@ -9,9 +9,14 @@
 //!
 //! It would be easy to read this facade as claiming parity. It does not.
 //!
-//! - **aarch64** has PSCI (`arch::aarch64::psci`), an ARM-standard firmware
-//!   interface. `SYSTEM_OFF` and `SYSTEM_RESET` are the same calls Linux makes, they work
-//!   on QEMU `virt`, and they work on a Graviton or an Ampere. This is the real thing.
+//! - **aarch64** has PSCI (`arch::aarch64::psci`), an ARM-standard firmware interface.
+//!   `SYSTEM_OFF` and `SYSTEM_RESET` are the same calls Linux makes, and they are
+//!   discovered rather than guessed — a fixed function ID, not an address the OS has to
+//!   find. Verified on QEMU `virt`. It should carry to other ARM platforms far better
+//!   than the x86 side carries anywhere, but note that `psci.rs` hardcodes the `HVC`
+//!   conduit first and a platform that needs `SMC` would need its conduit read from the
+//!   DT or FADT; that has not been tested against real hardware, and this project's
+//!   roadmap deliberately does not plan for it yet.
 //! - **x86_64** has no equivalent without ACPI. Soft-off requires reading `\_S5` out of
 //!   AML, which needs an interpreter this kernel does not have, so
 //!   `power_off` writes to the fixed `PM1a_CNT` addresses that *emulators* are known to

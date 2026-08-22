@@ -98,7 +98,7 @@ The suite instead prints a sentinel and powers off through **PSCI `SYSTEM_OFF`**
 
 Without the power-off the last two rows are the same timeout, and a kernel that panicked halfway through is indistinguishable from one that hung.
 
-The same PSCI calls back the shell's `shutdown` and `reboot` (`SYSTEM_OFF` and `SYSTEM_RESET`). This is the one place where the aarch64 port is *better served than amd64* rather than catching up: PSCI is a real ARM firmware interface, so `shutdown` on ARM works the same way on QEMU `virt` and on a Graviton or Ampere instance. The x86 side has no equivalent — soft-off there is an ACPI operation whose parameters live in AML, and this kernel has no interpreter, so it writes to the `PM1a_CNT` addresses that emulators are known to fix in place and reports plainly when none answers. See [Stopping and restarting a node](./architecture.md#stopping-and-restarting-a-node) for why the facade deliberately does not paper over that asymmetry.
+The same PSCI calls back the shell's `shutdown` and `reboot` (`SYSTEM_OFF` and `SYSTEM_RESET`). This is the one place where the aarch64 port is *better served than amd64* rather than catching up: PSCI's function IDs are fixed by the ARM specification, so there is nothing per-machine to discover. The x86 side has no equivalent — soft-off there needs `PM1a_CNT_BLK` out of the FADT, which needs an ACPI table parser this kernel does not have, so it writes to the addresses the emulators happen to end up with and reports plainly when none answers. See [Stopping and restarting a node](./architecture.md#stopping-and-restarting-a-node) for why the facade deliberately does not paper over that asymmetry.
 
 ## Running it
 

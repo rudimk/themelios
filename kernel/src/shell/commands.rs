@@ -39,6 +39,7 @@ pub fn cmd_help(_args: &str) {
     println!("  audit [n]        — show last n audit log entries (default 20)");
     println!("  shutdown         — stop the machine");
     println!("  reboot           — restart the machine");
+    println!("  exit             — (there is no shell to exit; see 'shutdown')");
 
     // The rest depend on the process table, the storage stack, the network stack or
     // containers — all part of the ring-3/VirtIO-PCI surface deferred on aarch64.
@@ -1249,8 +1250,14 @@ pub fn cmd_ps(_args: &str) {
 ///
 /// The "immutable, no SSH, nodes are cattle" design makes this less of a convenience than
 /// it looks: an orderly stop is the only way for a node to leave a cluster having said so.
-/// Nothing yet depends on that — there is no state to flush — which is exactly why this is
-/// worth having before there is.
+///
+/// **It is not yet a clean stop.** There *is* mutable state — the ext2 `/data` volume that
+/// `write` and `mkdir` reach — and `BlockDevice::flush` exists, but nothing on this path
+/// calls it, so the device write cache is not flushed before the machine goes down. An
+/// earlier version of this comment claimed there was no state to flush, which was simply
+/// wrong. Ordering a flush here means reaching the ring-3 filesystem servers from the
+/// shell task and waiting for them, which is real work and belongs with the storage port
+/// rather than bolted onto the power path.
 pub fn cmd_shutdown(_args: &str) {
     println!("Shutting down.");
     crate::arch::power::power_off();

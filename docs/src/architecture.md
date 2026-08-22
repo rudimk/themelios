@@ -126,7 +126,7 @@ Cattle still have to be put down deliberately. A node that vanishes is indisting
 | Real hardware? | **Yes** — the ARM-standard firmware interface, same call Linux makes | Reset yes; **shutdown no** |
 | Fallbacks | none — park the CPU | 8042 pulse, then a deliberate triple fault |
 
-On ARM this is finished work: PSCI is what a Graviton or Ampere instance actually implements, so the same code path that stops QEMU `virt` stops a cloud VM.
+On ARM this rests on a specified interface rather than a guessed address: PSCI's function IDs are fixed by the ARM spec, so there is nothing to discover and nothing to get wrong per-machine. It is verified on QEMU `virt`. One caveat the code is explicit about: the call can arrive over `HVC` or `SMC` depending on where the implementation lives, and `psci.rs` tries `HVC` first and `SMC` second rather than reading the platform's declared conduit — a machine that needs `SMC` and traps `HVC` fatally would not reach the fallback. Real ARM hardware is out of scope for the current roadmap, so this is untested there.
 
 On x86 soft-off (ACPI S5) requires reading the `\_S5` object out of the firmware's AML bytecode, which needs an ACPI interpreter this kernel does not have. `power_off` therefore writes the sleep-enable bit to the `PM1a_CNT` addresses that QEMU, Bochs and VirtualBox are each known to fix in place, and if none of them answers it says so on the console before parking the CPU. That is honest but it is not shutdown on physical x86 — closing that gap means an AML interpreter, not a longer table of magic port numbers.
 

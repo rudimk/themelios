@@ -142,13 +142,8 @@ unsafe fn call_both_conduits(function_id: u64) {
     }
 }
 
-/// Power off, or park the CPU forever if PSCI will not oblige.
-///
-/// The loop is not a fallback so much as an honest ending: if neither conduit works
-/// there is nothing further this kernel can do, and spinning with interrupts masked is
-/// preferable to returning into a caller that believed the machine had stopped. The
-/// harness sees no exit, times out, and reports a hang — which is exactly what has
-/// happened.
+/// Power off, or park the CPU forever if PSCI will not oblige — see [`park`] for what
+/// that means and why it is the right ending.
 pub fn shutdown_or_hang() -> ! {
     // SAFETY: this is the intended end of execution; nothing after it needs to run.
     unsafe { system_off() };
