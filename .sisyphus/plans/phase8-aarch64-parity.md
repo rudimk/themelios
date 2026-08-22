@@ -556,16 +556,55 @@ satisfy a contract nothing exercises.
 smoke green. **`blk.rs` and `net.rs` contain zero occurrences of `pci`/`Pci`** — the stated
 criterion, and not reachable while the drivers still constructed their own transport, which
 is why `init_from_pci` was folded into `init` and `open_transport` introduced.
-**Falsifiability:** stubbing `queue_max_size` to return 8 reddens `test_virtio_net`,
-`test_net_service` and `test_api_server` — the net path pre-posts more RX descriptors than
-that. Storage survives a short queue, which is itself informative: the block path's bounce
-buffer means it needs few descriptors.
+**Falsifiability — two demonstrations.** Stubbing the queue-size read to 8 reddens
+`test_virtio_net` and `test_net_service` (the run then aborts during `test_api_server`
+rather than reporting it as a clean failure — the earlier claim of "exactly three tests"
+described a tally that does not occur). Storage passes throughout, which is itself
+informative: the block path's bounce buffer means it needs few descriptors. Separately,
+making `config_generation` never settle fails *every* block device's initialisation with
+`ConfigUnstable`, which shows the new generation check is on the live path and rejects.
 
 **One defect found and fixed en route**, in 8.1's own work: `ensure_scratch_disk` wrote the
 new signature only when the image was *absent*, so a scratch image created before 8.1 was
 never signed, and any tree that had run the suite earlier failed the two destructive block
 tests with "no scratch disk found" — a confusing failure whose cause is a stale file. The
 guard now checks for the signature rather than for existence.
+
+**Two review passes, both REVISE, both applied.** One verified the zero-behaviour-change
+claim by comparing the *MMIO access trace* — order and value — between `main` and the
+branch, diffing all 37 constants, checking both doorbell sites and the `Send` bounds, and
+running both suites independently. It found no behaviour change. The other asked whether
+8.3 could actually implement the trait, and found four places where the surface was a PCI
+shape under a neutral name:
+
+1. **`Notifier` wrote 16 bits.** virtio-mmio's `QueueNotify` is 32-bit, and QEMU rejects
+   any access below `0x100` whose size is not 4 — it logs and *drops the write*. Every
+   kick would have been a silent no-op. Verified against `hw/virtio/virtio-mmio.c`.
+2. **`num_queues` had no mmio register.** Verified against `virtio_mmio.h`: there is no
+   NumQueues; `QueueNumMax` is per selected queue. Now a provided method that probes.
+3. **`device_config` returned a raw pointer** with neither length nor generation counter,
+   through which drivers read a 64-bit capacity and a 6-byte MAC.
+4. **"We poll" was encoded in MSI-X NO_VECTOR**, a register mmio lacks, while the avail
+   ring's flags said "interrupt me on every used buffer".
+
+Plus the ignored `index` parameters, now a `SelectedQueue` token: the ordering contract
+was prose, and an mmio implementation would plausibly *use* its index, giving the two
+impls different sensitivity to call order.
+
+**The method failure matters more than the defects.** The trait's surface was derived by
+reading the PCI implementation instead of writing the mmio one — the same technique
+8.spike used successfully, not repeated here until review said so. The revised surface was
+then validated by drafting a throwaway `MmioTransport` and compiling it: every method
+landed on a real register (`status` → `Status` 0x070 as a 32-bit access, `configure_queue`
+→ split low/high ring pairs + `QueueNum`/`QueueReady`, `queue_notifier` → the shared
+`QueueNotify` at 32 bits, `num_queues` → no register, hence the probe). **The draft needed
+no change to the trait**, which is the evidence the shape is now right. It was deleted
+rather than shipped — 8.2 is amd64-only and untested mmio code has no business in it.
+
+**Three claims this entry made about itself were wrong** and are corrected: "zero
+occurrences of `pci`/`Pci`" held only case-sensitively (both files still said "never name
+PCI"; now true either way); "the last PCI reference in either file" was false; and
+"`mod.rs` drops ~900 → 594" — `main` is **858**, and it is now 619.
 
 **Notes for 8.3:** implement `VirtioTransport` for an `MmioTransport` in a new
 `mmio_transport.rs`, and extend `open_transport()` to return it on aarch64. Nothing above
