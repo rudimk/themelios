@@ -28,6 +28,7 @@
 //! larger than the bounce buffer are split into chunks. This trades a memcpy for
 //! correctness and simplicity — exactly the right call for a Phase 3 driver.
 
+use super::discovery::{VirtioDevice, VirtioKind};
 use alloc::boxed::Box;
 use core::ptr::write_volatile;
 
@@ -98,6 +99,21 @@ impl VirtioBlk {
     /// Brings the transport up (handshake + feature negotiation + queue 0),
     /// reads the device capacity, allocates the header/status/bounce DMA
     /// buffers, and signals DRIVER_OK. The returned driver is ready for I/O.
+    /// Bring up a block device found by [`crate::drivers::virtio::discovery`].
+    ///
+    /// The transport-neutral entry point. Callers hand over a [`VirtioDevice`] and never
+    /// name PCI; when 8.2 turns the transport into a trait, only this function's body
+    /// changes, not the eighteen sites that call it.
+    pub fn init(dev: &VirtioDevice) -> Result<Self, VirtioError> {
+        debug_assert_eq!(
+            dev.kind(),
+            VirtioKind::Block,
+            "VirtioBlk::init handed a {} device",
+            dev.kind().name()
+        );
+        Self::init_from_pci(dev.pci())
+    }
+
     pub fn init_from_pci(dev: &PciDevice) -> Result<Self, VirtioError> {
         let transport = VirtioTransport::init(dev)?;
         // We need no device-specific feature bits for basic R/W — just the

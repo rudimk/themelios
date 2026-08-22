@@ -49,6 +49,15 @@
 //! permanently instead of reusing descriptors the device may still touch — see
 //! [`Virtqueue::fail`] and [`MAX_COMPLETION_SPINS`].
 
+/// Arch-neutral device discovery — "which VirtIO devices does this machine have?"
+///
+/// Answers that question without the caller naming PCI, so the eighteen call sites that
+/// used to walk PCI config space directly survive the move to virtio-mmio (8.3). The
+/// register-level transport stays PCI-shaped until 8.2.
+pub mod discovery;
+
+pub use discovery::{devices, devices_of_kind, first_of_kind, VirtioDevice, VirtioKind};
+
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::mm::addr::{PhysAddr, VirtAddr};
@@ -639,6 +648,15 @@ impl VirtioTransport {
     ///
     /// The caller continues with `negotiate_features`, `setup_queue`, and
     /// `set_driver_ok`.
+    /// Bring up the transport for a device found by [`discovery`].
+    ///
+    /// The transport-neutral entry point, mirroring `VirtioBlk::init`. Only the
+    /// transport self-test calls this directly; 8.2 replaces the body when
+    /// `VirtioTransport` becomes a trait with a virtio-mmio implementation.
+    pub fn init_for(dev: &VirtioDevice) -> Result<Self, VirtioError> {
+        Self::init(dev.pci())
+    }
+
     pub fn init(dev: &super::pci::PciDevice) -> Result<Self, VirtioError> {
         let mut common: Option<VirtAddr> = None;
         let mut notify_base: Option<VirtAddr> = None;
