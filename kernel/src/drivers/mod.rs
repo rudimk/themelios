@@ -52,5 +52,7 @@ pub mod pci;
 /// discovery, the device init handshake, feature negotiation, and the split
 /// virtqueue used to exchange buffers with the host. Sits in ring 0 as the thin
 /// trusted transport of the Phase 3 hybrid-microkernel storage design.
-#[cfg(target_arch = "x86_64")]
+///
+/// Arch-neutral since 8.3: the register-level transport is a trait with a virtio-PCI
+/// implementation on x86_64 and a virtio-mmio one on aarch64.
 pub mod virtio;

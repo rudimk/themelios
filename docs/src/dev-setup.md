@@ -151,39 +151,83 @@ brew bundle
 
 All build and run commands go through the `xtask` tool. You never need to invoke `cargo build` for the kernel directly.
 
+### Choosing the architecture: `--arch`
+
+Every command that produces or runs a kernel takes **one** architecture flag, spelled the
+same way everywhere:
+
+```bash
+--arch amd64      # or x86_64, or x86-64
+--arch arm64      # or aarch64
+```
+
+There is deliberately no `--amd64` / `--arm64` shorthand. Two spellings of one selector
+is two things to keep in sync, and the failure mode is quiet: a command that silently
+ignores an unrecognised flag builds the *default* architecture and reports success. One
+spelling, and an unknown flag is an error.
+
+Omitting `--arch` selects **amd64**, because that is the primary target and the one CI
+gates on. That default is a convenience, not a recommendation — when you are working
+across both architectures, name it on both sides:
+
+```bash
+cargo xtask test --arch amd64
+cargo xtask test --arch arm64
+```
+
+so that the two commands read as a pair and neither is "the one where the flag is
+missing".
+
+The rest of this section shows both forms for each command.
+
 ### Build the kernel
 
 ```bash
-cargo xtask build
-```
-
-This cross-compiles the kernel for `x86_64-unknown-none` (the default target).
-
-For arm64:
-
-```bash
-cargo xtask build --arch arm64
+cargo xtask build --arch amd64    # x86_64-unknown-none
+cargo xtask build --arch arm64    # aarch64-unknown-none-softfloat
 ```
 
 ### Run in QEMU
 
 ```bash
-cargo xtask run
+cargo xtask run --arch amd64
+cargo xtask run --arch arm64
 ```
 
-This builds the kernel, creates a bootable ISO, and launches it in QEMU in **headless mode** — serial output is piped to your terminal, but no graphical window opens. Press **Ctrl+A, X** to exit QEMU.
+This builds the kernel, creates a bootable ISO, and launches it in QEMU in **headless
+mode** — serial output is piped to your terminal, but no graphical window opens. You land
+at the ThemeliOS debug shell; type `help` for commands. Press **Ctrl+A, X** to exit QEMU.
 
-For arm64 (not yet implemented):
+The two are not equivalent in what they can reach: amd64 boots the full stack (storage,
+networking, containers, the management API), while arm64 is a ring-0 kernel-core port —
+memory, scheduling, interrupts, VirtIO and the shell. Commands whose subsystem is not
+yet ported are absent from the arm64 shell rather than present and broken.
+
+### Run the test suite
 
 ```bash
-cargo xtask run --arch arm64
+cargo xtask test --arch amd64
+cargo xtask test --arch arm64
+```
+
+Both boot the kernel under QEMU with the test harness compiled in, run the same 55-test
+suite, and exit with a non-zero status if anything fails. Tests whose subsystem is not
+ported to an architecture report `[SKIP]` with the reason, so the totals line reads
+`N passed, 0 failed, M skipped, 55 total` on both — the suite size is asserted, so a test
+cannot go missing silently.
+
+Both suites bind a fixed host TCP port for the networking tests, so **two suites cannot
+run at once**. If you need to (or a stale QEMU is holding the port), override it:
+
+```bash
+THEMELIOS_TEST_PORT=15107 cargo xtask test --arch amd64
 ```
 
 ### Build ISO only (without launching QEMU)
 
 ```bash
-cargo xtask iso                  # target/themelios-amd64.iso
-cargo xtask iso --arch aarch64   # target/themelios-arm64.iso
+cargo xtask iso --arch amd64   # target/themelios-amd64.iso
+cargo xtask iso --arch arm64   # target/themelios-arm64.iso
 ```
 
 This builds the kernel and creates a bootable ISO without launching QEMU. Useful when

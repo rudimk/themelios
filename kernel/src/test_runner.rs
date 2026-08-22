@@ -20,7 +20,6 @@
 
 extern crate alloc;
 
-#[cfg(target_arch = "x86_64")]
 use crate::drivers::virtio::{self, VirtioKind};
 use crate::println;
 
@@ -77,19 +76,14 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_audit",           func: test_audit },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_discovery", func: test_virtio_discovery },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_pci_scan",        func: test_pci_scan },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_transport", func: test_virtio_transport },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_queue_failure", func: test_virtio_queue_failure },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_blk",       func: test_virtio_blk },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_shared_memory",    func: test_shared_memory },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_server_spawn",     func: test_server_spawn },
@@ -105,9 +99,7 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_vfs_capability",   func: test_vfs_capability },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_fs_syscalls",      func: test_fs_syscalls },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_virtio_net",       func: test_virtio_net },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_net_service",      func: test_net_service },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_net_server_stack", func: test_net_server_stack },
@@ -181,15 +173,7 @@ static SKIPPED: &[SkippedTest] = &[
     },
     SkippedTest { name: "test_process", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_userspace_init", why: "ring-3/EL0 is deferred on aarch64" },
-    SkippedTest {
-        name: "test_virtio_discovery",
-        why: "the discovery seam has no aarch64 provider until virtio-mmio lands (8.3)",
-    },
     SkippedTest { name: "test_pci_scan", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
-    SkippedTest { name: "test_virtio_transport", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
-    SkippedTest { name: "test_virtio_queue_failure", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
-    SkippedTest { name: "test_virtio_blk", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
-    SkippedTest { name: "test_block_server_ipc", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_server_spawn", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_squashfs_server", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_overlay_server", why: "the storage stack rides on VirtIO-PCI" },
@@ -197,8 +181,6 @@ static SKIPPED: &[SkippedTest] = &[
     SkippedTest { name: "test_ext2_write", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_vfs_capability", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_fs_syscalls", why: "the storage stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_virtio_net", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_net_service", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_net_server_stack", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_net_icmp_echo", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_api_server", why: "the network stack rides on VirtIO-PCI" },
@@ -1470,7 +1452,6 @@ fn test_userspace_init() -> Result<(), &'static str> {
 /// Magic in sector 0 of the scratch disk, written by `xtask::ensure_scratch_disk`.
 ///
 /// Kept in sync with `SCRATCH_SIGNATURE` there.
-#[cfg(target_arch = "x86_64")]
 const SCRATCH_SIGNATURE: &[u8] = b"THEMELIOS-SCRATCH-V1";
 
 /// Find the scratch disk — the one block device these tests may destroy.
@@ -1488,7 +1469,6 @@ const SCRATCH_SIGNATURE: &[u8] = b"THEMELIOS-SCRATCH-V1";
 ///
 /// Probing for a signature removes the coupling entirely: these tests are correct on any
 /// platform, in any enumeration order.
-#[cfg(target_arch = "x86_64")]
 fn open_scratch_disk() -> Result<crate::drivers::virtio::blk::VirtioBlk, &'static str> {
     use crate::drivers::block::BlockDevice;
     use crate::drivers::virtio::blk::VirtioBlk;
@@ -1529,7 +1509,6 @@ fn open_scratch_disk() -> Result<crate::drivers::virtio::blk::VirtioBlk, &'stati
 /// that the set is complete and the by-kind helpers agree with the full enumeration —
 /// and, since 8.1, that no caller has to care about position: destructive tests find
 /// their disk by signature (see `open_scratch_disk`).
-#[cfg(target_arch = "x86_64")]
 fn test_virtio_discovery() -> Result<(), &'static str> {
     let devs = virtio::discovery::devices();
 
@@ -1630,7 +1609,6 @@ fn test_pci_scan() -> Result<(), &'static str> {
 ///
 /// If any step fails, the device wouldn't be drivable, so this is a strong
 /// signal that 3.1 works before the block read/write path (3.2) is built.
-#[cfg(target_arch = "x86_64")]
 fn test_virtio_transport() -> Result<(), &'static str> {
     // The trait is in scope for its methods; the concrete transport is never named —
     // which is the point of 8.2. When 8.3 adds virtio-mmio, this test exercises it with
@@ -1673,7 +1651,6 @@ fn test_virtio_transport() -> Result<(), &'static str> {
 /// it shipped a silent data-corruption path that every green run missed. The
 /// assertions live next to the code under test (`virtio::test_queue_failure_paths`);
 /// this drives them from the suite.
-#[cfg(target_arch = "x86_64")]
 fn test_virtio_queue_failure() -> Result<(), &'static str> {
     crate::drivers::virtio::test_queue_failure_paths()
 }
@@ -1691,7 +1668,6 @@ fn test_virtio_queue_failure() -> Result<(), &'static str> {
 /// 3. Multi-sector (3-sector) round-trip works
 /// 4. A request past the end of the device is rejected with OutOfRange
 /// 5. Bad (non-sector-multiple) buffer length is rejected
-#[cfg(target_arch = "x86_64")]
 fn test_virtio_blk() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use alloc::vec;
@@ -1847,7 +1823,6 @@ fn test_shared_memory() -> Result<(), &'static str> {
 /// client: writes a pattern into the shared region and issues a WRITE request,
 /// clears the region and issues a READ request, and verifies the data round-trips
 /// through the device via IPC + shared memory.
-#[cfg(target_arch = "x86_64")]
 fn test_block_server_ipc() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::{block, block_server};
@@ -3006,7 +2981,6 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
 /// negotiation, both virtqueues, TX (frame consumed by the device) and polled RX
 /// (a frame delivered into a pre-posted buffer), and the 12-byte VirtIO-net
 /// header handling (a wrong header length would misalign the parsed EtherType).
-#[cfg(target_arch = "x86_64")]
 fn test_virtio_net() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use alloc::vec;
@@ -3086,7 +3060,6 @@ fn test_virtio_net() -> Result<(), &'static str> {
 /// Also checks the `MSG_POLL` reply carries a monotonic, non-decreasing timestamp
 /// (the same tick source `SYS_UPTIME_MS` exposes). Exercises the whole pull-based
 /// bridge — endpoint, both shared regions, RX buffering, and TX — end to end.
-#[cfg(target_arch = "x86_64")]
 fn test_net_service() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::arch::time as idt;

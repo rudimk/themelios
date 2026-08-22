@@ -56,10 +56,23 @@ pub mod transport;
 
 /// The virtio-PCI (modern, 1.0+) transport implementation, and the
 /// `virtio_pci_common_cfg` register offsets that only it may use.
+#[cfg(target_arch = "x86_64")]
 pub mod pci_transport;
 
+/// The virtio-mmio transport implementation, and the register offsets that only it may
+/// use. This is how QEMU's aarch64 `virt` machine presents VirtIO devices.
+#[cfg(target_arch = "aarch64")]
+pub mod mmio_transport;
+
+// Consumed by the test suite and by the x86-only storage/network services, so on a
+// plain aarch64 build (no `--features test`) nothing in-tree names them.
+#[allow(unused_imports)]
 pub use discovery::{devices_of_kind, first_of_kind, VirtioKind};
+#[cfg(target_arch = "x86_64")]
 pub use pci_transport::PciTransport;
+
+#[cfg(target_arch = "aarch64")]
+pub use mmio_transport::MmioTransport;
 pub use transport::{Notifier, VirtioTransport};
 
 use core::ptr::{read_volatile, write_volatile};
@@ -143,6 +156,27 @@ pub enum VirtioError {
     FeatureNegotiationFailed,
     /// The selected virtqueue does not exist (queue size reported as 0).
     QueueUnavailable,
+
+    /// A virtio-mmio slot did not answer the expected `"virt"` magic.
+    ///
+    /// Either the address is not a virtio-mmio window at all, or the platform description
+    /// is wrong about where the bank lives.
+    BadMagic,
+
+    /// A virtio-mmio slot holds a **legacy (version 1)** device.
+    ///
+    /// QEMU defaults `virtio-mmio.force-legacy` to **true**, so a `virt` machine started
+    /// without `-global virtio-mmio.force-legacy=false` presents every device this way.
+    /// This kernel speaks only the modern (1.0+) interface.
+    LegacyTransport,
+
+    /// The device did not come out of reset: `Status` never read back `0`.
+    ///
+    /// The spec (§4.1.4.3.2 for PCI, §4.2.3.1 for mmio) makes the reset *asynchronous* —
+    /// writing `0` requests it, and the driver must wait for the register to read `0`
+    /// before touching anything else. A device still tearing down its old queue state
+    /// will accept the subsequent handshake writes and then discard them.
+    ResetTimeout,
 
     /// A device-config read ran past the end of the config region.
     ///

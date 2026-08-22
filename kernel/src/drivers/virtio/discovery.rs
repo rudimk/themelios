@@ -3,9 +3,10 @@
 //! "Which VirtIO devices does this machine have?" is a question with the same *answer
 //! shape* on every platform and a completely different *mechanism* on each. On x86_64
 //! it is a PCI configuration-space walk driven through the `0xCF8`/`0xCFC` I/O ports;
-//! on aarch64 `virt` it will be a scan of 32 fixed MMIO slots, each with a `DeviceID`
-//! register. There is no port I/O on aarch64 at all, and virtio-mmio has no PCI class
-//! code, so the *predicate* differs and not merely the enumeration.
+//! on aarch64 `virt` it is a scan of the 32 fixed MMIO slots [`crate::platform`]
+//! describes, each with a `DeviceID` register. There is no port I/O on aarch64 at all,
+//! and virtio-mmio has no PCI class code, so the *predicate* differs and not merely the
+//! enumeration.
 //!
 //! Before this module, every caller asked the question in x86 vocabulary:
 //!
@@ -31,32 +32,43 @@
 //! meet: discovery is the only place that knows *how* a device was found, so it is the
 //! only place that can say which transport speaks to it.
 //!
-//! [`VirtioDevice`] still carries a `PciDevice` today; 8.3 makes that a per-transport
-//! handle. What matters now is that no caller outside this module can see it.
+//! The per-transport handle lives in the private [`Handle`] enum, so no caller outside
+//! this module can see — or grow a dependency on — how a device was reached.
 //!
-//! ## Ordering is part of the contract
+//! ## Order is stable per platform, and the two platforms disagree
 //!
-//! [`devices`] returns devices in a stable, documented order, because callers select by
-//! position ("the first block device") and because the amd64 acceptance test for this
-//! sub-phase is that the discovered set is byte-identical to what the PCI walk produced
-//! before. On x86_64 that order is PCI bus/slot/function ascending, which is what
-//! `pci::devices_by_vendor` already yields.
+//! [`devices`] returns devices in a stable, documented order. On x86_64 that is PCI
+//! bus/slot/function ascending, which is what `pci::devices_by_vendor` yields; on aarch64
+//! it is ascending virtio-mmio slot address.
 //!
-//! It is worth writing down now that **aarch64 will not be able to preserve this
-//! ordering convention naively**: QEMU's `virt` maps `-device` arguments to virtio-mmio
-//! slots with *decreasing* base addresses, so "first on the command line" is the
-//! *highest* slot. Any code that assumes command-line order equals discovery order is
-//! already wrong there. Selecting by [`VirtioKind`] rather than by index is the habit
-//! that survives the move.
+//! **Those two orders are not the same list.** QEMU's `virt` maps `-device` arguments to
+//! virtio-mmio slots with *decreasing* base addresses, so "first on the command line" is
+//! the *highest* slot, and an identical QEMU invocation enumerates in reverse between the
+//! architectures — the harness's `block block block net` on amd64 comes back as
+//! `net block block block` here. Any code that infers *which* device it has from a
+//! position is therefore wrong on one of the two.
+//!
+//! So selection is by [`VirtioKind`], and anything destructive selects by *content*:
+//! `open_scratch_disk` in the test suite finds its disk by a signature in sector 0
+//! precisely because "the first block device" names different disks on the two
+//! platforms.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+#[cfg(target_arch = "x86_64")]
 use crate::drivers::pci::{self, PciDevice};
 
+#[cfg(target_arch = "aarch64")]
+use crate::mm::addr::{PhysAddr, VirtAddr};
+
 use super::transport::VirtioTransport;
-use super::{PciTransport, VirtioError};
+#[cfg(target_arch = "x86_64")]
+use super::PciTransport;
+#[cfg(target_arch = "aarch64")]
+use super::MmioTransport;
+use super::VirtioError;
 
 /// What a discovered VirtIO device *is*, independent of how it was found.
 ///
@@ -155,7 +167,24 @@ impl VirtioKind {
 #[derive(Debug, Clone)]
 pub struct VirtioDevice {
     kind: VirtioKind,
-    pci: PciDevice,
+    handle: Handle,
+}
+
+/// How to reach a discovered device — the one genuinely per-transport piece of a
+/// [`VirtioDevice`].
+///
+/// A PCI function is identified by bus/slot/function and reached by walking capabilities;
+/// a virtio-mmio device is a *mapped register window* and nothing else. The mmio variant
+/// carries the mapped address rather than the physical one because discovery had to map
+/// the window to read `DeviceID` in the first place — re-mapping it at
+/// [`VirtioDevice::open_transport`] time would burn a fresh page of virtual address space
+/// on every call, through a bump allocator with no unmap.
+#[derive(Debug, Clone)]
+enum Handle {
+    #[cfg(target_arch = "x86_64")]
+    Pci(PciDevice),
+    #[cfg(target_arch = "aarch64")]
+    Mmio { base: VirtAddr },
 }
 
 impl VirtioDevice {
@@ -163,7 +192,6 @@ impl VirtioDevice {
     pub fn kind(&self) -> VirtioKind {
         self.kind
     }
-
 }
 
 /// The discovered device list, populated once by [`init`].
@@ -196,26 +224,115 @@ pub fn init() {
     if slot.is_some() {
         return;
     }
-    let found: Vec<VirtioDevice> = pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID)
+    *slot = Some(enumerate());
+}
+
+/// Enumerate this platform's VirtIO devices.
+#[cfg(target_arch = "x86_64")]
+fn enumerate() -> Vec<VirtioDevice> {
+    pci::devices_by_vendor(pci::VIRTIO_VENDOR_ID)
         .into_iter()
         .map(|pci| VirtioDevice {
             kind: VirtioKind::from_pci_device_id(pci.device_id),
-            pci,
+            handle: Handle::Pci(pci),
         })
-        .collect();
-    *slot = Some(found);
+        .collect()
 }
 
+/// Enumerate this platform's VirtIO devices by scanning the virtio-mmio slot bank.
+///
+/// **Every slot is scanned, and each is classified by its `DeviceID` register — never by
+/// its position.** QEMU maps `-device` arguments to slots with *decreasing* base
+/// addresses, so command-line order and scan order run opposite ways; a kernel that
+/// inferred "the first disk" from a slot index would pick the wrong one, and on the amd64
+/// harness's layout that is the difference between the scratch disk and the ext2 volume.
+///
+/// A populated slot is mapped once, here, and the mapping travels in the [`Handle`] — so
+/// a device is mapped exactly once no matter how many times it is opened.
+///
+/// A legacy slot is reported and skipped rather than silently omitted: the difference
+/// between "no disk attached" and "the disk is there but QEMU is presenting it the old
+/// way" is one command-line flag, and a driver that only ever says "no VirtIO block
+/// device" gives no hint which.
+#[cfg(target_arch = "aarch64")]
+fn enumerate() -> Vec<VirtioDevice> {
+    use super::mmio_transport::SlotProbe;
+
+    let mut found = Vec::new();
+    let mut legacy = 0usize;
+    let mut empty = 0usize;
+
+    for dev in crate::platform::info().virtio_mmio {
+        // One page covers a 0x200-byte slot window.
+        let base = crate::mm::mmio::map(PhysAddr::new(dev.base), SLOT_WINDOW_BYTES);
+
+        // SAFETY: `base` is the window just mapped, of the required size.
+        match unsafe { MmioTransport::probe(base) } {
+            Ok(SlotProbe::Device(device_type)) => {
+                let kind = VirtioKind::from_device_type(device_type);
+                crate::println!(
+                    "[virtio]   slot @ {:#x}: type {} ({})",
+                    dev.base,
+                    device_type,
+                    kind.name()
+                );
+                found.push(VirtioDevice {
+                    kind,
+                    handle: Handle::Mmio { base },
+                });
+            }
+            Ok(SlotProbe::Empty) => empty += 1,
+            Err(VirtioError::LegacyTransport) => legacy += 1,
+            Err(_) => {}
+        }
+    }
+
+    if legacy > 0 {
+        crate::println!(
+            "[virtio] {legacy} slot(s) present a LEGACY (v1) device and were skipped — \
+             start QEMU with `-global virtio-mmio.force-legacy=false`"
+        );
+    }
+    crate::println!(
+        "[virtio] scanned {} mmio slots: {} device(s), {} empty, {} legacy",
+        crate::platform::info().virtio_mmio.len(),
+        found.len(),
+        empty,
+        legacy
+    );
+    found
+}
+
+/// Bytes of register window per virtio-mmio slot on QEMU `virt`.
+#[cfg(target_arch = "aarch64")]
+const SLOT_WINDOW_BYTES: usize = 0x200;
+
 impl VirtioDevice {
-    /// Open this device's transport, ready for the feature handshake.
+    /// Open this device's transport, reset it, and leave it ready for the feature
+    /// handshake.
     ///
-    /// **This is the seam 8.3 extends.** Discovery is the only place that knows *how* a
-    /// device was found, so it is the only place that can say which transport speaks to
-    /// it: a PCI function gets a [`PciTransport`], and an mmio slot will get an
-    /// `MmioTransport`. Drivers receive a `Box<dyn VirtioTransport>` and never learn
+    /// **This is the seam where the two transports meet.** Discovery is the only place
+    /// that knows *how* a device was found, so it is the only place that can say which
+    /// transport speaks to it: a PCI function gets a [`PciTransport`], an mmio slot gets
+    /// an [`MmioTransport`]. Drivers receive a `Box<dyn VirtioTransport>` and never learn
     /// which, which is what lets `blk.rs` and `net.rs` contain no reference to PCI at all.
+    ///
+    /// Because it is the single common path, it is also where
+    /// [`VirtioTransport::begin_init`] runs — the reset-and-acknowledge handshake the
+    /// spec defines identically for both. Constructing a transport therefore cannot
+    /// leave a device un-reset, which is a mistake the virtio-PCI path made for four
+    /// phases while a comment claimed otherwise.
     pub fn open_transport(&self) -> Result<Box<dyn VirtioTransport>, VirtioError> {
-        Ok(Box::new(PciTransport::init(&self.pci)?))
+        let transport: Box<dyn VirtioTransport> = match &self.handle {
+            #[cfg(target_arch = "x86_64")]
+            Handle::Pci(pci) => Box::new(PciTransport::init(pci)?),
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: the window was mapped and probed during discovery, and probing
+            // established that this slot holds a modern device.
+            Handle::Mmio { base } => Box::new(unsafe { MmioTransport::new(*base) }),
+        };
+        transport.begin_init()?;
+        Ok(transport)
     }
 }
 

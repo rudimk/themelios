@@ -43,6 +43,11 @@ pub mod net_service;
 
 /// Socket routing: the kernel's capability-checked UDP socket API (Phase 4.5).
 /// Routes socket syscalls to the ring-3 net server; never parses packets.
+///
+/// The one submodule here that needs ring 3: it maps sockets to owning processes through
+/// `crate::process`, which does not exist on aarch64 until the EL0 port. [`device`] and
+/// [`net_service`] above are ring-0 and compile everywhere.
+#[cfg(target_arch = "x86_64")]
 pub mod socket;
 
 /// Pack a 6-byte MAC into a little-endian u64, for passing to the net server via

@@ -93,7 +93,16 @@ struct Options {
     display: bool,
 }
 
-/// Parses --arch and --display flags from the argument list.
+/// Parses `--arch` and `--display` from the argument list.
+///
+/// **Anything else is a hard error.** Architecture is selected by exactly one flag, and
+/// the failure mode of ignoring an unrecognised one is quiet in the worst way: a
+/// `cargo xtask test --arm64` that silently drops the flag builds *amd64*, runs the amd64
+/// suite, and prints "all tests passed" — a green result for the architecture you were
+/// not testing. Rejecting the flag costs one line and makes the mistake impossible.
+///
+/// This is also why there is no `--amd64` / `--arm64` shorthand alongside `--arch`: one
+/// selector with one spelling cannot drift out of sync with itself.
 fn parse_options(args: &[String]) -> Options {
     let mut arch = "x86_64".to_string();
     let mut display = false;
@@ -109,13 +118,17 @@ fn parse_options(args: &[String]) -> Options {
                 arch = next.clone();
                 skip_next = true;
             } else {
-                eprintln!("Error: --arch requires a value (x86_64, arm64)");
+                eprintln!("Error: --arch requires a value (amd64, arm64)");
                 process::exit(1);
             }
         } else if let Some(value) = arg.strip_prefix("--arch=") {
             arch = value.to_string();
         } else if arg == "--display" {
             display = true;
+        } else {
+            eprintln!("Error: unknown option {arg:?}");
+            eprintln!("Architecture is selected with `--arch amd64` or `--arch arm64`.");
+            process::exit(1);
         }
     }
 
@@ -392,6 +405,56 @@ fn virtio_disk_args(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
         format!("virtio-blk-pci,drive={id},disable-legacy=on"),
     ]
 }
+
+/// QEMU device arguments for a VirtIO disk on the **aarch64 `virt`** machine.
+///
+/// `virt` has no PCI-attached VirtIO by default: devices arrive on the **virtio-mmio**
+/// bus, so the device model is `virtio-blk-device` rather than `virtio-blk-pci`. There is
+/// no `disable-legacy` property on the mmio device either — legacy versus modern is a
+/// property of the *bus*, set once for the machine by `virtio_mmio_modern_args`.
+///
+/// Note the slot mapping runs **backwards**: QEMU's `qbus_realize` prepends child buses,
+/// so `-device` arguments in increasing command-line order land on *decreasing* mmio base
+/// addresses. Callers must therefore not assume command-line order is discovery order —
+/// which is why every test that cares identifies its disk by content rather than position.
+fn virtio_disk_args_mmio(disk_path: &Path, id: &str, readonly: bool) -> Vec<String> {
+    let ro = if readonly { ",readonly=on" } else { "" };
+    vec![
+        "-drive".to_string(),
+        format!("file={},format=raw,if=none,id={id}{ro}", disk_path.display()),
+        "-device".to_string(),
+        format!("virtio-blk-device,drive={id}"),
+    ]
+}
+
+/// QEMU arguments forcing the **modern** virtio-mmio interface machine-wide.
+///
+/// QEMU's `virtio-mmio` device defaults `force-legacy` to **true**, and `hw/arm/virt.c`
+/// never overrides it — so a `virt` machine started without this presents every VirtIO
+/// device as legacy (version 1), which this kernel does not speak. The kernel reports and
+/// skips such slots by name rather than silently finding no devices, but the fix belongs
+/// here: without it there is nothing for it to find.
+fn virtio_mmio_modern_args() -> Vec<String> {
+    vec![
+        "-global".to_string(),
+        "virtio-mmio.force-legacy=false".to_string(),
+    ]
+}
+
+/// QEMU arguments for a VirtIO NIC on `virt`, with an optional host-forward rule.
+fn virtio_net_args_mmio(id: &str, hostfwd: Option<&str>) -> Vec<String> {
+    let mut netdev = format!("user,id={id}");
+    if let Some(rule) = hostfwd {
+        netdev.push(',');
+        netdev.push_str(rule);
+    }
+    vec![
+        "-netdev".to_string(),
+        netdev,
+        "-device".to_string(),
+        format!("virtio-net-device,netdev={id}"),
+    ]
+}
 /// `cargo xtask test --arch aarch64` — run the kernel suite on QEMU `virt`.
 ///
 /// Mirrors [`cmd_test`], with one structural difference: how the verdict gets out.
@@ -454,8 +517,28 @@ fn cmd_test_aarch64(root: &Path, target: &str) {
     let serial_log = root.join("target/aarch64-test-serial.log");
     let _ = fs::remove_file(&serial_log);
 
+    // The suite drives real storage and a NIC, so the aarch64 VM needs the same devices
+    // the amd64 one gets. Until 8.3 it had neither — only the firmware pflash pair and the
+    // boot ESP — which is why every storage and network test was skipped there.
+    let scratch = ensure_scratch_disk(root);
+    let (squashfs, ext2) = ensure_images(root);
+
     println!("Running the suite on QEMU virt (headless)...");
     let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
+
+    // Same three disks as the amd64 path, in the same command-line order. Note that on
+    // `virt` this maps to *decreasing* mmio slot addresses, so the resulting discovery
+    // order is the reverse of amd64's — deliberately not something any test depends on.
+    cmd.args(virtio_disk_args_mmio(&scratch, "blkscratch", false));
+    cmd.args(virtio_disk_args_mmio(&squashfs, "blkroot", true));
+    cmd.args(virtio_disk_args_mmio(&ext2, "blkdata", false));
+
+    // A NIC on user-mode networking, with the same host-forward rule the amd64 path uses.
+    let hostfwd = format!(
+        "hostfwd=tcp:127.0.0.1:{}-:{TCP_TEST_GUEST_PORT}",
+        tcp_test_host_port()
+    );
+    cmd.args(virtio_net_args_mmio("net0", Some(&hostfwd)));
     cmd.args(["-display", "none"]);
     cmd.arg("-serial").arg(format!("file:{}", serial_log.display()));
 
@@ -982,6 +1065,9 @@ fn prepare_aarch64_boot(root: &Path, kernel: &Path, limine_dir: &Path) -> (PathB
 fn qemu_aarch64_base(esp: &Path, code: &Path, vars: &Path) -> Command {
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-no-reboot"]);
+    // Without this every virtio-mmio device is presented as legacy (v1) — see
+    // `virtio_mmio_modern_args`.
+    cmd.args(virtio_mmio_modern_args());
     cmd.arg("-drive").arg(format!("if=pflash,format=raw,readonly=on,file={}", code.display()));
     cmd.arg("-drive").arg(format!("if=pflash,format=raw,file={}", vars.display()));
     cmd.arg("-drive").arg(format!("file=fat:rw:{},format=raw,if=virtio", esp.display()));
@@ -1070,6 +1156,9 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
     println!("Booting the aarch64 ISO on QEMU virt (headless)...");
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-no-reboot"]);
+    // Without this every virtio-mmio device is presented as legacy (v1) — see
+    // `virtio_mmio_modern_args`.
+    cmd.args(virtio_mmio_modern_args());
     cmd.arg("-drive")
         .arg(format!("if=pflash,format=raw,readonly=on,file={}", code.display()));
     cmd.arg("-drive")
@@ -1906,7 +1995,11 @@ Commands:
     arm64-iso-smoke  Boot the aarch64 ISO on QEMU virt (banner smoke)
 
 Options:
-    --arch <ARCH>  Target architecture: x86_64 (default), arm64
+    --arch <ARCH>  Target architecture: amd64 (default) or arm64.
+                   Accepts amd64 | x86_64 | x86-64, and arm64 | aarch64.
+                   Prefer naming it explicitly on both sides:
+                       cargo xtask test --arch amd64
+                       cargo xtask test --arch arm64
     --display      Open QEMU with a graphical window (for run command)
 
 Prerequisites:

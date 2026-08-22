@@ -64,8 +64,8 @@
 use crate::mm::addr::{PhysAddr, VirtAddr};
 
 use super::{
-    Virtqueue, VirtioError, MAX_QUEUE_SIZE, STATUS_DRIVER_OK, STATUS_FAILED, STATUS_FEATURES_OK,
-    VIRTIO_F_VERSION_1,
+    Virtqueue, VirtioError, MAX_QUEUE_SIZE, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK,
+    STATUS_FAILED, STATUS_FEATURES_OK, VIRTIO_F_VERSION_1,
 };
 
 /// Access width of a doorbell register.
@@ -287,6 +287,44 @@ pub trait VirtioTransport: Send {
     fn add_status(&self, bits: u8) {
         let current = self.status();
         self.set_status(current | bits);
+    }
+
+    /// Reset the device and open the handshake, leaving it ready for
+    /// [`negotiate_features`](Self::negotiate_features).
+    ///
+    /// **The reset is asynchronous, and this kernel used to assume it was not.** The spec
+    /// (§4.1.4.3.2 for PCI, §4.2.3.1 for mmio) says writing `0` to `Status` *requests* a
+    /// reset and the driver must then wait for the register to read back `0`. The
+    /// virtio-PCI path wrote `0` and immediately wrote `ACKNOWLEDGE`, under a comment that
+    /// claimed it waited — so for four phases the handshake raced a device that was still
+    /// tearing down its previous queue configuration.
+    ///
+    /// On amd64 that race was invisible, because nothing ever re-initialised a device that
+    /// had already been driven. 8.3's aarch64 suite does: several tests open the same
+    /// block device in turn, and the second driver's `ACKNOWLEDGE` landed while the device
+    /// was still resetting, so its queue programming was discarded and every request timed
+    /// out on a used ring that would never advance.
+    ///
+    /// The spin bound is generous and the failure is reported rather than ignored: a
+    /// device that will not reset cannot be driven, and pressing on would produce the
+    /// silent timeout this exists to prevent.
+    fn begin_init(&self) -> Result<(), VirtioError> {
+        /// Reads of `Status` to allow before declaring the device stuck. Emulated devices
+        /// reset within one; the bound only has to be large enough that a slow host
+        /// cannot reach it, since reaching it fails the device permanently.
+        const RESET_SPINS: usize = 100_000;
+
+        self.set_status(0);
+        for _ in 0..RESET_SPINS {
+            if self.status() == 0 {
+                // Acknowledge the device and announce we have a driver.
+                self.set_status(STATUS_ACKNOWLEDGE);
+                self.add_status(STATUS_DRIVER);
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(VirtioError::ResetTimeout)
     }
 
     /// Negotiate features: accept the intersection of what the device offers and what we

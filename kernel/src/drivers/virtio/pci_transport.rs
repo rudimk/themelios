@@ -33,7 +33,7 @@ use crate::mm::mmio;
 use super::transport::{Notifier, NotifyWidth, SelectedQueue, VirtioTransport};
 use super::{
     mmio_read_u16, mmio_read_u32, mmio_read_u8, mmio_write_u16, mmio_write_u32, mmio_write_u64,
-    mmio_write_u8, VirtioError, STATUS_ACKNOWLEDGE, STATUS_DRIVER,
+    mmio_write_u8, VirtioError,
 };
 
 // --- VirtIO PCI capability layout (fields relative to the capability offset) ---
@@ -103,14 +103,15 @@ pub struct PciTransport {
 }
 
 impl PciTransport {
-    /// Discover and reset a VirtIO PCI device, leaving it ready for feature
-    /// negotiation.
+    /// Locate a VirtIO PCI device's register regions and map them.
     ///
-    /// Steps:
-    /// 1. Walk the device's PCI vendor capabilities, mapping each register
-    ///    region (common / notify / ISR / device config) into uncached MMIO.
-    /// 2. Reset the device (write 0 to the status register).
-    /// 3. Set ACKNOWLEDGE then DRIVER status bits.
+    /// Walks the device's PCI vendor capabilities, mapping each register region
+    /// (common / notify / ISR / device config) into uncached MMIO. That is the whole job:
+    /// **the reset-and-acknowledge handshake is not done here.** It is spec sequencing
+    /// identical on every transport, so it lives once as
+    /// [`VirtioTransport::begin_init`] and is driven from
+    /// [`crate::drivers::virtio::discovery::VirtioDevice::open_transport`], which is the
+    /// one place both transports pass through.
     ///
     /// The caller continues with `negotiate_features`, `setup_queue`, and
     /// `set_driver_ok`.
@@ -161,22 +162,14 @@ impl PciTransport {
         let notify_base = notify_base.ok_or(VirtioError::MissingCapability)?;
         let isr = isr.ok_or(VirtioError::MissingCapability)?;
 
-        let transport = Self {
+        Ok(Self {
             common,
             notify_base,
             notify_off_multiplier,
             isr,
             device_cfg,
             device_cfg_len,
-        };
-
-        // Reset: write 0 to the status register and wait for it to read back 0.
-        transport.set_status(0);
-        // Acknowledge the device and announce we have a driver.
-        transport.set_status(STATUS_ACKNOWLEDGE);
-        transport.add_status(STATUS_DRIVER);
-
-        Ok(transport)
+        })
     }
 
 }

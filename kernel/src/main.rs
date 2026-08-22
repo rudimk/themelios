@@ -194,7 +194,6 @@ mod audit;
 /// Device drivers.
 /// VirtIO drivers for block devices, network interfaces, and console.
 /// Platform-specific drivers for timers, interrupt controllers, etc.
-#[cfg(target_arch = "x86_64")]
 mod drivers;
 
 /// Filesystem layer.
@@ -205,7 +204,11 @@ mod fs;
 
 /// Network stack.
 /// TCP/IP implementation for container networking and the management API.
-#[cfg(target_arch = "x86_64")]
+///
+/// Partially available on aarch64 since 8.3: `net::device` and `net::net_service` are
+/// ring-0 (the service is a `sched::spawn` task), so the VirtIO NIC and the frame bridge
+/// work there. `net::socket` needs `crate::process` and stays x86_64-only until the EL0
+/// port lands in 8.4/8.5.
 mod net;
 
 /// Linux compatibility layer (Phase 5): ELF loader and, later, the Linux syscall

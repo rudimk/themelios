@@ -82,27 +82,35 @@ themelios/
 
 ## Build Commands
 
-```bash
-# Build the kernel (defaults to x86_64)
-cargo xtask build
+Architecture is selected by **one** flag, `--arch`, on every command that produces or runs
+a kernel. It accepts `amd64` | `x86_64` | `x86-64` and `arm64` | `aarch64`. There is no
+`--amd64` / `--arm64` shorthand: two spellings of one selector drift, and a silently
+ignored flag builds the default architecture while reporting success. Omitting it selects
+amd64, but prefer naming it on both sides so the two commands read as a pair.
 
-# Build for a specific architecture
-cargo xtask build --arch aarch64
+```bash
+# Build the kernel
+cargo xtask build --arch amd64        # x86_64-unknown-none
+cargo xtask build --arch arm64        # aarch64-unknown-none-softfloat
 
 # Build kernel and create bootable ISO (without launching QEMU)
-cargo xtask iso
+cargo xtask iso --arch amd64          # target/themelios-amd64.iso
+cargo xtask iso --arch arm64          # target/themelios-arm64.iso
 
-# Build, create ISO, and run in QEMU (headless, serial output to terminal)
-cargo xtask run
+# Build, create ISO, and run in QEMU (headless, serial output to terminal;
+# lands at the debug shell — Ctrl+A, X to quit QEMU)
+cargo xtask run --arch amd64
+cargo xtask run --arch arm64
 
 # Same, but with a QEMU graphical window
-cargo xtask run --display
+cargo xtask run --arch amd64 --display
 
-# Build and run on arm64 QEMU
-cargo xtask run --arch aarch64
+# Run the test suite (same 55 tests on both; unported subsystems report [SKIP])
+cargo xtask test --arch amd64
+cargo xtask test --arch arm64
 
-# Run tests
-cargo xtask test
+# Both suites bind a fixed host TCP port, so two cannot run concurrently.
+THEMELIOS_TEST_PORT=15107 cargo xtask test --arch amd64
 
 # Build documentation
 cargo xtask docs
