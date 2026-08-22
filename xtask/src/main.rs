@@ -327,7 +327,16 @@ const SCRATCH_SIGNATURE: &[u8] = b"THEMELIOS-SCRATCH-V1";
 fn ensure_scratch_disk(root: &Path) -> PathBuf {
     let disk_path = root.join("target/themelios-scratch.img");
 
-    if !disk_path.exists() {
+    // Rewrite when the image is missing **or** unsigned. Checking only for existence
+    // would leave a scratch image created before the signature landed (8.1) permanently
+    // unsigned, and the destructive block tests would then fail with "no scratch disk
+    // found" on any tree that had run the suite before — a confusing failure whose cause
+    // is an old file rather than the code under test.
+    let needs_write = match fs::read(&disk_path) {
+        Ok(existing) => !existing.starts_with(SCRATCH_SIGNATURE),
+        Err(_) => true,
+    };
+    if needs_write {
         // 4 MiB of zeros. Enough for the driver to report a sane capacity and
         // for round-trip read/write sector tests in sub-phase 3.2.
         const SIZE_BYTES: usize = 4 * 1024 * 1024;
