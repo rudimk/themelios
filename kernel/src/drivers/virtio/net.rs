@@ -130,10 +130,12 @@ impl VirtioNet {
         let mut mac = [0u8; 6];
         transport.read_config(CFG_MAC as usize, &mut mac)?;
 
+        // `mtu` is a 16-bit field, so it is read with one 16-bit access — not two byte
+        // reads, which is what this did until review measured it against §4.2.2.2's rule
+        // that access width must match field width. One access also cannot tear, so it
+        // needs no generation check.
         let mtu = if feats & VIRTIO_NET_F_MTU != 0 {
-            let mut buf = [0u8; 2];
-            transport.read_config(CFG_MTU as usize, &mut buf)?;
-            u16::from_le_bytes(buf) as usize
+            transport.read_config_u16(CFG_MTU as usize)? as usize
         } else {
             DEFAULT_MTU
         };

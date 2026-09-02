@@ -56,10 +56,23 @@ pub mod transport;
 
 /// The virtio-PCI (modern, 1.0+) transport implementation, and the
 /// `virtio_pci_common_cfg` register offsets that only it may use.
+#[cfg(target_arch = "x86_64")]
 pub mod pci_transport;
 
+/// The virtio-mmio transport implementation, and the register offsets that only it may
+/// use. This is how QEMU's aarch64 `virt` machine presents VirtIO devices.
+#[cfg(target_arch = "aarch64")]
+pub mod mmio_transport;
+
+// Consumed by the test suite and by the x86-only storage/network services, so on a
+// plain aarch64 build (no `--features test`) nothing in-tree names them.
+#[allow(unused_imports)]
 pub use discovery::{devices_of_kind, first_of_kind, VirtioKind};
+#[cfg(target_arch = "x86_64")]
 pub use pci_transport::PciTransport;
+
+#[cfg(target_arch = "aarch64")]
+pub use mmio_transport::MmioTransport;
 pub use transport::{Notifier, VirtioTransport};
 
 use core::ptr::{read_volatile, write_volatile};
@@ -143,6 +156,36 @@ pub enum VirtioError {
     FeatureNegotiationFailed,
     /// The selected virtqueue does not exist (queue size reported as 0).
     QueueUnavailable,
+
+    /// A virtio-mmio slot did not answer the expected `"virt"` magic.
+    ///
+    /// Either the address is not a virtio-mmio window at all, or the platform description
+    /// is wrong about where the bank lives.
+    BadMagic,
+
+    /// A virtio-mmio slot holds a **legacy (version 1)** device.
+    ///
+    /// QEMU defaults `virtio-mmio.force-legacy` to **true**, so a `virt` machine started
+    /// without `-global virtio-mmio.force-legacy=false` presents every device this way.
+    /// This kernel speaks only the modern (1.0+) interface.
+    LegacyTransport,
+
+    /// A virtio-mmio slot reported a `Version` newer than the spec defines (0x2, 0x3).
+    ///
+    /// Distinct from [`LegacyTransport`](Self::LegacyTransport) on purpose: the operator
+    /// advice differs completely. Legacy means "pass `force-legacy=false`"; this means the
+    /// device speaks a revision this kernel predates, and the spec's instruction is to
+    /// ignore it.
+    UnknownVersion(u32),
+
+    /// The device did not come out of reset: `Status` never read back `0`.
+    ///
+    /// Whether a driver must wait for that is transport- and version-dependent:
+    /// virtio-PCI (§4.1.4.3.2) and virtio-mmio `Version` 0x3 (§4.2.2.2) require the wait;
+    /// virtio-mmio `Version` 0x2 (§4.2.2.1) requires the device to finish resetting
+    /// *within* the write, which is what QEMU implements. So this error is unreachable on
+    /// QEMU-mmio and live on the other two.
+    ResetTimeout,
 
     /// A device-config read ran past the end of the config region.
     ///

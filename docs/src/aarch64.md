@@ -6,9 +6,11 @@ ThemeliOS targets x86_64 first and aarch64 second. This chapter describes what t
 
 ## Scope, stated plainly
 
-The port covers boot, memory management on kernel-owned page tables, exceptions, interrupts, a preemptive scheduler, and an interactive shell. It does **not** cover ring-3, VirtIO-PCI, filesystems, networking or containers. "aarch64 support" here does not mean "containers on ARM".
+The port covers boot, memory management on kernel-owned page tables, exceptions, interrupts, a preemptive scheduler, an interactive shell, and — since Phase 8.3 — VirtIO over the mmio transport, giving the block and network drivers. It does **not** cover ring-3/EL0, and therefore not filesystems, sockets or containers. "aarch64 support" here does not mean "containers on ARM".
 
-That boundary is visible in the test suite rather than left to prose: an aarch64 run reports **16 passed, 0 failed, 38 skipped**, and each skipped test names the subsystem that explains it. The total is 54 on both architectures, so the two runs are directly comparable.
+That boundary is visible in the test suite rather than left to prose: an aarch64 run reports **23 passed, 0 failed, 32 skipped**, and each skipped test names the subsystem that explains it. The total is 55 on both architectures, so the two runs are directly comparable.
+
+(Phase 7 shipped this chapter saying 16 passed / 38 skipped. The passing count was right for the time; the skip count never was — 16 + 38 is 54, and the suite was 55. Corrected here along with the 8.3 figures.)
 
 | Subsystem | x86_64 | aarch64 |
 |---|---|---|
@@ -19,9 +21,11 @@ That boundary is visible in the test suite rather than left to prose: an aarch64
 | Preemptive scheduler | ✅ | ✅ |
 | Capability system, IPC, audit | ✅ | ✅ (compiled and tested; no *user* of them yet on a non-test boot) |
 | Debug shell | ✅ | reduced (8 of 25 commands) |
-| Ring-3 / EL0 | ✅ | deferred |
-| VirtIO-PCI, storage, network | ✅ | deferred |
-| Containers, management API | ✅ | deferred |
+| Ring-3 / EL0 | ✅ | deferred (8.4/8.5) |
+| VirtIO transport | ✅ virtio-PCI | ✅ virtio-mmio (8.3) |
+| VirtIO block + network drivers | ✅ | ✅ (8.3 — the drivers themselves; the servers above them are ring-3) |
+| Filesystems, sockets | ✅ | deferred (8.6/8.7 — both need ring 3) |
+| Containers, management API | ✅ | deferred (8.10) |
 
 ## How the code is organised
 

@@ -12,7 +12,7 @@ ThemeliOS development is organized into phases. Each phase builds on the previou
 | **5** | OCI container support | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Management API (Docker-compatible) | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port | Complete (ring-0 core) |
-| **8** | aarch64 parity (EL0, storage, net, containers) | Planned |
+| **8** | aarch64 parity (EL0, storage, net, containers) | In progress |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -181,9 +181,9 @@ container mutation crosses into the kernel through the capability-checked, audit
 
 **Delivered**: a ring-0 kernel core on QEMU `virt` — see the
 [aarch64 chapter](./aarch64.md) for the architectural differences that shaped it.
-The aarch64 suite reports **16 passed, 0 failed, 38 skipped** of the same 54 tests
-amd64 runs; skipped tests name the deferred subsystem rather than reporting a
-vacuous pass. The shell offers 8 of the 25 commands — those whose subsystems the
+The aarch64 suite reported **16 passed, 0 failed, 39 skipped** of the same 55 tests
+amd64 runs at the close of Phase 7 (8.3 has since taken it to 23/32); skipped tests
+name the deferred subsystem rather than reporting a vacuous pass. The shell offers 8 of the 25 commands — those whose subsystems the
 port actually has.
 
 **Deferred** (documented): EL0/ring-3 and everything downstream of it — VirtIO-PCI,
@@ -207,7 +207,7 @@ milestone does not imply "containers on ARM".
 | 7.3 | Scheduler context switch + preemption | Complete |
 | 7.4 | Shell, portable tests on aarch64 CI, finalize | Complete |
 
-## Phase 8 — aarch64 parity (Planned)
+## Phase 8 — aarch64 parity (In progress)
 
 **Goal**: Bring aarch64 from the Phase 7 ring-0 kernel core to full amd64 parity.
 
@@ -215,11 +215,11 @@ Phase 7 delivered a *kernel core* on ARM: paging, exceptions, the GIC, the timer
 scheduler, and an in-kernel shell. What it did not deliver is everything above EL1 —
 userspace, storage, networking, containers, the management API. Phase 8 closes that gap.
 
-Parity has one measurable definition: the kernel's 54-test suite currently runs **54/54 on
-amd64 and 16/54 on aarch64**, with 38 tests carrying written skip reasons. Parity is that
-skip list reaching zero. Every sub-phase names which entries it retires, and three of the
-38 cannot be retired by porting at all — they are retired by reframing, with the decision
-made in the sub-phase that owns each.
+Parity has one measurable definition: the kernel's 55-test suite runs **55/55 on amd64 and
+23/55 on aarch64**, with 32 tests carrying written skip reasons. Parity is that skip list
+reaching zero. Every sub-phase names which entries it retires, and three of the 32 cannot
+be retired by porting at all — they are retired by reframing, with the decision made in the
+sub-phase that owns each.
 
 **Ten sub-phases plus a throwaway spike**:
 - **8.1–8.3 — VirtIO transport.** An arch-neutral device-discovery seam, then a

@@ -33,7 +33,7 @@ use crate::mm::mmio;
 use super::transport::{Notifier, NotifyWidth, SelectedQueue, VirtioTransport};
 use super::{
     mmio_read_u16, mmio_read_u32, mmio_read_u8, mmio_write_u16, mmio_write_u32, mmio_write_u64,
-    mmio_write_u8, VirtioError, STATUS_ACKNOWLEDGE, STATUS_DRIVER,
+    mmio_write_u8, VirtioError,
 };
 
 // --- VirtIO PCI capability layout (fields relative to the capability offset) ---
@@ -78,9 +78,10 @@ const COMMON_QUEUE_DEVICE: u64 = 0x30; // u64 (used ring)
 
 /// A VirtIO device's discovered register regions and negotiated state.
 ///
-/// Constructed by [`PciTransport::init`], which walks the PCI capabilities,
-/// maps the MMIO regions, and runs the initialisation handshake up to (but not
-/// including) `DRIVER_OK`. The device-specific driver then negotiates features,
+/// Constructed by [`PciTransport::init`], which walks the PCI capabilities and maps the
+/// MMIO regions — and does *not* run the handshake. Reset-and-acknowledge is spec
+/// sequencing shared with virtio-mmio, so it lives on the trait as
+/// [`VirtioTransport::begin_init`] and runs from `open_transport`. The device-specific driver then negotiates features,
 /// sets up virtqueues, and finally calls `set_driver_ok`.
 pub struct PciTransport {
     /// Common configuration MMIO region.
@@ -103,14 +104,15 @@ pub struct PciTransport {
 }
 
 impl PciTransport {
-    /// Discover and reset a VirtIO PCI device, leaving it ready for feature
-    /// negotiation.
+    /// Locate a VirtIO PCI device's register regions and map them.
     ///
-    /// Steps:
-    /// 1. Walk the device's PCI vendor capabilities, mapping each register
-    ///    region (common / notify / ISR / device config) into uncached MMIO.
-    /// 2. Reset the device (write 0 to the status register).
-    /// 3. Set ACKNOWLEDGE then DRIVER status bits.
+    /// Walks the device's PCI vendor capabilities, mapping each register region
+    /// (common / notify / ISR / device config) into uncached MMIO. That is the whole job:
+    /// **the reset-and-acknowledge handshake is not done here.** It is spec sequencing
+    /// identical on every transport, so it lives once as
+    /// [`VirtioTransport::begin_init`] and is driven from
+    /// [`crate::drivers::virtio::discovery::VirtioDevice::open_transport`], which is the
+    /// one place both transports pass through.
     ///
     /// The caller continues with `negotiate_features`, `setup_queue`, and
     /// `set_driver_ok`.
@@ -161,22 +163,14 @@ impl PciTransport {
         let notify_base = notify_base.ok_or(VirtioError::MissingCapability)?;
         let isr = isr.ok_or(VirtioError::MissingCapability)?;
 
-        let transport = Self {
+        Ok(Self {
             common,
             notify_base,
             notify_off_multiplier,
             isr,
             device_cfg,
             device_cfg_len,
-        };
-
-        // Reset: write 0 to the status register and wait for it to read back 0.
-        transport.set_status(0);
-        // Acknowledge the device and announce we have a driver.
-        transport.set_status(STATUS_ACKNOWLEDGE);
-        transport.add_status(STATUS_DRIVER);
-
-        Ok(transport)
+        })
     }
 
 }
@@ -295,14 +289,32 @@ impl VirtioTransport for PciTransport {
             debug_assert!(out.is_empty(), "config read with no device-config region");
             return;
         };
-        // Byte-at-a-time. virtio-PCI permits wider accesses here, but the narrow form is
-        // the one both transports allow, and device config is read once at init — there
-        // is nothing to gain from a faster path that only works on one transport.
+        // Byte-at-a-time, which is what this method is *for*: byte-wide fields. Wider
+        // fields go through `config_read_u16`/`config_read_u32` so the access width
+        // matches the field width, as the spec requires.
         for (i, byte) in out.iter_mut().enumerate() {
             // SAFETY: `read_config` has already bounded `offset + out.len()` by
             // `config_len`, which is the length of this mapped region.
             *byte = unsafe { mmio_read_u8(base, (offset + i) as u64) };
         }
+    }
+
+    fn config_read_u16(&self, offset: usize) -> u16 {
+        let Some(base) = self.device_cfg else {
+            debug_assert!(false, "config read with no device-config region");
+            return 0;
+        };
+        // SAFETY: bounded and alignment-checked by `read_config_u16` before it gets here.
+        unsafe { mmio_read_u16(base, offset as u64) }
+    }
+
+    fn config_read_u32(&self, offset: usize) -> u32 {
+        let Some(base) = self.device_cfg else {
+            debug_assert!(false, "config read with no device-config region");
+            return 0;
+        };
+        // SAFETY: bounded and alignment-checked by the trait method that calls this.
+        unsafe { mmio_read_u32(base, offset as u64) }
     }
 
     fn config_generation(&self) -> u32 {

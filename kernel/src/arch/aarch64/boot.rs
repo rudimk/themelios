@@ -337,6 +337,19 @@ pub fn kmain_aarch64(
         crate::println!("[boot] Phase 7.3 scheduler FAILED self-test.");
     }
 
+    // --- Phase 8.3: VirtIO over virtio-mmio ---
+    //
+    // Placed here because it must precede the test suite and the shell, both of which
+    // expect the device list to be populated, and because `mm::mmio::map` needs the page
+    // tables and heap `bring_up_memory` installs. It does *not* depend on the scheduler;
+    // sitting after the 7.3 self-test is only so the boot log reads in phase order.
+    crate::drivers::virtio::discovery::init();
+    crate::println!(
+        "[virtio] discovery: {}",
+        crate::drivers::virtio::discovery::describe()
+    );
+    report_dma_coherence();
+
     // --- Test mode vs interactive ---
     //
     // Built with `--features test`, the suite runs here and stops the machine; the
@@ -885,6 +898,26 @@ fn timer_selftest() -> bool {
         );
     }
     false
+}
+
+/// Report the DMA coherence assumption the virtqueue rings are built on.
+///
+/// Rings and buffers live in the HHDM, which is **Normal Cacheable Inner-Shareable**
+/// memory. That is correct only if the device's accesses are coherent with the CPU's
+/// caches. On QEMU `virt` they are — the device tree marks every `virtio_mmio@` node
+/// `dma-coherent` — and on a real SBSA platform ACPI's `_CCA` says so.
+///
+/// This kernel reads neither yet: platform description parsing is not in the plan, and
+/// until it exists the coherent case is **assumed**. That assumption is printed rather
+/// than left implicit, because TCG models no caches at all — a wrong choice here is
+/// invisible in every test that will ever run under emulation and shows up as data
+/// corruption under load on real silicon, arbitrarily far from its cause. A line in the
+/// boot log is something a later hardware bring-up can grep for instead of rediscovering.
+fn report_dma_coherence() {
+    crate::println!(
+        "[virtio] dma: coherent (assumed; QEMU virt marks every virtio_mmio node \
+         dma-coherent — rings are Normal Cacheable Inner-Shareable in the HHDM)"
+    );
 }
 
 /// Bring up the memory subsystem: frame allocator, kernel heap, and the kernel's own
