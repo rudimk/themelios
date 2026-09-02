@@ -680,7 +680,14 @@ fn test_page_tables() -> Result<(), &'static str> {
     // 5. Test user address space create/destroy doesn't leak frames
     let free_before = mm::frame::free_frame_count();
 
+    // `new_user` takes the kernel space on x86_64, where a user root must copy the
+    // kernel half by value, and takes nothing on aarch64, where a user space is an
+    // independent TTBR0_EL1 tree with nothing to copy (8.4). The parameter is absent
+    // there rather than ignored — see `AddressSpace::new_user`.
+    #[cfg(target_arch = "x86_64")]
     let user_as = AddressSpace::new_user(&kernel_as);
+    #[cfg(target_arch = "aarch64")]
+    let user_as = AddressSpace::new_user();
     // Just creating a user address space allocates 1 frame (the PML4)
     let free_after_create = mm::frame::free_frame_count();
     if free_after_create >= free_before {
