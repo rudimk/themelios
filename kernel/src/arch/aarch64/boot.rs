@@ -337,6 +337,16 @@ pub fn kmain_aarch64(
         crate::println!("[boot] Phase 7.3 scheduler FAILED self-test.");
     }
 
+    // --- Phase 8.4: user address spaces on TTBR0_EL1 ---
+    //
+    // After the heap and the scheduler (it allocates), and before anything that might
+    // want a user space. Proves the TTBR0 regime translates and that ASID reuse is
+    // invalidated; leaves the low half parked again on the way out.
+    let user_as_ok = crate::mm::page_table::user_selftest();
+    if !user_as_ok {
+        crate::println!("[boot] Phase 8.4 user address space FAILED self-test.");
+    }
+
     // --- Phase 8.3: VirtIO over virtio-mmio ---
     //
     // Placed here because it must precede the test suite and the shell, both of which

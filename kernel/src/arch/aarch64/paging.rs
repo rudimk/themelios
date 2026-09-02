@@ -69,6 +69,7 @@
 //! translation regime we are actively executing on.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Number of entries in each page table level (9 index bits → 512 descriptors).
 pub const ENTRIES_PER_TABLE: usize = 512;
@@ -333,6 +334,33 @@ pub fn verify_tcr() -> (u64, u64) {
     let t1sz = (tcr >> 16) & 0x3f;
     // TG1 (bits 31:30) uses a different encoding from TG0: 0b10 = 4 KiB.
     let tg1 = (tcr >> 30) & 0x3;
+
+    // T0SZ (bits 5:0) and TG0 (bits 15:14) describe the *user* regime. Phase 7 had no
+    // reason to look at them; 8.4 does, for two reasons that are easy to conflate:
+    //
+    //  1. `user_va_bits()` derives the `copy_from_user`/`copy_to_user` bound from T0SZ
+    //     rather than hard-coding 48 bits. A hard-coded bound that disagreed with the
+    //     hardware would be wrong in one of two directions — too small merely rejects
+    //     valid pointers, but too large lets a user pointer past the end of the regime
+    //     through the check and into a walk.
+    //  2. TG0 must be the 4 KiB granule, or the L0/L1/L2/L3 index arithmetic the shared
+    //     walker performs does not describe this regime at all.
+    //
+    // Note TG0 and TG1 use *different* encodings for the same granule — TG0: 0b00 =
+    // 4 KiB, TG1: 0b10 = 4 KiB — which is exactly the sort of asymmetry that gets
+    // copy-pasted wrong, so both are checked explicitly against their own encoding.
+    let t0sz = (tcr >> 0) & 0x3f;
+    let tg0 = (tcr >> 14) & 0x3;
+    assert!(
+        t0sz == 16,
+        "aarch64 paging: TCR_EL1.T0SZ = {}, expected 16 (48-bit user VA)",
+        t0sz
+    );
+    assert!(
+        tg0 == 0b00,
+        "aarch64 paging: TCR_EL1.TG0 = {:#b}, expected 0b00 (4 KiB granule)",
+        tg0
+    );
     assert!(
         t1sz == 16,
         "aarch64 paging: TCR_EL1.T1SZ = {}, expected 16 (48-bit kernel VA)",
@@ -397,6 +425,22 @@ pub fn verify_tcr() -> (u64, u64) {
     );
 
     (t1sz, tg1)
+}
+
+/// Size of the user (`TTBR0_EL1`) virtual-address regime, in bits, read from
+/// `TCR_EL1.T0SZ`.
+///
+/// The regime spans `[0, 2^user_va_bits)`; anything at or above that translates through
+/// nothing and is the bound `copy_from_user`/`copy_to_user` reject against.
+///
+/// **Derived, not assumed.** Hard-coding 48 would be right on every machine this kernel
+/// currently boots and wrong on one configured with a larger T0SZ — and wrong in the
+/// dangerous direction, since a bound *above* the real top of the regime lets a user
+/// pointer past the check. [`verify_tcr`] asserts the value it is derived from, so the
+/// two cannot drift apart silently.
+pub fn user_va_bits() -> u32 {
+    let t0sz = read_tcr() & 0x3f;
+    64 - t0sz as u32
 }
 
 // --- Descriptor encode / decode ---
@@ -600,6 +644,117 @@ pub unsafe fn activate(root_phys: u64) {
 #[inline]
 pub fn current_root() -> u64 {
     read_ttbr1() & ADDR_MASK
+}
+
+/// Install a user address space in `TTBR0_EL1` under `asid`, and enable TTBR0 walks.
+///
+/// ## What the ASID buys, and the one case where it costs
+///
+/// TLB entries for the TTBR0 regime are *tagged* with the ASID in `TTBR0_EL1[63:48]`.
+/// Switching to a space with a **different** ASID therefore needs no invalidation at
+/// all: the old entries stay cached but no longer match, and the walker refills for the
+/// new tag. That is the whole point of tagging, and it is why the obvious "prove the
+/// TLBI matters by deleting it" experiment does not fail — with distinct ASIDs there is
+/// nothing stale to hit.
+///
+/// The invalidation is load-bearing in exactly one situation: **ASID reuse.** When the
+/// allocator wraps and hands a recycled number to a different tree, entries cached under
+/// that tag *do* match, and they describe the previous occupant's mappings. Hence
+/// `TLBI ASIDE1IS` here, keyed on the ASID being installed. [`ASID_ROLLOVER`] and the
+/// self-test that drives it exist to reach that case deliberately rather than waiting
+/// for it to appear under load.
+///
+/// **This `TLBI` is unverified, and that is measured rather than suspected.** Deleting
+/// it leaves `mm::page_table::user_selftest` — which forces a genuine ASID rollover —
+/// passing, because QEMU's TCG flushes its softmmu TLB whenever `TTBR0_EL1` is written,
+/// so nothing survives for a recycled tag to match. No guest-visible test can tell the
+/// two apart on a machine that discards the state. It is kept because the architecture
+/// requires it and its absence on real silicon is silent cross-address-space corruption;
+/// confirming it needs hardware.
+///
+/// ## `EPD0`
+///
+/// [`activate`] parks `TTBR0_EL1` and sets `TCR_EL1.EPD0` so low addresses fault instead
+/// of walking a table at PA 0. Installing a user space is where that gets undone —
+/// clearing `EPD0` is what makes the low half translate at all, and forgetting it would
+/// give a fully-built user tree that faults on every access.
+///
+/// # Safety
+///
+/// `root_phys` must be a page-aligned L0 table for the TTBR0 regime. This changes what
+/// EL0 (and EL1 accesses to low addresses) translate through; the caller is responsible
+/// for the space being the one the current task should be running on.
+pub unsafe fn activate_user(root_phys: u64, asid: u16) {
+    debug_assert_eq!(root_phys & 0xfff, 0, "user root must be page-aligned");
+    debug_assert_ne!(asid, 0, "ASID 0 is reserved; allocate a nonzero one");
+
+    let ttbr0 = (root_phys & ADDR_MASK) | ((asid as u64) << 48);
+
+    // SAFETY: the barrier order is the architecturally required one for a TTBR0 change
+    // that may be reusing an ASID: publish our descriptor stores, install the root,
+    // enable the regime, then drop any translation still cached under this tag before
+    // synchronizing. The `ISB` after `EPD0` is needed before the TLBI so the
+    // invalidation applies to the regime as newly configured.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "msr TTBR0_EL1, {ttbr0}",
+            // Clear TCR_EL1.EPD0 (bit 7) — enable walks through TTBR0.
+            "mrs {tmp}, TCR_EL1",
+            "bic {tmp}, {tmp}, #(1 << 7)",
+            "msr TCR_EL1, {tmp}",
+            "isb",
+            // Drop entries cached under this ASID. Only matters on reuse (see above),
+            // and costs one broadcast operation when it does not.
+            "tlbi aside1is, {asid_op}",
+            "dsb ish",
+            "isb",
+            ttbr0 = in(reg) ttbr0,
+            asid_op = in(reg) (asid as u64) << 48,
+            tmp = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Number of distinct ASIDs the allocator hands out before wrapping.
+///
+/// Deliberately far below the architectural space (256 or 65536 depending on
+/// `TCR_EL1.AS`) so that **rollover is reachable in a test rather than theoretical**.
+/// The recycling path is the only one where `TLBI ASIDE1IS` does any work, and a
+/// wrap-around that needs 65535 address spaces to reach is a path that gets exercised
+/// for the first time in production.
+///
+/// ASID 0 is skipped: it is conventionally reserved, and `activate_user` asserts nonzero
+/// so that "I forgot to allocate one" is a panic and not a silently shared tag.
+pub const ASID_ROLLOVER: u16 = 64;
+
+/// Next ASID to hand out. Wraps at [`ASID_ROLLOVER`], skipping 0.
+static NEXT_ASID: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate an ASID for a new user address space.
+///
+/// A monotonic counter modulo [`ASID_ROLLOVER`], skipping 0. Deliberately *not* a
+/// free-list that recycles the ASID of a destroyed space: a counter reaches the reuse
+/// case predictably after a known number of allocations, which is what makes the
+/// rollover self-test able to reach it. A free-list would make reuse depend on
+/// destruction order and turn the one path where invalidation matters into something
+/// that happens rarely and unrepeatably.
+///
+/// Two live address spaces sharing an ASID after a wrap is *sound* precisely because
+/// [`activate_user`] invalidates the tag on every install. That is the contract the two
+/// halves of this design make with each other, and the reason neither may be changed
+/// without the other.
+pub fn allocate_asid() -> u16 {
+    let n = NEXT_ASID.fetch_add(1, Ordering::Relaxed);
+    // Map onto 1..ASID_ROLLOVER — never 0.
+    let span = (ASID_ROLLOVER - 1) as u32;
+    (1 + (n - 1) % span) as u16
+}
+
+/// How many ASIDs have been handed out. For tests that need to drive a rollover.
+pub fn asids_allocated() -> u32 {
+    NEXT_ASID.load(Ordering::Relaxed) - 1
 }
 
 /// Mask selecting the VA field of a `TLBI VAE1*` register operand.

@@ -62,6 +62,25 @@ const ENTRIES_PER_TABLE: usize = paging::ENTRIES_PER_TABLE;
 /// First root-table index belonging to the kernel half (256 on x86_64, 0 on aarch64).
 const KERNEL_ROOT_START: usize = paging::KERNEL_ROOT_START;
 
+/// One past the last root entry a *user* address space owns.
+///
+/// The counterpart to [`KERNEL_ROOT_START`], and not simply derivable from it, because
+/// the two architectures partition a root differently:
+///
+/// - **x86_64** — one root, split. User owns `0..KERNEL_ROOT_START` (256), kernel owns
+///   the rest, and the kernel half's tables are shared with every other process.
+/// - **aarch64** — two roots. A user space *is* a `TTBR0_EL1` tree, so it owns all 512
+///   entries and shares none of them; `KERNEL_ROOT_START` is 0 here because the kernel's
+///   own tree, in `TTBR1_EL1`, starts at index 0 of a *different* root.
+///
+/// Writing "the user half is `0..KERNEL_ROOT_START`" is correct on x86 and silently
+/// empty on aarch64 — the shape of the `destroy` leak this constant exists to prevent.
+const USER_ROOT_END: usize = if KERNEL_ROOT_START == 0 {
+    ENTRIES_PER_TABLE
+} else {
+    KERNEL_ROOT_START
+};
+
 /// Initialize the kernel's own page tables and switch away from the bootloader's.
 ///
 /// Builds a root table cloning the bootloader's kernel-half mappings (HHDM, kernel
@@ -121,6 +140,12 @@ pub fn kernel_address_space() -> AddressSpace {
     );
     AddressSpace {
         root_phys: PhysAddr::new(phys),
+        // The kernel's own tree is never installed in TTBR0 and never ASID-tagged: its
+        // TTBR1 entries are global to every context. Zero marks "not a user space", and
+        // `activate_user` rejects it, so this handle cannot be installed as one by
+        // accident.
+        #[cfg(target_arch = "aarch64")]
+        asid: 0,
     }
 }
 
@@ -248,6 +273,16 @@ impl PageTable {
 pub struct AddressSpace {
     /// Physical address of this address space's root table.
     root_phys: PhysAddr,
+
+    /// The ASID this space's TLB entries are tagged with (aarch64 user spaces only).
+    ///
+    /// x86_64 has no equivalent: it invalidates the whole non-global TLB on every CR3
+    /// load, so there is nothing to tag. On aarch64 the tag is what lets a context
+    /// switch skip invalidation entirely — and what makes reuse after a rollover the
+    /// one case that needs it. Held here rather than looked up at switch time so the
+    /// space and its tag cannot get separated.
+    #[cfg(target_arch = "aarch64")]
+    asid: u16,
 }
 
 impl AddressSpace {
@@ -312,17 +347,39 @@ impl AddressSpace {
 
         Self {
             root_phys: new_root_phys,
+            // Not a user space — see `kernel_address_space`.
+            #[cfg(target_arch = "aarch64")]
+            asid: 0,
         }
     }
 
-    /// Create a new user address space sharing the kernel's mappings.
+    /// Create a new user address space.
     ///
-    /// The kernel half is copied from the kernel root so kernel code stays reachable
-    /// during privileged execution; the user half starts empty.
+    /// ## Two architectures, two shapes — and the shared version had an aarch64 bug
     ///
-    /// Only meaningful on architectures with a shared root. aarch64 userspace is
-    /// deferred with the rest of the EL0 port and will use an independent `TTBR0_EL1`
-    /// tree instead of copying anything.
+    /// **x86_64** has one root per address space, split down the middle: entries
+    /// `0..256` are the user half, `256..512` the kernel half. A user space must
+    /// therefore *copy* the kernel half by value so kernel code stays mapped while the
+    /// CPU is running on this root, and start the user half empty.
+    ///
+    /// **aarch64 has two roots.** `TTBR1_EL1` holds the kernel, `TTBR0_EL1` holds
+    /// userspace, and they are separate trees selected by the top bits of the virtual
+    /// address. A user space is a *whole independent root*, all 512 entries of it, and
+    /// nothing may be copied into it at all.
+    ///
+    /// The single shared implementation got this exactly backwards. `KERNEL_ROOT_START`
+    /// is `0` on aarch64, so the "user half" clear loop was `0..0` — a no-op — and the
+    /// "kernel half" copy loop was `0..512`, which copied **the entire kernel tree into
+    /// the user root**. Every EL0 process would have started life with the whole kernel
+    /// address space mapped and reachable, which is not a permission bug that `AP` bits
+    /// would have caught: the mappings would simply be present. It was invisible only
+    /// because nothing had ever loaded `TTBR0_EL1`.
+    ///
+    /// Splitting the function per architecture — rather than parameterising the loops —
+    /// is deliberate. The bug was a range expression that read as correct on one
+    /// architecture and inverted on the other, and no amount of care with the *bounds*
+    /// removes that. Two bodies, each stating what its architecture actually does.
+    #[cfg(target_arch = "x86_64")]
     pub fn new_user(kernel: &AddressSpace) -> Self {
         let kernel_root: &PageTable =
             // SAFETY: the kernel root is valid physical memory reachable via HHDM.
@@ -334,14 +391,14 @@ impl AddressSpace {
             // SAFETY: newly allocated frame, exclusive access.
             unsafe { &mut *new_root_phys.as_mut_ptr::<PageTable>() };
 
-        // User half — per-process, starts empty. Empty range on aarch64, where
-        // KERNEL_ROOT_START is 0 because the kernel owns a separate TTBR1 tree.
-        #[allow(clippy::reversed_empty_ranges)]
+        // User half — per-process, starts empty.
         for i in 0..KERNEL_ROOT_START {
             new_root.entries[i].clear();
         }
 
-        // Kernel half — shared.
+        // Kernel half — shared, copied by value. `new_kernel` pre-populated every slot
+        // (see `PREPOPULATE_KERNEL_ROOT`) so a kernel mapping added later is picked up
+        // through the shared next-level table rather than needing a copy-back.
         for i in KERNEL_ROOT_START..ENTRIES_PER_TABLE {
             new_root.entries[i].set(kernel_root.entries[i].as_u64());
         }
@@ -349,6 +406,56 @@ impl AddressSpace {
         Self {
             root_phys: new_root_phys,
         }
+    }
+
+    /// Create a new user address space: an empty `TTBR0_EL1` tree.
+    ///
+    /// See the x86_64 sibling for why these are separate functions.
+    ///
+    /// **Takes no kernel address space**, and that is the point rather than an
+    /// omission. There is nothing for it to do here — the kernel lives in `TTBR1_EL1`
+    /// and is reached by the hardware selecting a different root, not by anything this
+    /// tree contains. A `kernel: &AddressSpace` parameter that the body ignored would be
+    /// an invitation to "use" it, which is precisely how the copy-everything bug this
+    /// replaces would come back.
+    #[cfg(target_arch = "aarch64")]
+    pub fn new_user() -> Self {
+        let new_root_phys =
+            frame::allocate_frame().expect("new_user: failed to allocate root table frame");
+        let new_root: &mut PageTable =
+            // SAFETY: newly allocated frame, exclusive access via the HHDM.
+            unsafe { &mut *new_root_phys.as_mut_ptr::<PageTable>() };
+
+        // Every entry, empty. `frame::allocate_frame` does not promise zeroed memory,
+        // so this is the clear that makes the tree empty, not a formality.
+        for entry in new_root.entries.iter_mut() {
+            entry.clear();
+        }
+
+        Self {
+            root_phys: new_root_phys,
+            asid: paging::allocate_asid(),
+        }
+    }
+
+    /// The ASID this space's TLB entries are tagged with.
+    #[cfg(target_arch = "aarch64")]
+    pub fn asid(&self) -> u16 {
+        self.asid
+    }
+
+    /// Install this space in `TTBR0_EL1`, making its mappings the live low half.
+    ///
+    /// # Safety
+    ///
+    /// Changes what every low virtual address translates through, for EL0 and for EL1
+    /// accesses alike. The caller must be installing the space the current task should
+    /// be running on, and must not hold references derived from the outgoing one.
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn activate_user(&self) {
+        // SAFETY: forwarded to the caller. `root_phys` is our own root, page-aligned by
+        // the frame allocator, and `asid` was allocated nonzero by `new_user`.
+        unsafe { paging::activate_user(self.root_phys.as_u64(), self.asid) }
     }
 
     /// Physical address of this address space's root table — the value to load into
@@ -581,20 +688,34 @@ impl AddressSpace {
         None
     }
 
-    /// Destroy this address space, freeing its user-half table frames.
+    /// Destroy this address space, freeing the table frames it owns.
     ///
-    /// Frees the intermediate tables beneath the user half and then the root frame.
-    /// Does **not** free the mapped pages themselves, nor any kernel-half tables
-    /// (those are shared across all address spaces).
+    /// Frees the intermediate tables this space owns and then the root frame. Does
+    /// **not** free the mapped pages themselves, nor any table shared with other
+    /// address spaces.
+    ///
+    /// ## What "owns" means differs by architecture, and the shared bound was wrong
+    ///
+    /// On **x86_64** the root is shared between user and kernel, so only entries
+    /// `0..KERNEL_ROOT_START` — the user half — belong to this space. The kernel half
+    /// was copied by value from the kernel root and its tables are shared by every
+    /// process; freeing them would pull the kernel's own page tables out from under it.
+    ///
+    /// On **aarch64** the whole root is this space's: it is a `TTBR0_EL1` tree with no
+    /// kernel entries in it at all. [`USER_ROOT_END`] is therefore `ENTRIES_PER_TABLE`
+    /// here and `KERNEL_ROOT_START` on x86.
+    ///
+    /// This loop previously ran `0..KERNEL_ROOT_START` on both, which is `0..0` on
+    /// aarch64 — so a destroyed user space freed its root frame and **leaked every
+    /// intermediate table beneath it**. Unreachable until now only because no aarch64
+    /// user space had ever been built; it would have surfaced as a slow frame leak
+    /// under process churn, which is about the least diagnosable failure available.
     pub fn destroy(self) {
         // SAFETY: our root is a valid, HHDM-reachable table; we only read it to find
         // the frames to release.
         let root: &PageTable = unsafe { &*self.root_phys.as_ptr::<PageTable>() };
 
-        // Empty range on aarch64 (KERNEL_ROOT_START is 0): there is no user half in
-        // this tree to tear down.
-        #[allow(clippy::reversed_empty_ranges)]
-        for l0_idx in 0..KERNEL_ROOT_START {
+        for l0_idx in 0..USER_ROOT_END {
             if !root.entries[l0_idx].is_present() {
                 continue;
             }
@@ -952,5 +1073,242 @@ pub fn selftest() -> bool {
             phys.as_u64()
         );
     }
+    ok
+}
+
+// --- User address space self-test (Phase 8.4, aarch64) ---
+
+/// Two user virtual addresses used by [`user_selftest`], deliberately far apart so they
+/// land in different L1/L2 tables and the walk has to allocate real intermediates for
+/// each rather than reusing one leaf table.
+#[cfg(target_arch = "aarch64")]
+const USER_VA_A: u64 = 0x0000_0000_1000_0000;
+#[cfg(target_arch = "aarch64")]
+const USER_VA_B: u64 = 0x0000_0040_0000_0000;
+
+/// Sentinels written through the user mappings. Distinct values so a stale read is
+/// identifiable as *which* frame it came from rather than merely "wrong".
+#[cfg(target_arch = "aarch64")]
+const USER_PATTERN_1: u64 = 0x4142_4344_4546_4748;
+#[cfg(target_arch = "aarch64")]
+const USER_PATTERN_2: u64 = 0x5152_5354_5556_5758;
+
+/// Prove that an aarch64 user address space translates, and that ASID reuse invalidates.
+///
+/// ## What it establishes, in order
+///
+/// 1. **A `TTBR0_EL1` tree translates at all.** Build a user space, map one frame at two
+///    widely separated user VAs, install it, and write a sentinel through VA `A`.
+/// 2. **Three views, one frame.** Read the sentinel back through VA `B` and through the
+///    HHDM. All three must agree — which is only possible if both user VAs really walk
+///    to the frame the mapping named, rather than one of them faulting into a
+///    coincidentally-nonzero page or the write landing somewhere else entirely.
+/// 3. **A second space displaces the first.** Install a different space with a
+///    *different* frame at VA `A`, and the read must change. Without this, step 2 would
+///    pass just as well if `TTBR0_EL1` were being ignored and some stale mapping were
+///    answering.
+/// 4. **ASID reuse is reached.** The test forces a rollover — allocating spaces until
+///    the counter wraps onto the first space's tag — and repeats the displacement with a
+///    recycled ASID.
+///
+/// ## Step 4 exercises the recycling path; it does NOT verify the invalidation
+///
+/// Say this plainly, because the temptation to claim otherwise is exactly how this
+/// project's false claims get written.
+///
+/// The design intent was that step 4 would be the falsifiable one: with distinct ASIDs
+/// there is nothing stale to hit, so only *reuse* can expose a missing `TLBI ASIDE1IS`.
+/// That reasoning is architecturally correct. **It is still not testable here**, and the
+/// mutation was run rather than assumed: deleting the `TLBI ASIDE1IS` from
+/// [`crate::arch::paging::activate_user`] leaves this self-test **passing**.
+///
+/// The cause is the emulator, not the test. QEMU's TCG flushes its softmmu TLB when
+/// `TTBR0_EL1` is written, so no entry survives the switch for a recycled tag to match
+/// against. No guest-visible experiment can separate "invalidates correctly" from "never
+/// invalidates" on a machine that has already thrown the state away — which also means
+/// no *rearrangement* of this test would recover falsifiability.
+///
+/// The `TLBI` stays because the architecture requires it: on hardware that genuinely
+/// caches ASID-tagged entries, its absence is silent cross-address-space corruption.
+/// But it is **unverified**, and the first real ARM machine this kernel runs on is where
+/// it gets verified. Recorded here rather than in a commit message because this is the
+/// kind of gap that is only ever rediscovered by reading the code.
+///
+/// What *is* falsifiable here is step 3: removing the `msr TTBR0_EL1` from
+/// `activate_user` makes the displacement read return the previous space's frame.
+///
+/// ## Why this runs at EL1
+///
+/// The mappings carry `USER` (`AP[1]`), which permits EL0 access; it does not *deny*
+/// EL1 access. Privileged Access Never would, but PAN is Armv8.1 and the CPU this
+/// targets (`cortex-a72`) is Armv8.0, so EL1 loads and stores to user pages are
+/// permitted. The `PXN` that `encode_leaf` sets on user pages blocks EL1 *execution*,
+/// not data access. When PAN is present this test has to move to EL0 — noted here
+/// because the reason it works today is a property of the CPU, not of the design.
+#[cfg(target_arch = "aarch64")]
+pub fn user_selftest() -> bool {
+    use crate::arch::paging as apg;
+
+    let flags = PageFlags::PRESENT
+        .union(PageFlags::WRITABLE)
+        .union(PageFlags::USER);
+
+    // --- Space one: one frame, two user VAs ---
+    let space1 = AddressSpace::new_user();
+    let frame1 = match frame::allocate_frame() {
+        Some(f) => f,
+        None => {
+            println!("[selftest] user-as: FAIL — no frame for space one");
+            return false;
+        }
+    };
+    space1.map_page(VirtAddr::new(USER_VA_A), frame1, flags);
+    space1.map_page(VirtAddr::new(USER_VA_B), frame1, flags);
+
+    // SAFETY: installing a freshly built user tree. Nothing holds references derived
+    // from the low half — it translated nothing until this instant.
+    unsafe { space1.activate_user() };
+
+    // Write through VA A.
+    // SAFETY: just mapped writable, and the regime is live as of the ISB in
+    // `activate_user`.
+    unsafe { core::ptr::write_volatile(USER_VA_A as *mut u64, USER_PATTERN_1) };
+
+    // View 2: the other user VA. View 3: the HHDM alias of the same frame.
+    // SAFETY: both are live mappings of `frame1`.
+    let via_b = unsafe { core::ptr::read_volatile(USER_VA_B as *const u64) };
+    let via_hhdm = unsafe { core::ptr::read_volatile(frame1.as_ptr::<u64>()) };
+
+    let mut ok = true;
+    if via_b != USER_PATTERN_1 || via_hhdm != USER_PATTERN_1 {
+        println!(
+            "[selftest] user-as: FAIL — three views disagree: A wrote {:#x}, \
+             B read {:#x}, HHDM read {:#x}",
+            USER_PATTERN_1, via_b, via_hhdm
+        );
+        ok = false;
+    }
+
+    // --- Space two: a different frame at the same VA, distinct ASID ---
+    let space2 = AddressSpace::new_user();
+    let frame2 = match frame::allocate_frame() {
+        Some(f) => f,
+        None => {
+            println!("[selftest] user-as: FAIL — no frame for space two");
+            return false;
+        }
+    };
+    // SAFETY: fresh frame reachable through the HHDM.
+    unsafe { core::ptr::write_volatile(frame2.as_mut_ptr::<u64>(), USER_PATTERN_2) };
+    space2.map_page(VirtAddr::new(USER_VA_A), frame2, flags);
+
+    let asid1 = space1.asid();
+    let asid2 = space2.asid();
+    // SAFETY: switching the low half to a fully built tree.
+    unsafe { space2.activate_user() };
+    // SAFETY: live mapping of `frame2`.
+    let after_switch = unsafe { core::ptr::read_volatile(USER_VA_A as *const u64) };
+    if after_switch != USER_PATTERN_2 {
+        println!(
+            "[selftest] user-as: FAIL — after switching space, VA A read {:#x}, \
+             expected {:#x} (TTBR0 switch had no effect)",
+            after_switch, USER_PATTERN_2
+        );
+        ok = false;
+    }
+
+    // --- The part that actually tests the invalidation: ASID reuse ---
+    //
+    // Allocate spaces until the counter wraps back onto `asid1`, then build a space
+    // carrying that recycled tag with a *third* mapping at VA A. If `activate_user`
+    // did not invalidate, the entries still cached under `asid1` from space one would
+    // match and answer with `frame1`.
+    let mut recycled: Option<AddressSpace> = None;
+    for _ in 0..(apg::ASID_ROLLOVER as u32 + 2) {
+        let candidate = AddressSpace::new_user();
+        if candidate.asid() == asid1 {
+            recycled = Some(candidate);
+            break;
+        }
+        candidate.destroy();
+    }
+
+    match recycled {
+        None => {
+            println!(
+                "[selftest] user-as: FAIL — ASID {} never recycled within {} \
+                 allocations; the rollover case was not reached and the TLBI is untested",
+                asid1, apg::ASID_ROLLOVER
+            );
+            ok = false;
+        }
+        Some(space3) => {
+            let frame3 = match frame::allocate_frame() {
+                Some(f) => f,
+                None => {
+                    println!("[selftest] user-as: FAIL — no frame for the recycled space");
+                    return false;
+                }
+            };
+            const PATTERN_3: u64 = 0x6162_6364_6566_6768;
+            // SAFETY: fresh frame, HHDM-reachable.
+            unsafe { core::ptr::write_volatile(frame3.as_mut_ptr::<u64>(), PATTERN_3) };
+            space3.map_page(VirtAddr::new(USER_VA_A), frame3, flags);
+
+            // Re-install space one first, so its translations are genuinely cached under
+            // `asid1` immediately before the recycled space claims the same tag.
+            // SAFETY: space one is still intact.
+            unsafe { space1.activate_user() };
+            // SAFETY: live mapping.
+            let _warm = unsafe { core::ptr::read_volatile(USER_VA_A as *const u64) };
+
+            // SAFETY: installing the recycled-ASID space.
+            unsafe { space3.activate_user() };
+            // SAFETY: live mapping of `frame3` — unless a stale entry answers.
+            let recycled_read = unsafe { core::ptr::read_volatile(USER_VA_A as *const u64) };
+            if recycled_read != PATTERN_3 {
+                println!(
+                    "[selftest] user-as: FAIL — recycled ASID {} read {:#x}, expected \
+                     {:#x}{}",
+                    asid1,
+                    recycled_read,
+                    PATTERN_3,
+                    if recycled_read == USER_PATTERN_1 {
+                        " (this is space one's frame: TLBI ASIDE1IS did not invalidate)"
+                    } else {
+                        ""
+                    }
+                );
+                ok = false;
+            }
+            space3.destroy();
+            frame::deallocate_frame(frame3);
+        }
+    }
+
+    if ok {
+        // Deliberately does not say the invalidation was verified — it was not, and
+        // cannot be under TCG. See this function's docs.
+        println!(
+            "[selftest] user-as: PASS (three views agree; TTBR0 switch observed; \
+             ASID {} recycled after {} allocations — reuse path reached, TLBI \
+             unverified under emulation; asid2={})",
+            asid1,
+            apg::asids_allocated(),
+            asid2
+        );
+    }
+
+    // Leave the low half disabled again: nothing after this point should be translating
+    // user addresses, and leaving a destroyed space installed in TTBR0 would leave the
+    // walker pointed at freed frames.
+    space1.destroy();
+    space2.destroy();
+    frame::deallocate_frame(frame1);
+    frame::deallocate_frame(frame2);
+    // SAFETY: re-parks TTBR0 and re-sets EPD0 by reactivating the kernel root, which is
+    // the state every non-EL0 path expects.
+    unsafe { paging::activate(KERNEL_ROOT_PHYS.load(Ordering::Relaxed)) };
+
     ok
 }
