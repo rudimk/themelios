@@ -79,6 +79,9 @@ fn shell_entry() {
             #[cfg(target_arch = "x86_64")]
             "caps" => commands::cmd_caps(args),
             "audit" => commands::cmd_audit(args),
+            "shutdown" => commands::cmd_shutdown(args),
+            "reboot" => commands::cmd_reboot(args),
+            "exit" => commands::cmd_exit(args),
             #[cfg(target_arch = "x86_64")]
             "mount" => commands::cmd_mount(args),
             #[cfg(target_arch = "x86_64")]

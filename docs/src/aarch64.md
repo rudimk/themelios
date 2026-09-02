@@ -20,7 +20,7 @@ That boundary is visible in the test suite rather than left to prose: an aarch64
 | Exceptions, interrupts, timer | ✅ | ✅ |
 | Preemptive scheduler | ✅ | ✅ |
 | Capability system, IPC, audit | ✅ | ✅ (compiled and tested; no *user* of them yet on a non-test boot) |
-| Debug shell | ✅ | reduced (8 of 25 commands) |
+| Debug shell | ✅ | reduced (11 of 28 commands) |
 | Ring-3 / EL0 | ✅ | deferred (8.4/8.5) |
 | VirtIO transport | ✅ virtio-PCI | ✅ virtio-mmio (8.3) |
 | VirtIO block + network drivers | ✅ | ✅ (8.3 — the drivers themselves; the servers above them are ring-3) |
@@ -97,6 +97,8 @@ The suite instead prints a sentinel and powers off through **PSCI `SYSTEM_OFF`**
 | no exit before the deadline | fail — hang |
 
 Without the power-off the last two rows are the same timeout, and a kernel that panicked halfway through is indistinguishable from one that hung.
+
+The same PSCI calls back the shell's `shutdown` and `reboot` (`SYSTEM_OFF` and `SYSTEM_RESET`). This is the one place where the aarch64 port is *better served than amd64* rather than catching up: PSCI's function IDs are fixed by the ARM specification, so there is nothing per-machine to discover. The x86 side has no equivalent — soft-off there needs `PM1a_CNT_BLK` out of the FADT, which needs an ACPI table parser this kernel does not have, so it writes to the addresses the emulators happen to end up with and reports plainly when none answers. See [Stopping and restarting a node](./architecture.md#stopping-and-restarting-a-node) for why the facade deliberately does not paper over that asymmetry.
 
 ## Running it
 

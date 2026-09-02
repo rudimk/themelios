@@ -61,6 +61,13 @@ use core::arch::asm;
 /// implementation supports.
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 
+/// `PSCI SYSTEM_RESET`, SMC32 calling convention.
+///
+/// The neighbouring function ID to `SYSTEM_OFF`, with the same shape: no arguments, no
+/// return, does not come back. Mandatory in PSCI 0.2 and later, so any implementation
+/// that answers `SYSTEM_OFF` answers this too.
+const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+
 /// Power the machine off. Does not return if PSCI is available.
 ///
 /// Falls through to the caller only if neither conduit is implemented, which is why
@@ -77,12 +84,41 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 /// a real part the tail of a line could be cut. A prior version of this comment called
 /// the writes "synchronous", which they are not.
 pub unsafe fn system_off() {
+    // SAFETY: the caller's contract, forwarded — this is expected to stop the machine.
+    unsafe { call_both_conduits(PSCI_SYSTEM_OFF) }
+}
+
+/// Reset the machine. Does not return if PSCI is available.
+///
+/// The same call shape as [`system_off`], and subject to the same console-flush caveat:
+/// anything that must be read has to have left the UART before this runs.
+///
+/// # Safety
+///
+/// Restarts the machine. Every caller must be prepared for execution to end here.
+pub unsafe fn system_reset() {
+    // SAFETY: as above.
+    unsafe { call_both_conduits(PSCI_SYSTEM_RESET) }
+}
+
+/// Issue a no-argument PSCI call on `HVC` first, then `SMC`.
+///
+/// Both conduits are tried because which one reaches the implementation depends on where
+/// it lives, and a kernel at EL1 cannot tell: under an EL2 hypervisor it is `HVC`, on a
+/// machine whose PSCI lives in EL3 firmware it is `SMC`. QEMU `virt` intercepts
+/// PSCI-over-`HVC` regardless of EL2, so the first call is the one that fires there.
+///
+/// # Safety
+///
+/// The function IDs this is called with do not return on success. A caller must treat a
+/// return as "PSCI declined", not as "the call completed".
+unsafe fn call_both_conduits(function_id: u64) {
     // SAFETY: `HVC`/`SMC` with a PSCI function ID in x0. A conduit that is implemented
     // but does not recognise the call returns an error in x0; one that is not
     // implemented raises a synchronous exception the installed vectors report. Neither
     // corrupts state.
     //
-    // The ID goes through x0 directly rather than a scratch register. The previous
+    // The ID goes through x0 directly rather than a scratch register. An earlier
     // form (`in(reg)` plus an x0-x3 clobber list) excused itself with "harmless because
     // a successful call never returns" — which is self-cancelling, since the second
     // block exists *only* for the case where the first one does return. Under SMCCC 1.0
@@ -91,14 +127,14 @@ pub unsafe fn system_off() {
     unsafe {
         asm!(
             "hvc #0",
-            inout("x0") PSCI_SYSTEM_OFF => _,
+            inout("x0") function_id => _,
             out("x1") _, out("x2") _, out("x3") _,
             clobber_abi("C"),
             options(nostack),
         );
         asm!(
             "smc #0",
-            inout("x0") PSCI_SYSTEM_OFF => _,
+            inout("x0") function_id => _,
             out("x1") _, out("x2") _, out("x3") _,
             clobber_abi("C"),
             options(nostack),
@@ -106,17 +142,33 @@ pub unsafe fn system_off() {
     }
 }
 
-/// Power off, or park the CPU forever if PSCI will not oblige.
-///
-/// The loop is not a fallback so much as an honest ending: if neither conduit works
-/// there is nothing further this kernel can do, and spinning with interrupts masked is
-/// preferable to returning into a caller that believed the machine had stopped. The
-/// harness sees no exit, times out, and reports a hang — which is exactly what has
-/// happened.
+/// Power off, or park the CPU forever if PSCI will not oblige — see [`park`] for what
+/// that means and why it is the right ending.
 pub fn shutdown_or_hang() -> ! {
     // SAFETY: this is the intended end of execution; nothing after it needs to run.
     unsafe { system_off() };
+    park();
+}
 
+/// Reset, or park the CPU forever if PSCI will not oblige.
+///
+/// The [`shutdown_or_hang`] argument applies unchanged: a PSCI implementation that
+/// declines leaves nothing further to try, and there is no aarch64 equivalent of x86's
+/// triple-fault backstop — no architectural "the CPU gives up and resets" state to reach
+/// for. Parking is the whole fallback.
+pub fn reset_or_hang() -> ! {
+    // SAFETY: this is the intended end of execution; nothing after it needs to run.
+    unsafe { system_reset() };
+    park();
+}
+
+/// Stop this CPU for good.
+///
+/// Not a fallback so much as an honest ending: if neither conduit works there is nothing
+/// further this kernel can do, and spinning with interrupts masked is preferable to
+/// returning into a caller that believed the machine had stopped. The harness sees no
+/// exit, times out, and reports a hang — which is exactly what has happened.
+fn park() -> ! {
     crate::arch::irq::disable();
     loop {
         crate::arch::irq::halt();

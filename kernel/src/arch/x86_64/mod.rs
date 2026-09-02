@@ -23,6 +23,10 @@
 /// Low-level CPU instructions (I/O ports, halt, etc.).
 pub mod cpu;
 
+/// Machine power control: soft-off via the hypervisor ACPI ports, reset via the chipset
+/// reset register with an 8042 pulse and a triple fault behind it.
+pub mod power;
+
 /// Task context switching (callee-saved register save/restore, task bootstrap).
 pub mod context;
 

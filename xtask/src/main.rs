@@ -1709,8 +1709,16 @@ fn cmd_run(args: &[String]) {
             // -M q35: use the Q35 chipset (more modern than the default i440fx)
             // -cdrom: attach the ISO as a CD-ROM drive
             // -serial stdio: route the virtual COM1 port to our terminal
-            // -no-reboot: don't reboot on triple fault (helps debugging crashes)
-            // -no-shutdown: keep QEMU alive after guest shutdown
+            // -no-reboot: turn a guest reset request into a shutdown rather than a
+            //   restart, so a triple-faulting kernel stops once instead of looping.
+            //
+            // -no-shutdown is deliberately NOT passed. It used to be, to "keep QEMU alive
+            //   after guest shutdown" -- which made sense when a guest halt only ever
+            //   meant a crash worth inspecting. Now that the shell has a `shutdown`
+            //   command it means the opposite: QEMU pauses instead of exiting, the
+            //   terminal never comes back, and the command someone typed in order to
+            //   leave appears to do nothing. Dropping it also makes amd64 behave like
+            //   aarch64, which never passed it.
             let mut cmd = Command::new(qemu);
             cmd.current_dir(&root)
                 .args([
@@ -1719,7 +1727,6 @@ fn cmd_run(args: &[String]) {
                     "-cdrom", iso_path.to_str().unwrap(),
                     "-serial", "stdio",
                     "-no-reboot",
-                    "-no-shutdown",
                 ]);
 
             // Attach VirtIO block disks. Order fixes PCI slot assignment:

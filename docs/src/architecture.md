@@ -114,6 +114,26 @@ The OS root filesystem is read-only. The entire OS image is a single artifact th
 
 This model treats nodes as cattle: if a node is unhealthy, replace it with a fresh one. No debugging on the node, no SSHing in, no manual fixes.
 
+## Stopping and restarting a node
+
+Cattle still have to be put down deliberately. A node that vanishes is indistinguishable from one that crashed, and the difference matters to whatever is scheduling work onto it — so `arch::power` exposes two operations, `power_off` and `reset`, surfaced as the shell's `shutdown` and `reboot` and (eventually) as management-API verbs.
+
+**The two architectures are not equally well served here, and the facade deliberately does not hide that.**
+
+| | aarch64 | x86_64 |
+|---|---|---|
+| Mechanism | PSCI `SYSTEM_OFF` / `SYSTEM_RESET` over `HVC`/`SMC` | ACPI `PM1a_CNT` port write / chipset reset register `0xCF9` |
+| Real hardware? | **Yes** — the ARM-standard firmware interface, same call Linux makes | Reset yes; **shutdown no** |
+| Fallbacks | none — park the CPU | 8042 pulse, then a deliberate triple fault |
+
+On ARM this rests on a specified interface rather than a guessed address: PSCI's function IDs are fixed by the ARM spec, so there is nothing to discover and nothing to get wrong per-machine. It is verified on QEMU `virt`. One caveat the code is explicit about: the call can arrive over `HVC` or `SMC` depending on where the implementation lives, and `psci.rs` tries `HVC` first and `SMC` second rather than reading the platform's declared conduit — a machine that needs `SMC` and traps `HVC` fatally would not reach the fallback. Real ARM hardware is out of scope for the current roadmap, so this is untested there.
+
+On x86 soft-off (ACPI S5) requires reading the `\_S5` object out of the firmware's AML bytecode, which needs an ACPI interpreter this kernel does not have. `power_off` therefore writes the sleep-enable bit to the `PM1a_CNT` addresses that QEMU, Bochs and VirtualBox are each known to fix in place, and if none of them answers it says so on the console before parking the CPU. That is honest but it is not shutdown on physical x86 — closing that gap means an AML interpreter, not a longer table of magic port numbers.
+
+Reset is in better shape on both: `0xCF9` is genuine chipset hardware, and behind it sit the 8042 reset pulse and, last, a deliberate triple fault — which is not a mechanism so much as a consequence, since a CPU that cannot deliver a fault about a fault has no option but to reset.
+
+There is deliberately **no `exit` command**. The debug shell is not a login session; it is a kernel task that owns the only console, so terminating it would leave a running kernel nobody can talk to. Typing `exit` prints a pointer to `shutdown` instead.
+
 ## Target platforms
 
 ThemeliOS is designed to run as a virtual machine, with bare-metal support as a secondary goal.

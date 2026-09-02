@@ -51,3 +51,6 @@ pub mod paging;
 
 /// Task context switching (`TaskContext`, `switch_context`, task bootstrap).
 pub mod context;
+
+/// Machine power control (`power_off`, `reset`) — how the node stops and restarts.
+pub mod power;

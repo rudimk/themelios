@@ -183,7 +183,7 @@ container mutation crosses into the kernel through the capability-checked, audit
 [aarch64 chapter](./aarch64.md) for the architectural differences that shaped it.
 The aarch64 suite reported **16 passed, 0 failed, 39 skipped** of the same 55 tests
 amd64 runs at the close of Phase 7 (8.3 has since taken it to 23/32); skipped tests
-name the deferred subsystem rather than reporting a vacuous pass. The shell offers 8 of the 25 commands — those whose subsystems the
+name the deferred subsystem rather than reporting a vacuous pass. The shell offers 11 of the 28 commands — those whose subsystems the
 port actually has.
 
 **Deferred** (documented): EL0/ring-3 and everything downstream of it — VirtIO-PCI,

@@ -37,6 +37,9 @@ pub fn cmd_help(_args: &str) {
     println!("  peek <addr> [n]  — hex dump n bytes at virtual address");
     println!("  pgtable <addr>   — walk page tables for a virtual address");
     println!("  audit [n]        — show last n audit log entries (default 20)");
+    println!("  shutdown         — stop the machine");
+    println!("  reboot           — restart the machine");
+    println!("  exit             — (there is no shell to exit; see 'shutdown')");
 
     // The rest depend on the process table, the storage stack, the network stack or
     // containers — all part of the ring-3/VirtIO-PCI surface deferred on aarch64.
@@ -1232,4 +1235,61 @@ pub fn cmd_ps(_args: &str) {
         };
         println!("{:<12}   {:<9}  {:<9}  {}", &c.id[..12], c.image, status, c.name);
     }
+}
+
+// ============================================================================
+// Power control
+// ============================================================================
+
+/// `shutdown` — stop the machine.
+///
+/// Both architectures go through [`crate::arch::power`], which never returns. The console
+/// line is printed *before* the call because it is the last thing that will ever be
+/// printed if the machine does oblige — and the only diagnostic if it does not, since
+/// `power_off` parks the CPU rather than coming back.
+///
+/// The "immutable, no SSH, nodes are cattle" design makes this less of a convenience than
+/// it looks: an orderly stop is the only way for a node to leave a cluster having said so.
+///
+/// **It is not yet a clean stop.** There *is* mutable state — the ext2 `/data` volume that
+/// `write` and `mkdir` reach — and `BlockDevice::flush` exists, but nothing on this path
+/// calls it, so the device write cache is not flushed before the machine goes down. An
+/// earlier version of this comment claimed there was no state to flush, which was simply
+/// wrong. Ordering a flush here means reaching the ring-3 filesystem servers from the
+/// shell task and waiting for them, which is real work and belongs with the storage port
+/// rather than bolted onto the power path.
+pub fn cmd_shutdown(_args: &str) {
+    println!("Shutting down.");
+    crate::arch::power::power_off();
+}
+
+/// `reboot` — restart the machine.
+///
+/// See [`cmd_shutdown`].
+///
+/// **Under `cargo xtask run` this looks identical to `shutdown`, and is not.** xtask
+/// passes `-no-reboot` on both architectures, so QEMU exits on a guest reset request
+/// instead of restarting — which makes the two commands indistinguishable from the
+/// terminal. Launching the ISO by hand without that flag shows the difference: the boot
+/// banner scrolls past a second time.
+pub fn cmd_reboot(_args: &str) {
+    println!("Rebooting.");
+    crate::arch::power::reset();
+}
+
+/// `exit` — deliberately not a command that exits anything.
+///
+/// There is nowhere to exit *to*. This shell is not a login session or a subshell; it is a
+/// kernel task that owns the only console. Terminating it would leave a live kernel with a
+/// dead console and no way back short of a reset, which is strictly worse than every
+/// alternative the person typing `exit` might have wanted.
+///
+/// Aliasing it to `shutdown` would be worse still in the other direction: `exit` is muscle
+/// memory for "leave this shell", and answering it by powering off a node is a surprise
+/// with no undo. So it stays a signpost — one command's worth of discovery instead of a
+/// wrong guess in either direction.
+pub fn cmd_exit(_args: &str) {
+    println!("There is no shell to exit — this is the console, not a login session.");
+    println!("Use 'shutdown' to stop the machine, or 'reboot' to restart it.");
+    println!("(Ctrl+A then X quits QEMU without telling the OS.)");
 }
