@@ -197,7 +197,14 @@ cargo xtask run --arch arm64
 
 This builds the kernel, creates a bootable ISO, and launches it in QEMU in **headless
 mode** — serial output is piped to your terminal, but no graphical window opens. You land
-at the ThemeliOS debug shell; type `help` for commands. Press **Ctrl+A, X** to exit QEMU.
+at the ThemeliOS debug shell; type `help` for commands.
+
+To get out, type **`shutdown`** — the guest stops the machine and QEMU exits. **Ctrl+A, X**
+still works and is what you want when the kernel is wedged, but it kills the VM without the
+OS ever learning it is going down, so prefer `shutdown` when the shell is responsive.
+`reboot` restarts the machine; note that xtask passes `-no-reboot`, so QEMU exits rather
+than booting again — launch the ISO by hand without that flag if you want to watch it come
+back up.
 
 The two are not equivalent in what they can reach: amd64 boots the full stack (storage,
 networking, containers, the management API), while arm64 is a ring-0 kernel-core port —
