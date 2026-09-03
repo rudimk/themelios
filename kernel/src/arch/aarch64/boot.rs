@@ -339,9 +339,15 @@ pub fn kmain_aarch64(
 
     // --- Phase 8.4: user address spaces on TTBR0_EL1 ---
     //
-    // After the heap and the scheduler (it allocates), and before anything that might
-    // want a user space. Proves the TTBR0 regime translates and that ASID reuse is
-    // invalidated; leaves the low half parked again on the way out.
+    // Needs only the frame allocator (from `bring_up_memory`) and the serial console —
+    // not the heap, and not the scheduler. It sits here for boot-log readability, not
+    // because of a dependency; an earlier comment claimed the scheduler was required,
+    // which was invented. One real consequence of the position: preemption is live, so a
+    // timer tick can context-switch mid-test with a user space installed in TTBR0. Benign
+    // today because kernel tasks touch only high addresses.
+    //
+    // Proves the TTBR0 regime translates and that ASID reuse is invalidated; re-parks the
+    // low half on every exit path.
     let user_as_ok = crate::mm::page_table::user_selftest();
     if !user_as_ok {
         crate::println!("[boot] Phase 8.4 user address space FAILED self-test.");
