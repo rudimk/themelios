@@ -1437,33 +1437,66 @@ const EL0_CODE_VA: u64 = 0x0000_0000_0040_0000;
 #[cfg(target_arch = "aarch64")]
 const EL0_STACK_VA: u64 = 0x0000_0000_0080_0000;
 
-/// Drop to EL0, run a payload that makes three syscalls, and come back.
+/// Drop to EL0 and run a payload that makes three syscalls. **Never returns.**
 ///
 /// ## What it proves, and how each part can fail
 ///
+/// Every row below is a check that exists in [`el0_verify`]. An earlier version of this
+/// table listed four rows of which one was real: it advertised an assertion on the printed
+/// message that nothing observed, and one on "control returns here at all", which is not
+/// an assertion and whose premise is impossible — the last expression of this function has
+/// type `!`. A review found it by breaking `copy_from_user` outright and watching the test
+/// still report PASS. The instrument has since been built, so the table is now true.
+///
 /// | assertion | goes red when |
 /// |---|---|
+/// | exit status is `42` | the return value did not travel back to EL0 in `x0`, or `SP_EL0` was lost across a syscall |
+/// | `printed_bytes` == the message length | `copy_from_user`, the user mapping, or the UTF-8 path is wrong |
 /// | `svc_count` advances by 3 | the `0x400` slot is not dispatching, or `svc` never reaches EL1 |
-/// | exit status is `42` | the return value did not travel back to EL0 in `x0` |
-/// | `[el0] hello…` is printed | `copy_from_user` or the user mapping is wrong |
-/// | control returns here at all | the `eret` went somewhere other than the payload |
 ///
 /// The exit code is the *result of a syscall computed from its arguments* (`ADD(40, 2)`),
 /// not a constant. A payload that merely reached `SYS_EXIT` would pass a constant check;
-/// this one has to have received `42` back in `x0` from the previous syscall and carried
-/// it across a second one.
+/// this one has to have received `42` back in `x0` from the previous syscall, **spilled it
+/// to its user stack**, and reloaded it after a second syscall. The spill is what makes
+/// the frame's `SP_EL0` slot load-bearing: without it, zeroing `SP_EL0` on every exception
+/// return is undetectable, which a review measured.
 ///
-/// ## Why it returns rather than running forever
+/// The `svc_count` row is the weakest of the three — reaching `SYS_EXIT` with `42` already
+/// implies three syscalls — and is kept because it names the failing stage directly when
+/// the drop to EL0 works but dispatch does not.
+///
+/// ## Why it runs forever rather than returning
 ///
 /// `SYS_EXIT` records its code and returns to EL0, where the payload spins. There is no
 /// task teardown to invoke yet — that arrives with the scheduler integration in 8.5. So
 /// this test drops to EL0 **on a dedicated stack it can abandon**: the timer interrupt
-/// preempts the spinning payload, and the self-test observes the recorded status from the
+/// preempts the spinning payload, and [`el0_verify`] observes the recorded status from the
 /// next scheduled kernel task rather than by returning through the `eret`.
 ///
-/// That is a real limitation and it shapes the test: it can prove the round trip and the
-/// syscall results, and it cannot yet prove an orderly *exit* from EL0. Naming it here
-/// beats discovering later that "the EL0 test passes" meant less than it sounded like.
+/// ## What that costs, permanently, for the rest of the boot
+///
+/// Three consequences, none of them fixable without per-task `TTBR0_EL1`, and all of them
+/// previously undocumented:
+///
+/// 1. **The low half stays live at EL1.** [`AddressSpace::activate_user`] clears
+///    `TCR_EL1.EPD0` and this function never re-parks — it cannot, since the payload is
+///    still executing from that tree. So from here until shutdown, low virtual addresses
+///    translate at EL1 through a leaked user tree, and the guard-page behaviour that
+///    `new_user`'s docs describe is gone. `user_selftest` re-parks on every exit path
+///    precisely to preserve that property; this test regresses it, and a review confirmed
+///    it by reading the payload's first instruction from EL1 after the test finished.
+/// 2. **Seven frames, one ASID and one task leak.** The root, three intermediate tables
+///    (the code and stack VAs fall in different 2 MiB regions), two data frames, and an
+///    ASID out of the 63 available. `AddressSpace` has no `Drop`, and `destroy()` is never
+///    called. The frame-accounting tests still pass because the leak happens once, before
+///    the suite starts.
+/// 3. **`el0-payload` spins at EL0 forever**, taking a round-robin share of every timer
+///    slice for the life of the node.
+///
+/// The honest summary: this proves the round trip, the syscall results and the uaccess
+/// path, and it cannot yet prove an orderly *exit* from EL0 — it trades a permanent
+/// resource leak for that coverage. Naming it here beats discovering later that "the EL0
+/// test passes" meant less than it sounded like.
 #[cfg(target_arch = "aarch64")]
 pub fn el0_selftest() -> bool {
     use crate::arch::aarch64::syscall;
@@ -1562,6 +1595,23 @@ pub fn el0_verify() -> bool {
         );
         ok = false;
     }
+
+    // The uaccess assertion. `SYS_DEBUG_PRINT` counts the bytes it successfully copied out
+    // of userspace and printed; the payload's message is the only thing that increments
+    // it. Without this check, `copy_from_user` can fail on every call — or be replaced by
+    // an unconditional error return — and the test still passes, because the payload
+    // ignores that syscall's return value and nothing observes the console line. That was
+    // measured, not hypothesised.
+    let printed = syscall::printed_bytes();
+    let expected_bytes = syscall::msg_len();
+    if printed != expected_bytes {
+        println!(
+            "[selftest] el0: FAIL — SYS_DEBUG_PRINT copied {} bytes, expected {} \
+             (copy_from_user, the user mapping, or the UTF-8 path is broken)",
+            printed, expected_bytes
+        );
+        ok = false;
+    }
     match status {
         Some(42) => {}
         Some(other) => {
@@ -1580,8 +1630,14 @@ pub fn el0_verify() -> bool {
     if ok {
         println!(
             "[selftest] el0: PASS (dropped to EL0, {} syscalls dispatched via slot 8, \
-             ADD returned 42 through x0, SYS_EXIT observed)",
-            count - (expected - 3)
+             ADD returned 42 through x0 and survived a spill to SP_EL0, {} bytes copied \
+             from userspace, SYS_EXIT observed)",
+            // `saturating_sub` on both halves. Unreachable — a `Some(42)` status implies
+            // `el0_selftest` ran and stored `before + 3` — but this is a dev-profile build
+            // with overflow checks on, so an underflow here would panic *inside the
+            // success path of a passing test*, which is the worst place to learn about it.
+            count.saturating_sub(expected.saturating_sub(3)),
+            printed
         );
     }
     ok

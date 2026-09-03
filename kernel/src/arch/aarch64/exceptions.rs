@@ -27,9 +27,12 @@
 //! in Phase 7 — but only because early boot makes it so. Limine hands off with
 //! `SPSel = 0`, which would route exceptions to the `0x000` group *and* land them on an
 //! uninitialised `SP_EL1`; `arch::aarch64::boot::use_sp_el1` establishes the invariant
-//! this table assumes before anything can fault. The `0x400` group becomes live when EL0 lands with the
-//! deferred ring-3 port; until then it is wired to the same reporting path so that an
-//! unexpected entry is diagnosed instead of silently executing whatever follows.
+//! this table assumes before anything can fault. **The `0x400` group is live as of 8.4b**:
+//! slot 8 (synchronous) is the syscall path and slot 9 (IRQ) takes device interrupts that
+//! land while EL0 is running. Slots 10 and 11 — FIQ and SError from EL0 — remain wired to
+//! the reporting path, which is the intended handling and not an omission: no FIQ is
+//! routed to EL1 in this GICv2 configuration, and an SError from userspace is fatal for
+//! this phase.
 //!
 //! ## Why every slot is populated
 //!
@@ -95,6 +98,21 @@ pub struct ExceptionFrame {
     /// immediately before `eret`, never read back live after any window where preemption
     /// could occur. The file already reasons this way about `ELR_EL1`/`SPSR_EL1` — "single
     /// system registers, not per-task storage" — and this is the same argument.
+    ///
+    /// ## What is *not* yet true, and matters more than this field
+    ///
+    /// The scenario above needs two concurrent EL0 tasks, and **this port cannot have
+    /// them** — for a reason unrelated to `SP_EL0`. [`crate::arch::context::switch`] does
+    /// not swap `TTBR0_EL1` (it preserves x19-x30 and nothing else), so two EL0 tasks would
+    /// share whichever address space was installed last. The structure here is therefore
+    /// *correct and untested*: it is the shape the hazard requires, put in place before the
+    /// hazard can occur, not a fix for a bug that has been reproduced. Saying so plainly is
+    /// the point — a review measured it by zeroing both registers on every exception return
+    /// and watching the whole suite still pass, because the only EL0 code that exists never
+    /// touches its stack.
+    ///
+    /// Per-task `TTBR0_EL1` is the prerequisite for a real userspace and belongs with the
+    /// process-model work, not here. When it lands, this field stops being speculative.
     pub sp_el0: u64,
     /// The interrupted context's `TPIDR_EL0` — userspace's thread pointer (TLS).
     ///
@@ -107,16 +125,28 @@ pub struct ExceptionFrame {
 
 /// Bytes the entry stub reserves for an [`ExceptionFrame`].
 ///
-/// Kept in sync with the `sub sp, sp, #304` in the assembly below by the assertions
-/// that follow — mechanically, not by comment. This file already has one war story
-/// about hand-maintained assembly geometry drifting out of step (see the note on slot
-/// size); adding a field to `ExceptionFrame` should be a build error, not a handler
-/// that silently reads a neighbouring register's value.
+/// This constant is **substituted into the assembly below** as a `const` operand, so the
+/// `sub sp, sp, #N` in the stub and the matching `add sp, sp, #N` in the exit path cannot
+/// disagree with it: there is one number, in one place, and the assembler receives it from
+/// here. That is worth the small awkwardness of a formatted `global_asm!` string, because
+/// this file already has one war story about hand-maintained assembly geometry drifting
+/// out of step (see the note on slot size).
+///
+/// An earlier version of this comment claimed the assertions below policed the assembly.
+/// They did not and could not — the assembly held its own hand-written `304`, and raising
+/// the constant alone still built clean. The assertions police the *struct*; the `const`
+/// operand polices the *assembly*. Both are needed and they check different things.
 const EXC_FRAME_RESERVE: usize = 304;
 
+// Adding a field to `ExceptionFrame` that pushes it past the reserve is a build error.
+// Note this is `<=`, not `==`: the reserve is rounded up for alignment, so a frame may
+// legitimately be smaller. What it cannot be is larger than the space the stub reserved.
 const _: () = assert!(core::mem::size_of::<ExceptionFrame>() <= EXC_FRAME_RESERVE);
 // SP must stay 16-byte aligned across the `bl` into Rust (AAPCS64).
 const _: () = assert!(EXC_FRAME_RESERVE % 16 == 0);
+// `sub`/`add` immediates encode 12 bits unshifted; beyond that the assembler needs a
+// shifted form and the stub's four-instruction budget no longer holds.
+const _: () = assert!(EXC_FRAME_RESERVE < 4096);
 
 /// Count of `BRK` exceptions handled, so the self-test can prove the handler ran
 /// rather than inferring it from "we did not crash".
@@ -204,7 +234,7 @@ global_asm!(
 // So each slot holds four instructions: reserve the frame, save the two registers
 // needed as scratch, load the slot tag, and branch to the shared body below.
 .macro VECTOR_STUB tag
-    sub sp, sp, #304
+    sub sp, sp, #{reserve}
     stp x0, x1, [sp, #(0 * 8)]
     mov x1, #\tag
     b   aarch64_exc_common
@@ -291,7 +321,7 @@ aarch64_exc_common:
     ldp x26, x27, [sp, #(26 * 8)]
     ldp x28, x29, [sp, #(28 * 8)]
     ldr x30,      [sp, #(30 * 8)]
-    add sp, sp, #304
+    add sp, sp, #{reserve}
     eret
 
 .align 11
@@ -336,15 +366,22 @@ aarch64_vector_table:
     VECTOR_STUB 14
     .align 7
     VECTOR_STUB 15
-"#
+"#,
+    // The frame size the stub reserves and the exit path releases. Supplied from the Rust
+    // constant so the two cannot drift; see the doc on `EXC_FRAME_RESERVE`.
+    reserve = const EXC_FRAME_RESERVE,
 );
 
-/// Vector-slot tags, matching the `VECTOR_STUB` arguments above.
+// Vector-slot tags, matching the `VECTOR_STUB` arguments above.
+
 /// Vector slot 8: synchronous exception from a **lower** EL in AArch64 — the syscall
 /// path. Dispatch keys on this *before* looking at `ESR_EL1.EC`, so an `svc` executed at
 /// EL1 (which arrives at slot 4) stays fatal instead of being serviced as a syscall.
 const TAG_LOWER_A64_SYNC: u64 = 8;
 
+/// Vector slot 4: synchronous exception at the current EL on `SP_ELx` — the kernel
+/// faulting on itself. `BRK` is handled and resumed here; everything else (data aborts,
+/// instruction aborts, an `svc` executed at EL1) is fatal for this phase.
 const TAG_CUR_SPX_SYNC: u64 = 4;
 
 /// The IRQ slot, dispatched to the interrupt controller.
@@ -454,6 +491,15 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
             // bug, which is why the two arms sit next to each other with this note
             // between them.
             syscall::dispatch(frame);
+
+            // Same guard as the IRQ arm, and newly load-bearing here. Until 8.4b the only
+            // *resumable* path through the write-back tail was the IRQ one; the syscall
+            // path made it a second, and the tail's atomicity argument — ELR, SPSR, SP_EL0
+            // and TPIDR_EL0 restored from the frame with nothing able to preempt between
+            // the writes and the `eret` — depends on DAIF.I being masked on both. A
+            // dispatch handler that unmasked would return to the wrong userspace context
+            // in a way no test would attribute to this line.
+            debug_assert_irqs_masked("SVC vector exit");
             return;
         }
 
@@ -513,17 +559,36 @@ pub unsafe extern "C" fn aarch64_exception_entry(frame: &mut ExceptionFrame, tag
             frame.esr
         );
     }
-    if matches!(
-        ec,
-        EC_DATA_ABORT_CURRENT | EC_DATA_ABORT_LOWER | EC_INSTR_ABORT_CURRENT | EC_INSTR_ABORT_LOWER
-    ) {
+    // Gated on `esr_meaningful` as well, and that is not belt-and-braces: `ec` is derived
+    // from `frame.esr`, so on an IRQ/FIQ slot this `matches!` tests a *stale* syndrome. An
+    // unhandled slot-10 FIQ taken any time after a data abort would otherwise print a
+    // confident `FAR_EL1: … (translation fault (no mapping))` — the exact "confident
+    // diagnosis of the wrong thing" the STALE branch above exists to prevent, reintroduced
+    // eight lines below it. `FAR_EL1` is not written by IRQ/FIQ either, so the address
+    // would be stale even if the decision to print it were sound.
+    if esr_meaningful
+        && matches!(
+            ec,
+            EC_DATA_ABORT_CURRENT
+                | EC_DATA_ABORT_LOWER
+                | EC_INSTR_ABORT_CURRENT
+                | EC_INSTR_ABORT_LOWER
+        )
+    {
         println!(
             "  FAR_EL1: {:#018x}  ({})",
             frame.far,
             fault_status(frame.esr)
         );
     }
-    println!("  ELR_EL1: {:#018x}  (faulting instruction)", frame.elr);
+    // On a synchronous slot ELR is the faulting instruction; on an IRQ/FIQ slot it is
+    // merely whatever was *interrupted*, which is not a fault at all. Labelling both the
+    // same way sends the reader hunting for a bug at an innocent address.
+    if esr_meaningful {
+        println!("  ELR_EL1: {:#018x}  (faulting instruction)", frame.elr);
+    } else {
+        println!("  ELR_EL1: {:#018x}  (interrupted instruction)", frame.elr);
+    }
     println!("  SPSR:    {:#018x}", frame.spsr);
     println!("  x0-x3:   {:#018x} {:#018x} {:#018x} {:#018x}",
         frame.x[0], frame.x[1], frame.x[2], frame.x[3]);
@@ -714,8 +779,8 @@ pub fn brk_count() -> u64 {
 pub fn selftest() -> bool {
     let before = brk_count();
 
-    // Where is the stack, and how much of it is left? The exception stub reserves 288
-    // bytes and the Rust handler formats output on top of that, so a stack sitting
+    // Where is the stack, and how much of it is left? The exception stub reserves
+    // EXC_FRAME_RESERVE bytes and the Rust handler formats output on top of that, so a stack sitting
     // near a mapping boundary would fail here in a way that looks like a vector-table
     // bug. Print it so the two are distinguishable from the serial log alone.
     let sp: u64;
@@ -729,7 +794,8 @@ pub fn selftest() -> bool {
     // Deliberately *without* `nomem`/`nostack`. Both would be lies: the handler writes
     // BRK_COUNT, so telling the compiler this asm touches no memory would let it cache
     // the counter reads either side and fold the comparison to a constant; and taking
-    // the exception pushes a 288-byte frame, so it very much touches the stack.
+    // the exception pushes an EXC_FRAME_RESERVE-byte frame, so it very much touches the
+    // stack.
     unsafe {
         core::arch::asm!("brk #0", options(preserves_flags));
     }

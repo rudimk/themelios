@@ -626,6 +626,15 @@ fn worker_2() {
     worker_body(2);
 }
 
+/// Entry point for the task that drops to EL0.
+///
+/// Diverges: `el0_selftest` enters EL0 and the payload spins there, so this never returns
+/// to the scheduler. The task simply stops being scheduled as a kernel task and becomes
+/// the EL0 context.
+fn el0_task() {
+    crate::mm::page_table::el0_selftest();
+}
+
 /// Prove the aarch64 scheduler preempts and round-robins.
 ///
 /// Acceptance for 7.3 is "≥2 in-kernel tasks preempt and round-robin under the
@@ -655,15 +664,6 @@ fn worker_2() {
 /// delivering while the bootstrap task is running. It does *not* cover a worker that
 /// runs with interrupts masked — the bootstrap task is then never resumed to evaluate
 /// any deadline at all — so the workers carry their own escape.
-/// Entry point for the task that drops to EL0.
-///
-/// Diverges: `el0_selftest` enters EL0 and the payload spins there, so this never returns
-/// to the scheduler. The task simply stops being scheduled as a kernel task and becomes
-/// the EL0 context.
-fn el0_task() {
-    crate::mm::page_table::el0_selftest();
-}
-
 fn sched_selftest() -> bool {
     use crate::arch::aarch64::timer::{read_cntvct, reload};
     use crate::arch::time::tick_count;
