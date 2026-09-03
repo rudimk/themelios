@@ -337,6 +337,66 @@ pub fn kmain_aarch64(
         crate::println!("[boot] Phase 7.3 scheduler FAILED self-test.");
     }
 
+    // --- Phase 8.4: user address spaces on TTBR0_EL1 ---
+    //
+    // Needs only the frame allocator (from `bring_up_memory`) and the serial console —
+    // not the heap, and not the scheduler. It sits here for boot-log readability, not
+    // because of a dependency; an earlier comment claimed the scheduler was required,
+    // which was invented. One real consequence of the position: preemption is live, so a
+    // timer tick can context-switch mid-test with a user space installed in TTBR0. Benign
+    // today because kernel tasks touch only high addresses.
+    //
+    // Proves the TTBR0 regime translates and that ASID reuse is invalidated; re-parks the
+    // low half on every exit path.
+    let user_as_ok = crate::mm::page_table::user_selftest();
+    if !user_as_ok {
+        crate::println!("[boot] Phase 8.4 user address space FAILED self-test.");
+    }
+
+    // --- Phase 8.4b: the EL0 round trip ---
+    //
+    // Runs on its own task because `el0_selftest` does not return: it `eret`s into EL0 and
+    // the payload spins after `SYS_EXIT`, since there is no task teardown to invoke yet.
+    // The verdict is therefore collected here, from the boot task, after giving the EL0
+    // task time to be scheduled and make its three syscalls.
+    //
+    // Bounded on the tick, not on a spin count: if the drop to EL0 never happens, or the
+    // syscalls never arrive, this must *fail* rather than hang the boot.
+    let el0_ok = {
+        use crate::arch::time::tick_count;
+        crate::sched::spawn("el0-payload", el0_task);
+
+        // **Interrupts are masked here**, and that is the whole difficulty.
+        // `sched_selftest` ends with `arch::irq::disable()`, so on entry to this block the
+        // timer cannot fire: `tick_count()` is frozen and no preemption can occur. Two
+        // earlier attempts both foundered on not knowing that.
+        //
+        //   * A fixed 30-tick sleep calling `yield_now()`: `yield_now` switches tasks
+        //     without needing interrupts, so the loop *did* make progress — but the tick
+        //     bound it waited on was frozen, so it spun through 30 ticks' worth of
+        //     nothing, checked once, and reported FAIL for a payload that ran later, after
+        //     boot re-enabled interrupts.
+        //   * Spinning on `tick_count()`: with the timer masked the bound never advances
+        //     and the EL0 task is never scheduled. The kernel hung outright, and the smoke
+        //     failed on the missing shell banner rather than on any assertion.
+        //
+        // So: enable interrupts for the duration, wait on the condition, and restore the
+        // masked state afterwards so the rest of boot sees what it expects. The bound is
+        // now meaningful because the tick it counts is actually running.
+        crate::arch::irq::enable();
+        let start = tick_count();
+        while crate::arch::aarch64::syscall::exit_status().is_none()
+            && tick_count() - start < 200
+        {
+            core::hint::spin_loop();
+        }
+        crate::arch::irq::disable();
+        crate::mm::page_table::el0_verify()
+    };
+    if !el0_ok {
+        crate::println!("[boot] Phase 8.4b EL0 round trip FAILED self-test.");
+    }
+
     // --- Phase 8.3: VirtIO over virtio-mmio ---
     //
     // Placed here because it must precede the test suite and the shell, both of which
@@ -564,6 +624,15 @@ fn worker_1() {
 }
 fn worker_2() {
     worker_body(2);
+}
+
+/// Entry point for the task that drops to EL0.
+///
+/// Diverges: `el0_selftest` enters EL0 and the payload spins there, so this never returns
+/// to the scheduler. The task simply stops being scheduled as a kernel task and becomes
+/// the EL0 context.
+fn el0_task() {
+    crate::mm::page_table::el0_selftest();
 }
 
 /// Prove the aarch64 scheduler preempts and round-robins.

@@ -69,6 +69,7 @@
 //! translation regime we are actively executing on.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Number of entries in each page table level (9 index bits → 512 descriptors).
 pub const ENTRIES_PER_TABLE: usize = 512;
@@ -99,6 +100,12 @@ pub const LEVEL_NAMES: [&str; 4] = ["L0", "L1", "L2", "L3"];
 /// (2 MiB) to solve a problem this architecture does not have.
 pub const PREPOPULATE_KERNEL_ROOT: bool = false;
 
+/// `TCR_EL1.EPD0` (bit 7): disable translation-table walks through `TTBR0_EL1`.
+///
+/// Set by [`activate`] so a stray low address faults instead of walking a table at
+/// PA 0; cleared by [`activate_user`] when the first user space is installed.
+const TCR_EPD0: u64 = 1 << 7;
+
 /// Mask selecting the output-address bits [47:12] of a descriptor.
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
@@ -117,6 +124,35 @@ const DESC_SH_INNER: u64 = 0b11 << 8;
 const DESC_AP_RO: u64 = 1 << 7;
 /// Bit 6: `AP[1]` — EL0 (unprivileged) access permitted when set.
 const DESC_AP_EL0: u64 = 1 << 6;
+/// Bit 11: not-Global. **Set on user mappings, clear on kernel mappings.**
+///
+/// The polarity is the trap: clear means *global*, and a global TLB entry matches
+/// **every ASID**. So a user mapping left global is not merely untagged — it stays live
+/// across an address-space switch and answers for whichever process runs next, and
+/// `TLBI ASIDE1IS` cannot remove it, because ASID-tagged invalidation by definition
+/// selects only non-global entries.
+///
+/// 8.4 shipped ASID allocation, `TTBR0_EL1` switching and an `ASIDE1IS` invalidation
+/// while `encode_leaf` still produced global user pages — making the whole scheme inert
+/// on hardware. Review caught it against this file's own Phase 7 note, which had already
+/// written down that the ASID bits were "benign only because every mapping we produce is
+/// global … That stops being true the moment EL0 mappings with `nG = 1` land."
+///
+/// ## No test here can prove this bit is set, and that was measured
+///
+/// Clearing `DESC_NG` again and re-running `mm::page_table::user_selftest` leaves it
+/// **passing**. QEMU implements `TLBI ASIDE1{IS}` as a full flush of the EL1&0 regime
+/// (`tlbi_aa64_vmalle1is_write`), ignoring both the ASID operand and the global/non-global
+/// distinction — so under emulation a stale global entry is invalidated just as a tagged
+/// one would be, and the two cases are indistinguishable from inside the guest.
+///
+/// So the self-test's ASID arm demonstrates that *the TLBI instruction is present*
+/// (deleting it fails the test), not that the tagging works. The `nG` bit rests on the
+/// architecture specification, not on a green run. **This is a hardware-phase check**:
+/// on silicon, omitting `nG` makes the address-space switch in that test return the
+/// previous space's frame."
+const DESC_NG: u64 = 1 << 11;
+
 /// Bit 53: Privileged eXecute Never (EL1).
 const DESC_PXN: u64 = 1 << 53;
 /// Bit 54: Unprivileged eXecute Never (EL0).
@@ -166,9 +202,13 @@ impl PageFlags {
     /// Block/huge mapping. We never create these; the walk detects Limine's.
     pub const HUGE_PAGE: Self = Self(1 << 7);
 
-    /// Global mapping. aarch64 expresses the opposite (`nG`, not-global, bit 11);
-    /// leaving `nG` clear — which we do — already means global, so this flag needs
-    /// no encoding.
+    /// Global mapping — valid in every address space.
+    ///
+    /// aarch64 expresses the opposite (`nG`, not-global, bit 11), and globality is the
+    /// *default*: a descriptor with `nG` clear is global. So this flag still needs no
+    /// encoding — but the reason is no longer "we never set `nG`", which stopped being
+    /// true when user mappings landed. Globality is now decided by [`PageFlags::USER`]:
+    /// user pages are non-global, everything else is global.
     pub const GLOBAL: Self = Self(1 << 8);
 
     /// Execution from this mapping faults. Encoded as `PXN | UXN`.
@@ -333,6 +373,33 @@ pub fn verify_tcr() -> (u64, u64) {
     let t1sz = (tcr >> 16) & 0x3f;
     // TG1 (bits 31:30) uses a different encoding from TG0: 0b10 = 4 KiB.
     let tg1 = (tcr >> 30) & 0x3;
+
+    // T0SZ (bits 5:0) and TG0 (bits 15:14) describe the *user* regime. Phase 7 had no
+    // reason to look at them; 8.4 does, for two reasons that are easy to conflate:
+    //
+    //  1. `user_va_bits()` derives the `copy_from_user`/`copy_to_user` bound from T0SZ
+    //     rather than hard-coding 48 bits. A hard-coded bound that disagreed with the
+    //     hardware would be wrong in one of two directions — too small merely rejects
+    //     valid pointers, but too large lets a user pointer past the end of the regime
+    //     through the check and into a walk.
+    //  2. TG0 must be the 4 KiB granule, or the L0/L1/L2/L3 index arithmetic the shared
+    //     walker performs does not describe this regime at all.
+    //
+    // Note TG0 and TG1 use *different* encodings for the same granule — TG0: 0b00 =
+    // 4 KiB, TG1: 0b10 = 4 KiB — which is exactly the sort of asymmetry that gets
+    // copy-pasted wrong, so both are checked explicitly against their own encoding.
+    let t0sz = tcr & 0x3f;
+    let tg0 = (tcr >> 14) & 0x3;
+    assert!(
+        t0sz == 16,
+        "aarch64 paging: TCR_EL1.T0SZ = {}, expected 16 (48-bit user VA)",
+        t0sz
+    );
+    assert!(
+        tg0 == 0b00,
+        "aarch64 paging: TCR_EL1.TG0 = {:#b}, expected 0b00 (4 KiB granule)",
+        tg0
+    );
     assert!(
         t1sz == 16,
         "aarch64 paging: TCR_EL1.T1SZ = {}, expected 16 (48-bit kernel VA)",
@@ -399,6 +466,22 @@ pub fn verify_tcr() -> (u64, u64) {
     (t1sz, tg1)
 }
 
+/// Size of the user (`TTBR0_EL1`) virtual-address regime, in bits, read from
+/// `TCR_EL1.T0SZ`.
+///
+/// The regime spans `[0, 2^user_va_bits)`; anything at or above that translates through
+/// nothing and is the bound `copy_from_user`/`copy_to_user` reject against.
+///
+/// **Derived, not assumed.** Hard-coding 48 would be right on every machine this kernel
+/// currently boots and wrong on one configured with a larger T0SZ — and wrong in the
+/// dangerous direction, since a bound *above* the real top of the regime lets a user
+/// pointer past the check. [`verify_tcr`] asserts the value it is derived from, so the
+/// two cannot drift apart silently.
+pub fn user_va_bits() -> u32 {
+    let t0sz = read_tcr() & 0x3f;
+    64 - t0sz as u32
+}
+
 // --- Descriptor encode / decode ---
 
 /// Encode an L3 leaf descriptor mapping `phys` with `flags`.
@@ -433,6 +516,12 @@ pub fn encode_leaf(phys: u64, flags: PageFlags) -> u64 {
     }
     if flags.contains(PageFlags::USER) {
         desc |= DESC_AP_EL0;
+        // Non-global: this translation belongs to one address space, identified by the
+        // ASID in TTBR0_EL1. Without this the entry matches every ASID and survives an
+        // address-space switch — see `DESC_NG`. Kernel mappings deliberately stay global:
+        // they are identical in every context and re-walking them on each switch is pure
+        // cost.
+        desc |= DESC_NG;
         // EL0-accessible ⇒ never executable at EL1. This is the SMEP analog: without
         // it a user text page is executable by the kernel, so any corrupted branch
         // target lands in attacker-controlled code at EL1. Set while the encoder is
@@ -601,6 +690,144 @@ pub unsafe fn activate(root_phys: u64) {
 pub fn current_root() -> u64 {
     read_ttbr1() & ADDR_MASK
 }
+
+/// Install a user address space in `TTBR0_EL1` under `asid`, and enable TTBR0 walks.
+///
+/// ## What the ASID buys, and the one case where it costs
+///
+/// TLB entries for the TTBR0 regime are *tagged* with the ASID in `TTBR0_EL1[63:48]` —
+/// **provided the descriptor is non-global**. That proviso is the whole design: a global
+/// entry (`nG` clear) matches every ASID, is unaffected by ASID-tagged invalidation, and
+/// therefore survives an address-space switch and answers for the next process. User
+/// leaves must set `nG`, and [`encode_leaf`] does; see [`DESC_NG`] for the round this
+/// took to get right.
+///
+/// Given non-global user entries, switching to a space with a **different** ASID needs no
+/// invalidation: the old entries stay cached but no longer match. That is the point of
+/// tagging.
+///
+/// The invalidation is load-bearing in exactly one situation: **ASID reuse.** When the
+/// allocator wraps and hands a recycled number to a different tree, entries cached under
+/// that tag *do* match, and they describe the previous occupant's mappings. Hence
+/// `TLBI ASIDE1IS` here, keyed on the ASID being installed. [`ASID_ROLLOVER`] and the
+/// self-test that drives it exist to reach that case deliberately rather than waiting
+/// for it to appear under load.
+///
+/// **This `TLBI` is unverified, and that is measured rather than suspected.** Deleting
+/// it leaves `mm::page_table::user_selftest` — which forces a genuine ASID rollover —
+/// passing, because QEMU's TCG flushes its softmmu TLB whenever `TTBR0_EL1` is written,
+/// so nothing survives for a recycled tag to match. No guest-visible test can tell the
+/// two apart on a machine that discards the state. It is kept because the architecture
+/// requires it and its absence on real silicon is silent cross-address-space corruption;
+/// confirming it needs hardware.
+///
+/// ## `EPD0`
+///
+/// [`activate`] parks `TTBR0_EL1` and sets `TCR_EL1.EPD0` so low addresses fault instead
+/// of walking a table at PA 0. Installing a user space is where that gets undone —
+/// clearing `EPD0` is what makes the low half translate at all, and forgetting it would
+/// give a fully-built user tree that faults on every access.
+///
+/// # Safety
+///
+/// `root_phys` must be a page-aligned L0 table for the TTBR0 regime. This changes what
+/// EL0 (and EL1 accesses to low addresses) translate through; the caller is responsible
+/// for the space being the one the current task should be running on.
+pub unsafe fn activate_user(root_phys: u64, asid: u16) {
+    debug_assert_eq!(root_phys & 0xfff, 0, "user root must be page-aligned");
+    debug_assert_ne!(asid, 0, "ASID 0 is reserved; allocate a nonzero one");
+
+    let ttbr0 = (root_phys & ADDR_MASK) | ((asid as u64) << 48);
+
+    // Enable TTBR0 walks — **once**, not on every switch.
+    //
+    // `activate` parks the low half by setting `TCR_EL1.EPD0`, and the first user space
+    // installed has to clear it. Doing that unconditionally on every switch looks
+    // harmless and is not: QEMU's `TCR_EL1` write handler performs an *unconditional*
+    // full TLB flush, so a redundant write turns every address-space switch into a
+    // complete invalidation. That masked the `TLBI ASIDE1IS` below entirely — deleting
+    // the TLBI left the self-test passing, and the wrong conclusion drawn from that was
+    // that the ASID path could not be falsified under emulation at all. With the write
+    // made conditional, deleting the TLBI fails the test as intended.
+    //
+    // It is also simply correct: `EPD0` is a property of the regime, not of a particular
+    // address space, so re-clearing it per switch is work with no meaning.
+    //
+    // SAFETY: reads `TCR_EL1`, and writes it back only to clear `EPD0` — the field
+    // governing the TTBR0 regime, which translates nothing at the moment it is cleared.
+    unsafe {
+        let tcr: u64;
+        asm!("mrs {0}, TCR_EL1", out(reg) tcr, options(nomem, nostack, preserves_flags));
+        if tcr & TCR_EPD0 != 0 {
+            asm!(
+                "msr TCR_EL1, {0}",
+                "isb",
+                in(reg) tcr & !TCR_EPD0,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    // SAFETY: the architecturally required order for a TTBR0 change that may be reusing
+    // an ASID. `DSB ISHST` publishes our descriptor stores before the walker can see the
+    // new root; the `TLBI` then drops any translation still cached under this tag, and
+    // `DSB ISH` + `ISB` complete it before the next instruction is fetched.
+    //
+    // The invalidation follows the install rather than preceding it. ARM's recommended
+    // pattern for ASID reuse is to invalidate while the regime is parked, since between
+    // these two instructions the tag is live and the CPU may speculatively populate under
+    // it. Doing it properly means parking TTBR0 at a reserved root first — deferred, and
+    // recorded here rather than left as an unstated assumption.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "msr TTBR0_EL1, {ttbr0}",
+            "tlbi aside1is, {asid_op}",
+            "dsb ish",
+            "isb",
+            ttbr0 = in(reg) ttbr0,
+            asid_op = in(reg) (asid as u64) << 48,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Modulus of the ASID counter. The allocator hands out **`ASID_ROLLOVER - 1` = 63**
+/// distinct values (`1..=63`), recycling the first on the 64th allocation.
+///
+/// Deliberately far below the architectural space (256 or 65536 depending on
+/// `TCR_EL1.AS`) so that **rollover is reachable in a test rather than theoretical**.
+/// The recycling path is the only one where `TLBI ASIDE1IS` does any work, and a
+/// wrap-around that needs 65535 address spaces to reach is a path that gets exercised
+/// for the first time in production.
+///
+/// ASID 0 is skipped: it is conventionally reserved, and `activate_user` asserts nonzero
+/// so that "I forgot to allocate one" is a panic and not a silently shared tag.
+pub const ASID_ROLLOVER: u16 = 64;
+
+/// Next ASID to hand out. Wraps at [`ASID_ROLLOVER`], skipping 0.
+static NEXT_ASID: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate an ASID for a new user address space.
+///
+/// A monotonic counter modulo [`ASID_ROLLOVER`], skipping 0. Deliberately *not* a
+/// free-list that recycles the ASID of a destroyed space: a counter reaches the reuse
+/// case predictably after a known number of allocations, which is what makes the
+/// rollover self-test able to reach it. A free-list would make reuse depend on
+/// destruction order and turn the one path where invalidation matters into something
+/// that happens rarely and unrepeatably.
+///
+/// Two live address spaces sharing an ASID after a wrap is *sound* precisely because
+/// [`activate_user`] invalidates the tag on every install. That is the contract the two
+/// halves of this design make with each other, and the reason neither may be changed
+/// without the other.
+pub fn allocate_asid() -> u16 {
+    let n = NEXT_ASID.fetch_add(1, Ordering::Relaxed);
+    // Map onto 1..ASID_ROLLOVER — never 0.
+    let span = (ASID_ROLLOVER - 1) as u32;
+    (1 + (n - 1) % span) as u16
+}
+
 
 /// Mask selecting the VA field of a `TLBI VAE1*` register operand.
 ///

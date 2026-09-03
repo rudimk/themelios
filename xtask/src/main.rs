@@ -1248,6 +1248,17 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
         "Phase 7.3 scheduler FAILED self-test",
         "[selftest] sched: FAIL",
         "[selftest] percpu: FAIL",
+        // Phase 8.4 (user address spaces on TTBR0) and 8.4b (the EL0 round trip). These
+        // were missing until a review of 8.4b went looking: the list stopped at 7.3, so
+        // both sub-phases' self-tests printed their verdict into a log nothing inspected,
+        // and every assertion in them was decorative as far as CI was concerned. The
+        // `[selftest] …: FAIL` prefixes catch a specific failed assertion; the `[boot] …`
+        // lines catch the case where the self-test returns false by a path that did not
+        // print one — belt and braces, because they fail for different reasons.
+        "[selftest] user-as: FAIL",
+        "[boot] Phase 8.4 user address space FAILED self-test",
+        "[selftest] el0: FAIL",
+        "[boot] Phase 8.4b EL0 round trip FAILED self-test",
         "FP/SIMD does NOT trap at EL1",
         "!!! aarch64 EXCEPTION !!!",
     ];
