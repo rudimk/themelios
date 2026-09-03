@@ -134,10 +134,23 @@ const DESC_AP_EL0: u64 = 1 << 6;
 ///
 /// 8.4 shipped ASID allocation, `TTBR0_EL1` switching and an `ASIDE1IS` invalidation
 /// while `encode_leaf` still produced global user pages — making the whole scheme inert
-/// on hardware. QEMU hid it: TCG's softmmu TLB is neither ASID- nor global-aware, so the
-/// self-test passed. Review caught it against this file's own Phase 7 note, which had
-/// already written down that the ASID bits were "benign only because every mapping we
-/// produce is global … That stops being true the moment EL0 mappings with `nG = 1` land."
+/// on hardware. Review caught it against this file's own Phase 7 note, which had already
+/// written down that the ASID bits were "benign only because every mapping we produce is
+/// global … That stops being true the moment EL0 mappings with `nG = 1` land."
+///
+/// ## No test here can prove this bit is set, and that was measured
+///
+/// Clearing `DESC_NG` again and re-running `mm::page_table::user_selftest` leaves it
+/// **passing**. QEMU implements `TLBI ASIDE1{IS}` as a full flush of the EL1&0 regime
+/// (`tlbi_aa64_vmalle1is_write`), ignoring both the ASID operand and the global/non-global
+/// distinction — so under emulation a stale global entry is invalidated just as a tagged
+/// one would be, and the two cases are indistinguishable from inside the guest.
+///
+/// So the self-test's ASID arm demonstrates that *the TLBI instruction is present*
+/// (deleting it fails the test), not that the tagging works. The `nG` bit rests on the
+/// architecture specification, not on a green run. **This is a hardware-phase check**:
+/// on silicon, omitting `nG` makes the address-space switch in that test return the
+/// previous space's frame."
 const DESC_NG: u64 = 1 << 11;
 
 /// Bit 53: Privileged eXecute Never (EL1).

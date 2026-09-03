@@ -1166,26 +1166,41 @@ const USER_PATTERN_3: u64 = 0x6162_6364_6566_6768;
 /// Say this plainly, because the temptation to claim otherwise is exactly how this
 /// project's false claims get written.
 ///
-/// The design intent was that step 4 would be the falsifiable one: with distinct ASIDs
-/// there is nothing stale to hit, so only *reuse* can expose a missing `TLBI ASIDE1IS`.
-/// That reasoning is architecturally correct. **It is still not testable here**, and the
-/// mutation was run rather than assumed: deleting the `TLBI ASIDE1IS` from
-/// [`crate::arch::paging::activate_user`] leaves this self-test **passing**.
+/// 4. **The `TLBI ASIDE1IS` is present and does work.** Steps 1-3 pass with or without
+///    it, because the two spaces have distinct ASIDs and the second simply misses. So the
+///    test forces a *rollover* — allocating spaces until the counter wraps back onto the
+///    first space's tag — and repeats the displacement under a recycled ASID. Deleting
+///    the TLBI fails this arm:
 ///
-/// The cause is the emulator, not the test. QEMU's TCG flushes its softmmu TLB when
-/// `TTBR0_EL1` is written, so no entry survives the switch for a recycled tag to match
-/// against. No guest-visible experiment can separate "invalidates correctly" from "never
-/// invalidates" on a machine that has already thrown the state away — which also means
-/// no *rearrangement* of this test would recover falsifiability.
+///    ```text
+///    user-as: FAIL — recycled ASID 1 read 0x4142434445464748,
+///      expected 0x6162636465666768
+///      (this is space one's frame: TLBI ASIDE1IS did not invalidate)
+///    ```
 ///
-/// The `TLBI` stays because the architecture requires it: on hardware that genuinely
-/// caches ASID-tagged entries, its absence is silent cross-address-space corruption.
-/// But it is **unverified**, and the first real ARM machine this kernel runs on is where
-/// it gets verified. Recorded here rather than in a commit message because this is the
-/// kind of gap that is only ever rediscovered by reading the code.
+/// ## What step 4 does not establish — measured, not assumed
 ///
-/// What *is* falsifiable here is step 3: removing the `msr TTBR0_EL1` from
-/// `activate_user` makes the displacement read return the previous space's frame.
+/// It does **not** show the ASID scheme is correct. That also requires user leaves to
+/// carry `nG`: a global entry matches every ASID and is immune to ASID-tagged
+/// invalidation, so global user pages would defeat the whole mechanism. 8.4a shipped
+/// exactly that bug, and **clearing `nG` again leaves this test passing** — measured.
+///
+/// The reason is QEMU: it implements `TLBI ASIDE1{IS}` as a full flush of the EL1&0
+/// regime, ignoring both the ASID operand and the global bit. A stale global entry is
+/// therefore invalidated just as a tagged one would be, and no guest-visible experiment
+/// can tell the two apart. The `nG` bit rests on the architecture specification; on
+/// silicon, omitting it makes step 3 return the previous space's frame. **Hardware-phase
+/// check.**
+///
+/// Two earlier claims here were wrong and are corrected rather than deleted, because the
+/// error is instructive. This comment previously said the TLBI mutation could not be made
+/// to fail, and blamed TCG for flushing on `TTBR0_EL1` writes. TCG flushes on that write
+/// only when the ASID *field changes*, which in the decisive step it deliberately does
+/// not; what actually masked the TLBI was this kernel's own redundant `TCR_EL1` write on
+/// every switch, which QEMU turns into an unconditional flush. Making that write
+/// conditional — correct in its own right — restored the falsification. The lesson is
+/// narrower than "emulation hides things": *this* emulator hid it because *this* code did
+/// something unnecessary.
 ///
 /// ## Why this runs at EL1
 ///
@@ -1404,7 +1419,8 @@ fn user_selftest_inner() -> UserSelftestOutcome {
     if out.ok {
         println!(
             "[selftest] user-as: PASS (three views agree; TTBR0 switch observed; ASID {} \
-             recycled on allocation {} and invalidated; asid2={})",
+             recycled on allocation {}, TLBI proven by mutation; asid2={}). nG tagging \
+             NOT covered — QEMU cannot observe it; hardware-phase check.",
             asid1, attempts, asid2
         );
     }
