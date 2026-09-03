@@ -42,6 +42,91 @@
 
 use super::exceptions::ExceptionFrame;
 
+/// The aarch64 syscall frame — the exception frame itself, under the portable name.
+///
+/// A plain alias rather than a newtype, deliberately. aarch64 has no separate syscall
+/// entry path to build a distinct structure on: `svc` is an exception like any other, so
+/// the frame the vector stub already built *is* the syscall frame. Wrapping it would buy
+/// nothing and cost a conversion at every dispatch site.
+///
+/// That is itself the interesting asymmetry with x86, where `syscall`/`sysretq` is a
+/// separate mechanism from the IDT and needs its own naked stub and its own struct.
+pub type SyscallFrame = ExceptionFrame;
+
+/// The **positional** syscall ABI for aarch64 — the counterpart of the x86_64 impl in
+/// [`crate::arch::x86_64::syscall`], reached portably through [`crate::arch::syscall`].
+///
+/// | position | register |
+/// |---|---|
+/// | number | `x8` |
+/// | 0-5 | `x0`-`x5` |
+/// | return | `x0` |
+/// | user PC | `ELR_EL1` |
+///
+/// Unlike x86, the number and the return value live in **different** registers, so reading
+/// the number after writing the return value still works here. Portable callers must not
+/// rely on that; see [`SyscallFrame::ret_mut`]'s note on the x86 side.
+impl ExceptionFrame {
+    /// The syscall number the caller requested (`x8`).
+    #[inline]
+    pub fn nr(&self) -> u64 {
+        self.x[8]
+    }
+
+    /// Argument 0 (`x0`).
+    #[inline]
+    pub fn arg0(&self) -> u64 {
+        self.x[0]
+    }
+    /// Argument 1 (`x1`).
+    #[inline]
+    pub fn arg1(&self) -> u64 {
+        self.x[1]
+    }
+    /// Argument 2 (`x2`).
+    #[inline]
+    pub fn arg2(&self) -> u64 {
+        self.x[2]
+    }
+    /// Argument 3 (`x3`).
+    #[inline]
+    pub fn arg3(&self) -> u64 {
+        self.x[3]
+    }
+    /// Argument 4 (`x4`).
+    #[inline]
+    pub fn arg4(&self) -> u64 {
+        self.x[4]
+    }
+    /// Argument 5 (`x5`).
+    #[inline]
+    pub fn arg5(&self) -> u64 {
+        self.x[5]
+    }
+
+    /// Set the value userspace receives back (`x0`).
+    #[inline]
+    pub fn set_ret(&mut self, value: u64) {
+        self.x[0] = value;
+    }
+
+    /// Mutable handle on the return slot (`x0`), for callees that write it in place.
+    #[inline]
+    pub fn ret_mut(&mut self) -> &mut u64 {
+        &mut self.x[0]
+    }
+
+    /// The address userspace will resume at (`ELR_EL1`).
+    ///
+    /// Already points *past* the `svc`, which is the opposite of `brk` — see the dispatch
+    /// arm in `exceptions.rs`. So this is the resume address directly, with no adjustment,
+    /// matching what x86's `rcx` holds.
+    #[inline]
+    pub fn user_pc(&self) -> u64 {
+        self.elr
+    }
+}
+
 /// Syscall numbers. Deliberately the kernel's own small set for now; the Linux
 /// personality's `asm-generic` numbering is a separate table layered above this.
 pub mod nr {
@@ -82,18 +167,26 @@ pub const EINVAL: u64 = u64::MAX - 21;
 
 /// Dispatch one syscall from an EL0 exception frame.
 ///
-/// Reads the number from `x8` and, for the calls that exist today, the arguments from `x0`
-/// and `x1` — the ABI reserves `x0`-`x5` but nothing yet takes more than two — and writes
-/// the result back
-/// into `frame.x[0]` — the exception exit stub then restores that into the real `x0` on
-/// the way back to EL0, which is how a return value reaches userspace.
+/// Reads the number and arguments, and writes the result back, **through the positional
+/// accessors** rather than by indexing `frame.x` directly.
+///
+/// That is deliberate and is the only thing making the aarch64 half of
+/// [`crate::arch::syscall`] load-bearing. The facade's whole job is the mapping
+/// number→`x8`, args→`x0`-`x5`, return→`x0`; on this architecture nothing else calls it
+/// yet, because its consumer (`mod linux`) is still x86-gated. So if dispatch indexed the
+/// array itself, a wrong accessor — `nr()` reading `x[7]`, say — would compile, ship, and
+/// be caught by no test on either architecture. Routing the live syscall path through them
+/// means the EL0 self-test's three syscalls exercise `nr`, `arg0`, `arg1` and `set_ret`
+/// every boot.
+///
+/// The ABI reserves `arg0`-`arg5`; nothing implemented yet takes more than two.
 ///
 /// **Does not touch `frame.elr`.** `ELR_EL1` already points past the `svc`; see the note
 /// on the dispatch arm in `exceptions.rs`.
-pub fn dispatch(frame: &mut ExceptionFrame) {
-    let nr = frame.x[8];
-    let a0 = frame.x[0];
-    let a1 = frame.x[1];
+pub fn dispatch(frame: &mut SyscallFrame) {
+    let nr = frame.nr();
+    let a0 = frame.arg0();
+    let a1 = frame.arg1();
 
     let ret = match nr {
         nr::DEBUG_PRINT => sys_debug_print(a0, a1),
@@ -111,7 +204,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         _ => ENOSYS,
     };
 
-    frame.x[0] = ret;
+    frame.set_ret(ret);
 }
 
 /// `SYS_DEBUG_PRINT` — copy a string out of userspace and print it.

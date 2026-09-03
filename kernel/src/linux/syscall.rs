@@ -21,7 +21,7 @@
 //! id-getters, and `exit`/`exit_group`. Filesystem syscalls over the VFS are 5.2;
 //! threads + `futex` are 5.3. Everything unimplemented returns `-ENOSYS`.
 
-use crate::arch::x86_64::syscall::{copy_from_user, copy_to_user, user_range_ok, SyscallFrame};
+use crate::arch::syscall::{copy_from_user, copy_to_user, user_range_ok, SyscallFrame};
 use crate::mm::addr::VirtAddr;
 use crate::mm::page_table::PageFlags;
 use crate::process::{self, LINUX_BRK_BASE, LINUX_MMAP_BASE};
@@ -85,42 +85,42 @@ const ARCH_GET_FS: u64 = 0x1003;
 const MAP_ANONYMOUS: u64 = 0x20;
 
 /// Dispatch one Linux syscall. Reads the number/args from `frame` and writes the
-/// result (or `-errno`) into `frame.rax`.
+/// result (or `-errno`) into `frame.nr()`.
 pub fn dispatch(frame: &mut SyscallFrame) {
     // Filesystem syscalls (read/write/open/openat/close/fstat/lseek/getdents64/
     // getcwd/chdir/newfstatat/…) are serviced by the VFS-backed `fs` module,
     // which owns those numbers (Phase 5.2). If it doesn't recognise the number,
     // fall through to the process/memory/misc table below.
-    if let Some(r) = super::fs::dispatch(frame.rax, frame) {
-        frame.rax = r;
+    if let Some(r) = super::fs::dispatch(frame.nr(), frame) {
+        frame.set_ret(r);
         return;
     }
     let pid = crate::sched::current_process_id();
-    match frame.rax {
-        SYS_WRITEV => frame.rax = sys_writev(frame.rdi, frame.rsi, frame.rdx),
-        SYS_BRK => frame.rax = sys_brk(pid, frame.rdi),
-        SYS_MMAP => frame.rax = sys_mmap(pid, frame.rsi, frame.r10, frame.r8),
+    match frame.nr() {
+        SYS_WRITEV => frame.set_ret(sys_writev(frame.arg0(), frame.arg1(), frame.arg2())),
+        SYS_BRK => frame.set_ret(sys_brk(pid, frame.arg0())),
+        SYS_MMAP => frame.set_ret(sys_mmap(pid, frame.arg1(), frame.arg3(), frame.arg4())),
         // Accept mprotect/munmap as no-ops for now (W^X refinement + real unmap
         // are later work); returning success keeps allocators happy.
-        SYS_MPROTECT | SYS_MUNMAP => frame.rax = 0,
-        SYS_ARCH_PRCTL => frame.rax = sys_arch_prctl(frame.rdi, frame.rsi),
+        SYS_MPROTECT | SYS_MUNMAP => frame.set_ret(0),
+        SYS_ARCH_PRCTL => frame.set_ret(sys_arch_prctl(frame.arg0(), frame.arg1())),
         // isatty(): report "not a terminal" so stdio picks full buffering.
-        SYS_IOCTL => frame.rax = err(ENOTTY),
+        SYS_IOCTL => frame.set_ret(err(ENOTTY)),
         // Threads + futex (Phase 5.3).
-        SYS_CLONE => frame.rax = super::thread::sys_clone(frame),
+        SYS_CLONE => frame.set_ret(super::thread::sys_clone(frame)),
         SYS_FUTEX => {
             // FUTEX_WAIT may block, so enable interrupts first (like SYS_YIELD).
             crate::arch::irq::enable();
-            frame.rax = super::thread::sys_futex(frame);
+            frame.set_ret(super::thread::sys_futex(frame));
         }
-        SYS_SET_TID_ADDRESS => frame.rax = super::thread::sys_set_tid_address(frame.rdi),
-        SYS_GETTID => frame.rax = crate::sched::current_task_id() as u64,
-        SYS_GETPID => frame.rax = pid.as_usize() as u64,
+        SYS_SET_TID_ADDRESS => frame.set_ret(super::thread::sys_set_tid_address(frame.arg0())),
+        SYS_GETTID => frame.set_ret(crate::sched::current_task_id() as u64),
+        SYS_GETPID => frame.set_ret(pid.as_usize() as u64),
         // Everything runs as root (uid/gid 0) for now.
-        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => frame.rax = 0,
+        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => frame.set_ret(0),
         // Signals are stubbed: accept sigaction/sigprocmask so runtimes proceed.
         // (Signal-handler *delivery* is deferred — see Phase 5.7 notes.)
-        SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK => frame.rax = 0,
+        SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK => frame.set_ret(0),
         // Capability isolation (Phase 5.7): a container holds no `SOCKET_FACTORY`
         // capability, and the Linux `socket()` ABI carries no capability handle to
         // present one. So `socket()` is an unconditional, *enforced* `-EPERM` —
@@ -128,26 +128,26 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         // (Reusing the native `socket::sys_socket` would be wrong twice over: its
         // `SockError` uses the native high-bit ABI, which Linux userspace misreads
         // as a huge valid fd, and it needs a cap handle the ABI can't supply.)
-        SYS_SOCKET => frame.rax = err(EPERM),
+        SYS_SOCKET => frame.set_ret(err(EPERM)),
         // `kill(2)`: no cross-process signal capability exists, so a process may
         // only signal itself. `wait4(2)`: no parent/child linkage, so "no children".
-        SYS_KILL => sys_kill(pid, frame.rdi, frame.rsi, &mut frame.rax),
-        SYS_WAIT4 => frame.rax = err(ECHILD),
-        SYS_CLOSE => frame.rax = 0,
-        SYS_CLOCK_GETTIME => frame.rax = sys_clock_gettime(frame.rsi),
-        SYS_GETRANDOM => frame.rax = sys_getrandom(frame.rdi, frame.rsi),
+        SYS_KILL => sys_kill(pid, frame.arg0(), frame.arg1(), frame.ret_mut()),
+        SYS_WAIT4 => frame.set_ret(err(ECHILD)),
+        SYS_CLOSE => frame.set_ret(0),
+        SYS_CLOCK_GETTIME => frame.set_ret(sys_clock_gettime(frame.arg1())),
+        SYS_GETRANDOM => frame.set_ret(sys_getrandom(frame.arg0(), frame.arg1())),
         SYS_SCHED_YIELD => {
             crate::arch::irq::enable();
             crate::sched::yield_now();
-            frame.rax = 0;
+            frame.set_ret(0);
         }
         // `exit` terminates just the calling thread (honouring CLONE_CHILD_
         // CLEARTID so a joiner wakes); `exit_group` terminates the whole process.
-        SYS_EXIT => super::thread::thread_exit(frame.rdi),
-        SYS_EXIT_GROUP => super::thread::exit_group(frame.rdi),
+        SYS_EXIT => super::thread::thread_exit(frame.arg0()),
+        SYS_EXIT_GROUP => super::thread::exit_group(frame.arg0()),
         n => {
             crate::println!("[linux] ENOSYS: unimplemented syscall {}", n);
-            frame.rax = err(ENOSYS);
+            frame.set_ret(err(ENOSYS));
         }
     }
 }

@@ -82,7 +82,9 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_virtio_transport", func: test_virtio_transport },
     TestCase { name: "test_virtio_queue_failure", func: test_virtio_queue_failure },
     TestCase { name: "test_virtio_blk",       func: test_virtio_blk },
-    #[cfg(target_arch = "x86_64")]
+    // Un-gated in 8.4c: aarch64's `new_user` produces an empty low half as of 8.4a, so
+    // mapping a 4 KiB page at VA 0x4000_0000 no longer collides with the 1 GiB block
+    // QEMU `virt` used to leave inherited there.
     TestCase { name: "test_shared_memory",    func: test_shared_memory },
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
     #[cfg(target_arch = "x86_64")]
@@ -123,7 +125,9 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_elf_exec",         func: test_elf_exec },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_linux_exec",       func: test_linux_exec },
-    #[cfg(target_arch = "x86_64")]
+    // Runs on both arches as of 8.4c: `resolve_path` lifted out of the x86-gated
+    // `mod linux` into `crate::path`, because a container-escape clamp tested on one
+    // architecture and assumed on the other is not tested.
     TestCase { name: "test_path_resolve",     func: test_path_resolve },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_linux_fs",         func: test_linux_fs },
@@ -158,19 +162,23 @@ static TESTS: &[TestCase] = &[
 /// thirty-nine.
 #[cfg(target_arch = "aarch64")]
 static SKIPPED: &[SkippedTest] = &[
-    SkippedTest { name: "test_syscall", why: "ring-3/EL0 is deferred on aarch64" },
+    // Not "EL0 is deferred" — EL0 landed in 8.4b and the syscall path works. This test's
+    // body is pure x86 MSR verification (`EFER.SCE`, `STAR[47:32]`, `STAR[63:48]`,
+    // `LSTAR`, `FMASK & RFLAGS_IF`) followed by an in-kernel dispatch; it never enters
+    // ring 3 and has no aarch64 counterpart to port. Retiring it means writing a
+    // different test under the same name — `VBAR_EL1` installed, `ESR_EL1.EC == 0x15`
+    // decoded, dispatch over an aarch64 `SyscallFrame` — which is its own work item.
     SkippedTest {
-        name: "test_shared_memory",
-        // Not "EL0 is deferred": nothing here enters EL0, and `mm::shared` and
-        // `AddressSpace::new_user` both compile on aarch64. The real blocker is that
-        // `new_user` is not *ported* — a fresh address space inherits the low-half
-        // entries, so the 1 GiB block QEMU `virt` maps at VA 0x4000_0000 is present in
-        // it, and mapping a 4 KiB page beneath a block panics `ensure_table`. Tracked
-        // as follow-up work; it lands with the EL0 port, which is what will give
-        // `new_user` a reason to produce an empty low half.
-        why: "`AddressSpace::new_user` is not ported — a fresh space inherits low-half \
-              block mappings",
+        name: "test_syscall",
+        why: "the body is x86 MSR verification with no aarch64 counterpart; needs a \
+              different test under the same name, not a port",
     },
+    // `test_shared_memory` ran here until 8.4c. Its blocker was specific and is now
+    // gone: a fresh aarch64 address space used to inherit the low-half entries, so the
+    // 1 GiB block QEMU `virt` maps at VA 0x4000_0000 was present in it and mapping a
+    // 4 KiB page beneath that block panicked `ensure_table` — and 0x4000_0000 is the
+    // exact VA this test maps at. 8.4a gave `new_user` an empty low half by
+    // construction, which is what the old skip reason said would unblock it.
     SkippedTest { name: "test_process", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_userspace_init", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_pci_scan", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
@@ -191,10 +199,6 @@ static SKIPPED: &[SkippedTest] = &[
     SkippedTest { name: "test_tcp_client", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_elf_exec", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_linux_exec", why: "the Linux personality needs ring-3" },
-    SkippedTest {
-        name: "test_path_resolve",
-        why: "path clamping is portable, but `mod linux` is still x86_64-gated",
-    },
     SkippedTest { name: "test_linux_fs", why: "the Linux personality needs ring-3" },
     SkippedTest { name: "test_linux_threads", why: "the Linux personality needs ring-3" },
     SkippedTest { name: "test_container_run", why: "containers need ring-3 and the storage stack" },
@@ -1764,10 +1768,11 @@ fn test_virtio_blk() -> Result<(), &'static str> {
 /// 3. It can be mapped into a (user) address space, and `translate` resolves
 ///    each mapped page to the correct physical frame (the basis for handing a
 ///    block-transfer window to a ring-3 filesystem server)
-/// x86_64 only — step 3 maps the region into a user address space, which on aarch64
-/// would mean TTBR0, deliberately parked at 0 since 7.1. The portable half (allocation,
-/// zeroing, HHDM access) is covered by `test_frame_allocator` and `test_heap`.
-#[cfg(target_arch = "x86_64")]
+/// Arch-neutral since 8.4c. The old restriction — *"step 3 maps the region into a user
+/// address space, which on aarch64 would mean TTBR0, deliberately parked at 0 since
+/// 7.1"* — expired twice over: 8.4a gave aarch64 real `TTBR0_EL1` user spaces with an
+/// empty low half, and this test never activates the space anyway. It builds the tree and
+/// calls `translate`, which is a pure table walk needing no `TTBR0` at all.
 fn test_shared_memory() -> Result<(), &'static str> {
     use crate::mm::addr::VirtAddr;
     use crate::mm::page_table::{kernel_address_space, AddressSpace};
@@ -1796,8 +1801,17 @@ fn test_shared_memory() -> Result<(), &'static str> {
     }
 
     // 3. Map into a fresh user address space and verify translation.
+    //
+    // `new_user` takes the kernel space on x86_64 and nothing on aarch64 — the same
+    // documented asymmetry as in `test_frame_allocator`; see `AddressSpace::new_user`.
+    // The parameter is absent on aarch64 rather than accepted and ignored, deliberately,
+    // because an unused kernel-root argument is how a user space silently comes to
+    // inherit kernel-half mappings.
     let kernel_as = kernel_address_space();
+    #[cfg(target_arch = "x86_64")]
     let user = AddressSpace::new_user(&kernel_as);
+    #[cfg(target_arch = "aarch64")]
+    let user = AddressSpace::new_user();
     core::mem::forget(kernel_as);
 
     let virt = VirtAddr::new(0x4000_0000);
@@ -3921,9 +3935,11 @@ fn test_linux_exec() -> Result<(), &'static str> {
 
 /// Unit-test the security-critical Linux path resolver (Phase 5.2): `..` must be
 /// clamped at the root so a container path can never escape its rootfs.
-#[cfg(target_arch = "x86_64")]
+///
+/// Arch-neutral since 8.4c — the resolver lives in [`crate::path`], not in the x86-gated
+/// Linux personality.
 fn test_path_resolve() -> Result<(), &'static str> {
-    use crate::linux::fs::resolve_path;
+    use crate::path::resolve_path;
     let cases: &[(&str, &str, &str)] = &[
         ("/", "/hello.txt", "/hello.txt"),
         ("/", "hello.txt", "/hello.txt"),

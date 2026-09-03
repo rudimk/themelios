@@ -350,6 +350,88 @@ pub struct SyscallFrame {
     pub r11: u64,           // user RFLAGS (saved by syscall instruction)
 }
 
+/// The **positional** syscall ABI, which is what portable code actually needs.
+///
+/// The fields above are x86 registers; the Linux syscall ABI is a sequence of *argument
+/// positions* that each architecture assigns to registers of its own choosing. Callers in
+/// [`crate::linux`] want position 3, not `r10` — and before this existed, 76 call sites
+/// across the personality named x86 registers directly, which is why none of it could
+/// compile on aarch64.
+///
+/// The mapping here is the x86_64 Linux convention:
+///
+/// | position | register | note |
+/// |---|---|---|
+/// | number | `rax` | the return value shares this register |
+/// | 0-5 | `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` | **`r10`, not `rcx`** — the `syscall` instruction clobbers `rcx` with the return address, which is why the kernel ABI diverges from the userspace C one here |
+/// | return | `rax` | overwrites the number |
+/// | user PC | `rcx` | saved by the `syscall` instruction |
+///
+/// aarch64's counterpart is in [`crate::arch::aarch64::syscall`], and the two are reached
+/// through [`crate::arch::syscall`].
+impl SyscallFrame {
+    /// The syscall number the caller requested.
+    #[inline]
+    pub fn nr(&self) -> u64 {
+        self.rax
+    }
+
+    /// Argument 0 (`rdi`).
+    #[inline]
+    pub fn arg0(&self) -> u64 {
+        self.rdi
+    }
+    /// Argument 1 (`rsi`).
+    #[inline]
+    pub fn arg1(&self) -> u64 {
+        self.rsi
+    }
+    /// Argument 2 (`rdx`).
+    #[inline]
+    pub fn arg2(&self) -> u64 {
+        self.rdx
+    }
+    /// Argument 3 (`r10`, not `rcx` — see the table above).
+    #[inline]
+    pub fn arg3(&self) -> u64 {
+        self.r10
+    }
+    /// Argument 4 (`r8`).
+    #[inline]
+    pub fn arg4(&self) -> u64 {
+        self.r8
+    }
+    /// Argument 5 (`r9`).
+    #[inline]
+    pub fn arg5(&self) -> u64 {
+        self.r9
+    }
+
+    /// Set the value userspace receives back.
+    #[inline]
+    pub fn set_ret(&mut self, value: u64) {
+        self.rax = value;
+    }
+
+    /// Mutable handle on the return slot, for the callees that write it in place.
+    ///
+    /// Exists for `sys_kill`, which takes `&mut u64` rather than returning. On x86 the
+    /// return slot aliases the number's register, so calling this *after* reading
+    /// [`nr`](Self::nr) is the only correct order — on aarch64 they are separate registers
+    /// and the order does not matter, which is exactly the kind of difference a positional
+    /// API is meant to keep out of the caller.
+    #[inline]
+    pub fn ret_mut(&mut self) -> &mut u64 {
+        &mut self.rax
+    }
+
+    /// The address userspace will resume at (`rcx`, saved by the `syscall` instruction).
+    #[inline]
+    pub fn user_pc(&self) -> u64 {
+        self.rcx
+    }
+}
+
 // --- Syscall entry/exit stub ---
 
 /// The naked assembly syscall entry point, registered in IA32_LSTAR.

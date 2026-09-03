@@ -216,6 +216,14 @@ mod net;
 #[cfg(target_arch = "x86_64")]
 mod linux;
 
+/// Path resolution and the container-escape root clamp (`resolve_path`).
+///
+/// Arch-neutral and dependency-free (alloc only), deliberately **not** inside `mod linux`
+/// above: that module is x86-gated on its VFS and process dependencies, and keeping the
+/// clamp in there meant the security boundary every Linux path syscall funnels through was
+/// untested on aarch64. See the module docs.
+mod path;
+
 /// OCI / docker-save image unpacking (Phase 5.4): tar + JSON + layer assembly.
 /// Dependency-light (alloc-only) so it can lift into a ring-3 `oci-server`. Used
 /// by the Phase 5.5 container runtime.

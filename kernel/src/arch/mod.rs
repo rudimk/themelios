@@ -54,3 +54,7 @@ pub mod context;
 
 /// Machine power control (`power_off`, `reset`) — how the node stops and restarts.
 pub mod power;
+
+/// Syscall frame (`SyscallFrame`, positional `nr`/`arg0`-`arg5`/`set_ret`/`user_pc`) and
+/// the user-memory chokepoint (`copy_from_user`, `copy_to_user`, `user_range_ok`).
+pub mod syscall;

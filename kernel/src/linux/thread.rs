@@ -21,7 +21,7 @@
 //! under the non-preemptible single-core syscall before blocking, so there is no
 //! lost-wakeup window. No priority inheritance, requeue, or timeout (scoped out).
 
-use crate::arch::x86_64::syscall::{copy_from_user, copy_to_user, SyscallFrame};
+use crate::arch::syscall::{copy_from_user, copy_to_user, SyscallFrame};
 use crate::process::{self, ProcessId};
 use crate::sched::{self, task::TaskId};
 use crate::sync::InterruptMutex;
@@ -92,11 +92,11 @@ fn futex_wake(pid: usize, uaddr: u64, max: u32) -> u32 {
 /// Returns the new thread id to the parent; the child enters ring 3 separately
 /// (rax=0) via the thread trampoline.
 pub fn sys_clone(frame: &SyscallFrame) -> u64 {
-    let flags = frame.rdi;
-    let child_stack = frame.rsi;
-    let ptid = frame.rdx;
-    let ctid = frame.r10;
-    let tls = frame.r8;
+    let flags = frame.arg0();
+    let child_stack = frame.arg1();
+    let ptid = frame.arg2();
+    let ctid = frame.arg3();
+    let tls = frame.arg4();
 
     // 5.3 only supports thread clones (shared address space). fork/vfork later.
     if flags & CLONE_THREAD == 0 || flags & CLONE_VM == 0 || child_stack == 0 {
@@ -107,7 +107,7 @@ pub fn sys_clone(frame: &SyscallFrame) -> u64 {
     // Create the sibling task and seed its ring-3 entry: it resumes at the
     // parent's return RIP (rcx, saved by `syscall`) on the given child stack.
     let tid = sched::spawn_in_process("thread", thread_trampoline, pid);
-    sched::set_task_clone_entry(tid, frame.rcx, child_stack);
+    sched::set_task_clone_entry(tid, frame.user_pc(), child_stack);
     if flags & CLONE_SETTLS != 0 {
         sched::set_task_fs_base(tid, tls);
     }
@@ -135,9 +135,9 @@ pub fn sys_set_tid_address(tidptr: u64) -> u64 {
 
 /// `futex(uaddr, op, val, …)` — private WAIT/WAKE only.
 pub fn sys_futex(frame: &SyscallFrame) -> u64 {
-    let uaddr = frame.rdi;
-    let op = frame.rsi & FUTEX_CMD_MASK;
-    let val = frame.rdx as u32;
+    let uaddr = frame.arg0();
+    let op = frame.arg1() & FUTEX_CMD_MASK;
+    let val = frame.arg2() as u32;
     let pid = sched::current_process_id().as_usize();
 
     match op {
