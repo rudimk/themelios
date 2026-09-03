@@ -1426,3 +1426,163 @@ fn user_selftest_inner() -> UserSelftestOutcome {
     }
     out
 }
+
+// --- EL0 round-trip self-test (Phase 8.4b, aarch64) ---
+
+/// User VA the EL0 payload's code is mapped at.
+#[cfg(target_arch = "aarch64")]
+const EL0_CODE_VA: u64 = 0x0000_0000_0040_0000;
+/// User VA of the payload's stack page. Deliberately far from the code so a stack
+/// overflow runs into a hole rather than into the text it is executing.
+#[cfg(target_arch = "aarch64")]
+const EL0_STACK_VA: u64 = 0x0000_0000_0080_0000;
+
+/// Drop to EL0, run a payload that makes three syscalls, and come back.
+///
+/// ## What it proves, and how each part can fail
+///
+/// | assertion | goes red when |
+/// |---|---|
+/// | `svc_count` advances by 3 | the `0x400` slot is not dispatching, or `svc` never reaches EL1 |
+/// | exit status is `42` | the return value did not travel back to EL0 in `x0` |
+/// | `[el0] hello…` is printed | `copy_from_user` or the user mapping is wrong |
+/// | control returns here at all | the `eret` went somewhere other than the payload |
+///
+/// The exit code is the *result of a syscall computed from its arguments* (`ADD(40, 2)`),
+/// not a constant. A payload that merely reached `SYS_EXIT` would pass a constant check;
+/// this one has to have received `42` back in `x0` from the previous syscall and carried
+/// it across a second one.
+///
+/// ## Why it returns rather than running forever
+///
+/// `SYS_EXIT` records its code and returns to EL0, where the payload spins. There is no
+/// task teardown to invoke yet — that arrives with the scheduler integration in 8.5. So
+/// this test drops to EL0 **on a dedicated stack it can abandon**: the timer interrupt
+/// preempts the spinning payload, and the self-test observes the recorded status from the
+/// next scheduled kernel task rather than by returning through the `eret`.
+///
+/// That is a real limitation and it shapes the test: it can prove the round trip and the
+/// syscall results, and it cannot yet prove an orderly *exit* from EL0. Naming it here
+/// beats discovering later that "the EL0 test passes" meant less than it sounded like.
+#[cfg(target_arch = "aarch64")]
+pub fn el0_selftest() -> bool {
+    use crate::arch::aarch64::syscall;
+
+    let space = AddressSpace::new_user();
+
+    let code_frame = match frame::allocate_frame() {
+        Some(f) => f,
+        None => {
+            println!("[selftest] el0: FAIL — no frame for code");
+            return false;
+        }
+    };
+    let stack_frame = match frame::allocate_frame() {
+        Some(f) => f,
+        None => {
+            println!("[selftest] el0: FAIL — no frame for stack");
+            frame::deallocate_frame(code_frame);
+            return false;
+        }
+    };
+
+    // Copy the payload into the code frame through the HHDM, before the frame is user-
+    // mapped: writing it through the *user* VA would require the kernel to be running on
+    // this address space already, which it is not yet.
+    let payload = syscall::payload();
+    assert!(
+        payload.len() <= crate::mm::PAGE_SIZE as usize,
+        "EL0 payload is {} bytes, larger than the single page it is copied into",
+        payload.len()
+    );
+    // SAFETY: freshly allocated frame, reachable through the HHDM, exclusively ours.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            code_frame.as_mut_ptr::<u8>(),
+            payload.len(),
+        );
+    }
+
+    // Code: user-readable and executable — deliberately NOT writable, so a payload bug
+    // that writes to its own text faults instead of self-modifying.
+    space.map_page(
+        VirtAddr::new(EL0_CODE_VA),
+        code_frame,
+        PageFlags::PRESENT.union(PageFlags::USER),
+    );
+    // Stack: user, writable, and non-executable.
+    space.map_page(
+        VirtAddr::new(EL0_STACK_VA),
+        stack_frame,
+        PageFlags::PRESENT
+            .union(PageFlags::WRITABLE)
+            .union(PageFlags::USER)
+            .union(PageFlags::NO_EXECUTE),
+    );
+
+    syscall::clear_exit_status();
+    let before = crate::arch::aarch64::exceptions::svc_count();
+
+    // SAFETY: the tree is fully built and this is the space the payload runs in.
+    unsafe { space.activate_user() };
+
+    // The stack grows down: start it at the top of the mapped page.
+    let sp = EL0_STACK_VA + crate::mm::PAGE_SIZE;
+
+    // Hand off to EL0. This does not return — the payload spins after SYS_EXIT and the
+    // timer preempts it — so the verdict is collected by the task that runs next.
+    EL0_EXPECTED.store(before + 3, Ordering::Relaxed);
+    // SAFETY: code and stack are mapped in the installed tree with the permissions the
+    // payload needs.
+    unsafe { syscall::enter_el0(EL0_CODE_VA, sp) }
+}
+
+/// `svc_count` the EL0 payload is expected to reach, published before the drop so the
+/// checker can run from a different task.
+#[cfg(target_arch = "aarch64")]
+static EL0_EXPECTED: AtomicU64 = AtomicU64::new(0);
+
+/// Verify what [`el0_selftest`] produced. Called from a kernel task after the EL0 task
+/// has had time to run.
+#[cfg(target_arch = "aarch64")]
+pub fn el0_verify() -> bool {
+    use crate::arch::aarch64::{exceptions, syscall};
+
+    let count = exceptions::svc_count();
+    let expected = EL0_EXPECTED.load(Ordering::Relaxed);
+    let status = syscall::exit_status();
+
+    let mut ok = true;
+    if count < expected {
+        println!(
+            "[selftest] el0: FAIL — svc_count {} < expected {} (syscalls did not all \
+             reach the lower-EL sync vector)",
+            count, expected
+        );
+        ok = false;
+    }
+    match status {
+        Some(42) => {}
+        Some(other) => {
+            println!(
+                "[selftest] el0: FAIL — SYS_EXIT code {}, expected 42 (ADD's return value \
+                 did not travel back to EL0 in x0)",
+                other
+            );
+            ok = false;
+        }
+        None => {
+            println!("[selftest] el0: FAIL — payload never reached SYS_EXIT");
+            ok = false;
+        }
+    }
+    if ok {
+        println!(
+            "[selftest] el0: PASS (dropped to EL0, {} syscalls dispatched via slot 8, \
+             ADD returned 42 through x0, SYS_EXIT observed)",
+            count - (expected - 3)
+        );
+    }
+    ok
+}

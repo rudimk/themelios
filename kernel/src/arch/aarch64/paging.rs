@@ -477,7 +477,6 @@ pub fn verify_tcr() -> (u64, u64) {
 /// dangerous direction, since a bound *above* the real top of the regime lets a user
 /// pointer past the check. [`verify_tcr`] asserts the value it is derived from, so the
 /// two cannot drift apart silently.
-#[allow(dead_code)] // consumed by copy_from_user/copy_to_user in 8.4b
 pub fn user_va_bits() -> u32 {
     let t0sz = read_tcr() & 0x3f;
     64 - t0sz as u32

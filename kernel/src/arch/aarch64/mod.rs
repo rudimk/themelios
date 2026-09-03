@@ -47,6 +47,12 @@ pub mod timer;
 
 pub mod irq;
 
+/// EL0 syscall entry: the ABI, and dispatch from the lower-EL synchronous vector.
+pub mod syscall;
+
+/// Copying across the EL0 boundary, bounded by the hardware's own T0SZ.
+pub mod uaccess;
+
 /// PSCI power control — how the machine stops (the `isa-debug-exit` analog).
 pub mod psci;
 
