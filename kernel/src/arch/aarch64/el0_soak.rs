@@ -115,6 +115,9 @@ struct Slot {
     /// the other's base and both mismatch.
     tls_seen: AtomicU64,
     tls_expected: AtomicU64,
+    /// `d0`, `d8`, `d31` as this task read them back after 65536 preempted syscalls.
+    /// Each was seeded from the task's own TLS base, so they must still equal it.
+    fp_seen: [AtomicU64; 3],
 }
 
 impl Slot {
@@ -128,6 +131,7 @@ impl Slot {
             exited: AtomicU64::new(0),
             tls_seen: AtomicU64::new(0),
             tls_expected: AtomicU64::new(0),
+            fp_seen: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 }
@@ -189,6 +193,18 @@ pub fn note_tls(value: u64) {
     }
 }
 
+/// Record the three FPSIMD registers a soak task read back. No-op for other tasks.
+pub fn note_fp(d0: u64, d8: u64, d31: u64) {
+    let Some(pc) = crate::arch::aarch64::percpu::snapshot() else {
+        return;
+    };
+    if let Some(slot) = slot_for(pc.current_task) {
+        slot.fp_seen[0].store(d0, Ordering::Relaxed);
+        slot.fp_seen[1].store(d8, Ordering::Relaxed);
+        slot.fp_seen[2].store(d31, Ordering::Relaxed);
+    }
+}
+
 /// Record a soak task's `SYS_EXIT`. Returns true if this was a soak task.
 pub fn note_exit(code: u64) -> bool {
     let Some(pc) = crate::arch::aarch64::percpu::snapshot() else {
@@ -234,6 +250,17 @@ soak_payload_start:
     mov  x8, #6             // SYS_GETTLS
     svc  #0
     str  x0, [sp, #-16]!
+
+    // Seed three vector registers from this task's own TLS base. The two soak tasks have
+    // different bases, so if the context switch fails to save and restore FPSIMD state,
+    // whichever task ran last leaves its values behind and the other reads them.
+    // d0/d8/d31 are spread across the range so an off-by-one in the save's sixteen
+    // `stp q` pairs shows up instead of landing safely inside the covered span.
+    .arch_extension fp
+    fmov d0,  x0
+    fmov d8,  x0
+    fmov d31, x0
+    .arch_extension nofp
 1:
     mov  x8, #3             // SYS_ADD
     mov  x0, x20
@@ -242,6 +269,16 @@ soak_payload_start:
     add  x19, x19, x0       // accumulate the return
     subs x20, x20, #1
     b.ne 1b
+
+    // Report the vector registers before touching the stack again. Checked separately
+    // from the accumulator so a mismatch names FPSIMD directly.
+    .arch_extension fp
+    fmov x0, d0
+    fmov x1, d8
+    fmov x2, d31
+    .arch_extension nofp
+    mov  x8, #7             // SYS_FPCHECK
+    svc  #0
 
     // Reload the TLS value and fold it into the accumulator, so a lost SP_EL0 or a
     // mis-restored TPIDR_EL0 both change the single number the soak asserts on.
@@ -449,6 +486,25 @@ pub fn run() -> bool {
         // The TLS check, stated separately so a mismatch names the cause directly rather
         // than only shifting the accumulator. A scheduler that does not restore TPIDR_EL0
         // hands one task the other's base, so both slots report it.
+        // The FPSIMD check. Each register was seeded from this task's TLS base before the
+        // loop and read back after 65536 preempted syscalls, so anything other than that
+        // base means the per-task save area did not do its job — most likely by handing
+        // this task the *other* task's value, which is what a missing save/restore does.
+        for (idx, name) in ["d0", "d8", "d31"].iter().enumerate() {
+            let seen = s.fp_seen[idx].load(Ordering::Relaxed);
+            if seen != tls_expected {
+                println!(
+                    "[soak] FAIL — task {} read {} = {:#x}, expected {:#x} (FPSIMD state \
+                     did not survive the context switch)",
+                    s.task.load(Ordering::Relaxed),
+                    name,
+                    seen,
+                    tls_expected
+                );
+                ok = false;
+            }
+        }
+
         let tls_seen = s.tls_seen.load(Ordering::Relaxed);
         if tls_seen != tls_expected {
             println!(
@@ -500,8 +556,8 @@ pub fn run() -> bool {
     if ok {
         println!(
             "[soak] PASS ({} syscalls across {} EL0 tasks in separate address spaces, \
-             every return checked, each task's TPIDR_EL0 and SP_EL0 verified; {} ticks \
-             elapsed during the soak; intervals [{}, {}] and [{}, {}] overlap)",
+             every return checked, each task's TPIDR_EL0, SP_EL0 and FPSIMD verified; {} \
+             ticks elapsed during the soak; intervals [{}, {}] and [{}, {}] overlap)",
             SLOTS.iter().map(|s| s.calls.load(Ordering::Relaxed)).sum::<u64>(),
             TASKS,
             elapsed,

@@ -173,6 +173,20 @@ pub mod nr {
     /// userspace would observe.
     pub const GETTLS: u64 = 6;
 
+    /// Report three FPSIMD registers back to the kernel: `x0` = `d0`, `x1` = `d8`,
+    /// `x2` = `d31`.
+    ///
+    /// The only thing that makes the per-task FPSIMD save area observable. Deleting *both*
+    /// the save and the restore from the context switch left the entire suite green when
+    /// 8.4e first landed them, for the plain reason that no EL0 code used FP — the same
+    /// inert-mechanism pattern the 8.4c and 8.4d reviews each caught one sub-phase after
+    /// the fact. The soak's two tasks now seed these registers from their own distinct TLS
+    /// bases, so a missing save/restore hands one task the other's values.
+    ///
+    /// Three registers, spread across the range rather than adjacent, so an off-by-one in
+    /// the sixteen `stp q` pairs is caught rather than landing inside the covered span.
+    pub const FPCHECK: u64 = 7;
+
     /// Return the address userspace will resume at, via `user_pc()`.
     ///
     /// The self-test asserts the value lands inside the payload's mapped code page, which
@@ -262,6 +276,10 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         nr::GETPC => {
             LAST_USER_PC.store(pc, Ordering::Relaxed);
             pc
+        }
+        nr::FPCHECK => {
+            super::el0_soak::note_fp(a0, a1, a2);
+            0
         }
         nr::GETTLS => {
             let tls: u64;

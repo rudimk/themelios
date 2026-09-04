@@ -187,6 +187,8 @@ pub fn init() {
         asid: 0,
         #[cfg(target_arch = "aarch64")]
         tpidr_el0: 0,
+        #[cfg(target_arch = "aarch64")]
+        fp: crate::arch::aarch64::fpsimd::FpState::new(),
     }));
     sched.current_id = bootstrap_id;
     sched.next_id = 1;
@@ -494,6 +496,32 @@ pub fn schedule() {
             // base. Written unconditionally — including for kernel tasks, whose value is
             // 0 — because "skip it when the new value looks uninteresting" is exactly the
             // shape of the 4.5 stale-GS bug.
+            // FPSIMD: save the outgoing task's vector state and load the incoming
+            // task's, both before the switch — the same ordering as TPIDR_EL0 below and
+            // for the same reason.
+            //
+            // This is the *only* place FP needs saving. The kernel emits no vector
+            // instructions (softfloat build, asserted at compile time in `fpsimd`), so it
+            // cannot disturb a task's registers while handling that task's own exception:
+            // EL0 -> svc -> kernel -> eret leaves v0-v31 untouched. What can disturb them
+            // is another EL0 task running in between, which is exactly here. That is why
+            // `ExceptionFrame` gains no vector fields.
+            //
+            // Unconditional rather than lazy: Linux traps first-FP-use per thread and
+            // skips the copy for threads that never touch FP, but that bookkeeping is its
+            // own bug surface and 528 bytes at 100 Hz does not register.
+            {
+                use crate::arch::aarch64::fpsimd;
+                let cur_fp: *mut fpsimd::FpState =
+                    &mut sched.tasks[current_id].as_mut().unwrap().fp;
+                // SAFETY: both pointers are to live `FpState`s in the task table, which
+                // is locked here, and interrupts are masked for the whole switch.
+                unsafe { fpsimd::save(cur_fp) };
+                let next_fp: *const fpsimd::FpState =
+                    &sched.tasks[next_id].as_ref().unwrap().fp;
+                unsafe { fpsimd::restore(next_fp) };
+            }
+
             let next_tpidr = sched.tasks[next_id].as_ref().unwrap().tpidr_el0;
             // SAFETY: writing a thread-pointer register with no side effect at EL1.
             unsafe {
@@ -891,6 +919,8 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
         asid: 0,
         #[cfg(target_arch = "aarch64")]
         tpidr_el0: 0,
+        #[cfg(target_arch = "aarch64")]
+        fp: crate::arch::aarch64::fpsimd::FpState::new(),
     };
 
     // Place the task in its slot (either reusing an empty one or the new end)

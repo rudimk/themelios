@@ -519,7 +519,11 @@ const AARCH64_BOOT_FAILURES: &[&str] = &[
     // reopened by the next thing that printed its own verdict.
     "[soak] FAIL",
     "[boot] Phase 8.4d EL0 preemption soak FAILED",
-    "FP/SIMD does NOT trap at EL1",
+    // Was "FP/SIMD does NOT trap at EL1" until 8.4e, when FP had to be enabled at EL1
+    // for userspace's sake and that line stopped being a failure. The signature it is
+    // replaced by covers the thing that still matters: kernel work disturbing a task's
+    // vector state, which the save area exists to prevent.
+    "[fp] selftest: FAIL",
     "!!! aarch64 EXCEPTION !!!",
 ];
 
