@@ -513,6 +513,12 @@ const AARCH64_BOOT_FAILURES: &[&str] = &[
     "[boot] Phase 8.4 user address space FAILED self-test",
     "[selftest] el0: FAIL",
     "[boot] Phase 8.4b EL0 round trip FAILED self-test",
+    // Phase 8.4d, the EL0 preemption soak. Added at the same time as the soak itself,
+    // because a mutation that corrupted every soak return produced `[soak] FAIL` twice
+    // and *still* exited 0 — the identical hole the 8.4 entries above were added to close,
+    // reopened by the next thing that printed its own verdict.
+    "[soak] FAIL",
+    "[boot] Phase 8.4d EL0 preemption soak FAILED",
     "FP/SIMD does NOT trap at EL1",
     "!!! aarch64 EXCEPTION !!!",
 ];

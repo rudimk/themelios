@@ -134,11 +134,14 @@ pub mod nr {
     ///
     /// Returns the number of bytes printed, or one of the error sentinels below.
     pub const DEBUG_PRINT: u64 = 1;
-    /// Record the calling task's exit code.
+    /// Record the calling task's exit code and **block the task**.
     ///
-    /// **Does not terminate anything yet.** There is no task teardown for EL0 tasks in
-    /// this sub-phase: the handler stores the code and returns, and the caller is expected
-    /// to spin. Named `EXIT` for the ABI it will have, documented for the one it has.
+    /// Still not a full teardown — the kernel stack, address space, ASID and task slot are
+    /// not reclaimed — but the task stops being schedulable, which is the part that
+    /// matters in practice. Returning to a `b .` spin instead, as this did until 8.4d,
+    /// cost the arm64 suite 29 seconds once three EL0 tasks had accumulated: they took
+    /// three quarters of every round-robin cycle for the rest of boot, the whole suite,
+    /// and the interactive shell.
     pub const EXIT: u64 = 2;
     /// Return `x0 + x1`, so a test can assert a value *derived from its arguments*
     /// rather than merely that a syscall returned.
@@ -155,6 +158,21 @@ pub mod nr {
     /// The payload passes powers of two, so a wrong accessor changes the sum by a distinct
     /// amount rather than possibly cancelling out.
     pub const SUM6: u64 = 4;
+    /// Return the caller's live `TPIDR_EL0`, read from the register.
+    ///
+    /// The only thing that makes per-task TLS observable. A review mutation-tested the
+    /// whole `tpidr_el0` mechanism — the task field, the setter, and the `msr` on every
+    /// context switch — by poisoning all three, and the entire suite still passed: nothing
+    /// read the register back. The build was already saying so
+    /// (`function set_task_tpidr_el0 is never used`), which is the same signal the 8.4c
+    /// review caught one sub-phase earlier on the syscall accessors.
+    ///
+    /// Deliberately reads the **register**, not `frame.tpidr_el0`. Reading the frame would
+    /// only prove the exception entry saved what the exception entry saw; reading the
+    /// register proves the value the *scheduler* installed for this task is the one
+    /// userspace would observe.
+    pub const GETTLS: u64 = 6;
+
     /// Return the address userspace will resume at, via `user_pc()`.
     ///
     /// The self-test asserts the value lands inside the payload's mapped code page, which
@@ -234,6 +252,10 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         return;
     }
 
+    // Soak accounting, before the call is serviced so a task that never returns from a
+    // syscall is still counted as having made it. No-ops unless the soak is running.
+    super::el0_soak::note_syscall();
+
     let ret = match nr {
         nr::DEBUG_PRINT => sys_debug_print(a0, a1),
         nr::ADD => a0.wrapping_add(a1),
@@ -241,14 +263,43 @@ pub fn dispatch(frame: &mut SyscallFrame) {
             LAST_USER_PC.store(pc, Ordering::Relaxed);
             pc
         }
+        nr::GETTLS => {
+            let tls: u64;
+            // SAFETY: reading a thread-pointer register has no side effects.
+            unsafe { core::arch::asm!("mrs {}, TPIDR_EL0", out(reg) tls, options(nomem, nostack)) };
+            super::el0_soak::note_tls(tls);
+            tls
+        }
         nr::EXIT => {
-            // Nothing returns from here in a real process model; today the EL0 payload is
-            // driven by a self-test that treats EXIT as "stop and tell me you got here",
-            // so record it and let the test observe the count.
             // Code first, flag second, with the flag released — so an observer that sees
             // `EXITED` is guaranteed to see the code that goes with it. See `exit_status`.
-            EXIT_CODE.store(a0, Ordering::Relaxed);
-            EXITED.store(true, Ordering::Release);
+            // A soak task's exit belongs to its own per-task slot, not the single
+            // global pair the 8.4b self-test uses — two tasks exiting into one slot
+            // would have the second silently overwrite the first.
+            if !super::el0_soak::note_exit(a0) {
+                EXIT_CODE.store(a0, Ordering::Relaxed);
+                EXITED.store(true, Ordering::Release);
+            }
+
+            // **Park the task rather than returning to it.** There is still no EL0 task
+            // teardown — the stack, address space, ASID and task slot are not reclaimed —
+            // but blocking is enough to stop it *consuming the CPU*, and that turns out to
+            // matter far more than the leak.
+            //
+            // Until 8.4d every EL0 payload returned from `SYS_EXIT` into a `b .` spin, on
+            // the reasoning that a self-test task which never runs again is harmless. With
+            // one such task that was nearly true. With three — 8.4b's plus the soak's two —
+            // a review measured the arm64 suite going from 54 s to 83 s, of which only ~2 s
+            // was the soak's 131k syscalls: the rest was TCG faithfully emulating three
+            // infinite loops that had taken over three quarters of every round-robin cycle,
+            // for the whole suite and the interactive shell, in the shipped ISO.
+            //
+            // Blocking from inside the syscall handler is sound for exactly the reason the
+            // IRQ arm may call `schedule()`: the exception frame lives on this task's own
+            // kernel stack, so switching away leaves it intact. Nothing ever wakes this
+            // task, so `block_current_task` does not return and the `eret` below is never
+            // reached — which is the intended meaning of `exit`.
+            crate::sched::block_current_task();
             0
         }
         _ => ENOSYS,

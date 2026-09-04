@@ -48,6 +48,12 @@ static RELOAD: AtomicU64 = AtomicU64::new(0);
 
 /// Read the timer frequency in Hz.
 #[inline]
+/// The generic timer's frequency in Hz, for callers that need a wall-clock bound that
+/// survives masked interrupts (the counter advances regardless).
+pub fn frequency_hz() -> u64 {
+    read_cntfrq()
+}
+
 fn read_cntfrq() -> u64 {
     let v: u64;
     // SAFETY: reading CNTFRQ_EL0 has no side effects.
