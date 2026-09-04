@@ -443,7 +443,7 @@ pub fn schedule() {
         // so a Linux thread's `%fs`-relative TLS accesses would use whatever base
         // the previous task left behind. Reload it from the task on every switch.
         //
-        // aarch64's analog is TPIDR_EL0, which arrives with the EL0 port.
+        // aarch64's analog is TPIDR_EL0, restored a few lines below since 8.4d.
         #[cfg(target_arch = "x86_64")]
         crate::arch::x86_64::syscall::write_fs_base(
             sched.tasks[next_id].as_ref().unwrap().fs_base,
@@ -517,7 +517,8 @@ pub fn schedule() {
             // kernel process. That does mean a user tree stays installed while kernel
             // tasks run; it belongs to a live task rather than a leaked one, which is the
             // improvement over 8.4b, but the low half is still translatable at EL1 and
-            // that remains true until there is a reason to pay a TLBI per kernel switch.
+            // that remains true until there is a reason to park it. Parking would cost a
+            // `TCR_EL1.EPD0` write plus an `ISB`, not a TLBI — see `paging::activate_user`.
             let current_root = sched.tasks[current_id].as_ref().unwrap().ttbr0_root;
             let next_root = sched.tasks[next_id].as_ref().unwrap().ttbr0_root;
             let next_asid = sched.tasks[next_id].as_ref().unwrap().asid;

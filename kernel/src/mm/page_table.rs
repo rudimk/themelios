@@ -1579,6 +1579,11 @@ pub fn el0_selftest() -> bool {
         space.root_phys().as_u64(),
         space.asid(),
     );
+    // Note for anyone adding a third caller: `user_selftest` above also calls
+    // `activate_user` without registering, and is safe only because it runs on a task the
+    // scheduler considers kernel-only and re-parks the low half on every exit path. That
+    // is now a load-bearing property of that function, not an incidental one.
+    //
     // SAFETY: the tree is fully built and this is the space the payload runs in.
     unsafe { space.activate_user() };
 

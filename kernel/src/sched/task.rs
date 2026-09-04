@@ -176,9 +176,13 @@ pub struct Task {
     ///
     /// **This is what makes two concurrent EL0 tasks possible at all.** Before 8.4d
     /// `switch_context` preserved x19-x30 and nothing else, so every EL0 task shared
-    /// whichever address space was installed last — which is why `ExceptionFrame`'s
-    /// `sp_el0`/`tpidr_el0` fields were correct but untestable, the hazard they guard
-    /// against needing two EL0 tasks to exist.
+    /// whichever address space was installed last.
+    ///
+    /// It does *not* follow — and an earlier version of this comment claimed it did — that
+    /// `ExceptionFrame::sp_el0` was untestable before now. One EL0 task suffices: 8.4b's
+    /// payload spills a value to its user stack across a syscall, and zeroing `SP_EL0` on
+    /// exception return faults that single task. What two tasks add is coverage of the
+    /// *scheduler's* restore path, which is a different mechanism from the frame's.
     #[cfg(target_arch = "aarch64")]
     pub ttbr0_root: u64,
 
