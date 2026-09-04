@@ -29,47 +29,76 @@
 //! | return | `rax` | `x0` |
 //! | user PC | `rcx` | `ELR_EL1` |
 //!
-//! Two asymmetries the table hides, both of which the positional API exists to contain:
-//! x86 uses **`r10` for position 3, not `rcx`**, because the `syscall` instruction clobbers
-//! `rcx` with the return address; and on x86 the number and the return value **share a
-//! register**, so a caller that writes the return before reading the number loses the
-//! number — on aarch64 they are separate and the same code would work. Portable callers
-//! must therefore read the number first, and the facade is where that rule is written down.
+//! Three asymmetries the table hides, all of which the positional API exists to contain:
 //!
-//! ## User-memory access
+//! 1. x86 uses **`r10` for position 3, not `rcx`**, because the `syscall` instruction
+//!    clobbers `rcx` with the return address.
+//! 2. On x86 the number and the return value **share `rax`**, so writing the return before
+//!    reading the number loses the number. On aarch64 they are separate registers.
+//! 3. **And the mirror image, which matters just as much:** on aarch64 the return value and
+//!    *argument 0* share `x0`, so writing the return before reading `arg0()` loses the
+//!    argument. On x86 they are separate.
 //!
-//! [`copy_from_user`], [`copy_to_user`] and [`user_range_ok`] are the chokepoint for
-//! pointers that arrive from userspace. Both arches bound the range against their own user
-//! address regime — x86 against the canonical-hole boundary, aarch64 against
-//! `2^(64 - T0SZ)` read from `TCR_EL1`. **Both copy functions are `unsafe`**: a validated
-//! range is not a mapped range, and neither architecture has an exception table yet, so an
-//! in-range but unmapped pointer faults fatally. See the arch modules for the details and
-//! the current limitations.
+//! An earlier version of this note gave only the first two and described aarch64 as the
+//! safe case, which is exactly half a rule — each architecture has an aliasing pair, just a
+//! different one. The portable discipline that satisfies both: **read every input you need
+//! (`nr` and all arguments) before writing the return.** Both aliases are then unreachable.
+//!
+//! ## `clone` is the counter-example worth knowing about
+//!
+//! The claim above is that which register carries a position is per-architecture and of no
+//! interest to the caller. That holds for the *registers* and not for every syscall's
+//! *positions*: Linux's `clone` swaps positions 3 and 4 between architectures (arm64
+//! selects `CLONE_BACKWARDS`, giving `(flags, newsp, parent_tid, tls, child_tid)`, where
+//! x86_64 has `(flags, newsp, parent_tid, child_tid, tls)`). A positional facade cannot
+//! fix that and does not try to; see the note in [`crate::linux::thread`].
+//!
+//! ## User-memory access is NOT yet portable, and this module does not pretend it is
+//!
+//! [`copy_from_user`] and [`copy_to_user`] are re-exported **on x86_64 only**. An earlier
+//! version of this file re-exported an aarch64 pair under the same names and claimed the
+//! facade "flattens that difference away". It does not: the two are unrelated functions
+//! that happen to share a spelling.
+//!
+//! | | x86_64 | aarch64 |
+//! |---|---|---|
+//! | `copy_from_user` | `(uptr: u64, len: usize) -> Option<Vec<u8>>`, safe | `(dst: &mut [u8], src: u64) -> Result<(), UserCopyError>`, **`unsafe`** |
+//! | `copy_to_user` | `(uptr, &[u8]) -> bool`, safe | `(dst, &[u8]) -> Result<…>`, **`unsafe`** |
+//! | `user_range_ok` | bounds check **plus a page-table walk proving every page is mapped** | bounds check only |
+//!
+//! Different arity, argument order, return type, and safety — and, worst of the four, a
+//! different *security guarantee*: x86's `user_range_ok` proves the range is mapped, while
+//! aarch64's own docs say "a validated range is not a mapped range". None of the 21 call
+//! sites in [`crate::linux`] would compile against the aarch64 shape, so the collision was
+//! never going to be discovered by building.
+//!
+//! Unifying them is real work — aarch64 needs the exception table it does not have before
+//! it can offer x86's mapped-range guarantee — and it wants a live consumer to design
+//! against. That arrives with the ring-3 servers in 8.5. Until then a portable user-copy
+//! **does not exist**, and a module named `arch::syscall` claiming otherwise is worse than
+//! its absence: aarch64 code that needs these reaches for
+//! [`crate::arch::aarch64::uaccess`] by name and is thereby reminded that it is using the
+//! architecture-specific one.
 
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::syscall::SyscallFrame;
 
-// `allow(unused_imports)` on the aarch64 side only, and it is temporary rather than
-// cosmetic: the sole consumer of this facade today is `mod linux`, still x86-gated on its
-// VFS and process dependencies. So on aarch64 the re-exports are correct, compiled, and
-// nothing calls them until the ring-3 servers arrive in 8.5. Silencing it beats leaving
-// four warnings in every arm64 build for a module that is deliberately ahead of its
-// callers — but it does mean a *wrong* aarch64 mapping here would not be caught by the
-// build. The positional accessors are exercised by the EL0 self-test's dispatch path.
+// Unused on aarch64 today, and the `allow` is load-bearing rather than cosmetic — but not
+// for the reason a first draft of this comment gave, which claimed `dispatch` consumes it
+// through here. It does not: `dispatch` names the type from its own module. Nothing on
+// this architecture goes through the facade yet, because its only consumer (`mod linux`)
+// is x86-gated on the syscall-number table and its VFS dependencies, not merely on
+// register names.
+//
+// So this re-export is a declaration of intent that 8.5 will use. What keeps the *aarch64
+// mapping* honest in the meantime is not this line but `dispatch` routing the live syscall
+// path through all ten accessors, each of which the EL0 self-test now fails on if mutated.
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_imports)]
 pub use crate::arch::aarch64::syscall::SyscallFrame;
 
-// The user-copy trio is `pub(crate)` on x86, so the re-export has to be too — a `pub use`
-// of a `pub(crate)` item is an error, not a widening. That is the right visibility anyway:
-// this is a binary crate, and the one thing a user-memory chokepoint should never become
-// is part of a public API surface.
+// x86_64 only — see the table above. `pub(crate)` because that is the visibility of the
+// underlying items, and because the last thing a user-memory chokepoint should become is
+// part of a public API surface.
 #[cfg(target_arch = "x86_64")]
 pub(crate) use crate::arch::x86_64::syscall::{copy_from_user, copy_to_user, user_range_ok};
-
-// aarch64 keeps the user-copy primitives in their own module rather than beside the
-// dispatch code, because they are the hostile-input surface and warrant being read as a
-// unit. The facade flattens that difference away, which is the point of a facade.
-#[cfg(target_arch = "aarch64")]
-#[allow(unused_imports)] // see the note above; the consumer is `mod linux`, still x86-gated
-pub(crate) use crate::arch::aarch64::uaccess::{copy_from_user, copy_to_user, user_range_ok};

@@ -95,6 +95,22 @@ pub fn sys_clone(frame: &SyscallFrame) -> u64 {
     let flags = frame.arg0();
     let child_stack = frame.arg1();
     let ptid = frame.arg2();
+    // **Positions 3 and 4 are x86_64's, and `clone` is the one syscall where the
+    // *position* — not merely the register — is architecture-dependent.** Linux gates this
+    // on `CONFIG_CLONE_BACKWARDS`, which arm64 selects and x86_64 does not:
+    //
+    //   x86_64          clone(flags, newsp, parent_tid, child_tid, tls)
+    //   arm64           clone(flags, newsp, parent_tid, tls, child_tid)   <- 3/4 swapped
+    //
+    // So this is correct today and becomes silently wrong the moment `mod linux` is
+    // un-gated for aarch64 in 8.5: the ctid pointer would be installed as the thread's TLS
+    // base and the tid written into the TLS block. It compiles, it runs, and it corrupts.
+    //
+    // Deliberately not "fixed" with a `#[cfg]` here, because the whole module is x86-gated
+    // and a speculative branch nothing can execute is how wrong assumptions get frozen in.
+    // Recorded instead, at the site, so whoever un-gates the module meets it. The
+    // positional facade cannot help: it abstracts the register-to-position mapping, and
+    // this is a difference in the positions themselves. See `crate::arch::syscall`.
     let ctid = frame.arg3();
     let tls = frame.arg4();
 

@@ -85,7 +85,7 @@ const ARCH_GET_FS: u64 = 0x1003;
 const MAP_ANONYMOUS: u64 = 0x20;
 
 /// Dispatch one Linux syscall. Reads the number/args from `frame` and writes the
-/// result (or `-errno`) into `frame.nr()`.
+/// result (or `-errno`) into the frame's return slot via `set_ret`.
 pub fn dispatch(frame: &mut SyscallFrame) {
     // Filesystem syscalls (read/write/open/openat/close/fstat/lseek/getdents64/
     // getcwd/chdir/newfstatat/…) are serviced by the VFS-backed `fs` module,
@@ -159,16 +159,16 @@ pub fn dispatch(frame: &mut SyscallFrame) {
 /// - fatal self-signal → terminate the whole thread group via `exit_group`,
 ///   recording the conventional `128 + signo` exit status (never returns).
 ///
-/// Writes the result into `*rax` for the non-terminating paths. `ESRCH` is in the
+/// Writes the result into `*ret` for the non-terminating paths. `ESRCH` is in the
 /// errno set for completeness (a signal to a vanished target) but unreachable on
 /// the self-only path.
-fn sys_kill(current: crate::process::ProcessId, target: u64, sig: u64, rax: &mut u64) {
+fn sys_kill(current: crate::process::ProcessId, target: u64, sig: u64, ret: &mut u64) {
     if target as usize != current.as_usize() {
-        *rax = err(EPERM);
+        *ret = err(EPERM);
         return;
     }
     if sig == 0 {
-        *rax = 0;
+        *ret = 0;
         return;
     }
     // Fatal self-signal: never returns.

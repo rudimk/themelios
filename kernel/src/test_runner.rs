@@ -158,20 +158,25 @@ static TESTS: &[TestCase] = &[
 ///
 /// Empty on x86_64, which runs the whole suite. On aarch64 these name the deferred
 /// subsystems — ring-3/EL0, VirtIO-PCI and everything downstream of it — rather than
-/// the individual tests, because that is the actual reason and it is one decision, not
-/// thirty-nine.
+/// the individual tests, because that is the actual reason and it is a handful of
+/// decisions, not one per skipped test.
 #[cfg(target_arch = "aarch64")]
 static SKIPPED: &[SkippedTest] = &[
-    // Not "EL0 is deferred" — EL0 landed in 8.4b and the syscall path works. This test's
-    // body is pure x86 MSR verification (`EFER.SCE`, `STAR[47:32]`, `STAR[63:48]`,
-    // `LSTAR`, `FMASK & RFLAGS_IF`) followed by an in-kernel dispatch; it never enters
-    // ring 3 and has no aarch64 counterpart to port. Retiring it means writing a
-    // different test under the same name — `VBAR_EL1` installed, `ESR_EL1.EC == 0x15`
-    // decoded, dispatch over an aarch64 `SyscallFrame` — which is its own work item.
+    // Corrected twice. The original reason ("ring-3/EL0 is deferred on aarch64") went
+    // stale when EL0 landed in 8.4b. 8.4c replaced it with "it never enters ring 3",
+    // which is simply false — `arch/x86_64/syscall.rs` Part 3 is headed "Real ring 3
+    // round trip": it maps USER code/stack, writes shellcode containing two real
+    // `syscall` instructions, and `iretq`s to ring 3. That is most of the test.
+    //
+    // The accurate reason is narrower: roughly half the body verifies x86 MSRs (EFER.SCE,
+    // STAR[47:32], STAR[63:48], LSTAR, FMASK & RFLAGS_IF) that have no aarch64 analogue,
+    // and the ring-3 half's counterpart already exists as `page_table::el0_selftest`, a
+    // boot self-test rather than a suite entry. Retiring this means deciding where that
+    // coverage belongs, not porting a function.
     SkippedTest {
         name: "test_syscall",
-        why: "the body is x86 MSR verification with no aarch64 counterpart; needs a \
-              different test under the same name, not a port",
+        why: "half the body verifies x86 MSRs with no aarch64 analogue; the ring-3 half's \
+              counterpart is the boot-time el0 self-test, not a suite entry",
     },
     // `test_shared_memory` ran here until 8.4c. Its blocker was specific and is now
     // gone: a fresh aarch64 address space used to inherit the low-half entries, so the

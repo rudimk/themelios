@@ -97,8 +97,19 @@ fn read_user_path(ptr: u64, cwd: &str) -> Option<String> {
     Some(resolve_path(cwd, s))
 }
 
-/// Dispatch a Linux filesystem syscall. Returns the value to place in `rax`.
+/// Dispatch a Linux filesystem syscall. Returns the value to place in the return slot.
 /// Numbers not handled here return `None` so the caller can try other tables.
+///
+/// **These numbers are x86_64's, and they are not portable.** Linux has no single syscall
+/// numbering: aarch64 uses the `asm-generic` table, where these values mean different
+/// things — and the dangerous part is that they are mostly *valid* there rather than
+/// unassigned, so a mis-port routes calls to the wrong handler instead of erroring. `79`
+/// is `getcwd` here and `newfstatat` on arm64; `80` is `chdir` here and `fstat` there.
+///
+/// This matters for what the 8.4c facade does and does not buy. Removing the x86 register
+/// names from this module was necessary to make it portable and is nowhere near
+/// sufficient: this table is the second x86 dependency and the quietest of them. Porting
+/// the personality means a per-architecture number table, not a `#[cfg]` on the imports.
 pub fn dispatch(num: u64, frame: &SyscallFrame) -> Option<u64> {
     let pid = crate::sched::current_process_id();
     let r = match num {
