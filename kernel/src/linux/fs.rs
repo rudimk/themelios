@@ -10,7 +10,7 @@
 //!
 //! [`rootfs_mount`]: crate::process::rootfs_mount
 
-use crate::arch::x86_64::syscall::{copy_from_user, copy_to_user, user_range_ok, SyscallFrame};
+use crate::arch::syscall::{copy_from_user, copy_to_user, user_range_ok, SyscallFrame};
 use crate::process::{self, LinuxFd};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -48,36 +48,12 @@ const STAT_SIZE: usize = 144;
 const LINUX_DT_DIR: u8 = 4;
 const LINUX_DT_REG: u8 = 8;
 
-/// Resolve a Linux `path` against `cwd` into a normalized, absolute rootfs path
-/// that **cannot escape above the root**.
+/// Re-exported from [`crate::path`], which is where the implementation now lives.
 ///
-/// Components are processed left to right: `""`/`"."` are skipped, `".."` pops the
-/// last component (or stays at `/` if already at the root — the clamp that
-/// prevents container escape), everything else is pushed. The result is always
-/// absolute (`/`-prefixed) and free of `.`/`..`. This is the security boundary
-/// for Linux path syscalls, so it is factored out and unit-tested directly.
-pub fn resolve_path(cwd: &str, path: &str) -> String {
-    let mut comps: Vec<&str> = Vec::new();
-    // Absolute paths start from the root; relative paths start from the cwd.
-    let base = if path.starts_with('/') { "" } else { cwd };
-    for part in base.split('/').chain(path.split('/')) {
-        match part {
-            "" | "." => {}
-            ".." => {
-                comps.pop(); // pop() on empty is a no-op → clamped at root
-            }
-            other => comps.push(other),
-        }
-    }
-    let mut out = String::from("/");
-    for (i, c) in comps.iter().enumerate() {
-        if i > 0 {
-            out.push('/');
-        }
-        out.push_str(c);
-    }
-    out
-}
+/// Moved out in 8.4c so `test_path_resolve` can run on aarch64: the logic is pure string
+/// manipulation, but this file's imports kept all of `mod linux` x86-gated. Re-exported
+/// under the old name so the call sites below are unchanged.
+pub use crate::path::resolve_path;
 
 /// Map a container-relative resolved path (`rel`, the `..`-clamped output of
 /// [`resolve_path`], always absolute) to the **host** path actually used against
@@ -121,22 +97,33 @@ fn read_user_path(ptr: u64, cwd: &str) -> Option<String> {
     Some(resolve_path(cwd, s))
 }
 
-/// Dispatch a Linux filesystem syscall. Returns the value to place in `rax`.
+/// Dispatch a Linux filesystem syscall. Returns the value to place in the return slot.
 /// Numbers not handled here return `None` so the caller can try other tables.
+///
+/// **These numbers are x86_64's, and they are not portable.** Linux has no single syscall
+/// numbering: aarch64 uses the `asm-generic` table, where these values mean different
+/// things — and the dangerous part is that they are mostly *valid* there rather than
+/// unassigned, so a mis-port routes calls to the wrong handler instead of erroring. `79`
+/// is `getcwd` here and `newfstatat` on arm64; `80` is `chdir` here and `fstat` there.
+///
+/// This matters for what the 8.4c facade does and does not buy. Removing the x86 register
+/// names from this module was necessary to make it portable and is nowhere near
+/// sufficient: this table is the second x86 dependency and the quietest of them. Porting
+/// the personality means a per-architecture number table, not a `#[cfg]` on the imports.
 pub fn dispatch(num: u64, frame: &SyscallFrame) -> Option<u64> {
     let pid = crate::sched::current_process_id();
     let r = match num {
-        0 => sys_read(pid, frame.rdi as i32, frame.rsi, frame.rdx),   // read
-        1 => sys_write(pid, frame.rdi as i32, frame.rsi, frame.rdx),  // write
-        2 => sys_openat(pid, AT_FDCWD, frame.rdi, frame.rsi),          // open
-        3 => sys_close(pid, frame.rdi as i32),                         // close
-        5 => sys_fstat(pid, frame.rdi as i32, frame.rsi),              // fstat
-        8 => sys_lseek(pid, frame.rdi as i32, frame.rsi, frame.rdx),   // lseek
-        79 => sys_getcwd(pid, frame.rdi, frame.rsi),                   // getcwd
-        80 => sys_chdir(pid, frame.rdi),                               // chdir
-        217 => sys_getdents64(pid, frame.rdi as i32, frame.rsi, frame.rdx), // getdents64
-        257 => sys_openat(pid, frame.rdi as i64, frame.rsi, frame.rdx),     // openat
-        262 => sys_newfstatat(pid, frame.rdi as i64, frame.rsi, frame.rdx), // newfstatat
+        0 => sys_read(pid, frame.arg0() as i32, frame.arg1(), frame.arg2()),   // read
+        1 => sys_write(pid, frame.arg0() as i32, frame.arg1(), frame.arg2()),  // write
+        2 => sys_openat(pid, AT_FDCWD, frame.arg0(), frame.arg1()),          // open
+        3 => sys_close(pid, frame.arg0() as i32),                         // close
+        5 => sys_fstat(pid, frame.arg0() as i32, frame.arg1()),              // fstat
+        8 => sys_lseek(pid, frame.arg0() as i32, frame.arg1(), frame.arg2()),   // lseek
+        79 => sys_getcwd(pid, frame.arg0(), frame.arg1()),                   // getcwd
+        80 => sys_chdir(pid, frame.arg0()),                               // chdir
+        217 => sys_getdents64(pid, frame.arg0() as i32, frame.arg1(), frame.arg2()), // getdents64
+        257 => sys_openat(pid, frame.arg0() as i64, frame.arg1(), frame.arg2()),     // openat
+        262 => sys_newfstatat(pid, frame.arg0() as i64, frame.arg1(), frame.arg2()), // newfstatat
         267 => err(EINVAL), // readlinkat: no symlinks surfaced in 5.2
         _ => return None,
     };

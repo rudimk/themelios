@@ -42,6 +42,91 @@
 
 use super::exceptions::ExceptionFrame;
 
+/// The aarch64 syscall frame — the exception frame itself, under the portable name.
+///
+/// A plain alias rather than a newtype, deliberately. aarch64 has no separate syscall
+/// entry path to build a distinct structure on: `svc` is an exception like any other, so
+/// the frame the vector stub already built *is* the syscall frame. Wrapping it would buy
+/// nothing and cost a conversion at every dispatch site.
+///
+/// That is itself the interesting asymmetry with x86, where `syscall`/`sysretq` is a
+/// separate mechanism from the IDT and needs its own naked stub and its own struct.
+pub type SyscallFrame = ExceptionFrame;
+
+/// The **positional** syscall ABI for aarch64 — the counterpart of the x86_64 impl in
+/// [`crate::arch::x86_64::syscall`], reached portably through [`crate::arch::syscall`].
+///
+/// | position | register |
+/// |---|---|
+/// | number | `x8` |
+/// | 0-5 | `x0`-`x5` |
+/// | return | `x0` |
+/// | user PC | `ELR_EL1` |
+///
+/// Unlike x86, the number and the return value live in **different** registers, so reading
+/// the number after writing the return value still works here. Portable callers must not
+/// rely on that; see [`SyscallFrame::ret_mut`]'s note on the x86 side.
+impl ExceptionFrame {
+    /// The syscall number the caller requested (`x8`).
+    #[inline]
+    pub fn nr(&self) -> u64 {
+        self.x[8]
+    }
+
+    /// Argument 0 (`x0`).
+    #[inline]
+    pub fn arg0(&self) -> u64 {
+        self.x[0]
+    }
+    /// Argument 1 (`x1`).
+    #[inline]
+    pub fn arg1(&self) -> u64 {
+        self.x[1]
+    }
+    /// Argument 2 (`x2`).
+    #[inline]
+    pub fn arg2(&self) -> u64 {
+        self.x[2]
+    }
+    /// Argument 3 (`x3`).
+    #[inline]
+    pub fn arg3(&self) -> u64 {
+        self.x[3]
+    }
+    /// Argument 4 (`x4`).
+    #[inline]
+    pub fn arg4(&self) -> u64 {
+        self.x[4]
+    }
+    /// Argument 5 (`x5`).
+    #[inline]
+    pub fn arg5(&self) -> u64 {
+        self.x[5]
+    }
+
+    /// Set the value userspace receives back (`x0`).
+    #[inline]
+    pub fn set_ret(&mut self, value: u64) {
+        self.x[0] = value;
+    }
+
+    /// Mutable handle on the return slot (`x0`), for callees that write it in place.
+    #[inline]
+    pub fn ret_mut(&mut self) -> &mut u64 {
+        &mut self.x[0]
+    }
+
+    /// The address userspace will resume at (`ELR_EL1`).
+    ///
+    /// Already points *past* the `svc`, which is the opposite of `brk` — see the dispatch
+    /// arm in `exceptions.rs`. So this is the resume address directly, with no adjustment,
+    /// matching what x86's `rcx` holds.
+    #[inline]
+    pub fn user_pc(&self) -> u64 {
+        self.elr
+    }
+}
+
 /// Syscall numbers. Deliberately the kernel's own small set for now; the Linux
 /// personality's `asm-generic` numbering is a separate table layered above this.
 pub mod nr {
@@ -58,6 +143,24 @@ pub mod nr {
     /// Return `x0 + x1`, so a test can assert a value *derived from its arguments*
     /// rather than merely that a syscall returned.
     pub const ADD: u64 = 3;
+    /// Return the sum of **all six** argument positions, written back through `ret_mut`.
+    ///
+    /// Exists purely to make the rest of the positional API load-bearing. A review
+    /// mutation-tested all ten accessors and found six of them — `arg2`-`arg5`, `ret_mut`
+    /// and `user_pc` — could be wrong on *either* architecture and still ship green;
+    /// `arg4` and `arg5` and `ret_mut` were inert on both. The aarch64 build was even
+    /// printing `methods arg2, arg3, arg4, arg5, ret_mut, and user_pc are never used`
+    /// while a comment two files away claimed the EL0 self-test exercised them.
+    ///
+    /// The payload passes powers of two, so a wrong accessor changes the sum by a distinct
+    /// amount rather than possibly cancelling out.
+    pub const SUM6: u64 = 4;
+    /// Return the address userspace will resume at, via `user_pc()`.
+    ///
+    /// The self-test asserts the value lands inside the payload's mapped code page, which
+    /// is what makes `user_pc` — otherwise unreferenced on this architecture — a checked
+    /// mapping rather than a plausible-looking one.
+    pub const GETPC: u64 = 5;
 }
 
 /// Error returned in `x0` for an unrecognised syscall number.
@@ -82,22 +185,62 @@ pub const EINVAL: u64 = u64::MAX - 21;
 
 /// Dispatch one syscall from an EL0 exception frame.
 ///
-/// Reads the number from `x8` and, for the calls that exist today, the arguments from `x0`
-/// and `x1` — the ABI reserves `x0`-`x5` but nothing yet takes more than two — and writes
-/// the result back
-/// into `frame.x[0]` — the exception exit stub then restores that into the real `x0` on
-/// the way back to EL0, which is how a return value reaches userspace.
+/// Reads the number and arguments, and writes the result back, **through the positional
+/// accessors** rather than by indexing `frame.x` directly.
+///
+/// That is deliberate and is the only thing making the aarch64 half of
+/// [`crate::arch::syscall`] load-bearing. The facade's whole job is the mapping
+/// number→`x8`, args→`x0`-`x5`, return→`x0`; on this architecture nothing else calls it
+/// yet, because its consumer (`mod linux`) is still x86-gated. So if dispatch indexed the
+/// array itself, a wrong accessor — `nr()` reading `x[7]`, say — would compile, ship, and
+/// be caught by no test on either architecture.
+///
+/// Routing the live syscall path through them was not by itself enough, and an earlier
+/// version of this comment overclaimed that it was. A review mutation-tested all ten and
+/// found six inert: `arg2`-`arg5`, `ret_mut` and `user_pc` were unreferenced here, and
+/// `arg4`, `arg5` and `ret_mut` were unreferenced on **both** architectures — the arm64
+/// build was printing `methods arg2, arg3, arg4, arg5, ret_mut, and user_pc are never
+/// used` while the comment claimed otherwise. `SUM6` and `GETPC` exist to close that: with
+/// them, every one of the ten is on the boot path and mutating any of them fails the EL0
+/// self-test.
+///
+/// **Every input is read before the return is written.** On this architecture `set_ret`
+/// and `ret_mut` write `x0`, which *is* `arg0` — so writing the return first would destroy
+/// argument 0. That is the aarch64 mirror of x86's `rax` number/return alias, and reading
+/// all inputs up front satisfies both; see [`crate::arch::syscall`].
 ///
 /// **Does not touch `frame.elr`.** `ELR_EL1` already points past the `svc`; see the note
 /// on the dispatch arm in `exceptions.rs`.
-pub fn dispatch(frame: &mut ExceptionFrame) {
-    let nr = frame.x[8];
-    let a0 = frame.x[0];
-    let a1 = frame.x[1];
+pub fn dispatch(frame: &mut SyscallFrame) {
+    let nr = frame.nr();
+    let a0 = frame.arg0();
+    let a1 = frame.arg1();
+    let a2 = frame.arg2();
+    let a3 = frame.arg3();
+    let a4 = frame.arg4();
+    let a5 = frame.arg5();
+    let pc = frame.user_pc();
+
+    // `SUM6` writes its result through `ret_mut` instead of returning it, so that accessor
+    // is on the live path too. It returns early for that reason.
+    if nr == nr::SUM6 {
+        let sum = a0
+            .wrapping_add(a1)
+            .wrapping_add(a2)
+            .wrapping_add(a3)
+            .wrapping_add(a4)
+            .wrapping_add(a5);
+        *frame.ret_mut() = sum;
+        return;
+    }
 
     let ret = match nr {
         nr::DEBUG_PRINT => sys_debug_print(a0, a1),
         nr::ADD => a0.wrapping_add(a1),
+        nr::GETPC => {
+            LAST_USER_PC.store(pc, Ordering::Relaxed);
+            pc
+        }
         nr::EXIT => {
             // Nothing returns from here in a real process model; today the EL0 payload is
             // driven by a self-test that treats EXIT as "stop and tell me you got here",
@@ -111,7 +254,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         _ => ENOSYS,
     };
 
-    frame.x[0] = ret;
+    frame.set_ret(ret);
 }
 
 /// `SYS_DEBUG_PRINT` — copy a string out of userspace and print it.
@@ -164,6 +307,17 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Set when an EL0 payload calls `SYS_EXIT`, with the code it passed.
 static EXITED: AtomicBool = AtomicBool::new(false);
 static EXIT_CODE: AtomicU64 = AtomicU64::new(0);
+
+/// The `user_pc()` value observed by the most recent `SYS_GETPC`.
+///
+/// Checked by the EL0 self-test against the payload's code page. Without it `user_pc` is
+/// referenced by nothing on this architecture and a mutation to it ships green — measured.
+static LAST_USER_PC: AtomicU64 = AtomicU64::new(0);
+
+/// The `user_pc` the last `SYS_GETPC` observed, or 0 if none has run.
+pub fn last_user_pc() -> u64 {
+    LAST_USER_PC.load(Ordering::Relaxed)
+}
 
 /// Total bytes successfully copied out of userspace and printed by `SYS_DEBUG_PRINT`.
 ///
@@ -352,10 +506,33 @@ el0_payload_start:
     mov  x1, #(el0_payload_msg_end - el0_payload_msg)
     svc  #0
 
-    // EXIT(result of ADD, recovered from the stack). The self-test asserts this is 42,
-    // which now proves two things at once: the *return value* travelled back to EL0 in x0,
-    // and SP_EL0 survived the intervening syscall and any preemption inside it.
-    ldr  x0, [sp], #16
+    // SUM6(1, 2, 4, 8, 16, 32) -> 63. Exercises arg2-arg5 and ret_mut, none of which any
+    // other syscall touches — a review proved all four could be wrong and still ship
+    // green. Powers of two so a single wrong accessor shifts the sum by a distinct
+    // amount instead of possibly cancelling against another.
+    mov  x8, #4
+    mov  x0, #1
+    mov  x1, #2
+    mov  x2, #4
+    mov  x3, #8
+    mov  x4, #16
+    mov  x5, #32
+    svc  #0
+    str  x0, [sp, #-16]!    // park the sum; second stack use, second SP_EL0 dependency
+
+    // GETPC -> the address this payload resumes at. The kernel records it and the
+    // self-test asserts it lies inside this code page, which is what makes `user_pc` a
+    // checked mapping rather than a plausible-looking one.
+    mov  x8, #5
+    svc  #0
+
+    // EXIT(ADD result + SUM6 result) = 42 + 63 = 105. One number carrying both, so a
+    // wrong accessor anywhere in either call changes the exit code the test asserts on.
+    // Recovering both operands from the stack keeps SP_EL0 load-bearing across four
+    // syscalls rather than one.
+    ldr  x1, [sp], #16      // the SUM6 result
+    ldr  x0, [sp], #16      // the ADD result
+    add  x0, x0, x1
     mov  x8, #2
     svc  #0
 

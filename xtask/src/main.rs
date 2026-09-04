@@ -479,6 +479,44 @@ fn virtio_net_args_mmio(id: &str, hostfwd: Option<&str>) -> Vec<String> {
         format!("virtio-net-device,netdev={id}"),
     ]
 }
+/// Boot self-test failure signatures, scanned by **both** aarch64 QEMU paths.
+///
+/// Module-level rather than local to the smoke, because the two paths had drifted and it
+/// mattered. `cmd_test_aarch64` used to check only the suite's own PASS/FAIL sentinel, so
+/// a kernel whose *boot* self-tests failed still printed `[test] RESULT: ALL TESTS PASSED`
+/// and exited 0 — which is exactly what happened when an accessor mutation broke the EL0
+/// round trip during 8.4c: the suite reported success on a kernel that had already failed
+/// two boot assertions. CI happened to catch it because the smoke job scans this list, but
+/// `cargo xtask test --arch arm64` on its own did not, and that is the command a
+/// contributor runs.
+///
+/// The boot self-tests and the test suite check different things and both are gates; one
+/// list, two readers.
+const AARCH64_BOOT_FAILURES: &[&str] = &[
+    "KERNEL PANIC",
+    "Phase 7.1 MMU/paging FAILED self-test",
+    "[selftest] paging: FAIL",
+    "Phase 7.2 FAILED self-test",
+    "[selftest] exceptions: FAIL",
+    "[selftest] timer: FAIL",
+    "Phase 7.3 scheduler FAILED self-test",
+    "[selftest] sched: FAIL",
+    "[selftest] percpu: FAIL",
+    // Phase 8.4 (user address spaces on TTBR0) and 8.4b (the EL0 round trip). These
+    // were missing until a review of 8.4b went looking: the list stopped at 7.3, so
+    // both sub-phases' self-tests printed their verdict into a log nothing inspected,
+    // and every assertion in them was decorative as far as CI was concerned. The
+    // `[selftest] …: FAIL` prefixes catch a specific failed assertion; the `[boot] …`
+    // lines catch the case where the self-test returns false by a path that did not
+    // print one — belt and braces, because they fail for different reasons.
+    "[selftest] user-as: FAIL",
+    "[boot] Phase 8.4 user address space FAILED self-test",
+    "[selftest] el0: FAIL",
+    "[boot] Phase 8.4b EL0 round trip FAILED self-test",
+    "FP/SIMD does NOT trap at EL1",
+    "!!! aarch64 EXCEPTION !!!",
+];
+
 /// `cargo xtask test --arch aarch64` — run the kernel suite on QEMU `virt`.
 ///
 /// Mirrors [`cmd_test`], with one structural difference: how the verdict gets out.
@@ -606,6 +644,27 @@ fn cmd_test_aarch64(root: &Path, target: &str) {
         eprintln!("aarch64 suite FAILED — see the [FAIL] lines above.");
         process::exit(1);
     }
+
+    // Boot self-test failures, checked **before** honouring the PASS sentinel.
+    //
+    // The suite and the boot self-tests are independent gates: `run_tests` reports only on
+    // the tests in its own tables, and a boot self-test that fails merely prints and lets
+    // boot continue. So a kernel with a broken EL0 round trip reached `[test] RESULT: ALL
+    // TESTS PASSED` and this function exited 0 — observed during 8.4c, where mutating a
+    // syscall-frame accessor produced two `[selftest] el0: FAIL` lines and a passing suite.
+    // The smoke job scanned for these already; this path did not, which meant the command
+    // a contributor actually runs was the weaker of the two.
+    if let Some(sig) = AARCH64_BOOT_FAILURES
+        .iter()
+        .find(|f| serial.contains(**f))
+    {
+        eprintln!(
+            "aarch64 suite FAILED: kernel reported '{sig}' during boot. The test tables may \
+             all have passed — a boot self-test is a separate gate and this one is red."
+        );
+        process::exit(1);
+    }
+
     if serial.contains(PASS) {
         if !exited {
             // The suite passed but PSCI did not stop the machine. Worth saying out
@@ -1235,33 +1294,9 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
     // looking. 7.4 nearly shipped having broken exactly that rule.
     const MARKER: &str = "ThemeliOS debug shell";
 
-    // Failure signatures, checked before the marker on every poll. Without these the
-    // only failure mode is "marker never appeared", which costs the full timeout and
-    // reports nothing useful.
-    const FAILURES: &[&str] = &[
-        "KERNEL PANIC",
-        "Phase 7.1 MMU/paging FAILED self-test",
-        "[selftest] paging: FAIL",
-        "Phase 7.2 FAILED self-test",
-        "[selftest] exceptions: FAIL",
-        "[selftest] timer: FAIL",
-        "Phase 7.3 scheduler FAILED self-test",
-        "[selftest] sched: FAIL",
-        "[selftest] percpu: FAIL",
-        // Phase 8.4 (user address spaces on TTBR0) and 8.4b (the EL0 round trip). These
-        // were missing until a review of 8.4b went looking: the list stopped at 7.3, so
-        // both sub-phases' self-tests printed their verdict into a log nothing inspected,
-        // and every assertion in them was decorative as far as CI was concerned. The
-        // `[selftest] …: FAIL` prefixes catch a specific failed assertion; the `[boot] …`
-        // lines catch the case where the self-test returns false by a path that did not
-        // print one — belt and braces, because they fail for different reasons.
-        "[selftest] user-as: FAIL",
-        "[boot] Phase 8.4 user address space FAILED self-test",
-        "[selftest] el0: FAIL",
-        "[boot] Phase 8.4b EL0 round trip FAILED self-test",
-        "FP/SIMD does NOT trap at EL1",
-        "!!! aarch64 EXCEPTION !!!",
-    ];
+    // Failure signatures, checked before the marker on every poll. Shared with
+    // `cmd_test_aarch64` — see `AARCH64_BOOT_FAILURES`.
+    const FAILURES: &[&str] = AARCH64_BOOT_FAILURES;
 
     // Connect to QEMU's serial socket. It is created with `server=on,wait=off`, so the
     // listener may not exist for a moment after spawn.

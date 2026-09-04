@@ -1437,6 +1437,14 @@ const EL0_CODE_VA: u64 = 0x0000_0000_0040_0000;
 #[cfg(target_arch = "aarch64")]
 const EL0_STACK_VA: u64 = 0x0000_0000_0080_0000;
 
+/// The exit code the EL0 payload must produce: `ADD(40,2)` + `SUM6(1,2,4,8,16,32)`.
+///
+/// A single number carrying the result of two syscalls with eight arguments between them,
+/// so a wrong positional accessor anywhere shifts it. The SUM6 operands are powers of two
+/// precisely so two compensating errors cannot land back on the right total.
+#[cfg(target_arch = "aarch64")]
+const EL0_EXPECTED_EXIT: u64 = 42 + 63;
+
 /// Drop to EL0 and run a payload that makes three syscalls. **Never returns.**
 ///
 /// ## What it proves, and how each part can fail
@@ -1565,7 +1573,8 @@ pub fn el0_selftest() -> bool {
 
     // Hand off to EL0. This does not return — the payload spins after SYS_EXIT and the
     // timer preempts it — so the verdict is collected by the task that runs next.
-    EL0_EXPECTED.store(before + 3, Ordering::Relaxed);
+    // Five syscalls now: ADD, SUM6, DEBUG_PRINT, GETPC, EXIT.
+    EL0_EXPECTED.store(before + 5, Ordering::Relaxed);
     // SAFETY: code and stack are mapped in the installed tree with the permissions the
     // payload needs.
     unsafe { syscall::enter_el0(EL0_CODE_VA, sp) }
@@ -1602,6 +1611,21 @@ pub fn el0_verify() -> bool {
     // an unconditional error return — and the test still passes, because the payload
     // ignores that syscall's return value and nothing observes the console line. That was
     // measured, not hypothesised.
+    // `user_pc` — the only check on that accessor anywhere. `SYS_GETPC` recorded whatever
+    // `frame.user_pc()` returned; it must be an address inside the payload's own mapped
+    // code page. A mutation returning `spsr` or `sp_el0` instead lands far outside it.
+    let pc = syscall::last_user_pc();
+    let code_lo = EL0_CODE_VA;
+    let code_hi = EL0_CODE_VA + crate::mm::PAGE_SIZE;
+    if pc < code_lo || pc >= code_hi {
+        println!(
+            "[selftest] el0: FAIL — SYS_GETPC saw user_pc {:#x}, outside the payload's \
+             code page [{:#x}, {:#x}) (ELR_EL1 is not reaching user_pc())",
+            pc, code_lo, code_hi
+        );
+        ok = false;
+    }
+
     let printed = syscall::printed_bytes();
     let expected_bytes = syscall::msg_len();
     if printed != expected_bytes {
@@ -1613,12 +1637,15 @@ pub fn el0_verify() -> bool {
         ok = false;
     }
     match status {
-        Some(42) => {}
+        // 105 = ADD(40,2)=42 + SUM6(1,2,4,8,16,32)=63. One number carrying both results,
+        // so a wrong accessor anywhere in either call changes it. The two operands are
+        // recovered from the user stack, so SP_EL0 is load-bearing across four syscalls.
+        Some(EL0_EXPECTED_EXIT) => {}
         Some(other) => {
             println!(
-                "[selftest] el0: FAIL — SYS_EXIT code {}, expected 42 (ADD's return value \
-                 did not travel back to EL0 in x0)",
-                other
+                "[selftest] el0: FAIL — SYS_EXIT code {}, expected {} (= ADD 42 + SUM6 63; \
+                 a positional accessor, the x0 return path, or SP_EL0 is wrong)",
+                other, EL0_EXPECTED_EXIT
             );
             ok = false;
         }
@@ -1632,11 +1659,11 @@ pub fn el0_verify() -> bool {
             "[selftest] el0: PASS (dropped to EL0, {} syscalls dispatched via slot 8, \
              ADD returned 42 through x0 and survived a spill to SP_EL0, {} bytes copied \
              from userspace, SYS_EXIT observed)",
-            // `saturating_sub` on both halves. Unreachable — a `Some(42)` status implies
+            // `saturating_sub` on both halves. Unreachable — a matching status implies
             // `el0_selftest` ran and stored `before + 3` — but this is a dev-profile build
             // with overflow checks on, so an underflow here would panic *inside the
             // success path of a passing test*, which is the worst place to learn about it.
-            count.saturating_sub(expected.saturating_sub(3)),
+            count.saturating_sub(expected.saturating_sub(5)),
             printed
         );
     }
