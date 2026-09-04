@@ -99,27 +99,25 @@ pub struct ExceptionFrame {
     /// could occur. The file already reasons this way about `ELR_EL1`/`SPSR_EL1` — "single
     /// system registers, not per-task storage" — and this is the same argument.
     ///
-    /// ## What is *not* yet true, and matters more than this field
+    /// ## Live as of 8.4d
     ///
-    /// The scenario above needs two concurrent EL0 tasks, and **this port cannot have
-    /// them** — for a reason unrelated to `SP_EL0`. [`crate::arch::context::switch`] does
-    /// not swap `TTBR0_EL1` (it preserves x19-x30 and nothing else), so two EL0 tasks would
-    /// share whichever address space was installed last. The structure here is therefore
-    /// *correct and untested*: it is the shape the hazard requires, put in place before the
-    /// hazard can occur, not a fix for a bug that has been reproduced. Saying so plainly is
-    /// the point — a review measured it by zeroing both registers on every exception return
-    /// and watching the whole suite still pass, because the only EL0 code that exists never
-    /// touches its stack.
-    ///
-    /// Per-task `TTBR0_EL1` is the prerequisite for a real userspace and belongs with the
-    /// process-model work, not here. When it lands, this field stops being speculative.
+    /// This block used to say the hazard could not occur — that the port could not have two
+    /// concurrent EL0 tasks because the context switch did not swap `TTBR0_EL1`, so the
+    /// field was "correct and untested". Every clause of that is now false: 8.4d gave tasks
+    /// per-task `TTBR0_EL1`, and the soak runs two EL0 tasks in separate address spaces
+    /// whose payload spills to and reloads from its user stack across 65536 syscalls.
+    /// Zeroing `SP_EL0` on exception return now faults; it is checked on every boot.
     pub sp_el0: u64,
     /// The interrupted context's `TPIDR_EL0` — userspace's thread pointer (TLS).
     ///
     /// Same hazard and same fix as [`sp_el0`](Self::sp_el0). 7.3 gave `TPIDR_EL1` the
-    /// structural treatment (rewritten on every context switch); this is its EL0
-    /// counterpart, and the context switch saves neither today — it preserves x19-x30 and
-    /// nothing else.
+    /// structural treatment (rewritten on every context switch), and 8.4d gave `TPIDR_EL0`
+    /// its EL0 counterpart: the scheduler restores it from `Task::tpidr_el0` on every
+    /// switch, and the soak's `SYS_GETTLS` reads the live register back to check it.
+    ///
+    /// This field and that restore cover *different* transitions and both are needed: the
+    /// frame preserves the register across an exception taken **by** a task, the scheduler
+    /// restores it when switching **between** tasks.
     pub tpidr_el0: u64,
 }
 
