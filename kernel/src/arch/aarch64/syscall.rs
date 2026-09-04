@@ -234,6 +234,10 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         return;
     }
 
+    // Soak accounting, before the call is serviced so a task that never returns from a
+    // syscall is still counted as having made it. No-ops unless the soak is running.
+    super::el0_soak::note_syscall();
+
     let ret = match nr {
         nr::DEBUG_PRINT => sys_debug_print(a0, a1),
         nr::ADD => a0.wrapping_add(a1),
@@ -247,8 +251,13 @@ pub fn dispatch(frame: &mut SyscallFrame) {
             // so record it and let the test observe the count.
             // Code first, flag second, with the flag released — so an observer that sees
             // `EXITED` is guaranteed to see the code that goes with it. See `exit_status`.
-            EXIT_CODE.store(a0, Ordering::Relaxed);
-            EXITED.store(true, Ordering::Release);
+            // A soak task's exit belongs to its own per-task slot, not the single
+            // global pair the 8.4b self-test uses — two tasks exiting into one slot
+            // would have the second silently overwrite the first.
+            if !super::el0_soak::note_exit(a0) {
+                EXIT_CODE.store(a0, Ordering::Relaxed);
+                EXITED.store(true, Ordering::Release);
+            }
             0
         }
         _ => ENOSYS,

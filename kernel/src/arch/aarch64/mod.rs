@@ -53,6 +53,11 @@ pub mod syscall;
 /// Copying across the EL0 boundary, bounded by the hardware's own T0SZ.
 pub mod uaccess;
 
+/// The EL0 preemption soak: two userspace tasks in separate address spaces, every syscall
+/// return checked, with predicates that fail differently for a frozen timer and for a
+/// scheduler that does not interleave. Phase 8's riskiest unknown.
+pub mod el0_soak;
+
 /// PSCI power control — how the machine stops (the `isa-debug-exit` analog).
 pub mod psci;
 

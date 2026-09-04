@@ -164,6 +164,45 @@ pub struct Task {
     /// how `pthread_join` observes a thread has finished. 0 if unset.
     #[cfg(target_arch = "x86_64")]
     pub clear_child_tid: u64,
+
+    /// Root physical address of this task's `TTBR0_EL1` tree, or 0 for a task with no
+    /// user address space (every kernel task).
+    ///
+    /// The aarch64 counterpart of `process_id`+`process_pml4` on x86, and deliberately a
+    /// root address rather than a process id: `mod process` is ring-3 machinery that does
+    /// not exist on this architecture, and inventing a process table to hold one `u64` per
+    /// task would be building the wrong thing first. When the process model lands this
+    /// becomes a lookup; until then the task *is* the owner.
+    ///
+    /// **This is what makes two concurrent EL0 tasks possible at all.** Before 8.4d
+    /// `switch_context` preserved x19-x30 and nothing else, so every EL0 task shared
+    /// whichever address space was installed last — which is why `ExceptionFrame`'s
+    /// `sp_el0`/`tpidr_el0` fields were correct but untestable, the hazard they guard
+    /// against needing two EL0 tasks to exist.
+    #[cfg(target_arch = "aarch64")]
+    pub ttbr0_root: u64,
+
+    /// ASID for [`ttbr0_root`](Self::ttbr0_root), 0 when there is no user space.
+    ///
+    /// Carried beside the root because `TTBR0_EL1` holds both — the ASID lives in bits
+    /// 63:48 of the same register — so switching one without the other would tag the new
+    /// tree with the old address space's identifier and let stale entries match.
+    #[cfg(target_arch = "aarch64")]
+    pub asid: u16,
+
+    /// The `TPIDR_EL0` value for this task — userspace's thread pointer (TLS).
+    ///
+    /// Exact analog of `fs_base` on x86, and needed for the same reason: `TPIDR_EL0` is a
+    /// CPU-global register that `switch_context` does not save, so without restoring it
+    /// per switch a task's TLS-relative accesses would use whatever base the previous task
+    /// left behind. 7.3 gave `TPIDR_EL1` this treatment; this is its EL0 half.
+    ///
+    /// Note this is a *second* place the register is handled, alongside
+    /// `ExceptionFrame::tpidr_el0`. They cover different transitions and both are needed:
+    /// the frame preserves it across an exception taken *by* a task, this restores it when
+    /// the scheduler switches *between* tasks.
+    #[cfg(target_arch = "aarch64")]
+    pub tpidr_el0: u64,
 }
 
 impl Task {

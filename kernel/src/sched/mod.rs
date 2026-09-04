@@ -179,6 +179,14 @@ pub fn init() {
         clone_entry: None,
         #[cfg(target_arch = "x86_64")]
         clear_child_tid: 0,
+        // EL0 state, aarch64 only. The bootstrap task never runs at EL0, so it has no
+        // user address space: root 0 means "kernel task, leave TTBR0 alone".
+        #[cfg(target_arch = "aarch64")]
+        ttbr0_root: 0,
+        #[cfg(target_arch = "aarch64")]
+        asid: 0,
+        #[cfg(target_arch = "aarch64")]
+        tpidr_el0: 0,
     }));
     sched.current_id = bootstrap_id;
     sched.next_id = 1;
@@ -308,6 +316,35 @@ pub fn set_current_clear_child_tid(addr: u64) {
     let sched = guard.as_mut().expect("Scheduler not initialized");
     if let Some(Some(task)) = sched.tasks.get_mut(sched.current_id) {
         task.clear_child_tid = addr;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+/// Attach an EL0 address space to a task, so the scheduler installs it on every switch to
+/// that task.
+///
+/// The aarch64 counterpart of x86's `process_id` + `process_pml4` pairing. Called with the
+/// root physical address and ASID of a space built by
+/// [`crate::mm::page_table::AddressSpace::new_user`]; the caller keeps ownership of the
+/// space (typically by leaking it, since there is no task teardown for EL0 tasks yet).
+///
+/// Passing `root == 0` marks the task as kernel-only, which is the default.
+pub fn set_task_user_space(task_id: task::TaskId, root: u64, asid: u16) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+    if let Some(Some(task)) = sched.tasks.get_mut(task_id) {
+        task.ttbr0_root = root;
+        task.asid = asid;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+/// Set a task's `TPIDR_EL0` (userspace TLS base). Analog of `set_task_fs_base`.
+pub fn set_task_tpidr_el0(task_id: task::TaskId, value: u64) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("Scheduler not initialized");
+    if let Some(Some(task)) = sched.tasks.get_mut(task_id) {
+        task.tpidr_el0 = value;
     }
 }
 
@@ -446,6 +483,49 @@ pub fn schedule() {
                     // spaces, so the currently-executing code stays mapped.
                     unsafe { crate::arch::x86_64::cpu::write_cr3(pml4_phys); }
                 }
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Restore the next task's TPIDR_EL0, for the same reason x86 reloads FS base
+            // above: it is a CPU-global register the context switch does not save, so
+            // without this a task's TLS-relative accesses would use the previous task's
+            // base. Written unconditionally — including for kernel tasks, whose value is
+            // 0 — because "skip it when the new value looks uninteresting" is exactly the
+            // shape of the 4.5 stale-GS bug.
+            let next_tpidr = sched.tasks[next_id].as_ref().unwrap().tpidr_el0;
+            // SAFETY: writing a thread-pointer register with no side effect at EL1.
+            unsafe {
+                core::arch::asm!("msr TPIDR_EL0, {}", in(reg) next_tpidr, options(nomem, nostack));
+            }
+
+            // Install the next task's user address space. The aarch64 counterpart of the
+            // CR3 block above, with two differences worth stating.
+            //
+            // First, there is **no `kernel_stack_top` equivalent to stage**. x86 must load
+            // TSS.RSP0 before the switch so a ring-3 task's next trap finds a kernel
+            // stack; aarch64 does not, because `SP_EL1` *is* the kernel stack pointer and
+            // `switch_context` swaps it as part of the switch. `eret` to EL0 leaves
+            // SP_EL1 holding this task's kernel stack, and the next exception from EL0
+            // lands right back on it. Verified rather than assumed before relying on it.
+            //
+            // Second, the skip condition compares roots, not process ids: `mod process`
+            // is ring-3 machinery that does not exist here, so the task owns its root
+            // directly. A task with root 0 is kernel-only and we leave TTBR0 alone rather
+            // than parking it — matching x86, which likewise skips the CR3 write for the
+            // kernel process. That does mean a user tree stays installed while kernel
+            // tasks run; it belongs to a live task rather than a leaked one, which is the
+            // improvement over 8.4b, but the low half is still translatable at EL1 and
+            // that remains true until there is a reason to pay a TLBI per kernel switch.
+            let current_root = sched.tasks[current_id].as_ref().unwrap().ttbr0_root;
+            let next_root = sched.tasks[next_id].as_ref().unwrap().ttbr0_root;
+            let next_asid = sched.tasks[next_id].as_ref().unwrap().asid;
+            if next_root != 0 && next_root != current_root {
+                // SAFETY: `next_root` is a root produced by `AddressSpace::new_user` and
+                // kept alive by its owner; only the low half is affected, and the kernel
+                // executes from TTBR1, so the currently-running code stays mapped.
+                unsafe { crate::arch::paging::activate_user(next_root, next_asid) };
             }
         }
 
@@ -802,6 +882,14 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
         clone_entry: None, // set by Linux clone() for thread tasks (Phase 5.3)
         #[cfg(target_arch = "x86_64")]
         clear_child_tid: 0,
+        // EL0 state, aarch64 only. A freshly created task is a kernel task; an EL0
+        // address space is attached explicitly by `set_task_user_space`.
+        #[cfg(target_arch = "aarch64")]
+        ttbr0_root: 0,
+        #[cfg(target_arch = "aarch64")]
+        asid: 0,
+        #[cfg(target_arch = "aarch64")]
+        tpidr_el0: 0,
     };
 
     // Place the task in its slot (either reusing an empty one or the new end)

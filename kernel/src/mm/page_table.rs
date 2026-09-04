@@ -1565,6 +1565,20 @@ pub fn el0_selftest() -> bool {
     syscall::clear_exit_status();
     let before = crate::arch::aarch64::exceptions::svc_count();
 
+    // Register the space with the scheduler *as well as* installing it now.
+    //
+    // Installing it alone was enough while this was the only EL0 task in existence. It
+    // stopped being enough the moment 8.4d added a second one: the scheduler restores
+    // `TTBR0_EL1` only for tasks whose root it knows, so an out-of-band `activate_user`
+    // left this task's tree un-restorable. The soak's first run caught it immediately —
+    // this task resumed with the soak's tree installed and took an instruction abort at
+    // its own code VA, which is precisely the failure per-task address spaces exist to
+    // prevent, arriving from the one EL0 task that had opted out of them.
+    crate::sched::set_task_user_space(
+        crate::sched::current_task_id(),
+        space.root_phys().as_u64(),
+        space.asid(),
+    );
     // SAFETY: the tree is fully built and this is the space the payload runs in.
     unsafe { space.activate_user() };
 

@@ -397,6 +397,19 @@ pub fn kmain_aarch64(
         crate::println!("[boot] Phase 8.4b EL0 round trip FAILED self-test.");
     }
 
+    // --- Phase 8.4d: the EL0 preemption soak ---
+    //
+    // After the 8.4b round trip, which proves one syscall works at all; this proves
+    // thousands work while two EL0 tasks in separate address spaces are preempting each
+    // other. The plan calls this class of bug Phase 8's riskiest unknown, on the evidence
+    // that the x86 equivalents were rare flakes that became majority-of-runs as the suite
+    // grew — so it runs on every boot rather than living in the test suite, where a
+    // skipped-on-one-arch entry would hide it.
+    let soak_ok = crate::arch::aarch64::el0_soak::run();
+    if !soak_ok {
+        crate::println!("[boot] Phase 8.4d EL0 preemption soak FAILED.");
+    }
+
     // --- Phase 8.3: VirtIO over virtio-mmio ---
     //
     // Placed here because it must precede the test suite and the shell, both of which
