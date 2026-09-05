@@ -501,7 +501,8 @@ pub fn schedule() {
             // for the same reason.
             //
             // This is the *only* place FP needs saving. The kernel emits no vector
-            // instructions (softfloat build, asserted at compile time in `fpsimd`), so it
+            // instructions except the hand-written ones in `fpsimd` itself (softfloat
+            // build, asserted at compile time there), so it
             // cannot disturb a task's registers while handling that task's own exception:
             // EL0 -> svc -> kernel -> eret leaves v0-v31 untouched. What can disturb them
             // is another EL0 task running in between, which is exactly here. That is why

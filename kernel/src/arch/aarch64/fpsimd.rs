@@ -46,8 +46,10 @@
 //!
 //! ## Save on context switch, not on exception entry
 //!
-//! The kernel emits no FP, so it cannot clobber a task's vector registers while handling
-//! that task's own exception: EL0 → `svc` → kernel → `eret` leaves `v0`-`v31` untouched.
+//! The kernel emits no *compiler-generated* FP — the exceptions are `save`, `restore` and
+//! `selftest` in this file, which are hand-written and run only where they are meant to.
+//! So the kernel cannot clobber a task's vector registers while handling that task's own
+//! exception: EL0 → `svc` → kernel → `eret` leaves `v0`-`v31` untouched.
 //! What *can* clobber them is another EL0 task running in between. So the save belongs
 //! with the context switch and nowhere else — the same conclusion Linux reaches, and the
 //! reason [`crate::arch::aarch64::exceptions::ExceptionFrame`] gains no vector fields.
@@ -78,10 +80,19 @@ const _: () = assert!(
 /// A task's floating-point and SIMD register state.
 ///
 /// `v0`-`v31` are 128 bits each, plus the two status/control registers — 528 bytes with
-/// alignment. `align(16)` is load-bearing: the save and restore below use `stp q`/`ldp q`,
-/// which require 16-byte alignment.
+/// alignment.
+///
+/// `align(16)` is hygiene rather than a hard requirement, and an earlier version of this
+/// comment claimed otherwise ("`stp q`/`ldp q` require 16-byte alignment"). They do not
+/// here: `SCTLR_EL1.A` is 0 on this kernel — measured, `0x30d0199d` — so unaligned
+/// `LDP`/`STP` to Normal memory does not fault. The attribute costs nothing, avoids
+/// straddling cache lines, and *would* become load-bearing if alignment checking were ever
+/// enabled, which is reason enough to keep it — but not to misstate why.
+///
+/// Deliberately `Clone` but **not** `Copy`: at 528 bytes this now dominates `Task`, and
+/// `Copy` invites silent memcpys of that size at any assignment.
 #[repr(C, align(16))]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FpState {
     /// `v0`-`v31`, in register order.
     pub v: [u128; 32],
@@ -92,9 +103,14 @@ pub struct FpState {
     pub fpsr: u64,
 }
 
-// The save/restore asm hardcodes the FPCR/FPSR offsets, so tie them to the struct — the
-// `EXC_FRAME_RESERVE` lesson from 8.4b, where a constant sat beside hand-written assembly
-// that held its own copy of the number and the two could drift silently.
+// The FPCR/FPSR offsets reach the assembly as `const` operands, so there is one number in
+// one place — the `EXC_FRAME_RESERVE` technique from 8.4b, applied properly. A first pass
+// wrote the literals into the asm and left these assertions beside them, which is the very
+// arrangement 8.4b was criticised for: the assertions then constrained only the struct, and
+// the asm kept its own copy of the number.
+//
+// The assertions stay, because they pin what the *vector* half of the asm depends on —
+// `v` at offset 0 and the total size — which no operand expresses.
 const _: () = assert!(core::mem::offset_of!(FpState, v) == 0);
 const _: () = assert!(core::mem::offset_of!(FpState, fpcr) == 512);
 const _: () = assert!(core::mem::offset_of!(FpState, fpsr) == 520);
@@ -159,12 +175,14 @@ pub unsafe fn save(state: *mut FpState) {
             // Separate `str`s, not an `stp`: the GPR pair form encodes a signed 7-bit
             // scaled offset, i.e. [-512, 504], and 512 is one past its top. `str`'s
             // unsigned form reaches far further.
-            "str {t0}, [{p}, #512]",
-            "str {t1}, [{p}, #520]",
+            "str {t0}, [{p}, #{fpcr_off}]",
+            "str {t1}, [{p}, #{fpsr_off}]",
             ".arch_extension nofp",
             p = in(reg) state,
             t0 = out(reg) _,
             t1 = out(reg) _,
+            fpcr_off = const core::mem::offset_of!(FpState, fpcr),
+            fpsr_off = const core::mem::offset_of!(FpState, fpsr),
             options(nostack, preserves_flags),
         );
     }
@@ -196,15 +214,22 @@ pub unsafe fn restore(state: *const FpState) {
             "ldp q26, q27, [{p}, #(13 * 32)]",
             "ldp q28, q29, [{p}, #(14 * 32)]",
             "ldp q30, q31, [{p}, #(15 * 32)]",
-            "ldr {t0}, [{p}, #512]",
-            "ldr {t1}, [{p}, #520]",
+            "ldr {t0}, [{p}, #{fpcr_off}]",
+            "ldr {t1}, [{p}, #{fpsr_off}]",
             "msr FPCR, {t0}",
             "msr FPSR, {t1}",
             ".arch_extension nofp",
             p = in(reg) state,
             t0 = out(reg) _,
             t1 = out(reg) _,
-            options(nostack, preserves_flags),
+            fpcr_off = const core::mem::offset_of!(FpState, fpcr),
+            fpsr_off = const core::mem::offset_of!(FpState, fpsr),
+            // **No `preserves_flags`**, unlike `save`. On AArch64 that option covers NZCV
+            // *and FPSR*, and this block writes FPSR — promising to preserve a register it
+            // deliberately overwrites. Benign in a softfloat kernel that reads FP status
+            // nowhere, and exactly the kind of contract this port is careful about
+            // elsewhere. `save` keeps the option: it only ever reads FPSR.
+            options(nostack),
         );
     }
 }
@@ -251,12 +276,96 @@ static CLOBBERS: AtomicU64 = AtomicU64::new(0);
 /// one catches hand-written `asm!` and anything linked in that the target flag does not
 /// govern.
 pub fn selftest() -> bool {
+    // **Read `CPACR_EL1`. Do not assert its value in a string.**
+    //
+    // 8.4e deleted `verify_fp_trapped`, which was the only code in the kernel that ever
+    // read this register — and an earlier version of this function replaced it with a PASS
+    // line that *printed* `FPEN=0b11` without looking. That is exactly the failure 8.4b
+    // existed to fix: three comments claiming FP was trapped, none reading the register,
+    // and the truth (`FPEN = 0b11`, Limine's handoff value) sitting there unnoticed.
+    // Reintroducing it in the commit that removes the fix would have been a poor joke.
+    //
+    // It also makes `enable_fp_access` non-inert. Deleting that call passes every test
+    // otherwise, because Limine hands off with FP already enabled — so without this read
+    // the kernel would depend on the bootloader's choice while appearing to set it.
+    // Exercise `enable_fp_access` rather than merely observing its outcome.
+    //
+    // Reading the register alone is not enough to make that function non-inert: Limine
+    // hands off with FP already enabled, so deleting the call entirely still leaves
+    // `FPEN = 0b11` and every test green. That is a property of this bootloader, not of
+    // the kernel — on one that left FP off, the call would be the only thing standing
+    // between userspace and a fault on its first libc string routine. So clear the field,
+    // confirm it cleared, re-enable through the real function, and confirm that took.
+    //
+    // Interrupts are masked across the window because it is the one span in the kernel
+    // where FP genuinely must not be touched: a context switch in the middle would run
+    // `save`, whose sixteen `stp q` would trap. Nothing else in the window uses FP —
+    // no `println!`, which is why the results are collected and reported afterwards.
+    let irqs_were_on = crate::arch::irq::are_enabled();
+    crate::arch::irq::disable();
+    let cleared_ok = {
+        // SAFETY: read-modify-write of the FP-access gate, with interrupts masked and no
+        // FP executed before it is restored two statements later.
+        unsafe {
+            let c: u64;
+            core::arch::asm!("mrs {}, CPACR_EL1", out(reg) c, options(nomem, nostack));
+            core::arch::asm!(
+                "msr CPACR_EL1, {}",
+                "isb",
+                in(reg) c & !(0b11 << 20),
+                options(nomem, nostack, preserves_flags),
+            );
+            let after: u64;
+            core::arch::asm!("mrs {}, CPACR_EL1", out(reg) after, options(nomem, nostack));
+            (after >> 20) & 0b11 == 0
+        }
+    };
+    enable_fp_access();
+    if irqs_were_on {
+        crate::arch::irq::enable();
+    }
+
+    let cpacr: u64;
+    // SAFETY: reading CPACR_EL1 has no side effects.
+    unsafe { core::arch::asm!("mrs {}, CPACR_EL1", out(reg) cpacr, options(nomem, nostack)) };
+    let fpen = (cpacr >> 20) & 0b11;
+    if !cleared_ok {
+        println!(
+            "[fp] selftest: FAIL — CPACR_EL1.FPEN did not clear when written, so this \
+             test cannot prove `enable_fp_access` does anything."
+        );
+        return false;
+    }
+    if fpen != 0b11 {
+        println!(
+            "[fp] selftest: FAIL — CPACR_EL1.FPEN={:#04b}, expected 0b11. EL0 cannot use \
+             FP/SIMD, so userspace would fault on its first libc string routine. \
+             `enable_fp_access` did not take effect.",
+            fpen
+        );
+        return false;
+    }
+
+    // Preserve whatever the calling task actually had, so the test leaves nothing behind.
+    // Without this the `0xA5A5…` pattern below stays in the boot task's saved state for
+    // the life of the boot and shows up in any fault dump as though it were live.
+    let mut caller = FpState::new();
+    // SAFETY: `caller` is a live, aligned FpState.
+    unsafe { save(&mut caller) };
+
     // A pattern where every register differs, so a clobber of any single one is visible
     // and a swap between two is not mistaken for preservation.
     let mut pattern = FpState::new();
     for (i, slot) in pattern.v.iter_mut().enumerate() {
         *slot = 0xA5A5_0000_0000_0000_u128 << 64 | (0x1000 + i as u128);
     }
+    // FPCR/FPSR are covered too, and were not until a review deleted all eight of their
+    // save/restore instructions and watched the whole suite stay green — a third of the
+    // struct, both offset literals, and the two `offset_of!` assertions guarding them, all
+    // inert. RMode = 0b01 (round toward +inf) and the IXC cumulative flag are both legal
+    // non-default values in architecturally-defined bits, so they read back exactly.
+    pattern.fpcr = 0b01 << 22;
+    pattern.fpsr = 1 << 4;
 
     // SAFETY: `pattern` is a live, aligned FpState.
     unsafe { restore(&pattern) };
@@ -264,8 +373,14 @@ pub fn selftest() -> bool {
     // Representative kernel work, chosen for what it touches rather than for volume:
     // `format!` exercises `core::fmt` (the lowering that forced FP *on* back in 7.0b, when
     // the kernel was hardfloat), the allocator runs, and `yield_now` forces a real context
-    // switch — including this task's own FP save and restore, so the round trip is part of
-    // what is being checked.
+    // switch.
+    //
+    // Note what that last part does *not* prove. A review deleted the scheduler's
+    // save/restore entirely and this test still passed: for its own task the schedule-time
+    // round trip is value-preserving, so its presence and absence are indistinguishable
+    // from here. What this checks is that kernel code does not clobber FP, and that `save`
+    // and `restore` round-trip as a pair. The *scheduler's* use of them is guarded by the
+    // soak, which runs two EL0 tasks holding different values, and by nothing else.
     let s = alloc::format!("[fp] selftest scratch {}", crate::arch::time::tick_count());
     core::hint::black_box(&s);
     crate::sched::yield_now();
@@ -273,6 +388,11 @@ pub fn selftest() -> bool {
     let mut observed = FpState::new();
     // SAFETY: `observed` is a live, aligned FpState.
     unsafe { save(&mut observed) };
+
+    // Put the caller's real state back before reporting, so nothing downstream inherits
+    // the test pattern.
+    // SAFETY: `caller` holds the state saved at entry.
+    unsafe { restore(&caller) };
 
     let mut ok = true;
     for i in 0..32 {
@@ -287,11 +407,27 @@ pub fn selftest() -> bool {
             break; // one is enough; listing all 32 buries the signal
         }
     }
+    if observed.fpcr != pattern.fpcr {
+        println!(
+            "[fp] selftest: FAIL — FPCR changed: wrote {:#x}, read back {:#x}",
+            pattern.fpcr, observed.fpcr
+        );
+        ok = false;
+    }
+    if observed.fpsr != pattern.fpsr {
+        println!(
+            "[fp] selftest: FAIL — FPSR changed: wrote {:#x}, read back {:#x}",
+            pattern.fpsr, observed.fpsr
+        );
+        ok = false;
+    }
 
     if ok {
         println!(
-            "[fp] selftest: PASS (FPEN=0b11, v0-v31 survived core::fmt, the allocator and \
-             a context switch; kernel is softfloat by build assertion)"
+            "[fp] selftest: PASS (CPACR_EL1.FPEN={:#04b} read back, v0-v31 + FPCR/FPSR \
+             survived core::fmt, the allocator and a context switch; kernel is softfloat \
+             by build assertion)",
+            fpen
         );
     }
     ok

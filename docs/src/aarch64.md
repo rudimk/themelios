@@ -67,7 +67,15 @@ The kernel loads its root into `TTBR1_EL1` and parks `TTBR0_EL1` at zero. At EL1
 
 x86's `switch_context` ends in `ret`, which pops a return address off the stack. aarch64's `ret` branches to whatever is in `x30`. A new task's initial frame therefore places the bootstrap trampoline in the `x30` slot and the entry function in `x19`.
 
-There is **no FP save area**: the kernel is built for `aarch64-unknown-none-softfloat` and emits no vector instructions, and `CPACR_EL1.FPEN` is cleared at boot so a stray SIMD instruction traps loudly instead of corrupting another task's floating-point state. That backstop is verified at boot, not assumed — when it was first *read* rather than asserted, `FPEN` turned out to be `0b11`, so the safety net had never existed.
+### FPSIMD is saved per task, and FP is enabled at both ELs
+
+Until Phase 8.4e there was **no FP save area**: the kernel is built for `aarch64-unknown-none-softfloat`, and `CPACR_EL1.FPEN` was *cleared* at boot so a stray SIMD instruction trapped loudly instead of corrupting another task's floating-point state. That backstop was verified rather than assumed — when the register was first *read* instead of asserted about, `FPEN` turned out to be `0b11`, so the net had never existed behind three comments claiming it did.
+
+8.4e reverses it, because userspace must be hardfloat. There is no soft-float A-profile ABI (AAPCS64 defines one only for Armv8-R), glibc's *base* `strlen.S` opens with `ld1`, and the first lazy PLT binding in any dynamically-linked aarch64 binary executes SIMD. `FPEN` has four encodings and **none permits EL0 while trapping EL1** — `0b01` is the reverse — so enabling FP for userspace enables it at EL1 too.
+
+Each task therefore carries 528 bytes of `v0`-`v31` + `FPCR`/`FPSR`, saved and restored **on the context switch and nowhere else**. The kernel emits no FP, so it cannot disturb a task's registers while handling that task's own exception; what can is another EL0 task running in between. That is why the exception frame has no vector fields — the same conclusion Linux reaches.
+
+The removed trap is replaced by two guards: a **build-time assertion** that the target is softfloat (`target_feature = "neon"` is set for `aarch64-unknown-none` and unset for the softfloat target), which is stronger than the trap for the hazard that actually worried anyone; and a **boot self-test** that reads `CPACR_EL1` back, clears and re-enables `FPEN` to prove the enabling path works, and checks that a pattern in all 32 vector registers plus `FPCR`/`FPSR` survives `core::fmt`, the allocator and a context switch. `CPACR_EL1.ZEN` stays trapping and `HWCAP_SVE` is not advertised, because SVE's `z`/`p` state is not in the save area.
 
 ### A new task is entered by `ret`, not `eret`
 

@@ -260,6 +260,14 @@ soak_payload_start:
     fmov d0,  x0
     fmov d8,  x0
     fmov d31, x0
+    // Low 64 bits only. `fmov d<n>, x` zeroes bits 127:64, so both tasks carry zero up
+    // there and the soak cannot tell them apart in the high half — it checks that the
+    // *scheduler* keeps two tasks' vector state separate, which the low half settles.
+    // Full 128-bit width across all 32 registers is `fpsimd::selftest`'s job, and it does
+    // catch a save that drops a pair the soak never looks at. Seeding the high half here
+    // would need `ins`, which is Advanced SIMD: the softfloat assembler rejects it and
+    // `.arch_extension neon` is not a name it accepts, so it would take a broader `.arch`
+    // directive whose leak radius is worse than the gap it closes.
     .arch_extension nofp
 1:
     mov  x8, #3             // SYS_ADD
@@ -280,8 +288,19 @@ soak_payload_start:
     mov  x8, #7             // SYS_FPCHECK
     svc  #0
 
-    // Reload the TLS value and fold it into the accumulator, so a lost SP_EL0 or a
-    // mis-restored TPIDR_EL0 both change the single number the soak asserts on.
+    // Read TPIDR_EL0 **at EL0, after the loop**, and fold it in. This is the only check
+    // on the *exception frame's* tpidr_el0 restore, as opposed to the scheduler's.
+    //
+    // `SYS_GETTLS` above cannot cover it: it runs before any exception return has had a
+    // chance to clobber the register. A review zeroed `msr TPIDR_EL0` in the exception
+    // exit and the whole suite stayed green, including the line claiming TPIDR_EL0 was
+    // verified. Most of the 65536 returns below involve no context switch, so if the
+    // frame restore is broken the register reads back zero here.
+    mrs  x3, tpidr_el0
+    add  x19, x19, x3
+
+    // Reload the TLS value from the user stack and fold it in too, so a lost SP_EL0 also
+    // changes the single number the soak asserts on.
     ldr  x1, [sp], #16
     add  x19, x19, x1
 
@@ -469,7 +488,10 @@ pub fn run() -> bool {
         // the payload reloaded from its user stack. One number covering three mechanisms —
         // a wrong return value, a lost SP_EL0, or a mis-restored TPIDR_EL0 each change it.
         let tls_expected = s.tls_expected.load(Ordering::Relaxed);
-        let expected = EXPECTED_SUM.wrapping_add(tls_expected);
+        // Twice the TLS base: once read back through `mrs tpidr_el0` at EL0 (which tests
+        // the exception frame's restore) and once reloaded from the user stack (which
+        // tests SP_EL0). Wrapping, because the bases are large.
+        let expected = EXPECTED_SUM.wrapping_add(tls_expected.wrapping_mul(2));
         let got = s.exit_code.load(Ordering::Relaxed);
         if got != expected {
             println!(

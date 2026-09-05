@@ -271,8 +271,11 @@ parity — see above.**
   through `SPSR`) — disabling 7.2's abort vector and misattributing any pending SError
   to a later task; and `CPACR_EL1.FPEN` was **`0b11`** — Limine leaves FP enabled, so
   the "stray SIMD traps loudly" backstop justifying the absent `v8`-`v15` save area had
-  never existed. FPEN is now cleared *and verified* at boot, `verify_fp_trapped` gates
-  the sentinel, and the kernel passes every self-test with FP trapping.
+  never existed. FPEN was then cleared *and verified* at boot and the kernel passed
+  every self-test with FP trapping. **Superseded by 8.4e**, which had to enable FP again
+  for userspace's sake — `FPEN` has no encoding permitting EL0 while trapping EL1 — and
+  replaced the trap with a build-time softfloat assertion plus a per-task FPSIMD save
+  area; `verify_fp_trapped` no longer exists.
 - ✅ **7.4** **Shell, portable tests, CI, finalize.** `mod shell` and `mod test_runner`
   un-gated; `cap`/`audit`/`ipc`/`http`/`oci`/`mm::shared` un-gated for aarch64 (all
   `alloc`-only; `cap`+`audit` needed only `ProcessId`, so aarch64 gets the 41-line
