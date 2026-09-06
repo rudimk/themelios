@@ -203,6 +203,67 @@ fn ensure_limine(root: &Path) -> PathBuf {
 // Userspace servers
 // ============================================================================
 
+/// The Rust target triple the userspace servers are built for, given a kernel target.
+///
+/// **aarch64 servers are hardfloat**, unlike the kernel. That is not an oversight: there is
+/// no soft-float A-profile ABI, and real userspace uses SIMD unconditionally (glibc's base
+/// `strlen.S` opens with `ld1`). Phase 8.4e enabled `CPACR_EL1.FPEN` and gave every task a
+/// `v0`-`v31` save area precisely so this can be true. The kernel stays softfloat.
+fn server_target(kernel_target: &str) -> &'static str {
+    match kernel_target {
+        "x86_64-unknown-none" => "x86_64-unknown-none",
+        "aarch64-unknown-none-softfloat" => "aarch64-unknown-none",
+        other => panic!("no server target known for kernel target {other}"),
+    }
+}
+
+/// Short architecture name used to partition the staging directory.
+fn stage_arch(kernel_target: &str) -> &'static str {
+    match kernel_target {
+        "x86_64-unknown-none" => "amd64",
+        "aarch64-unknown-none-softfloat" => "arm64",
+        other => panic!("no staging arch known for kernel target {other}"),
+    }
+}
+
+/// `e_machine` values, for checking a staged ELF really is for the target we asked for.
+const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+
+fn expected_e_machine(kernel_target: &str) -> u16 {
+    match kernel_target {
+        "x86_64-unknown-none" => EM_X86_64,
+        "aarch64-unknown-none-softfloat" => EM_AARCH64,
+        other => panic!("no e_machine known for kernel target {other}"),
+    }
+}
+
+/// Read `e_machine` (ELF header offset 18, u16 LE) from a file, or `None` if it is not an
+/// ELF at all.
+///
+/// Flat binaries have no header, which is why this returns an `Option` and why the `.bin`
+/// blobs are protected structurally — by the per-arch staging directory and the kernel's
+/// `#[cfg]`'d `include_bytes!` — rather than by this check. Only the six detached `.elf`
+/// smoke binaries can be verified directly.
+fn elf_machine(path: &Path) -> Option<u16> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < 20 || &bytes[0..4] != b"\x7fELF" {
+        return None;
+    }
+    Some(u16::from_le_bytes([bytes[18], bytes[19]]))
+}
+
+/// Whether the userspace servers can be built for this kernel target yet.
+///
+/// `libthemelios`' syscall wrappers are 25 hand-written `asm!` blocks using the x86
+/// `syscall` instruction and register set, and the six detached smoke crates add 28 more
+/// in their `_start` routines. Those land in Phase 8.5b. Until then this returns false for
+/// aarch64 and the callers say so rather than failing to link — and the aarch64 kernel
+/// embeds nothing anyway, since `mod process` is still x86-gated.
+fn servers_supported(kernel_target: &str) -> bool {
+    kernel_target == "x86_64-unknown-none"
+}
+
 /// The userspace server binaries to build and embed in the kernel.
 ///
 /// Each entry is a binary crate in the `servers/` workspace. Built for
@@ -225,11 +286,21 @@ const SERVER_BINARIES: &[&str] = &[
 /// Servers are linked with `--oformat binary` (LLD emits the raw memory image,
 /// so the kernel needs no ELF parser) against the server linker script, with a
 /// static relocation model (they load at a fixed virtual base).
-fn build_servers(root: &Path) {
+fn build_servers(root: &Path, kernel_target: &str) {
+    let target = server_target(kernel_target);
     let servers_dir = root.join("servers");
     let linker_script = servers_dir.join("linker.ld");
-    let out_dir = root.join("target/servers");
-    fs::create_dir_all(&out_dir).expect("failed to create target/servers");
+    // **Staging is partitioned by architecture, and that is load-bearing.**
+    //
+    // These used to stage to a flat `target/servers/`, which was fine while only one
+    // architecture existed. The moment the target became a parameter it stopped being
+    // fine: `embedded.rs` embeds these by fixed path, so an arm64 kernel built after an
+    // amd64 build would have embedded **x86 blobs** and failed as an undefined-instruction
+    // abort at EL0, arbitrarily far from the cause. The kernel's `include_bytes!` are
+    // `#[cfg]`'d to the matching directory.
+    let out_dir = root.join("target/servers").join(stage_arch(kernel_target));
+    fs::create_dir_all(&out_dir)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_dir.display()));
 
     // Link flags: place sections per the server linker script, emit a flat
     // binary, and link non-relocatable (fixed load address).
@@ -238,14 +309,14 @@ fn build_servers(root: &Path) {
         linker_script.display()
     );
 
-    println!("Building userspace servers...");
+    println!("Building userspace servers for {target}...");
     let status = Command::new("cargo")
         .current_dir(&servers_dir)
         .env("RUSTFLAGS", &rustflags)
         .args([
             "build",
             "--release",
-            "--target", "x86_64-unknown-none",
+            "--target", target,
             BUILD_STD,
             BUILD_STD_FEATURES,
         ])
@@ -257,7 +328,7 @@ fn build_servers(root: &Path) {
     }
 
     // Stage each server's flat binary where the kernel embeds it.
-    let release_dir = servers_dir.join("target/x86_64-unknown-none/release");
+    let release_dir = servers_dir.join(format!("target/{target}/release"));
     for name in SERVER_BINARIES {
         let built = release_dir.join(name);
         let staged = out_dir.join(format!("{name}.bin"));
@@ -270,12 +341,12 @@ fn build_servers(root: &Path) {
 
     // Build the Phase 5.0/5.1 smoke-test binaries as real ELFs (not flat
     // binaries), staged where the kernel embeds them.
-    build_detached_elf(root, &out_dir, "elf-smoke"); // 5.0 loader test (native ABI)
-    build_detached_elf(root, &out_dir, "linux-smoke"); // 5.1 Linux-personality test
-    build_detached_elf(root, &out_dir, "fs-smoke"); // 5.2 Linux FS-syscall test
-    build_detached_elf(root, &out_dir, "threads-smoke"); // 5.3 threads/futex test
-    build_detached_elf(root, &out_dir, "isolation-smoke"); // 5.7 container-isolation test
-    build_detached_elf(root, &out_dir, "confine-smoke"); // 6.1b rootfs-confinement test
+    build_detached_elf(root, &out_dir, "elf-smoke", kernel_target); // 5.0 loader test (native ABI)
+    build_detached_elf(root, &out_dir, "linux-smoke", kernel_target); // 5.1 Linux-personality test
+    build_detached_elf(root, &out_dir, "fs-smoke", kernel_target); // 5.2 Linux FS-syscall test
+    build_detached_elf(root, &out_dir, "threads-smoke", kernel_target); // 5.3 threads/futex test
+    build_detached_elf(root, &out_dir, "isolation-smoke", kernel_target); // 5.7 container-isolation test
+    build_detached_elf(root, &out_dir, "confine-smoke", kernel_target); // 6.1b rootfs-confinement test
 }
 
 /// Build a detached smoke-test crate as a **real ELF** (not a flat binary).
@@ -285,7 +356,8 @@ fn build_servers(root: &Path) {
 /// ELF loader has genuine ELF headers + `PT_LOAD` segments to parse. Each is a
 /// detached crate (own workspace), so `build_servers`' flat-binary flags don't
 /// reach it. Staged to `target/servers/<name>.elf`.
-fn build_detached_elf(root: &Path, out_dir: &Path, name: &str) {
+fn build_detached_elf(root: &Path, out_dir: &Path, name: &str, kernel_target: &str) {
+    let target = server_target(kernel_target);
     let crate_dir = root.join("servers").join(name);
     // Static reloc + no-PIE keeps the output ET_EXEC with fixed segment vaddrs.
     let rustflags = "-C relocation-model=static -C link-arg=-no-pie";
@@ -298,7 +370,7 @@ fn build_detached_elf(root: &Path, out_dir: &Path, name: &str) {
             "build",
             "--release",
             "--target",
-            "x86_64-unknown-none",
+            target,
             "-Zbuild-std=core",
         ])
         .status()
@@ -308,7 +380,32 @@ fn build_detached_elf(root: &Path, out_dir: &Path, name: &str) {
         process::exit(1);
     }
 
-    let built = crate_dir.join(format!("target/x86_64-unknown-none/release/{name}"));
+    let built = crate_dir.join(format!("target/{target}/release/{name}"));
+
+    // Verify the artifact is for the architecture we asked for, *before* staging it.
+    //
+    // Catches a stale binary left by a previous build for the other architecture — the
+    // failure the per-arch staging directory prevents structurally, checked here as well
+    // because a `cargo build` that silently no-ops would otherwise stage last time's
+    // output. Flat `.bin` servers cannot be checked this way: `--oformat=binary` means
+    // there is no ELF header to read, so their protection is structural only.
+    let want = expected_e_machine(kernel_target);
+    match elf_machine(&built) {
+        Some(got) if got == want => {}
+        Some(got) => {
+            eprintln!(
+                "{name}: built ELF is for e_machine {got}, expected {want} ({target}). \
+                 A stale artifact from another architecture would be embedded in the \
+                 kernel and fault at its first instruction in userspace."
+            );
+            process::exit(1);
+        }
+        None => {
+            eprintln!("{name}: {} is not an ELF", built.display());
+            process::exit(1);
+        }
+    }
+
     let staged = out_dir.join(format!("{name}.elf"));
     fs::copy(&built, &staged)
         .unwrap_or_else(|e| panic!("failed to stage {name}: {e} ({})", built.display()));
@@ -1658,7 +1755,17 @@ fn cmd_build(args: &[String]) {
 
     // Build the userspace servers first — the kernel embeds their flat binaries
     // via include_bytes!, so they must exist before the kernel compiles.
-    build_servers(&root);
+    //
+    // Gated on the architecture, which it was not before: `cmd_build` called this
+    // unconditionally, including for `--arch aarch64`, where `libthemelios`' 25 `asm!`
+    // blocks are still x86-only and the build would fail. aarch64 servers land in 8.5b;
+    // until then the aarch64 kernel embeds nothing, because `mod process` — and with it
+    // `embedded.rs` — is x86-gated too.
+    if servers_supported(target) {
+        build_servers(&root, target);
+    } else {
+        println!("Skipping userspace servers: not yet ported to {target} (Phase 8.5b).");
+    }
 
     // Clean the kernel crate's cached artifacts before building. This forces
     // a full recompile every time, which ensures build.rs re-runs and generates
@@ -1851,7 +1958,15 @@ fn cmd_test(args: &[String]) {
     println!("Building ThemeliOS kernel (test mode) for {target}...");
 
     // Build the userspace servers first (the kernel embeds their binaries).
-    build_servers(&root);
+    //
+    // The aarch64 path returns above, before reaching this — which is the *other* half of
+    // the asymmetry the plan flagged: `cmd_build` built servers for an architecture that
+    // cannot compile them, and `cmd_test` built them for neither. Both are now explicit.
+    if servers_supported(target) {
+        build_servers(&root, target);
+    } else {
+        println!("Skipping userspace servers: not yet ported to {target} (Phase 8.5b).");
+    }
 
     // Clean cached artifacts to ensure build.rs re-runs (fresh ULID).
     let _ = Command::new("cargo")
