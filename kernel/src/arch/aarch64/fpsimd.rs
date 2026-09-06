@@ -35,10 +35,16 @@
 //!    (verified with `rustc --print cfg` for both), so the compiler can tell us. This is
 //!    strictly stronger than the trap for the case that actually worried us — someone
 //!    switching the target — because it fails the build instead of a boot.
-//! 2. **A boot self-test that the kernel does not clobber FP.** [`selftest`] loads a known
-//!    pattern into `v0`-`v31`, runs representative kernel work over it, and checks the
-//!    pattern survives. The trap could only catch FP the kernel *executed*; this catches
-//!    the consequence, which is what actually matters.
+//! 2. **A boot self-test.** [`selftest`] reads `CPACR_EL1` back rather than asserting its
+//!    value in a string, clears and re-enables `FPEN` to prove [`enable_fp_access`] does
+//!    something (deleting the call is otherwise undetectable — Limine hands off with FP
+//!    already on), and checks that a pattern in `v0`-`v31` *and* `FPCR`/`FPSR` survives
+//!    `core::fmt`, the allocator and a context switch. The trap could only catch FP the
+//!    kernel *executed*; this catches the consequence, which is what matters.
+//!
+//! What (2) does **not** cover is the scheduler's use of `save`/`restore`: for its own task
+//! the schedule-time round trip is value-preserving, so deleting it is invisible from here.
+//! That is the soak's job — two EL0 tasks holding different values — and nothing else's.
 //!
 //! Neither is airtight — (2) covers only the paths it exercises — but both are
 //! measurements rather than claims, which the thing they replace had not been until 8.4b
@@ -115,7 +121,8 @@ const _: () = assert!(core::mem::offset_of!(FpState, v) == 0);
 const _: () = assert!(core::mem::offset_of!(FpState, fpcr) == 512);
 const _: () = assert!(core::mem::offset_of!(FpState, fpsr) == 520);
 const _: () = assert!(core::mem::size_of::<FpState>() == 528);
-// `stp q`/`ldp q` require 16-byte alignment.
+// Pins the alignment the `repr` asks for. Not a hardware requirement here — see the type's
+// docs — but if `SCTLR_EL1.A` is ever set, this is what stops it becoming one silently.
 const _: () = assert!(core::mem::align_of::<FpState>() % 16 == 0);
 
 impl FpState {
