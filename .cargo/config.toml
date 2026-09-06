@@ -30,6 +30,8 @@ rustflags = ["-Crelocation-model=static", "-Clink-arg=-Tkernel/linker-x86_64.ld"
 # x0-x30. Any handler that touches FP on a path that *returns* would silently corrupt
 # the interrupted context, with no fault. Softfloat removes the hazard by construction
 # rather than by convention, at the cost of no FP in the kernel — the same trade Linux
-# makes. It also means `CPACR_EL1.FPEN` no longer has to be enabled in early boot.
+# makes. FP/SIMD *is* enabled in early boot as of Phase 8.4e — userspace needs it and
+# CPACR_EL1.FPEN cannot permit EL0 while trapping EL1 — but the kernel itself still emits
+# no vector instructions, which is what keeps it from clobbering a task's FPSIMD state.
 [target.aarch64-unknown-none-softfloat]
 rustflags = ["-Crelocation-model=static", "-Clink-arg=-Tkernel/linker-aarch64.ld"]

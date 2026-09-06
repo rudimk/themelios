@@ -207,6 +207,17 @@ pub struct Task {
     /// the scheduler switches *between* tasks.
     #[cfg(target_arch = "aarch64")]
     pub tpidr_el0: u64,
+
+    /// This task's FPSIMD registers, saved and restored across every context switch.
+    ///
+    /// 528 bytes per task — by far the largest field here, and unconditional rather than
+    /// lazily allocated. Userspace on aarch64 *is* hardfloat (there is no soft-float
+    /// A-profile ABI, and glibc's base `strlen` opens with `ld1`), so FP must be enabled
+    /// at EL0; `CPACR_EL1.FPEN` has no encoding that permits EL0 while trapping EL1, so it
+    /// is enabled at EL1 too and the kernel's softfloat build is what keeps it from
+    /// clobbering this. See [`crate::arch::aarch64::fpsimd`].
+    #[cfg(target_arch = "aarch64")]
+    pub fp: crate::arch::aarch64::fpsimd::FpState,
 }
 
 impl Task {

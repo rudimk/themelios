@@ -18,26 +18,20 @@
 //! so each stage prints a sentinel the CI smoke asserts on, and the smoke fails on the
 //! specific `FAIL` line rather than on a timeout.
 //!
-//! ## FP/SIMD is deliberately trapped
+//! ## FP/SIMD is enabled, and the backstop is no longer a trap
 //!
-//! Phase 7.0b built for the *hardfloat* `aarch64-unknown-none` target, where the
-//! compiler lowers struct moves and `core::fmt` to SIMD, and so had to enable
-//! `CPACR_EL1.FPEN` before the first `println!` or those lowerings trapped.
+//! Phase 7.0b built for the *hardfloat* target and had to enable `CPACR_EL1.FPEN` before
+//! the first `println!`. 7.3 moved to `aarch64-unknown-none-softfloat` and *disabled* FP,
+//! so a stray SIMD instruction would raise `ESR_EL1.EC = 0x07` rather than corrupt vector
+//! state the context switch did not save.
 //!
-//! The kernel now targets **`aarch64-unknown-none-softfloat`**, which emits no vector
-//! instructions, so boot *disables* FP access rather than enabling it. That is not
-//! merely simpler — it is what makes both the exception path and the context switch
-//! sound. Neither saves any
-//! vector register: the entry stub saves x0-x30, and `switch_context` saves x19-x30,
-//! even though AAPCS64 makes the low half of `v8`-`v15` callee-saved. With softfloat
-//! *and* `FPEN` trapping, any SIMD that ever sneaks in raises `ESR_EL1.EC = 0x07` —
-//! which the exception decoder names — instead of corrupting another task's
-//! floating-point state with no fault to point at.
-//!
-//! That backstop is **checked**, not assumed:
-//! [`exceptions::verify_fp_trapped`](crate::arch::aarch64::exceptions::verify_fp_trapped)
-//! reads `CPACR_EL1` at boot and the 7.3 sentinel depends on it. It was asserted in
-//! three comments and read by nothing until Phase 7.3.
+//! **8.4e enables it again**, because userspace must be hardfloat (no soft-float A-profile
+//! ABI exists; glibc's base `strlen.S` opens with `ld1`) and `FPEN` has no encoding that
+//! permits EL0 while trapping EL1. The kernel stays softfloat, tasks now carry a real
+//! `v0`-`v31` + `FPCR`/`FPSR` save area across context switches, and the removed trap is
+//! replaced by a build-time assertion that the target is softfloat plus a boot self-test
+//! that kernel work leaves vector state intact. See
+//! [`fpsimd`](crate::arch::aarch64::fpsimd) for the full argument.
 //!
 //! One thing must still happen before the first `println!`:
 //! 1. **Map the PL011 UART.** Limine's HHDM maps RAM but **not** device MMIO, so the
@@ -300,12 +294,17 @@ pub fn kmain_aarch64(
     // must not wait for the scheduler.
     crate::arch::aarch64::percpu::init();
 
-    // Establish — then confirm — the assumption the context switch and the exception
-    // stub both rest on: FP/SIMD traps, so the absent v8-v15 save area cannot corrupt
-    // state silently. Deliberately after the vector table is live, so that a stray
-    // vector instruction is reported rather than branching into bootloader leftovers.
-    crate::arch::aarch64::exceptions::trap_fp_access();
-    let fp_trapped = crate::arch::aarch64::exceptions::verify_fp_trapped();
+    // **Enable** FP/SIMD at EL0 and EL1 (Phase 8.4e), reversing 8.4b, which trapped it.
+    //
+    // Userspace on aarch64 is hardfloat — there is no soft-float A-profile ABI and glibc's
+    // base `strlen` opens with `ld1` — and `CPACR_EL1.FPEN` has no encoding that permits
+    // EL0 while trapping EL1. So the trap 8.4b installed and verified has to go, and the
+    // backstop it provided is replaced by a compile-time softfloat assertion plus a boot
+    // self-test that kernel work does not disturb vector state. See `fpsimd`.
+    //
+    // Still deliberately after the vector table is live: if this ordering is ever wrong,
+    // the fault is reported rather than branching into bootloader leftovers.
+    crate::arch::aarch64::fpsimd::enable_fp_access();
 
     // --- Phase 7.1: memory management on our own page tables ---
     bring_up_memory(hhdm, k, entries);
@@ -331,7 +330,11 @@ pub fn kmain_aarch64(
     // Run after the scheduler test, which is what gives the per-CPU block dozens of
     // switches to have been updated by; before it there would be nothing to check.
     let percpu_ok = crate::arch::aarch64::percpu::selftest();
-    if sched_ok && percpu_ok && fp_trapped {
+    // Runs here because it needs the scheduler: part of what it checks is that a task's
+    // vector state survives a real context switch, which is the transition the save area
+    // exists for.
+    let fp_ok = crate::arch::aarch64::fpsimd::selftest();
+    if sched_ok && percpu_ok && fp_ok {
         crate::println!("[boot] Phase 7.3 scheduler reached; self-test passed.");
     } else {
         crate::println!("[boot] Phase 7.3 scheduler FAILED self-test.");

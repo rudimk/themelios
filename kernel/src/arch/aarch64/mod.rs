@@ -58,6 +58,10 @@ pub mod uaccess;
 /// scheduler that does not interleave. Phase 8's riskiest unknown.
 pub mod el0_soak;
 
+/// Per-task FPSIMD state (`v0`-`v31` + `FPCR`/`FPSR`), and the `CPACR_EL1.FPEN` policy
+/// that makes userspace hardfloat possible. Phase 8.4e.
+pub mod fpsimd;
+
 /// PSCI power control — how the machine stops (the `isa-debug-exit` analog).
 pub mod psci;
 
