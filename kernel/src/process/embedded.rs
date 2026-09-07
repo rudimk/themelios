@@ -27,8 +27,11 @@
 //! aarch64 arm and the two sets of paths must stay in step with `xtask`'s `stage_arch`.
 //!
 //! The `.elf` blobs additionally carry a compile-time check that they are for the right
-//! architecture — see below. The flat `.bin` servers cannot: `--oformat=binary` leaves no
-//! ELF header to read, so their only protection is the partitioned directory.
+//! architecture — see below. The flat `.bin` servers cannot carry one: `--oformat=binary`
+//! leaves no ELF header to read. They are covered instead by the partitioned directory and
+//! by the committed hash manifest (`xtask/servers-amd64.sha256`, checked by `cargo xtask
+//! verify-servers`), which is what proves across the Phase 8 userspace port that the amd64
+//! blobs did not move.
 
 /// The echo server: a minimal IPC echo used to validate the server framework
 /// (sub-phase 3.4). Replaced/joined by the real filesystem servers in 3.5+.
@@ -95,10 +98,11 @@ pub static CONFINE_SMOKE: &[u8] = include_bytes!("../../../target/servers/amd64/
 // a blob built for the wrong architecture fails the *kernel build*, rather than being
 // loaded and faulting at its first instruction in userspace with no trace of why.
 //
-// Only the detached `.elf` smoke binaries can be checked. The flat `.bin` servers are
-// linked with `--oformat=binary`, so they are raw memory images with no header — nothing
-// to assert on, and the reason the staging directory is partitioned by architecture
-// instead of relying on a check like this one.
+// Only the detached `.elf` smoke binaries can be checked *here*. The flat `.bin` servers
+// are linked with `--oformat=binary`, so they are raw memory images with no header —
+// nothing to assert on, which is why the staging directory is partitioned by architecture
+// rather than relying on a check like this one, and why their contents are pinned by
+// `xtask`'s hash manifest instead.
 //
 // `xtask` performs the same check on the built artifact before staging it, which catches a
 // stale file from a previous build for the other architecture. Two checks, different
