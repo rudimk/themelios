@@ -2318,6 +2318,11 @@ fn render_manifest(out_dir: &Path) -> String {
 /// covers the seven flat `.bin` servers, which have no ELF header for `elf_machine` to
 /// read — the per-arch directory keeps the architectures apart structurally, and this
 /// keeps their *contents* honest.
+///
+/// On an architecture whose servers are not ported yet it succeeds without doing anything,
+/// so the CI step can be wired into both jobs now and starts checking on its own when the
+/// port lands. See the contradiction guards in the body for what keeps that from being a
+/// permanently silent pass.
 fn cmd_verify_servers(args: &[String]) {
     // `parse_options` rejects anything it does not know, so `--update` is stripped before
     // it rather than added to the shared option set — it is meaningful for this command
@@ -2328,16 +2333,44 @@ fn cmd_verify_servers(args: &[String]) {
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
+    let stage = stage_arch(target);
+    let manifest = manifest_path(&root, stage);
+
+    // An architecture with no servers yet is "nothing to verify", not a failure.
+    //
+    // This exists so the CI step can be added to **both** jobs today. The aarch64 job runs
+    // the same command, it passes by doing nothing, and it becomes load-bearing on its own
+    // the moment 8.5b flips `servers_supported` — with no workflow edit and nothing for
+    // anyone to remember. The alternative, "add the arm64 step when 8.5b lands", is the
+    // deferral that five review rounds running have caught going unmade.
+    //
+    // A check that passes by doing nothing is admittedly a weak check *today*. It earns its
+    // place through the two contradictions below, which are the states that would let the
+    // whole mechanism go quiet, and which are the reason this is not simply an early
+    // `return`.
     if !servers_supported(target) {
-        eprintln!("verify-servers: servers are not built for {target} yet (Phase 8.5b).");
-        process::exit(1);
+        // A manifest for an architecture that builds no servers means someone generated it
+        // and then lost the build wiring — the manifest would sit there looking like
+        // coverage while nothing produced the blobs it names.
+        if manifest.exists() {
+            eprintln!(
+                "verify-servers: {} exists, but no servers are built for {target}.\n\
+                 A manifest without a build is not coverage. Either restore the build \
+                 wiring (`servers_supported`) or delete the manifest.",
+                manifest.display()
+            );
+            process::exit(1);
+        }
+        println!(
+            "verify-servers: nothing to verify for {target} — servers are not ported yet \
+             (Phase 8.5b). This becomes a real check automatically when they are."
+        );
+        return;
     }
 
     build_servers(&root, target);
 
-    let stage = stage_arch(target);
     let out_dir = root.join("target/servers").join(stage);
-    let manifest = manifest_path(&root, stage);
     let actual = render_manifest(&out_dir);
 
     if update {
@@ -2534,6 +2567,8 @@ Commands:
     verify-servers   Build the userspace servers and check the staged blobs against the
                      committed hash manifest (xtask/servers-<arch>.sha256).
                      Pass --update to regenerate the manifest after an intended change.
+                     Succeeds without doing anything on an architecture whose servers
+                     are not ported yet, so it can be wired into CI for both.
     arm64-gate       Compile smoltcp + kernel for aarch64-unknown-none-softfloat (dependency gate)
     arm64-smoke      Boot the aarch64 kernel on QEMU virt from a UEFI ESP (banner smoke)
     arm64-iso-smoke  Boot the aarch64 ISO on QEMU virt (banner smoke)
