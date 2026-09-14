@@ -127,13 +127,43 @@ impl ExceptionFrame {
     }
 }
 
-/// Syscall numbers. Deliberately the kernel's own small set for now; the Linux
-/// personality's `asm-generic` numbering is a separate table layered above this.
+/// **EL0 self-test syscall numbers — deliberately NOT the ABI.**
+///
+/// These exist to exercise the EL0 entry/exit path, the positional accessors and the
+/// per-task state the scheduler restores. They are called only by hand-written assembly
+/// payloads inside this kernel; no server, and nothing in `libthemelios`, ever issues one.
+///
+/// They live in a reserved range starting at [`TEST_BASE`], well clear of the native ABI in
+/// [`crate::arch::syscall::abi`]. Until 8.5b they used the numbers **1-7**, which is to say
+/// the same seven numbers the ABI assigns to `SYS_SEND` through `SYS_DEBUG_PRINT` — with
+/// entirely different meanings. That was invisible while the two sets had no common caller,
+/// and would have stopped being invisible the moment a ported `libthemelios::syscall::send`
+/// (nr 1) reached this dispatcher and was serviced as `DEBUG_PRINT`, with an endpoint id
+/// where a user pointer belongs. It would have compiled and linked cleanly.
+///
+/// [`ABI_MAX`] and the assertion below keep the two ranges from ever meeting again.
 pub mod nr {
+    /// First number in the reserved EL0-test range.
+    ///
+    /// `0xFF00` is MOVZ-encodable in a single instruction, which matters: every caller is a
+    /// `mov x8, #N` inside a `global_asm!` payload, and a number needing a two-instruction
+    /// materialisation would silently change those payloads' length and layout.
+    pub const TEST_BASE: u64 = 0xFF00;
+
+    /// Highest number the native ABI will ever use.
+    ///
+    /// Not merely the current maximum (26): this is the bound the test range promises to
+    /// stay above, so the ABI has room to grow through 8.6-8.10 without anyone rechecking.
+    pub const ABI_MAX: u64 = 0x00FF;
+
+    const _: () = assert!(
+        TEST_BASE > ABI_MAX,
+        "EL0 test syscalls must not overlap the native ABI"
+    );
     /// Write a string to the kernel console. `x0` = pointer, `x1` = length.
     ///
     /// Returns the number of bytes printed, or one of the error sentinels below.
-    pub const DEBUG_PRINT: u64 = 1;
+    pub const DEBUG_PRINT: u64 = TEST_BASE;
     /// Record the calling task's exit code and **block the task**.
     ///
     /// Still not a full teardown — the kernel stack, address space, ASID and task slot are
@@ -142,10 +172,10 @@ pub mod nr {
     /// cost the arm64 suite 29 seconds once three EL0 tasks had accumulated: they took
     /// three quarters of every round-robin cycle for the rest of boot, the whole suite,
     /// and the interactive shell.
-    pub const EXIT: u64 = 2;
+    pub const EXIT: u64 = TEST_BASE + 1;
     /// Return `x0 + x1`, so a test can assert a value *derived from its arguments*
     /// rather than merely that a syscall returned.
-    pub const ADD: u64 = 3;
+    pub const ADD: u64 = TEST_BASE + 2;
     /// Return the sum of **all six** argument positions, written back through `ret_mut`.
     ///
     /// Exists purely to make the rest of the positional API load-bearing. A review
@@ -157,7 +187,7 @@ pub mod nr {
     ///
     /// The payload passes powers of two, so a wrong accessor changes the sum by a distinct
     /// amount rather than possibly cancelling out.
-    pub const SUM6: u64 = 4;
+    pub const SUM6: u64 = TEST_BASE + 3;
     /// Return the caller's live `TPIDR_EL0`, read from the register.
     ///
     /// The only thing that makes per-task TLS observable. A review mutation-tested the
@@ -171,7 +201,7 @@ pub mod nr {
     /// only prove the exception entry saved what the exception entry saw; reading the
     /// register proves the value the *scheduler* installed for this task is the one
     /// userspace would observe.
-    pub const GETTLS: u64 = 6;
+    pub const GETTLS: u64 = TEST_BASE + 5;
 
     /// Report three FPSIMD registers back to the kernel: `x0` = `d0`, `x1` = `d8`,
     /// `x2` = `d31`.
@@ -185,14 +215,14 @@ pub mod nr {
     ///
     /// Three registers, spread across the range rather than adjacent, so an off-by-one in
     /// the sixteen `stp q` pairs is caught rather than landing inside the covered span.
-    pub const FPCHECK: u64 = 7;
+    pub const FPCHECK: u64 = TEST_BASE + 6;
 
     /// Return the address userspace will resume at, via `user_pc()`.
     ///
     /// The self-test asserts the value lands inside the payload's mapped code page, which
     /// is what makes `user_pc` — otherwise unreferenced on this architecture — a checked
     /// mapping rather than a plausible-looking one.
-    pub const GETPC: u64 = 5;
+    pub const GETPC: u64 = TEST_BASE + 4;
 }
 
 /// Error returned in `x0` for an unrecognised syscall number.
@@ -554,7 +584,7 @@ core::arch::global_asm!(
 .globl el0_payload_msg_end
 el0_payload_start:
     // ADD(40, 2) -> x0 should come back 42.
-    mov  x8, #3
+    mov  x8, #{nr_add}
     mov  x0, #40
     mov  x1, #2
     svc  #0
@@ -570,7 +600,7 @@ el0_payload_start:
 
     // DEBUG_PRINT(msg, len) — the message sits immediately after the code, and is
     // reached PC-relative so the payload works at whatever user VA it is copied to.
-    mov  x8, #1
+    mov  x8, #{nr_print}
     adr  x0, el0_payload_msg
     mov  x1, #(el0_payload_msg_end - el0_payload_msg)
     svc  #0
@@ -579,7 +609,7 @@ el0_payload_start:
     // other syscall touches — a review proved all four could be wrong and still ship
     // green. Powers of two so a single wrong accessor shifts the sum by a distinct
     // amount instead of possibly cancelling against another.
-    mov  x8, #4
+    mov  x8, #{nr_sum6}
     mov  x0, #1
     mov  x1, #2
     mov  x2, #4
@@ -592,7 +622,7 @@ el0_payload_start:
     // GETPC -> the address this payload resumes at. The kernel records it and the
     // self-test asserts it lies inside this code page, which is what makes `user_pc` a
     // checked mapping rather than a plausible-looking one.
-    mov  x8, #5
+    mov  x8, #{nr_getpc}
     svc  #0
 
     // EXIT(ADD result + SUM6 result) = 42 + 63 = 105. One number carrying both, so a
@@ -602,7 +632,7 @@ el0_payload_start:
     ldr  x1, [sp], #16      // the SUM6 result
     ldr  x0, [sp], #16      // the ADD result
     add  x0, x0, x1
-    mov  x8, #2
+    mov  x8, #{nr_exit}
     svc  #0
 
     // SYS_EXIT does not yet unwind the task, so spin rather than falling into whatever
@@ -613,7 +643,20 @@ el0_payload_msg:
     .ascii "[el0] hello from userspace\n"
 el0_payload_msg_end:
 el0_payload_end:
-"#
+"#,
+    // Substituted, never written as literals.
+    //
+    // These were `mov x8, #1` .. `#5` until 8.5b moved the EL0 test calls out of the ABI's
+    // range. Five literals in a string the compiler does not check against `nr`, updated by
+    // hand — that is precisely the shape of edit that leaves one behind, and a missed one
+    // does not fail to build: it issues a *different, valid* syscall. As `const` operands
+    // the assembler takes the numbers from `nr` itself, so the payload cannot drift from
+    // the dispatcher again.
+    nr_add = const nr::ADD,
+    nr_print = const nr::DEBUG_PRINT,
+    nr_sum6 = const nr::SUM6,
+    nr_getpc = const nr::GETPC,
+    nr_exit = const nr::EXIT,
 );
 
 unsafe extern "C" {

@@ -80,6 +80,105 @@
 //! [`crate::arch::aarch64::uaccess`] by name and is thereby reminded that it is using the
 //! architecture-specific one.
 
+/// The ThemeliOS native syscall numbers — **one list, both architectures**.
+///
+/// These are the numbers `servers/libthemelios` encodes in its 25 syscall wrappers, and
+/// they are ABI: a server blob built against them must run unmodified on either
+/// architecture, because the two differ only in *which registers* carry the number and the
+/// arguments (`rax`/`rdi`… on x86, `x8`/`x0`… on aarch64), never in the numbers themselves.
+///
+/// # Why this module exists
+///
+/// Until 8.5b these numbers lived only in `arch/x86_64/syscall.rs`, and aarch64's
+/// dispatcher — written in 8.4 for EL0 bring-up, before any server existed — used **the
+/// same low numbers for entirely different calls**:
+///
+/// | nr | x86_64 + `libthemelios` | aarch64 before 8.5b |
+/// |---|---|---|
+/// | 1 | `SYS_SEND` | `DEBUG_PRINT` |
+/// | 2 | `SYS_RECEIVE` | `EXIT` |
+/// | 3 | `SYS_CALL` | `ADD` |
+/// | 4 | `SYS_REPLY` | `SUM6` |
+/// | 5 | `SYS_YIELD` | `GETPC` |
+/// | 6 | `SYS_EXIT` | `GETTLS` |
+/// | 7 | `SYS_DEBUG_PRINT` | `FPCHECK` |
+///
+/// Nothing detected that, because the two sets had no common caller: `libthemelios` was
+/// x86-only and aarch64's callers were hand-written EL0 test payloads. Porting the wrappers
+/// without fixing it would not have failed to build — `send()` would have compiled, linked,
+/// and invoked `DEBUG_PRINT` with an endpoint id where a pointer was expected. A collision
+/// that only manifests as wrong behaviour in ring 3 is worth a shared definition.
+///
+/// The aarch64 EL0 test syscalls now live in a reserved high range well clear of the ABI;
+/// see `arch::aarch64::syscall::nr`.
+pub mod abi {
+    pub const SYS_NULL: u64 = 0;
+    pub const SYS_SEND: u64 = 1;
+    pub const SYS_RECEIVE: u64 = 2;
+    pub const SYS_CALL: u64 = 3;
+    pub const SYS_REPLY: u64 = 4;
+    pub const SYS_YIELD: u64 = 5;
+    pub const SYS_EXIT: u64 = 6;
+    pub const SYS_DEBUG_PRINT: u64 = 7;
+    pub const SYS_OPEN: u64 = 8;
+    pub const SYS_READ_FILE: u64 = 9;
+    pub const SYS_WRITE_FILE: u64 = 10;
+    pub const SYS_CLOSE: u64 = 11;
+    pub const SYS_STAT: u64 = 12;
+    pub const SYS_READDIR: u64 = 13;
+    pub const SYS_UPTIME_MS: u64 = 14;
+    pub const SYS_SOCKET: u64 = 15;
+    pub const SYS_BIND: u64 = 16;
+    pub const SYS_SENDTO: u64 = 17;
+    pub const SYS_RECVFROM: u64 = 18;
+    pub const SYS_SOCKET_CLOSE: u64 = 19;
+    pub const SYS_TRY_RECEIVE: u64 = 20;
+    pub const SYS_CONNECT: u64 = 21;
+    pub const SYS_LISTEN: u64 = 22;
+    pub const SYS_ACCEPT: u64 = 23;
+    pub const SYS_TCP_SEND: u64 = 24;
+    pub const SYS_TCP_RECV: u64 = 25;
+    pub const SYS_MGMT: u64 = 26;
+}
+
+// The x86 dispatcher keeps its own copies of these constants — they are referenced in
+// dozens of places there and renaming them all would be churn for its own sake. What must
+// never happen is the two lists drifting, so every one of them is pinned here. A mismatch
+// is a build failure on amd64, not a runtime surprise in ring 3 on one architecture.
+#[cfg(target_arch = "x86_64")]
+mod abi_matches_x86 {
+    use super::abi;
+    use crate::arch::x86_64::syscall as x86;
+
+    const _: () = assert!(abi::SYS_NULL == x86::SYS_NULL);
+    const _: () = assert!(abi::SYS_SEND == x86::SYS_SEND);
+    const _: () = assert!(abi::SYS_RECEIVE == x86::SYS_RECEIVE);
+    const _: () = assert!(abi::SYS_CALL == x86::SYS_CALL);
+    const _: () = assert!(abi::SYS_REPLY == x86::SYS_REPLY);
+    const _: () = assert!(abi::SYS_YIELD == x86::SYS_YIELD);
+    const _: () = assert!(abi::SYS_EXIT == x86::SYS_EXIT);
+    const _: () = assert!(abi::SYS_DEBUG_PRINT == x86::SYS_DEBUG_PRINT);
+    const _: () = assert!(abi::SYS_OPEN == x86::SYS_OPEN);
+    const _: () = assert!(abi::SYS_READ_FILE == x86::SYS_READ_FILE);
+    const _: () = assert!(abi::SYS_WRITE_FILE == x86::SYS_WRITE_FILE);
+    const _: () = assert!(abi::SYS_CLOSE == x86::SYS_CLOSE);
+    const _: () = assert!(abi::SYS_STAT == x86::SYS_STAT);
+    const _: () = assert!(abi::SYS_READDIR == x86::SYS_READDIR);
+    const _: () = assert!(abi::SYS_UPTIME_MS == x86::SYS_UPTIME_MS);
+    const _: () = assert!(abi::SYS_SOCKET == x86::SYS_SOCKET);
+    const _: () = assert!(abi::SYS_BIND == x86::SYS_BIND);
+    const _: () = assert!(abi::SYS_SENDTO == x86::SYS_SENDTO);
+    const _: () = assert!(abi::SYS_RECVFROM == x86::SYS_RECVFROM);
+    const _: () = assert!(abi::SYS_SOCKET_CLOSE == x86::SYS_SOCKET_CLOSE);
+    const _: () = assert!(abi::SYS_TRY_RECEIVE == x86::SYS_TRY_RECEIVE);
+    const _: () = assert!(abi::SYS_CONNECT == x86::SYS_CONNECT);
+    const _: () = assert!(abi::SYS_LISTEN == x86::SYS_LISTEN);
+    const _: () = assert!(abi::SYS_ACCEPT == x86::SYS_ACCEPT);
+    const _: () = assert!(abi::SYS_TCP_SEND == x86::SYS_TCP_SEND);
+    const _: () = assert!(abi::SYS_TCP_RECV == x86::SYS_TCP_RECV);
+    const _: () = assert!(abi::SYS_MGMT == x86::SYS_MGMT);
+}
+
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::syscall::SyscallFrame;
 

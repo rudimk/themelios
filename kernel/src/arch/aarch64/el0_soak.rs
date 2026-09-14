@@ -247,7 +247,7 @@ soak_payload_start:
     // whole suite green. And holding the value on the stack across 65536 syscalls makes
     // SP_EL0 load-bearing *here*, which an earlier version of this payload did not: it
     // never touched its stack, so the page mapped for it was decoration.
-    mov  x8, #6             // SYS_GETTLS
+    mov  x8, #{nr_gettls}   // GETTLS
     svc  #0
     str  x0, [sp, #-16]!
 
@@ -270,7 +270,7 @@ soak_payload_start:
     // directive whose leak radius is worse than the gap it closes.
     .arch_extension nofp
 1:
-    mov  x8, #3             // SYS_ADD
+    mov  x8, #{nr_add}      // ADD
     mov  x0, x20
     mov  x1, x20
     svc  #0
@@ -285,7 +285,7 @@ soak_payload_start:
     fmov x1, d8
     fmov x2, d31
     .arch_extension nofp
-    mov  x8, #7             // SYS_FPCHECK
+    mov  x8, #{nr_fpcheck}  // FPCHECK
     svc  #0
 
     // Read TPIDR_EL0 **at EL0, after the loop**, and fold it in. This is the only check
@@ -305,12 +305,21 @@ soak_payload_start:
     add  x19, x19, x1
 
     mov  x0, x19            // EXIT(accumulator)
-    mov  x8, #2
+    mov  x8, #{nr_exit}
     svc  #0
 2:  b    2b                 // unreachable: SYS_EXIT blocks the task and never returns
 soak_payload_end:
 "#,
     iters = const ITERATIONS,
+    // Substituted rather than written as literals — see the matching note on the EL0
+    // payload in `syscall.rs`. These four were `#6`, `#3`, `#7` and `#2`, which as of 8.5b
+    // are `SYS_EXIT`, `SYS_CALL`, `SYS_DEBUG_PRINT` and `SYS_RECEIVE` in the native ABI.
+    // Had they stayed literal while the constants moved, the soak would have kept building
+    // and started issuing four entirely different, entirely valid syscalls.
+    nr_gettls = const super::syscall::nr::GETTLS,
+    nr_add = const super::syscall::nr::ADD,
+    nr_fpcheck = const super::syscall::nr::FPCHECK,
+    nr_exit = const super::syscall::nr::EXIT,
 );
 
 unsafe extern "C" {
