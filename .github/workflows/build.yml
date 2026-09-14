@@ -121,6 +121,13 @@ jobs:
 
       - name: Compile-gate smoltcp + kernel for aarch64
         run: cargo xtask arm64-gate
+      # Inert today and deliberately so: aarch64 has no userspace servers until
+      # 8.5b, so this succeeds with nothing to verify. It is here now rather than
+      # later so it activates on its own when the port lands, and so the two jobs
+      # do not drift. It still fails loudly if a manifest ever appears for an
+      # architecture that builds no servers.
+      - name: Verify server blobs against the committed hash manifest
+        run: cargo xtask verify-servers --arch arm64
 
       - name: Boot the aarch64 kernel on QEMU virt (banner smoke)
         run: cargo xtask arm64-smoke
