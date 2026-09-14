@@ -310,6 +310,93 @@ fn staged_artifacts() -> Vec<(String, bool)> {
     out
 }
 
+/// `--remap-path-prefix` flags that make the built artifacts independent of *this* machine.
+///
+/// The flat `.bin` servers embed absolute source paths in `.rodata` — panic locations from
+/// `core`, from `libthemelios`, and from registry dependencies like `smoltcp` and
+/// `linked_list_allocator`. Those paths are `$CARGO_HOME/registry/...` and
+/// `<sysroot>/lib/rustlib/src/...`, which differ per machine: `/root/.cargo` in a container,
+/// `/home/runner/.cargo` on a GitHub runner. Since `--oformat=binary` emits a raw memory
+/// image, a path that differs in *length* shifts everything after it, so one differing
+/// prefix moves every hash in the file.
+///
+/// This was invisible until the manifest ran on a second machine. Worth recording why the
+/// pre-existing verification missed it: byte-identity had been checked by rebuilding in a
+/// git worktree at a different path, which varies the *project* directory — and cargo
+/// already embeds workspace-local paths relatively (`libthemelios/src/lib.rs`). It never
+/// varied `$CARGO_HOME` or the sysroot, which are the paths that actually differ in CI. The
+/// check was sound and blind to the one variable that mattered.
+///
+/// Remapping both to fixed placeholders makes the output depend on the source *contents*
+/// and the pinned toolchain, not on where either happens to live. `verify_no_host_paths`
+/// then asserts the result structurally rather than trusting this to be complete.
+fn remap_flags() -> String {
+    let cargo_home = env::var("CARGO_HOME").unwrap_or_else(|_| {
+        format!(
+            "{}/.cargo",
+            env::var("HOME").expect("neither CARGO_HOME nor HOME is set")
+        )
+    });
+    let sysroot = Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .expect("failed to run `rustc --print sysroot`");
+
+    // The placeholders are arbitrary but must be stable; they appear verbatim in the
+    // shipped blobs' panic strings, so they are chosen to read sensibly there.
+    format!("--remap-path-prefix={cargo_home}=/cargo --remap-path-prefix={sysroot}=/rust")
+}
+
+/// The host paths that must not appear in a staged blob.
+///
+/// Returned as a list so `verify_no_host_paths` can name which one leaked.
+fn host_path_prefixes() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(h) = env::var("CARGO_HOME") {
+        v.push(h);
+    }
+    if let Ok(h) = env::var("HOME") {
+        v.push(format!("{h}/.cargo"));
+        v.push(format!("{h}/.rustup"));
+    }
+    if let Ok(out) = Command::new("rustc").arg("--print").arg("sysroot").output() {
+        v.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    v.retain(|s| !s.is_empty() && s != "/");
+    v
+}
+
+/// Assert that a staged blob carries no path from *this* machine.
+///
+/// This is what makes cross-machine reproducibility checkable instead of assumed. A hash
+/// manifest is only meaningful if the bytes do not depend on the builder, and the way that
+/// property breaks is a new dependency, a new panic site, or a toolchain change
+/// reintroducing an un-remapped absolute path. Catching it here names the cause; catching
+/// it via the manifest on someone else's machine names only the symptom, which is exactly
+/// how this was found.
+fn verify_no_host_paths(path: &Path, prefixes: &[String]) {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => panic!("failed to read staged {}: {e}", path.display()),
+    };
+    for prefix in prefixes {
+        let needle = prefix.as_bytes();
+        if needle.len() <= bytes.len()
+            && bytes.windows(needle.len()).any(|w| w == needle)
+        {
+            eprintln!(
+                "{}: contains the host path {prefix}.\n\
+                 The blob would hash differently on another machine, making the committed \
+                 manifest unusable. Extend `remap_flags` to cover this prefix.",
+                path.display()
+            );
+            process::exit(1);
+        }
+    }
+}
+
 /// Build the userspace server workspace and stage the flat binaries.
 ///
 /// Must run before the kernel build: the kernel `include_bytes!`s these files.
@@ -345,8 +432,9 @@ fn build_servers(root: &Path, kernel_target: &str) {
     // Link flags: place sections per the server linker script, emit a flat
     // binary, and link non-relocatable (fixed load address).
     let rustflags = format!(
-        "-C link-arg=-T{} -C link-arg=--oformat=binary -C relocation-model=static",
-        linker_script.display()
+        "-C link-arg=-T{} -C link-arg=--oformat=binary -C relocation-model=static {}",
+        linker_script.display(),
+        remap_flags()
     );
 
     println!("Building userspace servers for {target}...");
@@ -369,12 +457,14 @@ fn build_servers(root: &Path, kernel_target: &str) {
 
     // Stage each server's flat binary where the kernel embeds it.
     let release_dir = servers_dir.join(format!("target/{target}/release"));
+    let host_prefixes = host_path_prefixes();
     for name in SERVER_BINARIES {
         let built = release_dir.join(name);
         let staged = out_dir.join(format!("{name}.bin"));
         fs::copy(&built, &staged).unwrap_or_else(|e| {
             panic!("failed to stage server binary {}: {e}", built.display())
         });
+        verify_no_host_paths(&staged, &host_prefixes);
         let size = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
         println!("  {name}: {size} bytes -> {}", staged.display());
     }
@@ -383,6 +473,7 @@ fn build_servers(root: &Path, kernel_target: &str) {
     // binaries), staged where the kernel embeds them.
     for name in SERVER_ELFS {
         build_detached_elf(root, &out_dir, name, kernel_target);
+        verify_no_host_paths(&out_dir.join(format!("{name}.elf")), &host_prefixes);
     }
 }
 
@@ -397,12 +488,17 @@ fn build_detached_elf(root: &Path, out_dir: &Path, name: &str, kernel_target: &s
     let target = server_target(kernel_target);
     let crate_dir = root.join("servers").join(name);
     // Static reloc + no-PIE keeps the output ET_EXEC with fixed segment vaddrs.
-    let rustflags = "-C relocation-model=static -C link-arg=-no-pie";
+    //
+    // These six carry no host paths today (they are tiny, with no registry dependencies),
+    // which is why they were the six that *matched* across machines when the seven flat
+    // servers did not. They are remapped anyway: the property should hold by construction
+    // rather than by their staying small, and `verify_no_host_paths` checks it either way.
+    let rustflags = format!("-C relocation-model=static -C link-arg=-no-pie {}", remap_flags());
 
     println!("Building {name} (real ELF)...");
     let status = Command::new("cargo")
         .current_dir(&crate_dir)
-        .env("RUSTFLAGS", rustflags)
+        .env("RUSTFLAGS", &rustflags)
         .args([
             "build",
             "--release",
