@@ -169,7 +169,13 @@ narrative per commit._
 **Phase 8 — aarch64 parity: IN PROGRESS.** ✅ 8.spike (EL0 round trip proven), ✅ 8.1
 (arch-neutral discovery seam + `PlatformInfo`), ✅ 8.2 (`VirtioTransport` trait + PCI impl
 extracted), ✅ 8.3 (virtio-mmio — the first sub-phase to move the ratchet, retiring
-**seven** skips, not the eight the plan projected); next is 8.4 (EL0). Plan in
+**seven** skips, not the eight the plan projected), ✅ 8.4 (EL0: 8.4a–e — entry/exit,
+syscall dispatch, address spaces, the EL0 soak, FPSIMD context), and 8.5 (userspace
+servers on aarch64) is **in progress**: ✅ 8.5a (arch-partitioned server staging + the blob
+hash manifest), next 8.5b (`libthemelios`' 25 `asm!` blocks), 8.5c (the six `_start`
+routines), 8.5d (retire `test_process`, `test_userspace_init`, `test_server_spawn`,
+`test_registry_pull`). The a–d split is this session's decomposition of the plan's single
+8.5 entry, not something the plan names. Plan in
 `.sisyphus/plans/phase8-aarch64-parity.md` (v2, after five adversarial review passes — nine
 v1 claims and fourteen v2 claims were false, and the sub-phase order is reversed from v1).
 **Ten sub-phases plus a spike**, taking aarch64 from the Phase 7 ring-0 core to full amd64

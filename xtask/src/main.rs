@@ -203,12 +203,76 @@ fn ensure_limine(root: &Path) -> PathBuf {
 // Userspace servers
 // ============================================================================
 
+/// The Rust target triple the userspace servers are built for, given a kernel target.
+///
+/// **aarch64 servers are hardfloat**, unlike the kernel. That is not an oversight: there is
+/// no soft-float A-profile ABI, and real userspace uses SIMD unconditionally (glibc's base
+/// `strlen.S` opens with `ld1`). Phase 8.4e enabled `CPACR_EL1.FPEN` and gave every task a
+/// `v0`-`v31` save area precisely so this can be true. The kernel stays softfloat.
+fn server_target(kernel_target: &str) -> &'static str {
+    match kernel_target {
+        "x86_64-unknown-none" => "x86_64-unknown-none",
+        "aarch64-unknown-none-softfloat" => "aarch64-unknown-none",
+        other => panic!("no server target known for kernel target {other}"),
+    }
+}
+
+/// Short architecture name used to partition the staging directory.
+fn stage_arch(kernel_target: &str) -> &'static str {
+    match kernel_target {
+        "x86_64-unknown-none" => "amd64",
+        "aarch64-unknown-none-softfloat" => "arm64",
+        other => panic!("no staging arch known for kernel target {other}"),
+    }
+}
+
+/// `e_machine` values, for checking a staged ELF really is for the target we asked for.
+const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+
+fn expected_e_machine(kernel_target: &str) -> u16 {
+    match kernel_target {
+        "x86_64-unknown-none" => EM_X86_64,
+        "aarch64-unknown-none-softfloat" => EM_AARCH64,
+        other => panic!("no e_machine known for kernel target {other}"),
+    }
+}
+
+/// Read `e_machine` (ELF header offset 18, u16 LE) from a file, or `None` if it cannot be
+/// read or is not an ELF — an unreadable file and a non-ELF are deliberately the same
+/// answer here, because both mean "cannot vouch for this artifact" and both must fail.
+///
+/// Flat binaries have no header, which is why this returns an `Option` and why the `.bin`
+/// blobs are protected structurally — by the per-arch staging directory — rather than by
+/// this check. Only the six detached `.elf` smoke binaries can be verified this way.
+/// (`embedded.rs` is x86-only today and names `amd64` in its paths directly; the `#[cfg]`
+/// that selects between two staging directories arrives with 8.5b. Until then the
+/// partitioning is enforced on this side alone.)
+fn elf_machine(path: &Path) -> Option<u16> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < 20 || &bytes[0..4] != b"\x7fELF" {
+        return None;
+    }
+    Some(u16::from_le_bytes([bytes[18], bytes[19]]))
+}
+
+/// Whether the userspace servers can be built for this kernel target yet.
+///
+/// `libthemelios`' syscall wrappers are 25 hand-written `asm!` blocks using the x86
+/// `syscall` instruction and register set, and the six detached smoke crates add 28 more
+/// in their `_start` routines. Those land in Phase 8.5b. Until then this returns false for
+/// aarch64 and the callers say so rather than failing to link — and the aarch64 kernel
+/// embeds nothing anyway, since `mod process` is still x86-gated.
+fn servers_supported(kernel_target: &str) -> bool {
+    kernel_target == "x86_64-unknown-none"
+}
+
 /// The userspace server binaries to build and embed in the kernel.
 ///
-/// Each entry is a binary crate in the `servers/` workspace. Built for
-/// `x86_64-unknown-none`, linked with the server linker script as a flat binary,
-/// and copied to `target/servers/<name>.bin` where the kernel embeds it via
-/// `include_bytes!`.
+/// Each entry is a binary crate in the `servers/` workspace. Built for the server target
+/// matching the kernel's (see `server_target`), linked with the server linker script as a
+/// flat binary, and copied to `target/servers/<arch>/<name>.bin` where the kernel embeds
+/// it via `include_bytes!`. The `<arch>` component is not cosmetic — see `build_servers`.
 const SERVER_BINARIES: &[&str] = &[
     "echo-server",
     "api-server",
@@ -219,33 +283,168 @@ const SERVER_BINARIES: &[&str] = &[
     "net-server",
 ];
 
+/// The six detached smoke crates, built as real ELFs rather than flat binaries.
+///
+/// Kept as a named list so `build_servers` and the hash manifest walk the same set; they
+/// used to be six open-coded calls, which is how a list drifts from the thing that checks
+/// it.
+const SERVER_ELFS: &[&str] = &[
+    "elf-smoke",        // 5.0 loader test (native ABI)
+    "linux-smoke",      // 5.1 Linux-personality test
+    "fs-smoke",         // 5.2 Linux FS-syscall test
+    "threads-smoke",    // 5.3 threads/futex test
+    "isolation-smoke",  // 5.7 container-isolation test
+    "confine-smoke",    // 6.1b rootfs-confinement test
+];
+
+/// Every artifact `build_servers` stages, as `(file name, is_elf)`.
+///
+/// The manifest and the staging loop are both driven from here so a server added to one
+/// cannot be missing from the other.
+fn staged_artifacts() -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = SERVER_BINARIES
+        .iter()
+        .map(|n| (format!("{n}.bin"), false))
+        .collect();
+    out.extend(SERVER_ELFS.iter().map(|n| (format!("{n}.elf"), true)));
+    out
+}
+
+/// `--remap-path-prefix` flags that make the built artifacts independent of *this* machine.
+///
+/// The flat `.bin` servers embed absolute source paths in `.rodata` — panic locations from
+/// `core`, from `libthemelios`, and from registry dependencies like `smoltcp` and
+/// `linked_list_allocator`. Those paths are `$CARGO_HOME/registry/...` and
+/// `<sysroot>/lib/rustlib/src/...`, which differ per machine: `/root/.cargo` in a container,
+/// `/home/runner/.cargo` on a GitHub runner. Since `--oformat=binary` emits a raw memory
+/// image, a path that differs in *length* shifts everything after it, so one differing
+/// prefix moves every hash in the file.
+///
+/// This was invisible until the manifest ran on a second machine. Worth recording why the
+/// pre-existing verification missed it: byte-identity had been checked by rebuilding in a
+/// git worktree at a different path, which varies the *project* directory — and cargo
+/// already embeds workspace-local paths relatively (`libthemelios/src/lib.rs`). It never
+/// varied `$CARGO_HOME` or the sysroot, which are the paths that actually differ in CI. The
+/// check was sound and blind to the one variable that mattered.
+///
+/// Remapping both to fixed placeholders makes the output depend on the source *contents*
+/// and the pinned toolchain, not on where either happens to live. `verify_no_host_paths`
+/// then asserts the result structurally rather than trusting this to be complete.
+fn remap_flags() -> String {
+    let cargo_home = env::var("CARGO_HOME").unwrap_or_else(|_| {
+        format!(
+            "{}/.cargo",
+            env::var("HOME").expect("neither CARGO_HOME nor HOME is set")
+        )
+    });
+    let sysroot = Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .expect("failed to run `rustc --print sysroot`");
+
+    // The placeholders are arbitrary but must be stable; they appear verbatim in the
+    // shipped blobs' panic strings, so they are chosen to read sensibly there.
+    format!("--remap-path-prefix={cargo_home}=/cargo --remap-path-prefix={sysroot}=/rust")
+}
+
+/// The host paths that must not appear in a staged blob.
+///
+/// Returned as a list so `verify_no_host_paths` can name which one leaked.
+fn host_path_prefixes() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(h) = env::var("CARGO_HOME") {
+        v.push(h);
+    }
+    if let Ok(h) = env::var("HOME") {
+        v.push(format!("{h}/.cargo"));
+        v.push(format!("{h}/.rustup"));
+    }
+    if let Ok(out) = Command::new("rustc").arg("--print").arg("sysroot").output() {
+        v.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    v.retain(|s| !s.is_empty() && s != "/");
+    v
+}
+
+/// Assert that a staged blob carries no path from *this* machine.
+///
+/// This is what makes cross-machine reproducibility checkable instead of assumed. A hash
+/// manifest is only meaningful if the bytes do not depend on the builder, and the way that
+/// property breaks is a new dependency, a new panic site, or a toolchain change
+/// reintroducing an un-remapped absolute path. Catching it here names the cause; catching
+/// it via the manifest on someone else's machine names only the symptom, which is exactly
+/// how this was found.
+fn verify_no_host_paths(path: &Path, prefixes: &[String]) {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => panic!("failed to read staged {}: {e}", path.display()),
+    };
+    for prefix in prefixes {
+        let needle = prefix.as_bytes();
+        if needle.len() <= bytes.len()
+            && bytes.windows(needle.len()).any(|w| w == needle)
+        {
+            eprintln!(
+                "{}: contains the host path {prefix}.\n\
+                 The blob would hash differently on another machine, making the committed \
+                 manifest unusable. Extend `remap_flags` to cover this prefix.",
+                path.display()
+            );
+            process::exit(1);
+        }
+    }
+}
+
 /// Build the userspace server workspace and stage the flat binaries.
 ///
 /// Must run before the kernel build: the kernel `include_bytes!`s these files.
 /// Servers are linked with `--oformat binary` (LLD emits the raw memory image,
 /// so the kernel needs no ELF parser) against the server linker script, with a
 /// static relocation model (they load at a fixed virtual base).
-fn build_servers(root: &Path) {
+fn build_servers(root: &Path, kernel_target: &str) {
+    let target = server_target(kernel_target);
     let servers_dir = root.join("servers");
     let linker_script = servers_dir.join("linker.ld");
-    let out_dir = root.join("target/servers");
-    fs::create_dir_all(&out_dir).expect("failed to create target/servers");
+    // **Staging is partitioned by architecture, and that is load-bearing.**
+    //
+    // These used to stage to a flat `target/servers/`, which was fine while only one
+    // architecture existed. The moment the target became a parameter it stopped being
+    // fine: `embedded.rs` embeds these by fixed path, so an arm64 kernel built after an
+    // amd64 build would have embedded **x86 blobs** and failed as an undefined-instruction
+    // abort at EL0, arbitrarily far from the cause. `embedded.rs` names `amd64` directly
+    // today (it is x86-only); when 8.5b un-gates it the paths become `#[cfg]`'d and must
+    // stay in step with `stage_arch`.
+    //
+    // The directory is emptied first, not merged into: staging with `fs::copy` over
+    // whatever is already there would leave an orphan behind if a server is renamed or
+    // dropped from `SERVER_BINARIES`, and an orphan is exactly the kind of blob that
+    // survives long enough to be embedded by a path that still names it.
+    let out_dir = root.join("target/servers").join(stage_arch(kernel_target));
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir)
+            .unwrap_or_else(|e| panic!("failed to clear {}: {e}", out_dir.display()));
+    }
+    fs::create_dir_all(&out_dir)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_dir.display()));
 
     // Link flags: place sections per the server linker script, emit a flat
     // binary, and link non-relocatable (fixed load address).
     let rustflags = format!(
-        "-C link-arg=-T{} -C link-arg=--oformat=binary -C relocation-model=static",
-        linker_script.display()
+        "-C link-arg=-T{} -C link-arg=--oformat=binary -C relocation-model=static {}",
+        linker_script.display(),
+        remap_flags()
     );
 
-    println!("Building userspace servers...");
+    println!("Building userspace servers for {target}...");
     let status = Command::new("cargo")
         .current_dir(&servers_dir)
         .env("RUSTFLAGS", &rustflags)
         .args([
             "build",
             "--release",
-            "--target", "x86_64-unknown-none",
+            "--target", target,
             BUILD_STD,
             BUILD_STD_FEATURES,
         ])
@@ -257,25 +456,25 @@ fn build_servers(root: &Path) {
     }
 
     // Stage each server's flat binary where the kernel embeds it.
-    let release_dir = servers_dir.join("target/x86_64-unknown-none/release");
+    let release_dir = servers_dir.join(format!("target/{target}/release"));
+    let host_prefixes = host_path_prefixes();
     for name in SERVER_BINARIES {
         let built = release_dir.join(name);
         let staged = out_dir.join(format!("{name}.bin"));
         fs::copy(&built, &staged).unwrap_or_else(|e| {
             panic!("failed to stage server binary {}: {e}", built.display())
         });
+        verify_no_host_paths(&staged, &host_prefixes);
         let size = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
         println!("  {name}: {size} bytes -> {}", staged.display());
     }
 
     // Build the Phase 5.0/5.1 smoke-test binaries as real ELFs (not flat
     // binaries), staged where the kernel embeds them.
-    build_detached_elf(root, &out_dir, "elf-smoke"); // 5.0 loader test (native ABI)
-    build_detached_elf(root, &out_dir, "linux-smoke"); // 5.1 Linux-personality test
-    build_detached_elf(root, &out_dir, "fs-smoke"); // 5.2 Linux FS-syscall test
-    build_detached_elf(root, &out_dir, "threads-smoke"); // 5.3 threads/futex test
-    build_detached_elf(root, &out_dir, "isolation-smoke"); // 5.7 container-isolation test
-    build_detached_elf(root, &out_dir, "confine-smoke"); // 6.1b rootfs-confinement test
+    for name in SERVER_ELFS {
+        build_detached_elf(root, &out_dir, name, kernel_target);
+        verify_no_host_paths(&out_dir.join(format!("{name}.elf")), &host_prefixes);
+    }
 }
 
 /// Build a detached smoke-test crate as a **real ELF** (not a flat binary).
@@ -284,21 +483,27 @@ fn build_servers(root: &Path) {
 /// `--oformat=binary`) and forced to a static, non-PIE `ET_EXEC`, so the kernel's
 /// ELF loader has genuine ELF headers + `PT_LOAD` segments to parse. Each is a
 /// detached crate (own workspace), so `build_servers`' flat-binary flags don't
-/// reach it. Staged to `target/servers/<name>.elf`.
-fn build_detached_elf(root: &Path, out_dir: &Path, name: &str) {
+/// reach it. Staged to `out_dir` — `target/servers/<arch>/<name>.elf`.
+fn build_detached_elf(root: &Path, out_dir: &Path, name: &str, kernel_target: &str) {
+    let target = server_target(kernel_target);
     let crate_dir = root.join("servers").join(name);
     // Static reloc + no-PIE keeps the output ET_EXEC with fixed segment vaddrs.
-    let rustflags = "-C relocation-model=static -C link-arg=-no-pie";
+    //
+    // These six carry no host paths today (they are tiny, with no registry dependencies),
+    // which is why they were the six that *matched* across machines when the seven flat
+    // servers did not. They are remapped anyway: the property should hold by construction
+    // rather than by their staying small, and `verify_no_host_paths` checks it either way.
+    let rustflags = format!("-C relocation-model=static -C link-arg=-no-pie {}", remap_flags());
 
     println!("Building {name} (real ELF)...");
     let status = Command::new("cargo")
         .current_dir(&crate_dir)
-        .env("RUSTFLAGS", rustflags)
+        .env("RUSTFLAGS", &rustflags)
         .args([
             "build",
             "--release",
             "--target",
-            "x86_64-unknown-none",
+            target,
             "-Zbuild-std=core",
         ])
         .status()
@@ -308,7 +513,42 @@ fn build_detached_elf(root: &Path, out_dir: &Path, name: &str) {
         process::exit(1);
     }
 
-    let built = crate_dir.join(format!("target/x86_64-unknown-none/release/{name}"));
+    let built = crate_dir.join(format!("target/{target}/release/{name}"));
+
+    // Verify the artifact is for the architecture we asked for, *before* staging it.
+    //
+    // What this actually catches is narrower than "wrong architecture", because cargo's
+    // own output path is already target-qualified (`target/<triple>/release/`) and a
+    // cross-arch artifact cannot land there by ordinary operation. What *can* happen is a
+    // `cargo build` that reports success without relinking over an output that was
+    // truncated, replaced or deleted out from under it — verified by doing exactly that,
+    // after which cargo printed no `Compiling` line and this check was the only thing
+    // between the tampered file and the kernel image.
+    //
+    // The flat `.bin` servers cannot be checked *from the staged artifact*:
+    // `--oformat=binary` means there is no ELF header to read. Reading `e_machine` out of
+    // the `liblibthemelios.rlib` left in the same directory would look like a fix and is
+    // not one — it proves the workspace was built for the right triple, which the
+    // target-qualified path already guarantees, and says nothing about whether any
+    // individual binary was relinked. Their protection is the per-arch staging directory
+    // plus the hash manifest (`verify-servers`), not a header check.
+    let want = expected_e_machine(kernel_target);
+    match elf_machine(&built) {
+        Some(got) if got == want => {}
+        Some(got) => {
+            eprintln!(
+                "{name}: built ELF is for e_machine {got}, expected {want} ({target}). \
+                 A stale artifact from another architecture would be embedded in the \
+                 kernel and fault at its first instruction in userspace."
+            );
+            process::exit(1);
+        }
+        None => {
+            eprintln!("{name}: {} is not an ELF", built.display());
+            process::exit(1);
+        }
+    }
+
     let staged = out_dir.join(format!("{name}.elf"));
     fs::copy(&built, &staged)
         .unwrap_or_else(|e| panic!("failed to stage {name}: {e} ({})", built.display()));
@@ -1658,7 +1898,17 @@ fn cmd_build(args: &[String]) {
 
     // Build the userspace servers first — the kernel embeds their flat binaries
     // via include_bytes!, so they must exist before the kernel compiles.
-    build_servers(&root);
+    //
+    // Gated on the architecture, which it was not before: `cmd_build` called this
+    // unconditionally, including for `--arch aarch64`, where `libthemelios`' 25 `asm!`
+    // blocks are still x86-only and the build would fail. aarch64 servers land in 8.5b;
+    // until then the aarch64 kernel embeds nothing, because `mod process` — and with it
+    // `embedded.rs` — is x86-gated too.
+    if servers_supported(target) {
+        build_servers(&root, target);
+    } else {
+        println!("Skipping userspace servers: not yet ported to {target} (Phase 8.5b).");
+    }
 
     // Clean the kernel crate's cached artifacts before building. This forces
     // a full recompile every time, which ensures build.rs re-runs and generates
@@ -1840,6 +2090,22 @@ fn cmd_test(args: &[String]) {
     let target = resolve_target(&opts.arch);
     let root = workspace_root();
 
+    // Build the userspace servers first (the kernel embeds their binaries).
+    //
+    // **This must stay above the aarch64 dispatch below.** Before 8.5a the `build_servers`
+    // call sat after it, so `cmd_test --arch aarch64` returned first and staged nothing —
+    // harmless only because `embedded.rs` is still x86-gated and the aarch64 test kernel
+    // embeds nothing. The moment 8.5b un-gates it, an aarch64 test kernel would
+    // `include_bytes!` whatever `target/servers/arm64/` happened to hold from an earlier
+    // `cargo xtask build --arch arm64` — the exact stale-blob failure this sub-phase
+    // exists to prevent, on the one command CI runs. Hoisting it makes the gate live on
+    // both paths today (aarch64 prints the skip) and correct on both after 8.5b.
+    if servers_supported(target) {
+        build_servers(&root, target);
+    } else {
+        println!("Skipping userspace servers: not yet ported to {target} (Phase 8.5b).");
+    }
+
     // aarch64 runs the same suite but cannot report its verdict the same way: the
     // `virt` machine has no `isa-debug-exit`, so the result comes off the serial
     // console. Different enough in its mechanics to warrant its own function.
@@ -1849,9 +2115,6 @@ fn cmd_test(args: &[String]) {
     }
 
     println!("Building ThemeliOS kernel (test mode) for {target}...");
-
-    // Build the userspace servers first (the kernel embeds their binaries).
-    build_servers(&root);
 
     // Clean cached artifacts to ensure build.rs re-runs (fresh ULID).
     let _ = Command::new("cargo")
@@ -2014,7 +2277,18 @@ fn cmd_docs(_args: &[String]) {
         Err(e) => eprintln!("Failed to run mdbook: {e}\nInstall with: cargo install mdbook"),
     }
 
-    // Build rustdoc (API docs for the kernel crate)
+    // Build rustdoc (API docs for the kernel crate).
+    //
+    // This documents the amd64 kernel, which `include_bytes!`s the staged server blobs —
+    // so it carries the same build dependency as `cmd_build` and `cmd_test`, and was the
+    // one command that did not honour it. On a fresh clone `cargo doc` failed with
+    // "couldn't read .../target/servers/amd64/echo-server.bin". No CI job runs `xtask
+    // docs`, which is why it stayed broken quietly.
+    let doc_target = "x86_64-unknown-none";
+    if servers_supported(doc_target) {
+        build_servers(&root, doc_target);
+    }
+
     println!("Building rustdoc...");
     let doc_status = Command::new("cargo")
         .current_dir(&root)
@@ -2090,6 +2364,288 @@ fn cmd_arm64_gate(_args: &[String]) {
     println!("arm64 gate passed: smoltcp + kernel build for aarch64-unknown-none-softfloat.");
 }
 
+// ---------------------------------------------------------------------------
+// Server blob hash manifest
+// ---------------------------------------------------------------------------
+//
+// Phase 8 ports userspace to aarch64. The single most valuable invariant across that work
+// is that **the amd64 blobs do not change** — every `#[cfg]` added to `libthemelios` and
+// to the six `_start` routines is supposed to be inert on x86, and if one is not, the
+// symptom is a behavioural change in ring 3 that no test necessarily names.
+//
+// The plan's acceptance line for 8.5 is explicit that these hashes are "committed and
+// checked in CI, **not diffed once by hand**", having watched exactly that happen once
+// before. So: a manifest in the tree, and a command CI runs. A hand comparison proves the
+// blobs were identical on one machine on one afternoon; this proves it on every push.
+//
+// The manifest legitimately changes whenever a server's code changes. `--update`
+// regenerates it, and the resulting diff is the point: it forces the change to be looked
+// at and committed deliberately rather than absorbed silently.
+
+/// Path of the committed hash manifest for a staging arch.
+fn manifest_path(root: &Path, stage: &str) -> PathBuf {
+    root.join("xtask").join(format!("servers-{stage}.sha256"))
+}
+
+/// Render the manifest for the currently staged artifacts.
+///
+/// Format is one `<hex>  <name>` line per artifact, sorted by name — the same shape
+/// `sha256sum` emits, so it can be eyeballed and regenerated by hand if this code is ever
+/// in doubt.
+fn render_manifest(out_dir: &Path) -> String {
+    let mut names: Vec<String> = staged_artifacts().into_iter().map(|(n, _)| n).collect();
+    names.sort();
+    let mut s = String::new();
+    for name in names {
+        let path = out_dir.join(&name);
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read staged {}: {e}", path.display()));
+        s.push_str(&format!("{}  {}\n", hex(&sha256(&bytes)), name));
+    }
+    s
+}
+
+/// `cargo xtask verify-servers [--arch amd64] [--update]`
+///
+/// Builds the servers and compares the staged blobs against the committed manifest.
+///
+/// Deliberately builds rather than checking whatever is lying in `target/`: a manifest
+/// check that passes because nothing was rebuilt is worth nothing. This is the check that
+/// covers the seven flat `.bin` servers, which have no ELF header for `elf_machine` to
+/// read — the per-arch directory keeps the architectures apart structurally, and this
+/// keeps their *contents* honest.
+///
+/// On an architecture whose servers are not ported yet it succeeds without doing anything,
+/// so the CI step can be wired into both jobs now and starts checking on its own when the
+/// port lands. See the contradiction guards in the body for what keeps that from being a
+/// permanently silent pass.
+fn cmd_verify_servers(args: &[String]) {
+    // `parse_options` rejects anything it does not know, so `--update` is stripped before
+    // it rather than added to the shared option set — it is meaningful for this command
+    // only, and `cargo xtask build --update` should stay an error.
+    let update = args.iter().any(|a| a == "--update");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--update").cloned().collect();
+    let opts = parse_options(&rest);
+    let target = resolve_target(&opts.arch);
+    let root = workspace_root();
+
+    let stage = stage_arch(target);
+    let manifest = manifest_path(&root, stage);
+
+    // An architecture with no servers yet is "nothing to verify", not a failure.
+    //
+    // This exists so the CI step can be added to **both** jobs today. The aarch64 job runs
+    // the same command, it passes by doing nothing, and it becomes load-bearing on its own
+    // the moment 8.5b flips `servers_supported` — with no workflow edit and nothing for
+    // anyone to remember. The alternative, "add the arm64 step when 8.5b lands", is the
+    // deferral that five review rounds running have caught going unmade.
+    //
+    // A check that passes by doing nothing is admittedly a weak check *today*. It earns its
+    // place through the two contradictions below, which are the states that would let the
+    // whole mechanism go quiet, and which are the reason this is not simply an early
+    // `return`.
+    if !servers_supported(target) {
+        // A manifest for an architecture that builds no servers means someone generated it
+        // and then lost the build wiring — the manifest would sit there looking like
+        // coverage while nothing produced the blobs it names.
+        if manifest.exists() {
+            eprintln!(
+                "verify-servers: {} exists, but no servers are built for {target}.\n\
+                 A manifest without a build is not coverage. Either restore the build \
+                 wiring (`servers_supported`) or delete the manifest.",
+                manifest.display()
+            );
+            process::exit(1);
+        }
+        println!(
+            "verify-servers: nothing to verify for {target} — servers are not ported yet \
+             (Phase 8.5b). This becomes a real check automatically when they are."
+        );
+        return;
+    }
+
+    build_servers(&root, target);
+
+    let out_dir = root.join("target/servers").join(stage);
+    let actual = render_manifest(&out_dir);
+
+    if update {
+        fs::write(&manifest, &actual)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", manifest.display()));
+        println!("Wrote {} ({} artifacts).", manifest.display(), staged_artifacts().len());
+        return;
+    }
+
+    let expected = match fs::read_to_string(&manifest) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("verify-servers: cannot read {}: {e}", manifest.display());
+            eprintln!("Generate it with: cargo xtask verify-servers --arch {} --update", opts.arch);
+            process::exit(1);
+        }
+    };
+
+    if expected == actual {
+        println!(
+            "verify-servers: {} staged {stage} blobs match {}.",
+            staged_artifacts().len(),
+            manifest.display()
+        );
+        return;
+    }
+
+    eprintln!("verify-servers: staged {stage} blobs do NOT match {}.", manifest.display());
+    eprintln!();
+    let exp: Vec<&str> = expected.lines().collect();
+    let act: Vec<&str> = actual.lines().collect();
+    for line in &act {
+        if !exp.contains(line) {
+            let name = line.split_whitespace().nth(1).unwrap_or("?");
+            let was = exp
+                .iter()
+                .find(|l| l.split_whitespace().nth(1) == Some(name))
+                .and_then(|l| l.split_whitespace().next())
+                .unwrap_or("(absent from manifest)");
+            eprintln!("  {name}\n    manifest: {was}\n    built:    {}", line.split_whitespace().next().unwrap_or("?"));
+        }
+    }
+    for line in &exp {
+        let name = line.split_whitespace().nth(1).unwrap_or("?");
+        if !act.iter().any(|l| l.split_whitespace().nth(1) == Some(name)) {
+            eprintln!("  {name}\n    manifest: {}\n    built:    (not staged)", line.split_whitespace().next().unwrap_or("?"));
+        }
+    }
+    eprintln!();
+    eprintln!("If this change is intended, regenerate and commit the manifest:");
+    eprintln!("    cargo xtask verify-servers --arch {} --update", opts.arch);
+    process::exit(1);
+}
+
+/// Lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// SHA-256 (FIPS 180-4).
+///
+/// Hand-rolled because `xtask` has no dependencies and gaining one for this would be a
+/// poor trade. Correctness is not asserted, it is tested — see the `sha256_vectors` test
+/// below, which checks the two standard vectors plus the multi-block case that catches the
+/// padding bugs a single-block implementation gets away with.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    // Pad: 0x80, zeros to 56 mod 64, then the message length in *bits*, big-endian.
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let (mut a, mut b, mut c, mut d) = (h[0], h[1], h[2], h[3]);
+        let (mut e, mut f, mut g, mut hh) = (h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(v);
+        }
+    }
+
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hex, sha256};
+
+    /// FIPS 180-4 vectors, plus a 1000-byte input.
+    ///
+    /// The long case is the one that matters: a 1000-byte message spans sixteen blocks and
+    /// its length does not fit in one byte, so an implementation that mishandles padding or
+    /// writes the bit length in the wrong endianness passes the first two and fails this.
+    #[test]
+    fn sha256_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&sha256(&[b'a'; 1000])),
+            "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"
+        );
+    }
+
+    /// The manifest and the staging loop must walk the same set.
+    #[test]
+    fn staged_set_is_complete() {
+        let staged = super::staged_artifacts();
+        assert_eq!(staged.len(), super::SERVER_BINARIES.len() + super::SERVER_ELFS.len());
+        assert_eq!(staged.iter().filter(|(_, is_elf)| *is_elf).count(), 6);
+        assert_eq!(staged.iter().filter(|(_, is_elf)| !*is_elf).count(), 7);
+    }
+}
+
 /// Print usage information.
 fn print_usage() {
     eprintln!(
@@ -2104,6 +2660,11 @@ Commands:
     test     Build and run tests in QEMU
     image    Create the SquashFS root and ext2 data disk images
     docs     Build mdbook and rustdoc
+    verify-servers   Build the userspace servers and check the staged blobs against the
+                     committed hash manifest (xtask/servers-<arch>.sha256).
+                     Pass --update to regenerate the manifest after an intended change.
+                     Succeeds without doing anything on an architecture whose servers
+                     are not ported yet, so it can be wired into CI for both.
     arm64-gate       Compile smoltcp + kernel for aarch64-unknown-none-softfloat (dependency gate)
     arm64-smoke      Boot the aarch64 kernel on QEMU virt from a UEFI ESP (banner smoke)
     arm64-iso-smoke  Boot the aarch64 ISO on QEMU virt (banner smoke)
@@ -2141,6 +2702,7 @@ fn main() {
         "test" => cmd_test(rest),
         "image" => cmd_image(rest),
         "docs" => cmd_docs(rest),
+        "verify-servers" => cmd_verify_servers(rest),
         "arm64-gate" => cmd_arm64_gate(rest),
         "arm64-smoke" => cmd_arm64_smoke(rest),
         "arm64-iso-smoke" => cmd_arm64_iso_smoke(rest),
