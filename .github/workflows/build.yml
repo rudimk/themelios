@@ -50,6 +50,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 xorriso squashfs-tools e2fsprogs
 
+      # The amd64 server blobs must not change while Phase 8 ports userspace to
+      # aarch64. Every `#[cfg]` added to `libthemelios` and to the six `_start`
+      # routines is supposed to be inert on x86; if one is not, the symptom is a
+      # behavioural change in ring 3 that no test necessarily names. This rebuilds
+      # all thirteen and compares them against the committed manifest.
+      #
+      # Runs before the suite because it is the cheaper signal: it needs no QEMU,
+      # and a blob that moved unexpectedly is worth knowing about before spending
+      # fifteen minutes finding out which test it broke.
+      #
+      # An intended change regenerates the manifest:
+      #     cargo xtask verify-servers --arch amd64 --update
+      # and the resulting diff is committed deliberately.
+      - name: Verify server blobs against the committed hash manifest
+        run: cargo xtask verify-servers --arch amd64
+
       - name: Run kernel tests
         run: cargo xtask test --arch amd64
 
