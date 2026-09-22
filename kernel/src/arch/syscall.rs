@@ -80,6 +80,58 @@
 //! [`crate::arch::aarch64::uaccess`] by name and is thereby reminded that it is using the
 //! architecture-specific one.
 
+/// The ThemeliOS native syscall numbers — **one list, every consumer**.
+///
+/// The list itself lives in `syscall_abi.rs`, as a file with no crate references, because
+/// `servers/libthemelios` is a separate cargo workspace and includes the same file by
+/// `#[path]`. Putting the constants here instead would mean two lists and a checker between
+/// them, which is what 8.5b's first attempt did — and a review then showed the checker
+/// covered only the kernel's half. See that file's module docs for the history.
+///
+/// The aarch64 EL0 test syscalls live in a reserved high range well clear of these; see
+/// `arch::aarch64::syscall::nr`.
+#[path = "syscall_abi.rs"]
+mod syscall_abi;
+pub use syscall_abi::abi;
+
+// The x86 dispatcher keeps its own copies of these constants — they are referenced in
+// dozens of places there and renaming them all would be churn for its own sake. What must
+// never happen is the two lists drifting, so every one of them is pinned here. A mismatch
+// is a build failure on amd64, not a runtime surprise in ring 3 on one architecture.
+#[cfg(target_arch = "x86_64")]
+mod abi_matches_x86 {
+    use super::abi;
+    use crate::arch::x86_64::syscall as x86;
+
+    const _: () = assert!(abi::SYS_NULL == x86::SYS_NULL);
+    const _: () = assert!(abi::SYS_SEND == x86::SYS_SEND);
+    const _: () = assert!(abi::SYS_RECEIVE == x86::SYS_RECEIVE);
+    const _: () = assert!(abi::SYS_CALL == x86::SYS_CALL);
+    const _: () = assert!(abi::SYS_REPLY == x86::SYS_REPLY);
+    const _: () = assert!(abi::SYS_YIELD == x86::SYS_YIELD);
+    const _: () = assert!(abi::SYS_EXIT == x86::SYS_EXIT);
+    const _: () = assert!(abi::SYS_DEBUG_PRINT == x86::SYS_DEBUG_PRINT);
+    const _: () = assert!(abi::SYS_OPEN == x86::SYS_OPEN);
+    const _: () = assert!(abi::SYS_READ_FILE == x86::SYS_READ_FILE);
+    const _: () = assert!(abi::SYS_WRITE_FILE == x86::SYS_WRITE_FILE);
+    const _: () = assert!(abi::SYS_CLOSE == x86::SYS_CLOSE);
+    const _: () = assert!(abi::SYS_STAT == x86::SYS_STAT);
+    const _: () = assert!(abi::SYS_READDIR == x86::SYS_READDIR);
+    const _: () = assert!(abi::SYS_UPTIME_MS == x86::SYS_UPTIME_MS);
+    const _: () = assert!(abi::SYS_SOCKET == x86::SYS_SOCKET);
+    const _: () = assert!(abi::SYS_BIND == x86::SYS_BIND);
+    const _: () = assert!(abi::SYS_SENDTO == x86::SYS_SENDTO);
+    const _: () = assert!(abi::SYS_RECVFROM == x86::SYS_RECVFROM);
+    const _: () = assert!(abi::SYS_SOCKET_CLOSE == x86::SYS_SOCKET_CLOSE);
+    const _: () = assert!(abi::SYS_TRY_RECEIVE == x86::SYS_TRY_RECEIVE);
+    const _: () = assert!(abi::SYS_CONNECT == x86::SYS_CONNECT);
+    const _: () = assert!(abi::SYS_LISTEN == x86::SYS_LISTEN);
+    const _: () = assert!(abi::SYS_ACCEPT == x86::SYS_ACCEPT);
+    const _: () = assert!(abi::SYS_TCP_SEND == x86::SYS_TCP_SEND);
+    const _: () = assert!(abi::SYS_TCP_RECV == x86::SYS_TCP_RECV);
+    const _: () = assert!(abi::SYS_MGMT == x86::SYS_MGMT);
+}
+
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::syscall::SyscallFrame;
 

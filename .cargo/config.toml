@@ -35,3 +35,28 @@ rustflags = ["-Crelocation-model=static", "-Clink-arg=-Tkernel/linker-x86_64.ld"
 # no vector instructions, which is what keeps it from clobbering a task's FPSIMD state.
 [target.aarch64-unknown-none-softfloat]
 rustflags = ["-Crelocation-model=static", "-Clink-arg=-Tkernel/linker-aarch64.ld"]
+
+# There is deliberately **no** `[target.aarch64-unknown-none]` section, and that is a
+# decision rather than an omission.
+#
+# `aarch64-unknown-none` is the *servers'* target — the hardfloat sibling of the kernel's
+# softfloat one, chosen because ring-3 code has no reason to forgo SIMD and `libthemelios`'
+# consumers benefit from it. The mapping lives in `xtask`'s `server_target`, not here.
+#
+# Phase 8.5's plan called for adding a section for it. Measuring first showed that would be
+# worse than doing nothing:
+#
+#   * `xtask` builds the servers with `RUSTFLAGS` set in the environment, and env
+#     `RUSTFLAGS` *replaces* `target.*.rustflags` wholesale rather than appending. Any flags
+#     written here would be silently discarded on every build the project actually performs.
+#   * They would not be discarded for a direct `cargo build --target aarch64-unknown-none`,
+#     which is the one case they would reach — and there they would apply the **kernel's**
+#     linker script to a server. That is not hypothetical: it is exactly what the
+#     `x86_64-unknown-none` section above does today, and why a direct
+#     `cargo build -p squashfs-server --target x86_64-unknown-none` fails with
+#     "cannot find linker script kernel/linker-x86_64.ld" while the same build through
+#     `cargo xtask build` succeeds.
+#
+# So the entry would be inert where it is read and harmful where it is not. Servers are
+# built through `xtask`; that is where their flags belong.
+

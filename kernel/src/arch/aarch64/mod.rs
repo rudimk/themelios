@@ -58,6 +58,12 @@ pub mod uaccess;
 /// scheduler that does not interleave. Phase 8's riskiest unknown.
 pub mod el0_soak;
 
+/// The native IPC ABI exercised from EL0: `SEND`/`RECEIVE`/`REPLY`/`CALL` across three
+/// endpoints, against a kernel-side peer. What keeps 8.5b's dispatcher from being a
+/// `match` nothing calls, and what finds a register-mapping bug here rather than inside the
+/// first server to run on this architecture. Phase 8.5b.
+pub mod el0_ipc;
+
 /// Per-task FPSIMD state (`v0`-`v31` + `FPCR`/`FPSR`), and the `CPACR_EL1.FPEN` policy
 /// that makes userspace hardfloat possible. Phase 8.4e.
 pub mod fpsimd;

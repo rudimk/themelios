@@ -69,6 +69,15 @@ pub mod http;
 #[path = "../../../kernel/src/oci/json.rs"]
 pub mod json;
 
+/// The native syscall numbers, **single-sourced** from the kernel's
+/// `arch/syscall_abi.rs` (Phase 8.5b). That file deliberately names nothing from either
+/// crate so it can be included from both sides, which makes these numbers one list rather
+/// than two lists and a checker — see its module docs for why that distinction was earned
+/// rather than assumed.
+#[path = "../../../kernel/src/arch/syscall_abi.rs"]
+mod syscall_abi;
+pub use syscall_abi::abi;
+
 // ----- Boot info -----
 
 /// Fixed virtual address where the kernel maps the server's boot-info page.
@@ -270,33 +279,187 @@ pub struct IpcMessage {
 /// clobbers RCX (return RIP) and R11 (saved RFLAGS).
 pub mod syscall {
     use super::IpcMessage;
+    // **The syscall numbers are not declared here.** They come from the kernel's own file,
+    // included the same way `http` and `json` are.
+    //
+    // Until a review of 8.5b they were 26 local `const`s duplicating the kernel's, pinned to
+    // nothing. Setting this crate's `SYS_SEND` to 99 built the whole project green; the only
+    // symptom was an amd64 test timing out after three minutes, and on aarch64 — where no
+    // server runs yet — there would have been none at all. A number meaning two different
+    // things on two sides of a boundary is the precise defect 8.5b exists to remove, and a
+    // checker comparing two lists only removes it where the checker can see.
+    use super::abi::*;
 
-    const SYS_SEND: u64 = 1;
-    const SYS_RECEIVE: u64 = 2;
-    const SYS_CALL: u64 = 3;
-    const SYS_REPLY: u64 = 4;
-    const SYS_YIELD: u64 = 5;
-    const SYS_EXIT: u64 = 6;
-    const SYS_DEBUG_PRINT: u64 = 7;
+    // ----- The raw syscall primitives -----
+    //
+    // Every wrapper below is architecture-neutral Rust. These three functions are the only
+    // place the register mapping appears, and the only `asm!` in this crate.
+    //
+    // Until Phase 8.5b there were 25 `asm!` blocks here, one per wrapper, each naming
+    // `rax`/`rdi`/`rsi`/`rdx`/`r10`/`r9`/`r8` by hand. Porting that shape would have meant
+    // writing 25 more for aarch64 and keeping 50 hand-written register lists in step — and
+    // a register list is not something a compiler checks. The failure mode is specific and
+    // silent: one wrapper passing an argument in the wrong position compiles, links, and
+    // sends the kernel a plausible value in the wrong slot.
+    //
+    // The ABI is positional on both architectures, so it collapses to this:
+    //
+    //   |          | x86_64                           | aarch64   |
+    //   |----------|----------------------------------|-----------|
+    //   | number   | `rax`                            | `x8`      |
+    //   | args 0-5 | `rdi`, `rsi`, `rdx`, `r10`, `r9`, `r8` | `x0`-`x5` |
+    //   | rets 0-5 | `rax`, `rdi`, `rsi`, `rdx`, `r8`, `r9` | `x0`-`x5` |
+    //
+    // Two asymmetries on the x86 side are deliberate and were preserved verbatim from the
+    // 25 blocks this replaced, not tidied:
+    //
+    //   * Argument 3 is `r10`, not `rcx`, because the `syscall` instruction overwrites
+    //     `rcx` with the return address. `r11` is likewise destroyed (it takes RFLAGS), so
+    //     both are declared clobbered.
+    //   * Argument position 4 is `r9` and 5 is `r8`, while *return* position 4 is `r8` and
+    //     5 is `r9`. The in and out mappings genuinely differ for those two registers. On
+    //     aarch64 both are simply `x4`/`x5`.
+    //
+    // `nostack` holds on both: none of these touch the stack red zone.
+
+    /// A syscall returning a single value in return position 0.
+    ///
+    /// Unused argument positions are passed as zero rather than left undefined. Slightly
+    /// more work than the old per-wrapper blocks, which simply did not set registers they
+    /// had no use for — and worth it: an argument register the caller leaves alone holds
+    /// whatever the last call left there, so a kernel that later starts reading that
+    /// position sees stale data rather than an obvious zero.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn sys(nr: u64, a: [u64; 6]) -> u64 {
+        let ret: u64;
+        // SAFETY: the caller guarantees `nr` and `a` form a valid call under the kernel's
+        // documented ABI; `rcx` and `r11` are declared clobbered as `syscall` requires.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") nr => ret,
+                in("rdi") a[0], in("rsi") a[1], in("rdx") a[2],
+                in("r10") a[3], in("r9") a[4], in("r8") a[5],
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// A syscall returning up to six values, in return positions 0-5.
+    ///
+    /// Callers that want fewer simply ignore the tail; `SYS_CALL` uses the first four and
+    /// `SYS_RECEIVE` all six.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn sys_multi(nr: u64, a: [u64; 6]) -> [u64; 6] {
+        let (r0, r1, r2, r3, r4, r5): (u64, u64, u64, u64, u64, u64);
+        // SAFETY: as `sys`. Note `r9`/`r8` carry argument positions 4/5 on the way in and
+        // return positions 5/4 on the way out, which is why their `inout` pairs look
+        // crossed — see the table above.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") nr => r0,
+                inout("rdi") a[0] => r1,
+                inout("rsi") a[1] => r2,
+                inout("rdx") a[2] => r3,
+                in("r10") a[3],
+                inout("r9") a[4] => r5,
+                inout("r8") a[5] => r4,
+                out("rcx") _, out("r11") _,
+                options(nostack),
+            );
+        }
+        [r0, r1, r2, r3, r4, r5]
+    }
+
+    /// A syscall that does not return — `SYS_EXIT`.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn sys_noreturn(nr: u64, a: [u64; 6]) -> ! {
+        // SAFETY: the kernel never returns to the caller of this syscall.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                in("rax") nr,
+                in("rdi") a[0], in("rsi") a[1], in("rdx") a[2],
+                in("r10") a[3], in("r9") a[4], in("r8") a[5],
+                options(nostack, noreturn),
+            );
+        }
+    }
+
+    /// A syscall returning a single value in `x0`.
+    ///
+    /// `x8` carries the number because that is what Linux and `asm-generic` use on
+    /// aarch64, so every toolchain, debugger and `strace` already agrees — see the module
+    /// docs in the kernel's `arch/aarch64/syscall.rs`. The `svc` immediate is ignored.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn sys(nr: u64, a: [u64; 6]) -> u64 {
+        let ret: u64;
+        // SAFETY: the caller guarantees `nr` and `a` form a valid call under the kernel's
+        // documented ABI. `svc` clobbers no general-purpose register beyond those named.
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                in("x8") nr,
+                inout("x0") a[0] => ret,
+                in("x1") a[1], in("x2") a[2], in("x3") a[3],
+                in("x4") a[4], in("x5") a[5],
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// A syscall returning up to six values, in `x0`-`x5`.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn sys_multi(nr: u64, a: [u64; 6]) -> [u64; 6] {
+        let (r0, r1, r2, r3, r4, r5): (u64, u64, u64, u64, u64, u64);
+        // SAFETY: as `sys`.
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                in("x8") nr,
+                inout("x0") a[0] => r0,
+                inout("x1") a[1] => r1,
+                inout("x2") a[2] => r2,
+                inout("x3") a[3] => r3,
+                inout("x4") a[4] => r4,
+                inout("x5") a[5] => r5,
+                options(nostack),
+            );
+        }
+        [r0, r1, r2, r3, r4, r5]
+    }
+
+    /// A syscall that does not return — `SYS_EXIT`.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn sys_noreturn(nr: u64, a: [u64; 6]) -> ! {
+        // SAFETY: the kernel never returns to the caller of this syscall.
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                in("x8") nr,
+                in("x0") a[0], in("x1") a[1], in("x2") a[2],
+                in("x3") a[3], in("x4") a[4], in("x5") a[5],
+                options(nostack, noreturn),
+            );
+        }
+    }
+
 
     /// Send a message to `endpoint` with `badge`. Returns 0 on success.
     pub fn send(endpoint: u64, words: [u64; 4], badge: u64) -> u64 {
         let ret: u64;
         // SAFETY: a syscall with the kernel's documented SEND register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_SEND => ret,
-                in("rdi") endpoint,
-                in("rsi") words[0],
-                in("rdx") words[1],
-                in("r10") words[2],
-                in("r9") words[3],
-                in("r8") badge,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_SEND, [endpoint, words[0], words[1], words[2], words[3], badge]) };
         ret
     }
 
@@ -310,19 +473,13 @@ pub mod syscall {
         let token: u64;
         // SAFETY: RECEIVE register ABI; kernel returns words/badge/token in
         // RAX/RDI/RSI/RDX/R8/R9.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_RECEIVE => w0,
-                inout("rdi") endpoint => w1,
-                out("rsi") w2,
-                out("rdx") w3,
-                out("r8") badge,
-                out("r9") token,
-                out("rcx") _, out("r11") _, out("r10") _,
-                options(nostack),
-            );
-        }
+        let __r = unsafe { sys_multi(SYS_RECEIVE, [endpoint, 0, 0, 0, 0, 0]) };
+            w0 = __r[0];
+            w1 = __r[1];
+            w2 = __r[2];
+            w3 = __r[3];
+            badge = __r[4];
+            token = __r[5];
         IpcMessage { words: [w0, w1, w2, w3], badge, reply_token: token }
     }
 
@@ -334,20 +491,11 @@ pub mod syscall {
         let w3: u64;
         // SAFETY: CALL register ABI; kernel returns reply words in
         // RAX/RDI/RSI/RDX.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_CALL => w0,
-                inout("rdi") endpoint => w1,
-                inout("rsi") words[0] => w2,
-                inout("rdx") words[1] => w3,
-                in("r10") words[2],
-                in("r9") words[3],
-                in("r8") badge,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        let __r = unsafe { sys_multi(SYS_CALL, [endpoint, words[0], words[1], words[2], words[3], badge]) };
+            w0 = __r[0];
+            w1 = __r[1];
+            w2 = __r[2];
+            w3 = __r[3];
         IpcMessage { words: [w0, w1, w2, w3], badge: 0, reply_token: 0 }
     }
 
@@ -355,50 +503,22 @@ pub mod syscall {
     pub fn reply(endpoint: u64, reply_token: u64, words: [u64; 4]) -> u64 {
         let ret: u64;
         // SAFETY: REPLY register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_REPLY => ret,
-                in("rdi") endpoint,
-                in("rsi") reply_token,
-                in("rdx") words[0],
-                in("r10") words[1],
-                in("r9") words[2],
-                in("r8") words[3],
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_REPLY, [endpoint, reply_token, words[0], words[1], words[2], words[3]]) };
         ret
     }
 
     /// Yield the current time slice to the scheduler.
     pub fn yield_now() {
         // SAFETY: YIELD takes no arguments.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_YIELD => _,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        unsafe { sys(SYS_YIELD, [0, 0, 0, 0, 0, 0]) };
     }
 
     /// Milliseconds since boot (monotonic). Drives smoltcp's `Instant` clock in
     /// the net server's poll loop.
-    const SYS_UPTIME_MS: u64 = 14;
     pub fn uptime_ms() -> u64 {
         let ms: u64;
         // SAFETY: UPTIME_MS takes no arguments and returns the value in RAX.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_UPTIME_MS => ms,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ms = unsafe { sys(SYS_UPTIME_MS, [0, 0, 0, 0, 0, 0]) };
         ms
     }
 
@@ -408,7 +528,6 @@ pub mod syscall {
     /// continuously driving smoltcp; a blocking `receive` would stall the poll
     /// loop. On return RAX = 1/0 (had message?), with the words in
     /// RDI/RSI/RDX/R8 and the reply token in R9.
-    const SYS_TRY_RECEIVE: u64 = 20;
     pub fn try_receive(endpoint: u64) -> Option<IpcMessage> {
         let has: u64;
         let w0: u64;
@@ -419,19 +538,13 @@ pub mod syscall {
         // SAFETY: TRY_RECEIVE takes the endpoint in RDI and returns the
         // has-message flag in RAX plus the message words/token in the registers
         // above. It never blocks.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_TRY_RECEIVE => has,
-                inout("rdi") endpoint => w0,
-                out("rsi") w1,
-                out("rdx") w2,
-                out("r8") w3,
-                out("r9") token,
-                out("rcx") _, out("r11") _, out("r10") _,
-                options(nostack),
-            );
-        }
+        let __r = unsafe { sys_multi(SYS_TRY_RECEIVE, [endpoint, 0, 0, 0, 0, 0]) };
+            has = __r[0];
+            w0 = __r[1];
+            w1 = __r[2];
+            w2 = __r[3];
+            w3 = __r[4];
+            token = __r[5];
         if has == 0 {
             None
         } else {
@@ -442,14 +555,7 @@ pub mod syscall {
     /// Terminate this server process. Never returns.
     pub fn exit(code: u64) -> ! {
         // SAFETY: EXIT terminates the task; the kernel never returns here.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                in("rax") SYS_EXIT,
-                in("rdi") code,
-                options(nostack, noreturn),
-            );
-        }
+        unsafe { sys_noreturn(SYS_EXIT, [code, 0, 0, 0, 0, 0]) }
     }
 
     // --- Filesystem syscalls (Phase 3) ---
@@ -457,30 +563,13 @@ pub mod syscall {
     // Number in RAX, args in RDI/RSI/RDX/R10; result in RAX. A return value with
     // the high bit set is an encoded `fs_proto::FsError`.
 
-    const SYS_OPEN: u64 = 8;
-    const SYS_READ_FILE: u64 = 9;
-    const SYS_WRITE_FILE: u64 = 10;
-    const SYS_CLOSE: u64 = 11;
-    const SYS_STAT: u64 = 12;
-    const SYS_READDIR: u64 = 13;
 
     /// Raw 4-argument syscall helper for the filesystem calls.
     #[inline]
     fn fs_syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         let ret: u64;
         // SAFETY: a syscall with the kernel's documented FS register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") num => ret,
-                in("rdi") a1,
-                in("rsi") a2,
-                in("rdx") a3,
-                in("r10") a4,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(num, [a1, a2, a3, a4, 0, 0]) };
         ret
     }
 
@@ -522,11 +611,6 @@ pub mod syscall {
     // set is an encoded `net_proto` socket error. IPv4 addresses are packed
     // `a<<24|b<<16|c<<8|d`.
 
-    const SYS_SOCKET: u64 = 15;
-    const SYS_BIND: u64 = 16;
-    const SYS_SENDTO: u64 = 17;
-    const SYS_RECVFROM: u64 = 18;
-    const SYS_SOCKET_CLOSE: u64 = 19;
 
     /// Create a socket of `sock_type` (0 = UDP) using the network-authority
     /// capability `factory`. Returns a socket capability handle, or a high-bit
@@ -535,16 +619,7 @@ pub mod syscall {
         // RDI = type, RSI = factory handle.
         let ret: u64;
         // SAFETY: SYS_SOCKET register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_SOCKET => ret,
-                in("rdi") sock_type,
-                in("rsi") factory,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_SOCKET, [sock_type, factory, 0, 0, 0, 0]) };
         ret
     }
 
@@ -552,17 +627,7 @@ pub mod syscall {
     pub fn bind(sock: u64, local_ip: u64, port: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_BIND register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_BIND => ret,
-                in("rdi") sock,
-                in("rsi") local_ip,
-                in("rdx") port,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_BIND, [sock, local_ip, port, 0, 0, 0]) };
         ret
     }
 
@@ -571,19 +636,7 @@ pub mod syscall {
     pub fn sendto(sock: u64, buf: *const u8, len: usize, ip: u64, port: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_SENDTO register ABI (buf/len validated by the kernel).
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_SENDTO => ret,
-                in("rdi") sock,
-                in("rsi") buf as u64,
-                in("rdx") len as u64,
-                in("r10") ip,
-                in("r9") port,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_SENDTO, [sock, buf as u64, len as u64, ip, port, 0]) };
         ret
     }
 
@@ -593,18 +646,7 @@ pub mod syscall {
     pub fn recvfrom(sock: u64, buf: *mut u8, len: usize, src_out: *mut u8) -> u64 {
         let ret: u64;
         // SAFETY: SYS_RECVFROM register ABI (pointers validated by the kernel).
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_RECVFROM => ret,
-                in("rdi") sock,
-                in("rsi") buf as u64,
-                in("rdx") len as u64,
-                in("r10") src_out as u64,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_RECVFROM, [sock, buf as u64, len as u64, src_out as u64, 0, 0]) };
         ret
     }
 
@@ -612,30 +654,16 @@ pub mod syscall {
     pub fn socket_close(sock: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_SOCKET_CLOSE register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_SOCKET_CLOSE => ret,
-                in("rdi") sock,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_SOCKET_CLOSE, [sock, 0, 0, 0, 0, 0]) };
         ret
     }
 
     // --- TCP stream syscalls (Phase 4.6) ---
 
-    const SYS_CONNECT: u64 = 21;
-    const SYS_LISTEN: u64 = 22;
-    const SYS_ACCEPT: u64 = 23;
-    const SYS_TCP_SEND: u64 = 24;
-    const SYS_TCP_RECV: u64 = 25;
 
     /// `SYS_MGMT` (the op-multiplexed container management ABI) and its verb
     /// selectors. Only `listen` is wired in Phase 6.4; the rest arrive with the
     /// ring-3 api-server (6.5).
-    const SYS_MGMT: u64 = 26;
     const MGMT_OP_LISTEN: u64 = 1;
     const MGMT_OP_LIST: u64 = 2;
     const MGMT_OP_INSPECT: u64 = 3;
@@ -654,16 +682,7 @@ pub mod syscall {
     pub fn listen(sock: u64, backlog: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_LISTEN register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_LISTEN => ret,
-                in("rdi") sock,
-                in("rsi") backlog,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_LISTEN, [sock, backlog, 0, 0, 0, 0]) };
         ret
     }
 
@@ -674,16 +693,7 @@ pub mod syscall {
     pub fn accept(sock: u64, peer_out: *mut u8) -> u64 {
         let ret: u64;
         // SAFETY: SYS_ACCEPT register ABI (peer_out validated by the kernel).
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_ACCEPT => ret,
-                in("rdi") sock,
-                in("rsi") peer_out as u64,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_ACCEPT, [sock, peer_out as u64, 0, 0, 0, 0]) };
         ret
     }
 
@@ -692,17 +702,7 @@ pub mod syscall {
     pub fn connect(sock: u64, ip: u64, port: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_CONNECT register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_CONNECT => ret,
-                in("rdi") sock,
-                in("rsi") ip,
-                in("rdx") port,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_CONNECT, [sock, ip, port, 0, 0, 0]) };
         ret
     }
 
@@ -712,17 +712,7 @@ pub mod syscall {
     pub fn tcp_send(sock: u64, buf: *const u8, len: usize) -> u64 {
         let ret: u64;
         // SAFETY: SYS_TCP_SEND register ABI (buf/len validated by the kernel).
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_TCP_SEND => ret,
-                in("rdi") sock,
-                in("rsi") buf as u64,
-                in("rdx") len as u64,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_TCP_SEND, [sock, buf as u64, len as u64, 0, 0, 0]) };
         ret
     }
 
@@ -732,17 +722,7 @@ pub mod syscall {
     pub fn tcp_recv(sock: u64, buf: *mut u8, len: usize) -> u64 {
         let ret: u64;
         // SAFETY: SYS_TCP_RECV register ABI (pointers validated by the kernel).
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_TCP_RECV => ret,
-                in("rdi") sock,
-                in("rsi") buf as u64,
-                in("rdx") len as u64,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_TCP_RECV, [sock, buf as u64, len as u64, 0, 0, 0]) };
         ret
     }
 
@@ -755,17 +735,7 @@ pub mod syscall {
     pub fn mgmt_listen(mgmt_cap: u64, port: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_MGMT register ABI — RDI = verb, RSI = mgmt cap, RDX = port.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_MGMT => ret,
-                in("rdi") MGMT_OP_LISTEN,
-                in("rsi") mgmt_cap,
-                in("rdx") port,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_MGMT, [MGMT_OP_LISTEN, mgmt_cap, port, 0, 0, 0]) };
         ret
     }
 
@@ -776,20 +746,7 @@ pub mod syscall {
     fn mgmt_read0(op: u64, mgmt_cap: u64, out: *mut u8, out_len: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_MGMT register ABI; the kernel validates out[..out_len].
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_MGMT => ret,
-                in("rdi") op,
-                in("rsi") mgmt_cap,
-                in("rdx") 0u64,          // no input ptr
-                in("r10") 0u64,          // no input len
-                in("r8") out as u64,
-                in("r9") out_len,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_MGMT, [op, mgmt_cap, 0u64, 0u64, out_len, out as u64]) };
         ret
     }
 
@@ -811,20 +768,7 @@ pub mod syscall {
         let ret: u64;
         // SAFETY: SYS_MGMT register ABI; the kernel validates id[..id_len] and
         // out[..out_len].
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_MGMT => ret,
-                in("rdi") MGMT_OP_INSPECT,
-                in("rsi") mgmt_cap,
-                in("rdx") id as u64,
-                in("r10") id_len,
-                in("r8") out as u64,
-                in("r9") out_len,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_MGMT, [MGMT_OP_INSPECT, mgmt_cap, id as u64, id_len, out_len, out as u64]) };
         ret
     }
 
@@ -834,20 +778,7 @@ pub mod syscall {
     fn mgmt_call(op: u64, mgmt_cap: u64, in_ptr: *const u8, in_len: u64, out: *mut u8, out_len: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_MGMT register ABI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_MGMT => ret,
-                in("rdi") op,
-                in("rsi") mgmt_cap,
-                in("rdx") in_ptr as u64,
-                in("r10") in_len,
-                in("r8") out as u64,
-                in("r9") out_len,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_MGMT, [op, mgmt_cap, in_ptr as u64, in_len, out_len, out as u64]) };
         ret
     }
 
@@ -886,31 +817,14 @@ pub mod syscall {
     pub fn mgmt_audit_deny(mgmt_cap: u64) -> u64 {
         let ret: u64;
         // SAFETY: SYS_MGMT register ABI — RDI = verb, RSI = mgmt cap; no other args.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_MGMT => ret,
-                in("rdi") MGMT_OP_AUDIT_DENY,
-                in("rsi") mgmt_cap,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        ret = unsafe { sys(SYS_MGMT, [MGMT_OP_AUDIT_DENY, mgmt_cap, 0, 0, 0, 0]) };
         ret
     }
 
     /// Print a single byte to the kernel serial console (debugging only).
     pub fn debug_print_char(ch: u8) {
         // SAFETY: DEBUG_PRINT takes the character in RDI.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") SYS_DEBUG_PRINT => _,
-                in("rdi") ch as u64,
-                out("rcx") _, out("r11") _,
-                options(nostack),
-            );
-        }
+        unsafe { sys(SYS_DEBUG_PRINT, [ch as u64, 0, 0, 0, 0, 0]) };
     }
 }
 
