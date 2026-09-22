@@ -413,6 +413,18 @@ pub fn kmain_aarch64(
         crate::println!("[boot] Phase 8.4d EL0 preemption soak FAILED.");
     }
 
+    // --- Phase 8.5b: the native IPC ABI, from EL0 ---
+    //
+    // After the soak, which proves thousands of syscalls survive preemption, and using the
+    // *real* ABI rather than the test numbers those two use. It runs on the boot path for
+    // the same reason they do: an arch-gated entry in the test suite would report [SKIP] on
+    // amd64 and prove nothing, while this has to hold on every aarch64 boot before any
+    // server can be trusted to run.
+    let ipc_ok = crate::arch::aarch64::el0_ipc::run();
+    if !ipc_ok {
+        crate::println!("[boot] Phase 8.5b EL0 IPC round trip FAILED.");
+    }
+
     // --- Phase 8.3: VirtIO over virtio-mmio ---
     //
     // Placed here because it must precede the test suite and the shell, both of which

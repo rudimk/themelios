@@ -116,6 +116,37 @@ impl ExceptionFrame {
         &mut self.x[0]
     }
 
+    /// Write a **multi-value** return into `x0`-`x5`, in order.
+    ///
+    /// Three of the native ABI's calls return more than one value: `SYS_RECEIVE` hands back
+    /// four message words plus a badge and a reply token, `SYS_TRY_RECEIVE` a
+    /// had-a-message flag plus four words and a token, and `SYS_CALL` four reply words. x86
+    /// scatters these across `rax`, `rdi`, `rsi`, `rdx`, `r8` and `r9` — an order with no
+    /// logic to it beyond "the registers that were free". aarch64 has the luxury of
+    /// `x0`-`x5` in sequence, so this takes a slice and writes it positionally.
+    ///
+    /// Taking a slice rather than offering a `set_ret_n(i, v)` is deliberate: a per-index
+    /// setter invites a caller to write some slots and forget others, and a forgotten slot
+    /// does not read as absent in ring 3 — it reads as whatever argument the caller passed
+    /// in that register, which for `SYS_RECEIVE` means the endpoint id arriving where
+    /// `words[1]` belongs. Writing the whole tuple at once makes that omission impossible
+    /// to express.
+    ///
+    /// # Panics
+    ///
+    /// If `values` is longer than six. Six is the entire positional return space; a caller
+    /// asking for a seventh has a bug that must not be silently truncated into a value
+    /// userspace will read as data.
+    #[inline]
+    pub fn set_rets(&mut self, values: &[u64]) {
+        assert!(
+            values.len() <= 6,
+            "aarch64 syscall returns are x0-x5; {} values do not fit",
+            values.len()
+        );
+        self.x[..values.len()].copy_from_slice(values);
+    }
+
     /// The address userspace will resume at (`ELR_EL1`).
     ///
     /// Already points *past* the `svc`, which is the opposite of `brk` — see the dispatch
@@ -245,6 +276,176 @@ pub const EFAULT: u64 = u64::MAX - 13;
 /// valid UTF-8 where a string was required.
 pub const EINVAL: u64 = u64::MAX - 21;
 
+/// Service one call from the **native ThemeliOS ABI** — the numbers in
+/// [`crate::arch::syscall::abi`], which `servers/libthemelios` encodes.
+///
+/// Returns `true` if `nr` belonged to the ABI and has been serviced (including by writing
+/// an error), `false` if it did not, leaving the caller to try the EL0 test range.
+///
+/// # Register mapping
+///
+/// x86 scatters these across `rax`, `rdi`, `rsi`, `rdx`, `r10`, `r9` and `r8` in an order
+/// driven by which registers `syscall` leaves alone. aarch64 has `x0`-`x5` free and in
+/// sequence, so every call here is positional: arguments in order from `x0`, returns in
+/// order from `x0`. The two architectures therefore agree on the *numbers* and on the
+/// *order of the values*, and differ only in which register holds position N — which is the
+/// entire premise of a portable `libthemelios`.
+///
+/// # Interrupt discipline
+///
+/// The SVC vector arrives with `DAIF.I` set, and `exceptions.rs` asserts it is still set at
+/// `eret`. But `ipc_send`, `ipc_receive`, `ipc_call` and `ipc_reply` can all block, and a
+/// task that blocks with interrupts masked never gets a timer tick to be scheduled off —
+/// the node simply stops. So the blocking arms unmask around the call and re-mask after,
+/// which is the same thing x86's `cpu::sti()` does at these sites, made symmetric because
+/// here there is an assertion that will catch an unbalanced path.
+///
+/// `SYS_EXIT` is the exception: it does not return, so it re-masks *before* blocking rather
+/// than after.
+fn dispatch_native(frame: &mut SyscallFrame, nr: u64, a: [u64; 6]) -> bool {
+    use crate::arch::syscall::abi;
+
+    /// Run a possibly-blocking body with interrupts unmasked, restoring the mask after.
+    ///
+    /// Not a bare `enable()`/`disable()` pair at each site: the SVC exit assertion turns a
+    /// forgotten `disable()` into a debug panic far from the arm that forgot it, and there
+    /// are seven such arms.
+    fn blocking<T>(body: impl FnOnce() -> T) -> T {
+        super::irq::enable();
+        let out = body();
+        super::irq::disable();
+        out
+    }
+
+    match nr {
+        abi::SYS_NULL => frame.set_ret(0),
+
+        // x0 = endpoint, x1-x4 = words, x5 = badge.
+        abi::SYS_SEND => {
+            let msg = crate::ipc::IpcMessage::new([a[1], a[2], a[3], a[4]]);
+            let r = blocking(|| crate::ipc::ipc_send(a[0], msg, a[5]));
+            frame.set_ret(match r {
+                Ok(()) => 0,
+                Err(_) => !0u64,
+            });
+        }
+
+        // x0 = endpoint. Returns words[0..4], badge, reply_token in x0-x5.
+        abi::SYS_RECEIVE => {
+            match blocking(|| crate::ipc::ipc_receive(a[0])) {
+                Ok(m) => frame.set_rets(&[
+                    m.words[0], m.words[1], m.words[2], m.words[3], m.badge, m.reply_token,
+                ]),
+                Err(_) => frame.set_ret(!0u64),
+            }
+        }
+
+        // x0 = endpoint, x1-x4 = words, x5 = badge. Returns the four reply words in x0-x3.
+        abi::SYS_CALL => {
+            let msg = crate::ipc::IpcMessage::new([a[1], a[2], a[3], a[4]]);
+            match blocking(|| crate::ipc::ipc_call(a[0], msg, a[5])) {
+                Ok(r) => frame.set_rets(&[r.words[0], r.words[1], r.words[2], r.words[3]]),
+                Err(_) => frame.set_ret(!0u64),
+            }
+        }
+
+        // x0 = endpoint, x1 = reply_token, x2-x5 = words.
+        abi::SYS_REPLY => {
+            let msg = crate::ipc::IpcMessage::new([a[2], a[3], a[4], a[5]]);
+            let r = blocking(|| crate::ipc::ipc_reply(a[0], a[1], msg));
+            frame.set_ret(match r {
+                Ok(()) => 0,
+                Err(_) => !0u64,
+            });
+        }
+
+        // Non-blocking, so no unmask: x0 = 1 with words[0..4] in x1-x4 and the token in x5
+        // when a message was waiting, else x0 = 0.
+        //
+        // Note the shift relative to `SYS_RECEIVE`, which is not a mistake and is inherited
+        // from x86: there, `rax` carries the flag and word 0 moves down to `rdi`. Keeping
+        // the same shape means one `libthemelios` body works on both.
+        abi::SYS_TRY_RECEIVE => match crate::ipc::ipc_try_receive(a[0]) {
+            Ok(Some(m)) => frame.set_rets(&[
+                1,
+                m.words[0],
+                m.words[1],
+                m.words[2],
+                m.words[3],
+                m.reply_token,
+            ]),
+            Ok(None) => frame.set_ret(0),
+            Err(_) => frame.set_ret(!0u64),
+        },
+
+        abi::SYS_YIELD => {
+            blocking(crate::sched::yield_now);
+            frame.set_ret(0);
+        }
+
+        // 100 Hz tick x 10. A plain atomic read; nothing to unmask for.
+        abi::SYS_UPTIME_MS => {
+            frame.set_ret(crate::arch::time::tick_count().wrapping_mul(10))
+        }
+
+        // x0 = the byte to print.
+        //
+        // Not to be confused with `nr::DEBUG_PRINT` in the EL0 test range, which takes a
+        // (pointer, length) pair and prints a whole string. The two are genuinely different
+        // calls that happen to share a name, and before 8.5b they also shared the number 7 —
+        // which is exactly why the test range moved.
+        abi::SYS_DEBUG_PRINT => {
+            crate::print!("{}", (a[0] & 0xFF) as u8 as char);
+            frame.set_ret(0);
+        }
+
+        abi::SYS_EXIT => {
+            crate::println!(
+                "[syscall] SYS_EXIT: task {} exit code {}",
+                crate::sched::current_task_id(),
+                a[0]
+            );
+            // Route the code to the IPC round trip's slot if that test owns this task.
+            // Same arrangement as the soak's, and for the same reason: a single global
+            // exit slot shared between EL0 tests has the second exit overwrite the first.
+            super::el0_ipc::note_exit(a[0]);
+            // Blocks and never returns, so unlike the arms above there is no "after" in
+            // which to restore the mask. It is already masked and stays that way.
+            crate::sched::block_current_task();
+        }
+
+        // The filesystem, socket and management numbers. These are ABI — a server built
+        // against `libthemelios` may issue them — but aarch64 has no VFS (8.6), no network
+        // stack (8.7) and no management ABI (8.10) to service them with.
+        //
+        // Named explicitly rather than left to the `_ => false` below, which would send
+        // them into the EL0 test range's `_ => ENOSYS` and reach the same value by
+        // accident. The distinction matters when 8.6 lands: deleting a number from this
+        // list is how it becomes implemented, and a list is something you can read to see
+        // what is missing. An accidental fall-through is not.
+        abi::SYS_OPEN
+        | abi::SYS_READ_FILE
+        | abi::SYS_WRITE_FILE
+        | abi::SYS_CLOSE
+        | abi::SYS_STAT
+        | abi::SYS_READDIR
+        | abi::SYS_SOCKET
+        | abi::SYS_BIND
+        | abi::SYS_SENDTO
+        | abi::SYS_RECVFROM
+        | abi::SYS_SOCKET_CLOSE
+        | abi::SYS_CONNECT
+        | abi::SYS_LISTEN
+        | abi::SYS_ACCEPT
+        | abi::SYS_TCP_SEND
+        | abi::SYS_TCP_RECV
+        | abi::SYS_MGMT => frame.set_ret(ENOSYS),
+
+        _ => return false,
+    }
+    true
+}
+
 /// Dispatch one syscall from an EL0 exception frame.
 ///
 /// Reads the number and arguments, and writes the result back, **through the positional
@@ -282,6 +483,13 @@ pub fn dispatch(frame: &mut SyscallFrame) {
     let a4 = frame.arg4();
     let a5 = frame.arg5();
     let pc = frame.user_pc();
+
+    // The native ABI first. Its range and the EL0 test range are disjoint by assertion (see
+    // `nr::ABI_MAX`), so this ordering is a statement about which path matters, not a
+    // precedence rule — no number can match in both.
+    if dispatch_native(frame, nr, [a0, a1, a2, a3, a4, a5]) {
+        return;
+    }
 
     // `SUM6` writes its result through `ret_mut` instead of returning it, so that accessor
     // is on the live path too. It returns early for that reason.
@@ -548,6 +756,45 @@ pub unsafe fn enter_el0(entry: u64, sp: u64) -> ! {
             entry = in(reg) entry,
             sp = in(reg) sp,
             spsr = in(reg) SPSR_EL0T,
+            options(noreturn, nostack),
+        )
+    }
+}
+
+/// Drop to EL0 with three argument words already in `x0`-`x2`.
+///
+/// [`enter_el0`] leaves the general-purpose registers holding whatever the kernel entry
+/// function left there, which is fine for a payload whose inputs are all assembled into it.
+/// The 8.5b IPC payload's are not: its endpoint ids come from `create_endpoint` at runtime,
+/// so they cannot be `const` operands, and baking them in would mean rewriting the page's
+/// instructions — which is how a position-independent payload stops being one.
+///
+/// Passing them in registers is also a small check on the exception return in its own
+/// right: if `eret` does not deliver `x0`-`x2` as set up here, every syscall in that payload
+/// addresses the wrong endpoint and the test hangs rather than quietly passing.
+///
+/// # Safety
+///
+/// Same contract as [`enter_el0`]: `entry` and `sp` must be mapped in the currently
+/// installed `TTBR0_EL1` tree with appropriate permissions, and this never returns.
+pub unsafe fn enter_el0_with_args(entry: u64, sp: u64, args: [u64; 3]) -> ! {
+    // SAFETY: as `enter_el0`, plus the three argument registers. `x0`-`x2` are set last,
+    // after every other `msr`, so nothing between here and `eret` can clobber them — the
+    // register operands below are constrained to `reg`, which excludes the explicitly named
+    // `in("x0")` and friends.
+    unsafe {
+        core::arch::asm!(
+            "msr DAIFSet, #0xf",
+            "msr ELR_EL1, {entry}",
+            "msr SP_EL0, {sp}",
+            "msr SPSR_EL1, {spsr}",
+            "eret",
+            entry = in(reg) entry,
+            sp = in(reg) sp,
+            spsr = in(reg) SPSR_EL0T,
+            in("x0") args[0],
+            in("x1") args[1],
+            in("x2") args[2],
             options(noreturn, nostack),
         )
     }

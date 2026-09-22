@@ -764,6 +764,14 @@ const AARCH64_BOOT_FAILURES: &[&str] = &[
     // replaced by covers the thing that still matters: kernel work disturbing a task's
     // vector state, which the save area exists to prevent.
     "[fp] selftest: FAIL",
+    // Phase 8.5b, the native IPC ABI from EL0. Added with the self-test rather than after
+    // it, which by now is the rule here and not a courtesy: every entry above this one was
+    // added retroactively, after a review found the self-test it belongs to printing FAIL
+    // into a log CI never read. Three separate mutations of the 8.5b dispatcher — a zeroed
+    // reply token, two swapped return slots and a badge read from the wrong register — each
+    // produce one of these two lines.
+    "[el0-ipc] FAIL",
+    "[boot] Phase 8.5b EL0 IPC round trip FAILED",
     "!!! aarch64 EXCEPTION !!!",
 ];
 
