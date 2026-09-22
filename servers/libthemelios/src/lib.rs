@@ -69,6 +69,15 @@ pub mod http;
 #[path = "../../../kernel/src/oci/json.rs"]
 pub mod json;
 
+/// The native syscall numbers, **single-sourced** from the kernel's
+/// `arch/syscall_abi.rs` (Phase 8.5b). That file deliberately names nothing from either
+/// crate so it can be included from both sides, which makes these numbers one list rather
+/// than two lists and a checker — see its module docs for why that distinction was earned
+/// rather than assumed.
+#[path = "../../../kernel/src/arch/syscall_abi.rs"]
+mod syscall_abi;
+pub use syscall_abi::abi;
+
 // ----- Boot info -----
 
 /// Fixed virtual address where the kernel maps the server's boot-info page.
@@ -270,6 +279,16 @@ pub struct IpcMessage {
 /// clobbers RCX (return RIP) and R11 (saved RFLAGS).
 pub mod syscall {
     use super::IpcMessage;
+    // **The syscall numbers are not declared here.** They come from the kernel's own file,
+    // included the same way `http` and `json` are.
+    //
+    // Until a review of 8.5b they were 26 local `const`s duplicating the kernel's, pinned to
+    // nothing. Setting this crate's `SYS_SEND` to 99 built the whole project green; the only
+    // symptom was an amd64 test timing out after three minutes, and on aarch64 — where no
+    // server runs yet — there would have been none at all. A number meaning two different
+    // things on two sides of a boundary is the precise defect 8.5b exists to remove, and a
+    // checker comparing two lists only removes it where the checker can see.
+    use super::abi::*;
 
     // ----- The raw syscall primitives -----
     //
@@ -435,13 +454,6 @@ pub mod syscall {
         }
     }
 
-    const SYS_SEND: u64 = 1;
-    const SYS_RECEIVE: u64 = 2;
-    const SYS_CALL: u64 = 3;
-    const SYS_REPLY: u64 = 4;
-    const SYS_YIELD: u64 = 5;
-    const SYS_EXIT: u64 = 6;
-    const SYS_DEBUG_PRINT: u64 = 7;
 
     /// Send a message to `endpoint` with `badge`. Returns 0 on success.
     pub fn send(endpoint: u64, words: [u64; 4], badge: u64) -> u64 {
@@ -503,7 +515,6 @@ pub mod syscall {
 
     /// Milliseconds since boot (monotonic). Drives smoltcp's `Instant` clock in
     /// the net server's poll loop.
-    const SYS_UPTIME_MS: u64 = 14;
     pub fn uptime_ms() -> u64 {
         let ms: u64;
         // SAFETY: UPTIME_MS takes no arguments and returns the value in RAX.
@@ -517,7 +528,6 @@ pub mod syscall {
     /// continuously driving smoltcp; a blocking `receive` would stall the poll
     /// loop. On return RAX = 1/0 (had message?), with the words in
     /// RDI/RSI/RDX/R8 and the reply token in R9.
-    const SYS_TRY_RECEIVE: u64 = 20;
     pub fn try_receive(endpoint: u64) -> Option<IpcMessage> {
         let has: u64;
         let w0: u64;
@@ -553,12 +563,6 @@ pub mod syscall {
     // Number in RAX, args in RDI/RSI/RDX/R10; result in RAX. A return value with
     // the high bit set is an encoded `fs_proto::FsError`.
 
-    const SYS_OPEN: u64 = 8;
-    const SYS_READ_FILE: u64 = 9;
-    const SYS_WRITE_FILE: u64 = 10;
-    const SYS_CLOSE: u64 = 11;
-    const SYS_STAT: u64 = 12;
-    const SYS_READDIR: u64 = 13;
 
     /// Raw 4-argument syscall helper for the filesystem calls.
     #[inline]
@@ -607,11 +611,6 @@ pub mod syscall {
     // set is an encoded `net_proto` socket error. IPv4 addresses are packed
     // `a<<24|b<<16|c<<8|d`.
 
-    const SYS_SOCKET: u64 = 15;
-    const SYS_BIND: u64 = 16;
-    const SYS_SENDTO: u64 = 17;
-    const SYS_RECVFROM: u64 = 18;
-    const SYS_SOCKET_CLOSE: u64 = 19;
 
     /// Create a socket of `sock_type` (0 = UDP) using the network-authority
     /// capability `factory`. Returns a socket capability handle, or a high-bit
@@ -661,16 +660,10 @@ pub mod syscall {
 
     // --- TCP stream syscalls (Phase 4.6) ---
 
-    const SYS_CONNECT: u64 = 21;
-    const SYS_LISTEN: u64 = 22;
-    const SYS_ACCEPT: u64 = 23;
-    const SYS_TCP_SEND: u64 = 24;
-    const SYS_TCP_RECV: u64 = 25;
 
     /// `SYS_MGMT` (the op-multiplexed container management ABI) and its verb
     /// selectors. Only `listen` is wired in Phase 6.4; the rest arrive with the
     /// ring-3 api-server (6.5).
-    const SYS_MGMT: u64 = 26;
     const MGMT_OP_LISTEN: u64 = 1;
     const MGMT_OP_LIST: u64 = 2;
     const MGMT_OP_INSPECT: u64 = 3;

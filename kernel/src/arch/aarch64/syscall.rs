@@ -769,6 +769,9 @@ pub unsafe fn enter_el0(entry: u64, sp: u64) -> ! {
 /// so they cannot be `const` operands, and baking them in would mean rewriting the page's
 /// instructions — which is how a position-independent payload stops being one.
 ///
+/// A fourth was added when a review found the payload covering only four of the fifteen
+/// dispatcher arms; the extra endpoint is what lets it poll `TRY_RECEIVE`.
+///
 /// Passing them in registers is also a small check on the exception return in its own
 /// right: if `eret` does not deliver `x0`-`x2` as set up here, every syscall in that payload
 /// addresses the wrong endpoint and the test hangs rather than quietly passing.
@@ -777,7 +780,7 @@ pub unsafe fn enter_el0(entry: u64, sp: u64) -> ! {
 ///
 /// Same contract as [`enter_el0`]: `entry` and `sp` must be mapped in the currently
 /// installed `TTBR0_EL1` tree with appropriate permissions, and this never returns.
-pub unsafe fn enter_el0_with_args(entry: u64, sp: u64, args: [u64; 3]) -> ! {
+pub unsafe fn enter_el0_with_args(entry: u64, sp: u64, args: [u64; 4]) -> ! {
     // SAFETY: as `enter_el0`, plus the three argument registers. `x0`-`x2` are set last,
     // after every other `msr`, so nothing between here and `eret` can clobber them — the
     // register operands below are constrained to `reg`, which excludes the explicitly named
@@ -795,6 +798,7 @@ pub unsafe fn enter_el0_with_args(entry: u64, sp: u64, args: [u64; 3]) -> ! {
             in("x0") args[0],
             in("x1") args[1],
             in("x2") args[2],
+            in("x3") args[3],
             options(noreturn, nostack),
         )
     }

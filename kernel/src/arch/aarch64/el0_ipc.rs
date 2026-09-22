@@ -19,26 +19,44 @@
 //!
 //! ## What the round trip checks, and how it self-checks
 //!
-//! A kernel task and an EL0 task talk to each other across three endpoints, so every
-//! syscall runs in the direction a real server would use it:
+//! A kernel task and an EL0 task talk to each other across four endpoints, so every syscall
+//! runs in the direction a real server would use it:
 //!
 //! | step | kernel task | EL0 payload | proves |
 //! |---|---|---|---|
-//! | 1 | `ipc_call(EP_A, …)` | `SYS_RECEIVE` then `SYS_REPLY` | the six-value return; `REPLY`'s mapping |
-//! | 2 | `ipc_receive(EP_B)` | `SYS_SEND` | `SEND`'s six arguments |
-//! | 3 | `ipc_receive(EP_C)` + `ipc_reply` | `SYS_CALL` | `CALL`'s four-word reply |
+//! | 1 | `ipc_call(EP_A, …)`, checks the reply words | `SYS_RECEIVE` then `SYS_REPLY` | `RECEIVE`'s six-value return; `REPLY`'s six arguments |
+//! | 2 | `ipc_receive(EP_B)`, checks words + badge | `SYS_SEND` | `SEND`'s six arguments |
+//! | 3 | `ipc_send(EP_D, …)` after step 2 | `SYS_TRY_RECEIVE`, polled | both branches, and the *shifted* six-value return |
+//! | 4 | `ipc_receive(EP_C)`, checks words + badge, then replies | `SYS_CALL` | `CALL`'s six arguments and four-word reply |
+//! | 5 | — | `YIELD`, `UPTIME_MS`, `DEBUG_PRINT`, `NULL`, an unimplemented number | the arms with no other caller |
 //!
-//! Step 1 is the interesting one, because it cannot be faked. `SYS_RECEIVE` returns the
-//! reply token in `x5`, and the payload passes that token straight back as `SYS_REPLY`'s
-//! second argument. If `set_rets` writes the token to the wrong slot — or if `REPLY` reads
-//! its arguments from the wrong registers — the reply is addressed to nothing, the kernel
-//! task stays blocked in `ipc_call`, and the test times out. The token's correctness is
-//! *required for the test to finish at all*, not merely asserted afterwards.
+//! Step 1 cannot be faked. `SYS_RECEIVE` returns the reply token in `x5`, and the payload
+//! passes that token straight back as `SYS_REPLY`'s second argument. If `set_rets` writes
+//! it to the wrong slot, the reply is addressed to nothing, the kernel task stays blocked
+//! in `ipc_call`, and the test times out. The token's correctness is *required for the test
+//! to terminate*, not asserted afterwards.
 //!
-//! Everywhere else the payload folds each returned value into one accumulator at a distinct
-//! shift, so two values arriving in each other's registers changes the exit code rather
-//! than cancelling out. The single number the test compares is therefore sensitive to every
-//! slot in all four calls.
+//! Every other checked value is folded into one rolling hash, `acc = acc * 31 + value`, in
+//! a fixed order — so two values arriving in each other's registers change the exit code
+//! rather than cancelling out.
+//!
+//! ## What an earlier version of this claimed, and did not do
+//!
+//! This block used to say the accumulator was "sensitive to every slot in all four calls".
+//! It was not, and a review demonstrated it: the payload sent `REPLY` with all four words
+//! `xzr` and `CALL` with all six arguments `xzr`, and the kernel peer looked at neither. So
+//! `SYS_REPLY`'s and `SYS_CALL`'s *argument* mappings could both be reversed in the
+//! dispatcher and this test still printed PASS.
+//!
+//! That mattered specifically rather than abstractly: `echo-server`, the first thing 8.5c
+//! runs, does `receive` then `reply(ep, token, [...])`. A wrong `REPLY` word mapping is the
+//! first bug it would hit, and it is exactly the bug this test exists to pre-empt.
+//!
+//! The same review broke all six arms the payload never called — `NULL`, `TRY_RECEIVE`,
+//! `YIELD`, `UPTIME_MS`, `DEBUG_PRINT` and the sixteen `ENOSYS` numbers — simultaneously,
+//! and the suite still reported 25 passed / 0 failed. Five of fifteen arms were covered.
+//! Step 5 and the `TRY_RECEIVE` poll close both gaps; the table above is now a description
+//! rather than an intention.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -57,40 +75,91 @@ const STACK_VA: u64 = 0xb0_0000;
 
 /// Request words the kernel task sends in step 1, and the badge alongside them.
 ///
-/// Distinct bit patterns rather than small integers: a word arriving in the wrong slot has
-/// to change the accumulator, and `1`/`2`/`3` differ too little for a shift-and-add to
-/// guarantee that.
+/// Distinct bit patterns rather than small integers, so a word arriving in the wrong slot
+/// has to change the hash rather than possibly cancelling against another.
 const REQ: [u64; 4] = [0x11, 0x22, 0x33, 0x44];
 const REQ_BADGE: u64 = 0x55;
 
-/// Words the EL0 payload sends back in step 2, and its badge.
+/// Words the EL0 payload replies with in step 1, checked by the kernel peer.
+///
+/// These were all zero until a review reversed `SYS_REPLY`'s four word slots in the
+/// dispatcher and this test still printed PASS. `REPLY`'s word mapping is the first thing a
+/// real server exercises, so it is now carried by real values that the peer compares.
+const REPLY_WORDS: [u64; 4] = [0xC1, 0xC2, 0xC3, 0xC4];
+
+/// Words the EL0 payload sends in step 2, and its badge.
 const SEND_WORDS: [u64; 4] = [0x66, 0x77, 0x88, 0x99];
 const SEND_BADGE: u64 = 0xAA;
 
-/// Words the kernel task replies with in step 3.
+/// Words the kernel peer sends to EP_D for the EL0 task to pick up with `TRY_RECEIVE`.
+const TRY_WORDS: [u64; 4] = [0xD1, 0xD2, 0xD3, 0xD4];
+
+/// Words the EL0 payload sends as its `SYS_CALL` request, checked by the kernel peer —
+/// uncovered for the same reason `REPLY_WORDS` was.
+const CALL_WORDS: [u64; 4] = [0xE1, 0xE2, 0xE3, 0xE4];
+const CALL_BADGE: u64 = 0xE5;
+
+/// Words the kernel task replies with to the EL0 task's `SYS_CALL`.
 const CALL_REPLY: [u64; 4] = [0xB1, 0xB2, 0xB3, 0xB4];
+
+/// Byte the payload passes to `SYS_DEBUG_PRINT`, which appears on the console when that arm
+/// works. Chosen printable so a human reading the serial log can see it.
+const PRINT_CH: u64 = b'*' as u64;
+
+/// Multiplier for the payload's rolling hash.
+///
+/// The accumulator is `acc = acc * HASH_MUL + value` per checked value, rather than each
+/// value packed at its own bit offset. Packing ran out of bits once the checked set grew
+/// past nine values, and worse, it made the *number of things checked* a function of the
+/// bit budget. A rolling hash is position-sensitive without a budget, so coverage can grow
+/// without re-laying the encoding — and `madd` computes it in one instruction.
+const HASH_MUL: u64 = 31;
 
 /// The accumulator the payload is expected to exit with.
 ///
-/// Computed here the same way the assembly computes it, from the same constants — so the
-/// expectation and the payload cannot disagree about what a correct run produces without
-/// one of them being edited in isolation.
+/// Computed here by the same rule and in the same order as the assembly, from the same
+/// constants, so the expectation and the payload cannot disagree about a correct run
+/// without one of them being edited in isolation.
 const fn expected_acc() -> u64 {
-    // Step 1: the four request words at shifts 0/8/16/24, then the badge at 32.
-    let mut acc = REQ[0] | (REQ[1] << 8) | (REQ[2] << 16) | (REQ[3] << 24) | (REQ_BADGE << 32);
-    // Step 3: the four reply words at shifts 40/44/48/52. Narrower spacing is fine — the
-    // values are all under 0x100 and the shifts stay inside 64 bits.
-    acc += CALL_REPLY[0] << 40;
-    acc += CALL_REPLY[1] << 44;
-    acc += CALL_REPLY[2] << 48;
-    acc += CALL_REPLY[3] << 52;
-    acc
+    const fn fold(acc: u64, v: u64) -> u64 {
+        acc.wrapping_mul(HASH_MUL).wrapping_add(v)
+    }
+    let mut a = 0u64;
+    // Step 1, RECEIVE: four words then the badge. The reply token is deliberately not
+    // folded — its value is dynamic, and it is checked by being required to work.
+    a = fold(a, REQ[0]);
+    a = fold(a, REQ[1]);
+    a = fold(a, REQ[2]);
+    a = fold(a, REQ[3]);
+    a = fold(a, REQ_BADGE);
+    // Step 3, TRY_RECEIVE: the had-a-message flag, four words, then the reply token, which
+    // is 0 for a plain send and is checked as being 0.
+    a = fold(a, 1);
+    a = fold(a, TRY_WORDS[0]);
+    a = fold(a, TRY_WORDS[1]);
+    a = fold(a, TRY_WORDS[2]);
+    a = fold(a, TRY_WORDS[3]);
+    a = fold(a, 0);
+    // Step 4, CALL: the four reply words.
+    a = fold(a, CALL_REPLY[0]);
+    a = fold(a, CALL_REPLY[1]);
+    a = fold(a, CALL_REPLY[2]);
+    a = fold(a, CALL_REPLY[3]);
+    // Step 5: YIELD -> 0, UPTIME_MS -> non-zero (folded as 1), DEBUG_PRINT -> 0,
+    // NULL -> 0, and an unimplemented ABI number -> ENOSYS.
+    a = fold(a, 0);
+    a = fold(a, 1);
+    a = fold(a, 0);
+    a = fold(a, 0);
+    a = fold(a, super::syscall::ENOSYS);
+    a
 }
 
 /// Endpoint ids, published for the payload's sake once created.
 static EP_A: AtomicU64 = AtomicU64::new(0);
 static EP_B: AtomicU64 = AtomicU64::new(0);
 static EP_C: AtomicU64 = AtomicU64::new(0);
+static EP_D: AtomicU64 = AtomicU64::new(0);
 
 /// Set when the kernel task has completed all three steps without a mismatch.
 static KERNEL_SIDE_OK: AtomicBool = AtomicBool::new(false);
@@ -140,38 +209,40 @@ ipc_payload_start:
     mov  x19, x0            // EP_A
     mov  x20, x1            // EP_B
     mov  x21, x2            // EP_C
+    mov  x23, x3            // EP_D
     mov  x22, xzr           // accumulator
+    mov  x25, #{mul}        // the hash multiplier, held for the whole payload
 
     // --- Step 1: RECEIVE on EP_A, then REPLY with the token we were handed ---
-    //
-    // Returns words[0..4] in x0-x3, the badge in x4 and the reply token in x5.
     mov  x8, #{nr_receive}
     mov  x0, x19
     svc  #0
 
-    // Fold all five *data* slots in at distinct shifts. The token is deliberately not
-    // folded in: its value is dynamic, and it is checked far more strongly by being
-    // required to work in the REPLY below.
-    add  x22, x22, x0
-    add  x22, x22, x1, lsl #8
-    add  x22, x22, x2, lsl #16
-    add  x22, x22, x3, lsl #24
-    add  x22, x22, x4, lsl #32
+    // Fold the five data slots. The token (x5) is not folded: its value is dynamic, and it
+    // is checked far more strongly by being required to work in the REPLY below.
+    madd x22, x22, x25, x0
+    madd x22, x22, x25, x1
+    madd x22, x22, x25, x2
+    madd x22, x22, x25, x3
+    madd x22, x22, x25, x4
 
-    // REPLY(EP_A, token, [0,0,0,0]). x5 still holds the token from the receive above.
-    mov  x1, x5
+    // REPLY(EP_A, token, [four non-zero words]).
+    //
+    // Those words were all `xzr` until a review reversed REPLY's four word slots in the
+    // dispatcher and this test still printed PASS. They are non-zero now and the kernel
+    // peer compares them, because REPLY's word mapping is the first thing a real server
+    // exercises — `echo-server` does `receive` then `reply(ep, token, [...])` — and it was
+    // the one mapping this test existed to pre-empt and did not cover.
+    mov  x1, x5             // the token, straight back out
     mov  x8, #{nr_reply}
     mov  x0, x19
-    mov  x2, xzr
-    mov  x3, xzr
-    mov  x4, xzr
-    mov  x5, xzr
+    mov  x2, #{rw0}
+    mov  x3, #{rw1}
+    mov  x4, #{rw2}
+    mov  x5, #{rw3}
     svc  #0
 
     // --- Step 2: SEND on EP_B ---
-    //
-    // x0 = endpoint, x1-x4 = words, x5 = badge. Six arguments, which is the widest the
-    // positional ABI goes and the only call here that uses every one of them.
     mov  x8, #{nr_send}
     mov  x0, x20
     mov  x1, #{sw0}
@@ -181,24 +252,67 @@ ipc_payload_start:
     mov  x5, #{sbadge}
     svc  #0
 
-    // --- Step 3: CALL on EP_C ---
+    // --- Step 3: poll TRY_RECEIVE on EP_D until the peer's message lands ---
     //
-    // Same six arguments in, four reply words back in x0-x3. The request words are not
-    // checked by the kernel side here (step 2 already covers argument passing); what this
-    // step exists for is the four-word reply.
+    // The poll covers both branches: the peer sends only after servicing step 2, so the
+    // first calls return 0 (no message) and a later one returns 1 with the words. That is
+    // the only exercise of the six-slot return's *shifted* form — the flag in slot 0 moving
+    // the words down one relative to RECEIVE — which had no caller anywhere before.
+2:  mov  x8, #{nr_try_receive}
+    mov  x0, x23
+    svc  #0
+    cbz  x0, 2b
+
+    madd x22, x22, x25, x0  // the flag itself
+    madd x22, x22, x25, x1
+    madd x22, x22, x25, x2
+    madd x22, x22, x25, x3
+    madd x22, x22, x25, x4
+    madd x22, x22, x25, x5  // reply token: 0 for a plain send, and checked as such
+
+    // --- Step 4: CALL on EP_C, with a real request the peer verifies ---
     mov  x8, #{nr_call}
     mov  x0, x21
-    mov  x1, xzr
-    mov  x2, xzr
-    mov  x3, xzr
-    mov  x4, xzr
-    mov  x5, xzr
+    mov  x1, #{cw0}
+    mov  x2, #{cw1}
+    mov  x3, #{cw2}
+    mov  x4, #{cw3}
+    mov  x5, #{cbadge}
     svc  #0
 
-    add  x22, x22, x0, lsl #40
-    add  x22, x22, x1, lsl #44
-    add  x22, x22, x2, lsl #48
-    add  x22, x22, x3, lsl #52
+    madd x22, x22, x25, x0
+    madd x22, x22, x25, x1
+    madd x22, x22, x25, x2
+    madd x22, x22, x25, x3
+
+    // --- Step 5: the arms with no other caller ---
+    //
+    // A review broke all six of these at once — NULL, TRY_RECEIVE, YIELD, UPTIME_MS,
+    // DEBUG_PRINT and the sixteen ENOSYS numbers — and the suite still reported 25/0/30.
+    // Folding each return into the same accumulator is what makes them load-bearing.
+
+    mov  x8, #{nr_yield}    // YIELD -> 0
+    svc  #0
+    madd x22, x22, x25, x0
+
+    mov  x8, #{nr_uptime}   // UPTIME_MS -> a live tick count; fold whether it is non-zero,
+    svc  #0                 // since the value itself is not reproducible
+    cmp  x0, #0
+    cset x0, ne
+    madd x22, x22, x25, x0
+
+    mov  x8, #{nr_print}    // DEBUG_PRINT(byte) -> 0, and puts a character on the console
+    mov  x0, #{print_ch}
+    svc  #0
+    madd x22, x22, x25, x0
+
+    mov  x8, #{nr_null}     // NULL -> 0
+    svc  #0
+    madd x22, x22, x25, x0
+
+    mov  x8, #{nr_unimpl}   // an ABI number aarch64 does not implement yet -> ENOSYS.
+    svc  #0                 // Folded raw, so returning 0 or falling through to the test
+    madd x22, x22, x25, x0  // range's own ENOSYS by accident both change the accumulator.
 
     // --- Exit with the accumulator ---
     mov  x8, #{nr_exit}
@@ -214,13 +328,30 @@ ipc_payload_end:
     nr_receive = const crate::arch::syscall::abi::SYS_RECEIVE,
     nr_reply = const crate::arch::syscall::abi::SYS_REPLY,
     nr_send = const crate::arch::syscall::abi::SYS_SEND,
+    nr_try_receive = const crate::arch::syscall::abi::SYS_TRY_RECEIVE,
     nr_call = const crate::arch::syscall::abi::SYS_CALL,
+    nr_yield = const crate::arch::syscall::abi::SYS_YIELD,
+    nr_uptime = const crate::arch::syscall::abi::SYS_UPTIME_MS,
+    nr_print = const crate::arch::syscall::abi::SYS_DEBUG_PRINT,
+    nr_null = const crate::arch::syscall::abi::SYS_NULL,
+    nr_unimpl = const crate::arch::syscall::abi::SYS_OPEN,
     nr_exit = const crate::arch::syscall::abi::SYS_EXIT,
+    mul = const HASH_MUL,
+    print_ch = const PRINT_CH,
+    rw0 = const REPLY_WORDS[0],
+    rw1 = const REPLY_WORDS[1],
+    rw2 = const REPLY_WORDS[2],
+    rw3 = const REPLY_WORDS[3],
     sw0 = const SEND_WORDS[0],
     sw1 = const SEND_WORDS[1],
     sw2 = const SEND_WORDS[2],
     sw3 = const SEND_WORDS[3],
     sbadge = const SEND_BADGE,
+    cw0 = const CALL_WORDS[0],
+    cw1 = const CALL_WORDS[1],
+    cw2 = const CALL_WORDS[2],
+    cw3 = const CALL_WORDS[3],
+    cbadge = const CALL_BADGE,
 );
 
 unsafe extern "C" {
@@ -246,51 +377,74 @@ fn kernel_peer() {
     let ep_a = EP_A.load(Ordering::Relaxed);
     let ep_b = EP_B.load(Ordering::Relaxed);
     let ep_c = EP_C.load(Ordering::Relaxed);
+    let ep_d = EP_D.load(Ordering::Relaxed);
+
+    macro_rules! fail {
+        ($($arg:tt)*) => {{
+            println!($($arg)*);
+            KERNEL_SIDE_DONE.store(true, Ordering::Release);
+            return;
+        }};
+    }
 
     // Step 1: call into EL0 and wait for its reply. If the payload mishandles the token
     // this never returns, which is the timeout `run` bounds.
-    let step1 = crate::ipc::ipc_call(ep_a, crate::ipc::IpcMessage::new(REQ), REQ_BADGE);
-    if step1.is_err() {
-        println!("[el0-ipc] FAIL — kernel ipc_call on EP_A errored");
-        KERNEL_SIDE_DONE.store(true, Ordering::Release);
-        return;
+    //
+    // The reply's *words* are checked too. They were ignored until a review reversed
+    // `SYS_REPLY`'s four word slots and this test still passed.
+    match crate::ipc::ipc_call(ep_a, crate::ipc::IpcMessage::new(REQ), REQ_BADGE) {
+        Ok(reply) => {
+            if reply.words != REPLY_WORDS {
+                fail!(
+                    "[el0-ipc] FAIL — REPLY words arrived as {:#x?}, expected {:#x?}",
+                    reply.words, REPLY_WORDS
+                );
+            }
+        }
+        Err(_) => fail!("[el0-ipc] FAIL — kernel ipc_call on EP_A errored"),
     }
 
-    // Step 2: receive what EL0 sent, and check every word and the badge. This is the only
-    // check on `SYS_SEND`'s argument mapping, so it compares all six positions.
+    // Step 2: receive what EL0 sent, checking every word and the badge — the only check on
+    // `SYS_SEND`'s six argument positions.
     match crate::ipc::ipc_receive(ep_b) {
         Ok(m) => {
             if m.words != SEND_WORDS || m.badge != SEND_BADGE {
-                println!(
+                fail!(
                     "[el0-ipc] FAIL — SEND arrived as words {:#x?} badge {:#x}, expected {:#x?} / {:#x}",
                     m.words, m.badge, SEND_WORDS, SEND_BADGE
                 );
-                KERNEL_SIDE_DONE.store(true, Ordering::Release);
-                return;
             }
         }
-        Err(_) => {
-            println!("[el0-ipc] FAIL — kernel ipc_receive on EP_B errored");
-            KERNEL_SIDE_DONE.store(true, Ordering::Release);
-            return;
-        }
+        Err(_) => fail!("[el0-ipc] FAIL — kernel ipc_receive on EP_B errored"),
     }
 
-    // Step 3: serve EL0's CALL, replying with the four words it folds into its accumulator.
+    // Step 3: post a message for the EL0 task to collect with `TRY_RECEIVE`.
+    //
+    // Sent only now, after step 2, so the payload's poll loop is guaranteed to observe the
+    // empty case first — which is how both branches of that arm get covered rather than
+    // just the one.
+    if crate::ipc::ipc_send(ep_d, crate::ipc::IpcMessage::new(TRY_WORDS), 0).is_err() {
+        fail!("[el0-ipc] FAIL — kernel ipc_send on EP_D errored");
+    }
+
+    // Step 4: serve EL0's CALL. Its *request* words and badge are checked here for the same
+    // reason step 1's reply words are: they were `xzr` and nothing looked at them, so
+    // `SYS_CALL`'s argument mapping was unverified.
     match crate::ipc::ipc_receive(ep_c) {
         Ok(m) => {
-            let r = crate::ipc::ipc_reply(ep_c, m.reply_token, crate::ipc::IpcMessage::new(CALL_REPLY));
-            if r.is_err() {
-                println!("[el0-ipc] FAIL — kernel ipc_reply on EP_C errored");
-                KERNEL_SIDE_DONE.store(true, Ordering::Release);
-                return;
+            if m.words != CALL_WORDS || m.badge != CALL_BADGE {
+                fail!(
+                    "[el0-ipc] FAIL — CALL request arrived as words {:#x?} badge {:#x}, expected {:#x?} / {:#x}",
+                    m.words, m.badge, CALL_WORDS, CALL_BADGE
+                );
+            }
+            if crate::ipc::ipc_reply(ep_c, m.reply_token, crate::ipc::IpcMessage::new(CALL_REPLY))
+                .is_err()
+            {
+                fail!("[el0-ipc] FAIL — kernel ipc_reply on EP_C errored");
             }
         }
-        Err(_) => {
-            println!("[el0-ipc] FAIL — kernel ipc_receive on EP_C errored");
-            KERNEL_SIDE_DONE.store(true, Ordering::Release);
-            return;
-        }
+        Err(_) => fail!("[el0-ipc] FAIL — kernel ipc_receive on EP_C errored"),
     }
 
     KERNEL_SIDE_OK.store(true, Ordering::Relaxed);
@@ -310,6 +464,7 @@ fn el0_entry() {
                 EP_A.load(Ordering::Relaxed),
                 EP_B.load(Ordering::Relaxed),
                 EP_C.load(Ordering::Relaxed),
+                EP_D.load(Ordering::Relaxed),
             ],
         )
     }
@@ -325,6 +480,7 @@ pub fn run() -> bool {
     EP_A.store(crate::ipc::create_endpoint("el0-ipc-a"), Ordering::Relaxed);
     EP_B.store(crate::ipc::create_endpoint("el0-ipc-b"), Ordering::Relaxed);
     EP_C.store(crate::ipc::create_endpoint("el0-ipc-c"), Ordering::Relaxed);
+    EP_D.store(crate::ipc::create_endpoint("el0-ipc-d"), Ordering::Relaxed);
 
     let bytes = payload();
     assert!(
@@ -384,17 +540,27 @@ pub fn run() -> bool {
     let want = expected_acc();
 
     if !exited {
-        // The most likely cause is the one described in the module docs: a reply token that
-        // did not survive `SYS_RECEIVE`'s return, leaving both halves blocked forever.
+        // Deliberately does not name a cause. An earlier version asserted "a lost reply
+        // token leaves both halves blocked", which is the *most common* cause but not the
+        // only one — breaking `TRY_RECEIVE` strands the peer in `ipc_send` on EP_D instead,
+        // and the message then confidently blamed the wrong mechanism. Any arm that fails
+        // to hand control back leaves this same footprint.
         println!(
-            "[el0-ipc] FAIL — EL0 task never exited (kernel side {}); a lost reply token \
-             leaves both halves blocked",
+            "[el0-ipc] FAIL — EL0 task never exited (kernel side {}). Some call did not \
+             return control: a reply token lost in `SYS_RECEIVE`'s return and a broken \
+             `TRY_RECEIVE` both look like this",
             if kernel_ok { "completed" } else { "also stuck or failed" }
         );
         return false;
     }
     if !kernel_ok {
-        // The kernel half prints its own specific failure before setting DONE.
+        // The kernel half prints its own specific failure before setting DONE — but only
+        // when it reached one. A review noted the `!DONE` case returns here having printed
+        // nothing; CI still catches it through the `[boot] …FAILED` sentinel, but a silent
+        // branch in a self-test is worth closing rather than relying on the backstop.
+        if !KERNEL_SIDE_DONE.load(Ordering::Acquire) {
+            println!("[el0-ipc] FAIL — kernel peer never finished (still blocked?)");
+        }
         return false;
     }
     if acc != want {
@@ -409,8 +575,10 @@ pub fn run() -> bool {
     }
 
     println!(
-        "[el0-ipc] PASS (SEND/RECEIVE/REPLY/CALL across 3 endpoints from EL0; \
-         accumulator {:#x} matches, reply token round-tripped through userspace)",
+        "[el0-ipc] PASS (all 15 native-ABI arms from EL0 across 4 endpoints — \
+         SEND/RECEIVE/REPLY/CALL/TRY_RECEIVE/YIELD/UPTIME_MS/DEBUG_PRINT/NULL/EXIT plus \
+         ENOSYS; hash {:#x} matches over 20 checked values, reply token round-tripped \
+         through userspace)",
         acc
     );
     true
