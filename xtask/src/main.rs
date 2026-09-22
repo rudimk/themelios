@@ -243,36 +243,21 @@ fn expected_e_machine(kernel_target: &str) -> u16 {
 /// answer here, because both mean "cannot vouch for this artifact" and both must fail.
 ///
 /// Flat binaries have no header, which is why this returns an `Option` and why the `.bin`
-/// blobs are protected structurally — by the per-arch staging directory — rather than by
-/// this check. Only the six detached `.elf` smoke binaries can be verified this way.
-/// (`embedded.rs` is x86-only today and names `amd64` in its paths directly; the `#[cfg]`
-/// that selects between two staging directories arrives with 8.5b. Until then the
-/// partitioning is enforced on this side alone.)
+/// blobs are protected structurally — by the per-arch staging directory and the hash
+/// manifests — rather than by this check. Only the detached `.elf` smoke binaries can be
+/// verified this way: six of them on x86_64, one (`elf-smoke`) on aarch64, per
+/// `server_elfs`.
+///
+/// (`embedded.rs` is still x86-only and names `amd64` in its paths directly. The `#[cfg]`
+/// that selects between two staging directories arrives with **8.5d**, which un-gates
+/// `mod process` for aarch64; an earlier version of this comment said 8.5b, which came and
+/// went without it. Until then the partitioning is enforced on this side alone.)
 fn elf_machine(path: &Path) -> Option<u16> {
     let bytes = fs::read(path).ok()?;
     if bytes.len() < 20 || &bytes[0..4] != b"\x7fELF" {
         return None;
     }
     Some(u16::from_le_bytes([bytes[18], bytes[19]]))
-}
-
-/// Whether the userspace servers can be built for this kernel target yet.
-///
-/// `libthemelios`' syscall wrappers are 25 hand-written `asm!` blocks using the x86
-/// `syscall` instruction and register set, and the six detached smoke crates add 28 more
-/// in their `_start` routines. Those land in Phase 8.5b. Until then this returns false for
-/// aarch64 and the callers say so rather than failing to link — and the aarch64 kernel
-/// embeds nothing anyway, since `mod process` is still x86-gated.
-fn servers_supported(kernel_target: &str) -> bool {
-    // 8.5c turned this true for aarch64. `libthemelios`' 25 syscall wrappers landed in
-    // 8.5b, so the seven flat servers link; `elf-smoke`'s aarch64 `_start` landed here. The
-    // five Linux-personality smoke crates are excluded by `server_elfs`, not by this gate —
-    // they are a missing *kernel* facility (the Linux table, Phase 8.9), not a missing
-    // server toolchain.
-    matches!(
-        kernel_target,
-        "x86_64-unknown-none" | "aarch64-unknown-none-softfloat"
-    )
 }
 
 /// The userspace server binaries to build and embed in the kernel.
@@ -1944,16 +1929,18 @@ fn cmd_build(args: &[String]) {
     // Build the userspace servers first — the kernel embeds their flat binaries
     // via include_bytes!, so they must exist before the kernel compiles.
     //
-    // Gated on the architecture, which it was not before: `cmd_build` called this
-    // unconditionally, including for `--arch aarch64`, where `libthemelios`' 25 `asm!`
-    // blocks are still x86-only and the build would fail. aarch64 servers land in 8.5b;
-    // until then the aarch64 kernel embeds nothing, because `mod process` — and with it
-    // `embedded.rs` — is x86-gated too.
-    if servers_supported(target) {
-        build_servers(&root, target);
-    } else {
-        println!("Skipping userspace servers: not yet ported to {target} (Phase 8.5b).");
-    }
+    // Both architectures now. `cmd_build` called this unconditionally before 8.5a, which
+    // was wrong for a different reason than it looks: the pre-8.5a `build_servers`
+    // hard-coded the x86 target, so `--arch arm64` built *x86* servers and left them in a
+    // staging directory the arm64 kernel would then have embedded. 8.5a partitioned the
+    // directory and gated the call; 8.5c made the gate true for aarch64 as well.
+    //
+    // There is deliberately no `else` branch. `resolve_target` yields exactly two targets
+    // and both build servers, so any "skipping servers" message would be unreachable text —
+    // and an unreachable branch explaining a deferral that has already happened is the
+    // inert-mechanism pattern pointed backwards. A third architecture will announce itself
+    // through `server_target`'s panic, which names the unknown target.
+    build_servers(&root, target);
 
     // Clean the kernel crate's cached artifacts before building. This forces
     // a full recompile every time, which ensures build.rs re-runs and generates
@@ -2137,19 +2124,15 @@ fn cmd_test(args: &[String]) {
 
     // Build the userspace servers first (the kernel embeds their binaries).
     //
-    // **This must stay above the aarch64 dispatch below.** Before 8.5a the `build_servers`
-    // call sat after it, so `cmd_test --arch aarch64` returned first and staged nothing —
-    // harmless only because `embedded.rs` is still x86-gated and the aarch64 test kernel
-    // embeds nothing. The moment 8.5b un-gates it, an aarch64 test kernel would
-    // `include_bytes!` whatever `target/servers/arm64/` happened to hold from an earlier
-    // `cargo xtask build --arch arm64` — the exact stale-blob failure this sub-phase
-    // exists to prevent, on the one command CI runs. Hoisting it makes the gate live on
-    // both paths today (aarch64 prints the skip) and correct on both after 8.5b.
-    if servers_supported(target) {
-        build_servers(&root, target);
-    } else {
-        println!("Skipping userspace servers: not yet ported to {target} (Phase 8.5b).");
-    }
+    // **This must stay above the aarch64 dispatch below.**
+    //
+    // Before 8.5a the `build_servers` call sat *after* it, so `cmd_test --arch aarch64`
+    // returned first and staged nothing. That was harmless only while `embedded.rs` was
+    // x86-gated. It stops being harmless in 8.5d, when an aarch64 test kernel will
+    // `include_bytes!` whatever `target/servers/arm64/` happens to hold — the exact
+    // stale-blob failure 8.5a exists to prevent, on the one command CI runs. Hoisting it
+    // made the gate live on both paths; 8.5c made it build on both.
+    build_servers(&root, target);
 
     // aarch64 runs the same suite but cannot report its verdict the same way: the
     // `virt` machine has no `isa-debug-exit`, so the result comes off the serial
@@ -2329,10 +2312,7 @@ fn cmd_docs(_args: &[String]) {
     // one command that did not honour it. On a fresh clone `cargo doc` failed with
     // "couldn't read .../target/servers/amd64/echo-server.bin". No CI job runs `xtask
     // docs`, which is why it stayed broken quietly.
-    let doc_target = "x86_64-unknown-none";
-    if servers_supported(doc_target) {
-        build_servers(&root, doc_target);
-    }
+    build_servers(&root, "x86_64-unknown-none");
 
     println!("Building rustdoc...");
     let doc_status = Command::new("cargo")
@@ -2480,37 +2460,19 @@ fn cmd_verify_servers(args: &[String]) {
     let stage = stage_arch(target);
     let manifest = manifest_path(&root, stage);
 
-    // An architecture with no servers yet is "nothing to verify", not a failure.
+    // The "nothing to verify" branch that stood here until 8.5c is gone, and its going is
+    // the point rather than a cleanup.
     //
-    // This exists so the CI step can be added to **both** jobs today. The aarch64 job runs
-    // the same command, it passes by doing nothing, and it becomes load-bearing on its own
-    // the moment 8.5b flips `servers_supported` — with no workflow edit and nothing for
-    // anyone to remember. The alternative, "add the arm64 step when 8.5b lands", is the
-    // deferral that five review rounds running have caught going unmade.
+    // It was added in 8.5b so the CI step could be wired into *both* jobs immediately: the
+    // aarch64 job ran this same command, passed by doing nothing, and was to become
+    // load-bearing on its own the moment aarch64 gained servers — with no workflow edit and
+    // nothing for anyone to remember. That is exactly what happened in 8.5c, one sub-phase
+    // later. The branch has now served its whole purpose and can no longer execute, since
+    // both targets `resolve_target` yields build servers.
     //
-    // A check that passes by doing nothing is admittedly a weak check *today*. It earns its
-    // place through the two contradictions below, which are the states that would let the
-    // whole mechanism go quiet, and which are the reason this is not simply an early
-    // `return`.
-    if !servers_supported(target) {
-        // A manifest for an architecture that builds no servers means someone generated it
-        // and then lost the build wiring — the manifest would sit there looking like
-        // coverage while nothing produced the blobs it names.
-        if manifest.exists() {
-            eprintln!(
-                "verify-servers: {} exists, but no servers are built for {target}.\n\
-                 A manifest without a build is not coverage. Either restore the build \
-                 wiring (`servers_supported`) or delete the manifest.",
-                manifest.display()
-            );
-            process::exit(1);
-        }
-        println!(
-            "verify-servers: nothing to verify for {target} — servers are not ported yet \
-             (Phase 8.5b). This becomes a real check automatically when they are."
-        );
-        return;
-    }
+    // Keeping it would leave text that can never print, explaining a deferral that has
+    // already been made. The self-activating design is worth recording; the dead code is
+    // not.
 
     build_servers(&root, target);
 

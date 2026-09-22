@@ -847,6 +847,14 @@ likely arch-neutral as-is, so try it before writing a sibling. The real hazard i
 `-Crelocation-model=static`, which the script does not control. Budget link-map reading for
 the relocation behavior.
 
+**Resolved in 8.5c, and the hedge was right.** All seven flat servers linked for aarch64
+with no change to the script and no change to their crates — `libthemelios`' wrappers from
+8.5b were sufficient. A review verified by link map that `_start` sits at `0x200000` on both
+architectures, that every image has **zero relocations**, and that the GOT concern runs the
+*opposite* way from the one budgeted for: **x86_64** emits a `.got` orphan (landing inside
+the image, below `__bss_start`, which is why amd64 has always worked) and aarch64 emits
+none. The link-map budget was not needed.
+
 ---
 
 ### Tier 3 — un-gate the arch-neutral stack
@@ -932,6 +940,18 @@ forms, and **every one is a path-clamping entry point**, so enumerate them rathe
 discovering them one `ENOSYS` at a time; `arch_prctl` has no analog and TLS is set directly
 via `TPIDR_EL0` (8.4 plumbed it); `EM_AARCH64` (0xB7) accepted, checked against the build
 target; the `clone` argument order per `CLONE_BACKWARDS`.
+
+**Plus the five `_start` routines 8.5c deferred here.** `linux-smoke`, `fs-smoke`,
+`threads-smoke`, `isolation-smoke` and `confine-smoke` still have x86-only `global_asm!`
+entry points issuing `arch_prctl`, `brk`, `mmap`, `write` and `exit_group` by their
+**x86_64** Linux numbers. 8.5 was scoped to rewrite all six; only `elf-smoke` was, because
+it speaks the native ABI. The other five target a table that does not exist until this
+sub-phase, so writing them in 8.5 would have been assembly that could not execute and that
+8.9 would rewrite once the `asm-generic` numbers were settled. They are listed in
+`xtask`'s `SERVER_ELFS_ARM64` (currently `["elf-smoke"]`), guarded by a unit test that fails
+if one is added early; un-gating them is a line of that list plus their `_start` routines.
+Note `arch_prctl` has no analog, so `linux-smoke`'s aarch64 `_start` sets TLS via
+`TPIDR_EL0` directly — which is the same asymmetry the result-mapping note below describes.
 
 **Retires (4):** `test_elf_exec`, `test_linux_exec`, `test_linux_fs`, `test_linux_threads`.
 Note `test_linux_exec`'s result mapping (`test_runner.rs:3850`) asserts

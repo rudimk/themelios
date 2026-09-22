@@ -42,7 +42,13 @@ use core::panic::PanicInfo;
 /// This crate is a detached workspace with no dependency on `libthemelios`, so it
 /// includes the same constants file directly. That file deliberately names nothing from
 /// any crate, which is what makes it includable from here.
+// `allow(dead_code)`: the file declares all 27 ABI numbers and this crate uses one. Without
+// it every build of this crate — on both architectures — emits 26 `dead_code` warnings,
+// which is 26 of the 27 the whole server build produces. `libthemelios` avoids them by
+// re-exporting with `pub use`; here the module is private, so the allow is the honest
+// equivalent rather than making an internal detail public to silence a warning.
 #[path = "../../../kernel/src/arch/syscall_abi.rs"]
+#[allow(dead_code)]
 mod syscall_abi;
 use syscall_abi::abi;
 

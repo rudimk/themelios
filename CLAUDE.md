@@ -153,7 +153,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Complete (ring-0 core; EL0/storage/net/containers deferred) |
-| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.3 done) |
+| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.4 and 8.5a–c done) |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -172,10 +172,22 @@ extracted), ✅ 8.3 (virtio-mmio — the first sub-phase to move the ratchet, re
 **seven** skips, not the eight the plan projected), ✅ 8.4 (EL0: 8.4a–e — entry/exit,
 syscall dispatch, address spaces, the EL0 soak, FPSIMD context), and 8.5 (userspace
 servers on aarch64) is **in progress**: ✅ 8.5a (arch-partitioned server staging + the blob
-hash manifest), next 8.5b (`libthemelios`' 25 `asm!` blocks), 8.5c (the six `_start`
-routines), 8.5d (retire `test_process`, `test_userspace_init`, `test_server_spawn`,
-`test_registry_pull`). The a–d split is this session's decomposition of the plan's single
-8.5 entry, not something the plan names. Plan in
+hash manifest), ✅ 8.5b (the native syscall ABI on aarch64 — one number list shared by
+kernel and `libthemelios`, the IPC dispatcher, and `libthemelios`' 25 wrappers collapsed to
+three positional primitives per arch), ✅ 8.5c (**the userspace servers build for
+aarch64**: all seven flat servers plus `elf-smoke`, staged and hashed as
+`servers-arm64.sha256`), next 8.5d (un-gate `mod process`/`embedded.rs` on aarch64 so the
+kernel can embed and spawn them — which is what turns "echo-server links" into the plan's
+acceptance, "echo-server runs at EL0 and completes an IPC round trip" — then retire
+`test_process`, `test_userspace_init`, `test_server_spawn`, `test_registry_pull`).
+
+The a–d split is this session's decomposition of the plan's single 8.5 entry, not something
+the plan names. **One scope change is recorded in the plan**: 8.5 was to rewrite all six
+`global_asm!` `_start` routines, and only `elf-smoke`'s was. The other five issue Linux
+personality syscalls by their x86_64 numbers, and `mod linux` — which holds both the
+personality *and* the ELF loader — is x86-gated until **8.9**, whose Deliver list now names
+them. Writing them in 8.5 would have been assembly that could not execute against a table
+that does not exist. Plan in
 `.sisyphus/plans/phase8-aarch64-parity.md` (v2, after five adversarial review passes — nine
 v1 claims and fourteen v2 claims were false, and the sub-phase order is reversed from v1).
 **Ten sub-phases plus a spike**, taking aarch64 from the Phase 7 ring-0 core to full amd64
