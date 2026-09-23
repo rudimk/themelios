@@ -254,10 +254,22 @@ pub fn assign_task_to_kernel(task_id: TaskId) {
 /// Returns `(ProcessId, Option<CapHandle>)` — the new process's PID and
 /// the capability handle in the parent's CSpace (if a parent was given).
 pub fn create_process(name: &str, parent_cspace: Option<&mut CSpace>) -> (ProcessId, Option<CapHandle>) {
-    let kernel_as = page_table::kernel_address_space();
-    let user_as = AddressSpace::new_user(&kernel_as);
-    // Don't drop the kernel AddressSpace handle (it's a global reference)
-    core::mem::forget(kernel_as);
+    // `new_user` takes the kernel space on x86_64, where a user root must copy the kernel
+    // half by value, and takes nothing on aarch64, where a user space is an independent
+    // `TTBR0_EL1` tree with nothing to copy. The parameter is absent there rather than
+    // ignored, deliberately — see `AddressSpace::new_user`, whose docs argue that a
+    // parameter the body did not use would invite exactly the copy-everything bug the
+    // split replaced. Same shape as the two call sites in `test_runner`.
+    #[cfg(target_arch = "x86_64")]
+    let user_as = {
+        let kernel_as = page_table::kernel_address_space();
+        let user_as = AddressSpace::new_user(&kernel_as);
+        // Don't drop the kernel AddressSpace handle (it's a global reference).
+        core::mem::forget(kernel_as);
+        user_as
+    };
+    #[cfg(target_arch = "aarch64")]
+    let user_as = AddressSpace::new_user();
 
     let cspace = CSpace::new();
 

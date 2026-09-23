@@ -171,7 +171,6 @@ pub fn init() {
         // Ring-3 / Linux-thread state, x86_64 only — see `task::Task`.
         #[cfg(target_arch = "x86_64")]
         kernel_stack_top: 0, // Bootstrap uses Limine's stack; never returns from ring 3
-        #[cfg(target_arch = "x86_64")]
         process_id: ProcessId::KERNEL,
         #[cfg(target_arch = "x86_64")]
         fs_base: 0,
@@ -697,20 +696,19 @@ pub fn current_task_id() -> TaskId {
 /// system and the audit log both attribute operations to a process, and answering
 /// "the kernel" is correct there — where it stops being correct is the moment EL0
 /// lands, at which point `Task::process_id` un-gates and this reads it like x86 does.
-#[cfg(target_arch = "aarch64")]
-pub fn current_process_id() -> ProcessId {
-    ProcessId::KERNEL
-}
-
 /// Get the current task's process ID.
-#[cfg(target_arch = "x86_64")]
+///
+/// Until 8.5d the aarch64 build had a second version of this that always answered
+/// `ProcessId::KERNEL`, because there was no process table to ask — one process existed
+/// and saying so was the honest answer. `mod process` is un-gated now, so both
+/// architectures read the real owner out of the task, and `cap`/`audit` attribute ring-3
+/// work to the process that did it rather than to the kernel.
 pub fn current_process_id() -> ProcessId {
     let guard = SCHEDULER.lock();
     let sched = guard.as_ref().expect("Scheduler not initialized");
     sched.tasks[sched.current_id].as_ref().unwrap().process_id
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Spawn a new task within a specific process.
 ///
 /// Like `spawn()`, but assigns the task to the given process instead of
@@ -904,7 +902,6 @@ fn create_task(sched: &mut Scheduler, name: &str, entry: fn()) -> TaskId {
         // Ring-3 / Linux-thread state, x86_64 only — see `task::Task`.
         #[cfg(target_arch = "x86_64")]
         kernel_stack_top: stack_top_virt.as_u64(),
-        #[cfg(target_arch = "x86_64")]
         process_id: ProcessId::KERNEL, // Default to kernel process; caller can override
         #[cfg(target_arch = "x86_64")]
         fs_base: 0, // set by arch_prctl(ARCH_SET_FS) for Linux TLS (Phase 5.1)

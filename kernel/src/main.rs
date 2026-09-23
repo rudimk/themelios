@@ -152,27 +152,11 @@ mod cap;
 /// Process abstraction.
 /// Bundles an address space, capability space, and task list into a single
 /// unit of isolation. The kernel process (PID 0) owns all boot-time tasks.
-#[cfg(target_arch = "x86_64")]
+///
+/// Un-gated for aarch64 in Phase 8.5d. Until then this was x86-only and aarch64 got the
+/// identity-type-only stub below, because the table, address spaces and embedded-server
+/// plumbing are all ring-3 machinery that EL0 had not reached.
 mod process;
-
-/// Process identity, without a process table.
-///
-/// The full `process` module — the table, address spaces, CSpace ownership, the
-/// embedded-server plumbing — is ring-3 machinery and stays x86_64-only until the EL0
-/// port. But `ProcessId` is just a newtype, and both `cap` and `audit` need it to say
-/// *who* performed an operation. On aarch64 the honest answer is always the kernel:
-/// there is exactly one process until EL0 lands, and `sched::current_process_id`
-/// returns `ProcessId::KERNEL` to say so.
-///
-/// Exposing the identity type without the table keeps the capability system and the
-/// audit log genuinely portable, rather than stubbing them out and losing the
-/// architecture's flagship test on half its targets.
-#[cfg(not(target_arch = "x86_64"))]
-mod process {
-    #[path = "pid.rs"]
-    pub mod pid;
-    pub use pid::ProcessId;
-}
 
 /// Platform description — where this machine's fixed devices are and how they
 /// interrupt. One hard-coded provider per architecture today; a discovery phase adds
