@@ -690,14 +690,6 @@ pub fn current_task_id() -> TaskId {
 
 /// Get the current task's process ID.
 ///
-/// On aarch64 this is always [`ProcessId::KERNEL`], and that is a statement of fact
-/// rather than a placeholder: the port is ring-0 only, so every task belongs to the
-/// kernel process and `Task` carries no `process_id` field to read. The capability
-/// system and the audit log both attribute operations to a process, and answering
-/// "the kernel" is correct there — where it stops being correct is the moment EL0
-/// lands, at which point `Task::process_id` un-gates and this reads it like x86 does.
-/// Get the current task's process ID.
-///
 /// Until 8.5d the aarch64 build had a second version of this that always answered
 /// `ProcessId::KERNEL`, because there was no process table to ask — one process existed
 /// and saying so was the honest answer. `mod process` is un-gated now, so both
@@ -714,13 +706,41 @@ pub fn current_process_id() -> ProcessId {
 /// Like `spawn()`, but assigns the task to the given process instead of
 /// the kernel process (PID 0). Also adds the task ID to the process's
 /// task list so the process tracks ownership.
+///
+/// ## aarch64 also copies the process's translation root into the task (8.5d)
+///
+/// x86's `schedule()` resolves a task's address space *indirectly*, by looking its
+/// `process_id` up in the process table (`process_pml4`). aarch64's does not: it reads
+/// `Task::ttbr0_root` directly, because 8.4d needed per-task EL0 address spaces two
+/// sub-phases before `mod process` existed here.
+///
+/// That difference is load-bearing rather than cosmetic, and it is the reason this
+/// copy happens here instead of in the scheduler. `schedule()` runs holding
+/// `SCHEDULER`; asking the process table for a root inside it would take
+/// `PROCESS_TABLE` *under* `SCHEDULER`, while `create_process` → `spawn_server` →
+/// `spawn_in_process` takes them in the opposite order. That is a lock-order
+/// inversion, i.e. a deadlock, for a value that never changes after spawn. So the
+/// root is resolved once, here, **before** the scheduler lock is taken.
+///
+/// A process with no address space (PID 0, the kernel) yields no root and the task
+/// stays kernel-only, which is exactly what `ttbr0_root == 0` means to `schedule()`.
 pub fn spawn_in_process(name: &str, entry: fn(), pid: ProcessId) -> TaskId {
+    // Resolve the process's translation root *outside* the scheduler lock — see above.
+    #[cfg(target_arch = "aarch64")]
+    let user_space = crate::process::with_address_space(pid, |a| (a.root_phys().as_u64(), a.asid()));
+
     let id = {
         let mut guard = SCHEDULER.lock();
         let sched = guard.as_mut().expect("Scheduler not initialized");
         let id = create_task(sched, name, entry);
         // Override the default kernel PID with the target process
         sched.tasks[id].as_mut().unwrap().process_id = pid;
+        #[cfg(target_arch = "aarch64")]
+        if let Some((root, asid)) = user_space {
+            let task = sched.tasks[id].as_mut().unwrap();
+            task.ttbr0_root = root;
+            task.asid = asid;
+        }
         id
     };
     crate::process::add_task_to_process(pid, id);

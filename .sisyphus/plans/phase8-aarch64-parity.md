@@ -855,6 +855,36 @@ architectures, that every image has **zero relocations**, and that the GOT conce
 the image, below `__bss_start`, which is why amd64 has always worked) and aarch64 emits
 none. The link-map budget was not needed.
 
+**Closed in 8.5d. Acceptance met: `echo-server` runs at EL0 and completes an IPC round
+trip**, as a suite entry (`test_server_spawn`) rather than a one-off, and all four listed
+skips are retired. amd64 stayed byte-identical throughout — `verify-servers` reports 13/13
+against `servers-amd64.sha256` and 8/8 against `servers-arm64.sha256`, unchanged, because
+8.5d touched only the kernel side.
+
+Three notes for whoever reads this next:
+
+  * **The plan's "`#[cfg]`'d `include_bytes!`" is a `#[cfg]`'d *macro*, not a `#[cfg]`'d
+    call.** `concat!` operates on literals, so a `const SERVER_ARCH: &str` spliced into the
+    path fails with "expected a literal" at every call site. Two `#[cfg]`'d `macro_rules!`
+    arms wrapping `include_bytes!(concat!(…))` keep the choice in one place. The
+    build-time `e_machine` assertion the plan asked for is live on aarch64 through
+    `ELF_SMOKE`, the one ELF an arm64 kernel carries; mutating the macro's aarch64 arm to
+    point at `amd64` fails the kernel build with `assertion failed: elf_machine(ELF_SMOKE)
+    == EXPECTED_E_MACHINE`.
+  * **The `.cargo/config.toml` entry for the servers' aarch64 target was deliberately not
+    added.** The servers are a separate workspace built by `xtask` with its own
+    `RUSTFLAGS`; a config entry would let a bare `cargo build` in `servers/` pick up the
+    *kernel's* linker script and produce a plausible, wrong artifact. The single build path
+    is the property worth keeping.
+  * **What the plan did not anticipate: the scheduler's two different ways of finding a
+    task's address space.** x86 resolves `process_id` → `process_pml4`; aarch64 reads
+    `Task::ttbr0_root`, because 8.4d needed per-task EL0 spaces before `mod process`
+    existed here. `spawn_in_process` therefore copies root+ASID into the task, outside the
+    scheduler lock — `PROCESS_TABLE` under `SCHEDULER` would invert the order
+    `create_process` → `spawn_server` → `spawn_in_process` already sets. Neither the
+    unification nor the lock order is hard; not noticing it is, and the symptom is an
+    instruction abort at the user entry address with nothing naming the cause.
+
 ---
 
 ### Tier 3 — un-gate the arch-neutral stack
@@ -1083,25 +1113,41 @@ The 39 entries, assigned. This table is the phase's progress bar and must sum to
 | ✅ 8.1 discovery seam (amd64) | 0 | 16 | 39 |
 | ✅ 8.2 transport trait (amd64) | 0 | 16 | 39 |
 | ✅ **8.3 virtio-mmio** | **7** | **23** | **32** |
-| 8.4 user AS + SVC + EL0 | 3 | 26 | 29 |
-| 8.5 libthemelios + smokes | 4 | 30 | 25 |
-| 8.6 storage | 6 | 36 | 19 |
-| 8.7 networking | 7 | 43 | 12 |
-| 8.8 Linux dispatcher (amd64) | 0 | 43 | 12 |
-| 8.9 aarch64 Linux table | 4 | 47 | 8 |
-| **8.10 containers + mgmt** | **8** | **55** | **0** |
+| ✅ 8.4 user AS + SVC + EL0 | **2** (projected 3) | **25** | **30** |
+| ✅ **8.5 libthemelios + smokes** | **4** | **29** | **26** |
+| 8.6 storage | 6 | 35 | 20 |
+| 8.7 networking | 7 | 42 | 13 |
+| 8.8 Linux dispatcher (amd64) | 0 | 42 | 13 |
+| 8.9 aarch64 Linux table | 4 | 46 | 9 |
+| **8.10 containers + mgmt** | **7** | **53** | **2** |
+| reframed, not ported | 2 | 55 | 0 |
 
-`7 + 3 + 4 + 6 + 7 + 4 + 8 = 39`. ✓
+`7 + 2 + 4 + 6 + 7 + 4 + 7 + 2 = 39`. ✓
+
+**Two corrections to this table, both of which it was hiding.**
+
+8.4 retired **two**, not three: `test_shared_memory` and `test_path_resolve`. The third,
+`test_syscall`, is one of the entries the plan already says cannot be retired by porting —
+its body is entirely x86 MSR verification and retiring it means writing a *different test
+under the same name*. Listing it under 8.4 double-counted it.
+
+And the two entries that are retired by **reframing** rather than by porting —
+`test_syscall` and `test_pci_scan` — now have their own row instead of being silently
+folded into 8.10's count, which is what made that row read 8 while its own section reads
+"Retires (7 — the last)". Neither belongs to a sub-phase; both need a decision and a new
+body, and a row that says so is worth more than an arithmetic that happens to reach 55.
 
 **8.3 retired 7, not the 8 projected.** The eighth was `test_pci_scan`, which this
 sub-phase was supposed to retire "by reframing" — and did not. Reframing it is not a
 porting task at all: the test cannot run on aarch64 (there is no port I/O), so retiring it
 means deciding whether the parity denominator is the suite size or the suite minus tests
 that are inherently single-architecture. That is a question about what parity *means*, and
-answering it while adding a transport would have buried it. Moved to **8.10**, the parity
-gate, which is where the denominator has to be settled anyway — it is now the sub-phase
-that must retire all three reframing cases, not just two. The row above is the measured
-result, not the projection.
+answering it while adding a transport would have buried it. Moved out of 8.3 — and, as of
+8.5d, out of 8.10's count too, into the table's own **"reframed, not ported"** row
+alongside `test_syscall`. Both still have to be settled by the parity gate; what changed is
+that they are no longer hidden inside a sub-phase's number, where "8.10 retires 8" read as
+eight tests to port when two of them are decisions about what parity *means*. The rows
+above are the measured results, not the projections.
 
 **The suite grew from 54 to 55 in 8.1**, which added `test_virtio_discovery` — the
 committed baseline asserting that the discovery seam returns the same devices in the same
