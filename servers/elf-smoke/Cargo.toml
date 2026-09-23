@@ -1,6 +1,7 @@
 # ELF loader smoke-test binary (Phase 5.0).
 #
-# A minimal `no_std`/`no_main` x86-64 program with a hand-written `_start`, built
+# A minimal `no_std`/`no_main` program with a hand-written `_start` — one per
+# architecture as of Phase 8.5c, x86_64 and aarch64, sharing their constants — built
 # as a real **ELF** (unlike the other servers, which link with `--oformat=binary`
 # to a flat image). The kernel's Phase 5.0 ELF loader loads and runs this to prove
 # it parses ELF headers, maps PT_LOAD segments, and builds a correct initial

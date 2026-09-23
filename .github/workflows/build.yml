@@ -121,11 +121,19 @@ jobs:
 
       - name: Compile-gate smoltcp + kernel for aarch64
         run: cargo xtask arm64-gate
-      # Inert today and deliberately so: aarch64 has no userspace servers until
-      # 8.5b, so this succeeds with nothing to verify. It is here now rather than
-      # later so it activates on its own when the port lands, and so the two jobs
-      # do not drift. It still fails loudly if a manifest ever appears for an
-      # architecture that builds no servers.
+      # Live as of 8.5c: this hashes eight real blobs — the seven flat servers and
+      # elf-smoke — against xtask/servers-arm64.sha256.
+      #
+      # It was added in 8.5a while aarch64 had no userspace servers at all, when it
+      # succeeded by doing nothing. That was deliberate: the alternative was "add the
+      # arm64 step once the servers build", which is the kind of deferral that does not
+      # get made. Instead the command was written to succeed with nothing to verify on
+      # an unported architecture, so this step would start checking by itself the moment
+      # one gained servers.
+      #
+      # That is what happened, two sub-phases later, with no edit to this file. The
+      # branch that made it a no-op is gone from xtask — both targets build servers now,
+      # so it could no longer run.
       - name: Verify server blobs against the committed hash manifest
         run: cargo xtask verify-servers --arch arm64
 
