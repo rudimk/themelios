@@ -70,11 +70,10 @@ static TESTS: &[TestCase] = &[
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_syscall",          func: test_syscall },
     TestCase { name: "test_capabilities",    func: test_capabilities },
-    #[cfg(target_arch = "x86_64")]
+    // Un-gated in 8.5d along with `mod process` itself.
     TestCase { name: "test_process",         func: test_process },
     TestCase { name: "test_ipc",             func: test_ipc },
     TestCase { name: "test_audit",           func: test_audit },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_userspace_init",  func: test_userspace_init },
     TestCase { name: "test_virtio_discovery", func: test_virtio_discovery },
     #[cfg(target_arch = "x86_64")]
@@ -87,7 +86,8 @@ static TESTS: &[TestCase] = &[
     // QEMU `virt` used to leave inherited there.
     TestCase { name: "test_shared_memory",    func: test_shared_memory },
     TestCase { name: "test_block_server_ipc", func: test_block_server_ipc },
-    #[cfg(target_arch = "x86_64")]
+    // Un-gated in 8.5d: `spawn_server` drops into EL0 through `enter_el0` now, and this is
+    // the first aarch64 test to execute a staged server blob rather than merely link one.
     TestCase { name: "test_server_spawn",     func: test_server_spawn },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_squashfs_server",  func: test_squashfs_server },
@@ -141,7 +141,6 @@ static TESTS: &[TestCase] = &[
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_container_confinement", func: test_container_confinement },
     TestCase { name: "test_sha256",           func: test_sha256 },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_registry_pull",    func: test_registry_pull },
     TestCase { name: "test_registry_hardening", func: test_registry_hardening },
     TestCase { name: "test_http_request",      func: test_http_request },
@@ -184,10 +183,7 @@ static SKIPPED: &[SkippedTest] = &[
     // 4 KiB page beneath that block panicked `ensure_table` — and 0x4000_0000 is the
     // exact VA this test maps at. 8.4a gave `new_user` an empty low half by
     // construction, which is what the old skip reason said would unblock it.
-    SkippedTest { name: "test_process", why: "ring-3/EL0 is deferred on aarch64" },
-    SkippedTest { name: "test_userspace_init", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_pci_scan", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
-    SkippedTest { name: "test_server_spawn", why: "ring-3/EL0 is deferred on aarch64" },
     SkippedTest { name: "test_squashfs_server", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_overlay_server", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_ext2_read", why: "the storage stack rides on VirtIO-PCI" },
@@ -209,10 +205,6 @@ static SKIPPED: &[SkippedTest] = &[
     SkippedTest { name: "test_container_run", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_container_isolation", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_container_confinement", why: "containers need ring-3 and the storage stack" },
-    SkippedTest {
-        name: "test_registry_pull",
-        why: "uses a mock transport, not the NIC — blocked on the embedded ring-3 payload",
-    },
     SkippedTest { name: "test_container_registry", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_container_logs", why: "containers need ring-3 and the storage stack" },
     SkippedTest { name: "test_management_capability", why: "containers need ring-3 and the storage stack" },
@@ -1036,8 +1028,14 @@ fn test_capabilities() -> Result<(), &'static str> {
 /// 3. Process list reflects the new process
 /// 4. Destroying a process frees all associated resources
 /// 5. Frame count is stable across create/destroy cycles (no leaks)
-/// x86_64 only — the process table is ring-3 machinery (address spaces, CSpace ownership).
-#[cfg(target_arch = "x86_64")]
+///
+/// **Portable as of Phase 8.5d**, when `mod process` un-gated. Every assertion here is
+/// about the table and the frame accounting, both architecture-neutral; the one thing
+/// that differs underneath is what `create_process` allocates — an x86 PML4 with the
+/// kernel half copied in, or an empty aarch64 `TTBR0_EL1` root — and the leak check
+/// covers either. It is a *stronger* check on aarch64, where a space also claims an ASID:
+/// six create/destroy cycles that balanced frames but leaked roots would still show up
+/// here, and the ASID recycling itself is covered by `mm::page_table::user_selftest`.
 fn test_process() -> Result<(), &'static str> {
     use crate::process;
     use crate::mm;
@@ -1428,8 +1426,12 @@ fn test_audit() -> Result<(), &'static str> {
 /// 2. Init sends IPC messages to the kernel via syscall
 /// 3. The kernel-side server receives the messages
 /// 4. Timer preemption works on the init process
-/// x86_64 only — starts a ring-3 init process.
-#[cfg(target_arch = "x86_64")]
+///
+/// **Portable as of Phase 8.5d.** `process::init` gained an aarch64 payload and
+/// trampoline; what this test asserts — that userspace-originated IPC reaches a kernel
+/// task, repeatedly — is the same on both. It is the one EL0 test here whose payload is
+/// *written into a page by the kernel* rather than staged by the build, so it covers a
+/// path `test_server_spawn` does not.
 fn test_userspace_init() -> Result<(), &'static str> {
     use crate::process;
 
@@ -1938,7 +1940,14 @@ fn test_block_server_ipc() -> Result<(), &'static str> {
 ///    allocation)
 /// 3. The full kernel↔ring-3 IPC round trip works (SYS_RECEIVE + SYS_REPLY)
 /// 4. The reply matches the request transformation (word0 + 1)
-#[cfg(target_arch = "x86_64")]
+///
+/// **Portable as of Phase 8.5d.** This is the test the aarch64 userspace port was aimed
+/// at: 8.5b proved the native syscall ABI works from a hand-written EL0 payload and 8.5c
+/// proved the servers *link* for aarch64, but neither ran a byte of one. Everything both
+/// sub-phases built — the shared ABI numbers, `libthemelios`' three positional primitives,
+/// the staged blobs and their hash manifest — is unvalidated until `echo-server` itself
+/// receives a message and replies to it. Nothing in the body is architecture-specific;
+/// `spawn_server` hides the one real difference (`iretq` frame vs `eret`).
 fn test_server_spawn() -> Result<(), &'static str> {
     use crate::ipc::{self, IpcMessage};
     use crate::process::embedded;
@@ -4588,7 +4597,6 @@ fn test_sha256() -> Result<(), &'static str> {
 /// working state. This still fully exercises the production `pull` decompress
 /// path — `gzip::decompress` parses the RFC-1952 header and inflates via
 /// `miniz_oxide::inflate` (which handles stored blocks like any other).
-#[cfg(target_arch = "x86_64")]
 fn make_gzip(data: &[u8]) -> alloc::vec::Vec<u8> {
     let mut out = alloc::vec::Vec::new();
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0xff]); // header (FLG=0)
@@ -4620,7 +4628,17 @@ fn make_gzip(data: &[u8]) -> alloc::vec::Vec<u8> {
 /// gzip decompression, and registry-format layer assembly — deterministically,
 /// with no live network. (The live TCP `Connection` + a `guestfwd` registry is a
 /// documented follow-up.)
-#[cfg(target_arch = "x86_64")]
+///
+/// **Portable as of Phase 8.5d.** Nothing here was ever architecture-specific: the
+/// pipeline is pure byte-shuffling over an in-memory mock, and the one thing keeping it
+/// x86-only was that the layer's payload was `LINUX_SMOKE`, an ELF that exists only in the
+/// amd64 staging directory. The test never *runs* that payload — it is a file the pull
+/// must reproduce byte-for-byte — so it is now `ELF_SMOKE`, which is staged for both.
+///
+/// Note what that swap does and does not change. It keeps the property the test is for
+/// (bytes in = bytes out through gzip, tar and digest verification) and keeps the payload
+/// a real, non-trivial file rather than a synthetic one. It does not make this a test of
+/// the Linux personality; it never was.
 fn test_registry_pull() -> Result<(), &'static str> {
     use crate::oci::{self, registry, sha256};
     use crate::process::embedded;
@@ -4629,7 +4647,7 @@ fn test_registry_pull() -> Result<(), &'static str> {
 
     // Build the blobs: an image config, and a gzipped single-layer tar with /init.
     let config_blob = br#"{"config":{"Entrypoint":["/init"],"Env":["PATH=/bin"],"WorkingDir":"/"}}"#.to_vec();
-    let layer_tar = make_tar(&[("init", embedded::LINUX_SMOKE, b'0')]);
+    let layer_tar = make_tar(&[("init", embedded::ELF_SMOKE, b'0')]);
     let layer_blob = make_gzip(&layer_tar);
 
     let cfg_digest = alloc::format!("sha256:{}", sha256::hex(&sha256::sha256(&config_blob)));
@@ -4695,7 +4713,7 @@ fn test_registry_pull() -> Result<(), &'static str> {
         .iter()
         .find(|f| f.path == "/init")
         .ok_or("/init missing from pulled image")?;
-    if init.data != embedded::LINUX_SMOKE {
+    if init.data != embedded::ELF_SMOKE {
         return Err("/init contents wrong after registry pull");
     }
     if image.config.entrypoint != ["/init"] {
@@ -4714,7 +4732,6 @@ fn test_registry_pull() -> Result<(), &'static str> {
 }
 
 /// Flip a byte in a copy of a blob (to break its digest), test helper.
-#[cfg(target_arch = "x86_64")]
 fn image_bad_layer(blob: &[u8]) -> alloc::vec::Vec<u8> {
     let mut b = blob.to_vec();
     if let Some(x) = b.last_mut() {

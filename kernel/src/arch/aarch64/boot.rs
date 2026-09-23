@@ -326,6 +326,25 @@ pub fn kmain_aarch64(
 
     // --- Phase 7.3: preemptive scheduling ---
     crate::sched::init();
+
+    // --- Phase 8.5d: the process table ---
+    //
+    // Immediately after `sched::init`, mirroring `kmain_x86_64` — and for the same two
+    // reasons, in the same order. It must be *after*, because PID 0 exists to own the
+    // tasks the scheduler has just created (0 = bootstrap, 1 = idle) and there is nothing
+    // to assign before they exist. It must be *before* anything that spawns into a
+    // process, because `spawn_in_process` looks the target up in this table.
+    //
+    // Nothing above this line may create a process, which is why it sits here rather than
+    // next to the 8.5d server spawn it enables: the EL0 self-tests below (`user_selftest`,
+    // `el0_ipc`, the soak) deliberately build bare `AddressSpace`s and drop into EL0
+    // without a process at all. That is not an oversight to be tidied up later — those
+    // tests predate the process table on this architecture and must keep working without
+    // it, so that a failure in `mod process` cannot masquerade as an EL0 failure.
+    crate::process::init();
+    crate::process::assign_task_to_kernel(0);
+    crate::process::assign_task_to_kernel(1);
+
     let sched_ok = sched_selftest();
     // Run after the scheduler test, which is what gives the per-CPU block dozens of
     // switches to have been updated by; before it there would be nothing to check.

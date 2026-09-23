@@ -2,15 +2,15 @@
 
 ThemeliOS targets x86_64 first and aarch64 second. This chapter describes what the ARM64 port *is*, what it deliberately is not, and the handful of architectural differences that shaped it.
 
-> **Status**: Phase 7 complete — a **ring-0 kernel core** on QEMU `virt`. EL0/userspace, storage, networking and containers on ARM are a separate ABI surface and are deferred.
+> **Status**: Phase 8 in progress. The port has a **ring-0 kernel core** plus **EL0 userspace** on QEMU `virt`: as of 8.5d the kernel spawns its embedded userspace servers at EL0 and they answer IPC. Storage, networking, the Linux personality and containers on ARM are still deferred.
 
 ## Scope, stated plainly
 
-The port covers boot, memory management on kernel-owned page tables, exceptions, interrupts, a preemptive scheduler, an interactive shell, and — since Phase 8.3 — VirtIO over the mmio transport, giving the block and network drivers. It does **not** cover ring-3/EL0, and therefore not filesystems, sockets or containers. "aarch64 support" here does not mean "containers on ARM".
+The port covers boot, memory management on kernel-owned page tables, exceptions, interrupts, a preemptive scheduler, an interactive shell, VirtIO over the mmio transport (8.3, giving the block and network drivers), and — since 8.4/8.5 — EL0: user address spaces, the native syscall ABI, the process table, and the flat-binary userspace servers running at EL0. It does **not** yet cover the filesystem or socket servers above them, the Linux personality, or containers. "aarch64 support" here still does not mean "containers on ARM".
 
-That boundary is visible in the test suite rather than left to prose: an aarch64 run reports **23 passed, 0 failed, 32 skipped**, and each skipped test names the subsystem that explains it. The total is 55 on both architectures, so the two runs are directly comparable.
+That boundary is visible in the test suite rather than left to prose: an aarch64 run reports **29 passed, 0 failed, 26 skipped**, and each skipped test names the subsystem that explains it. The total is 55 on both architectures, so the two runs are directly comparable.
 
-(Phase 7 shipped this chapter saying 16 passed / 38 skipped. The passing count was right for the time; the skip count never was — 16 + 38 is 54, and the suite was 55. Corrected here along with the 8.3 figures.)
+(Phase 7 shipped this chapter saying 16 passed / 38 skipped. The passing count was right for the time; the skip count never was — 16 + 38 is 54, and the suite was 55. Corrected along with the 8.3 figures, and updated again at 8.5d.)
 
 | Subsystem | x86_64 | aarch64 |
 |---|---|---|
@@ -19,9 +19,10 @@ That boundary is visible in the test suite rather than left to prose: an aarch64
 | Kernel page tables | ✅ | ✅ |
 | Exceptions, interrupts, timer | ✅ | ✅ |
 | Preemptive scheduler | ✅ | ✅ |
-| Capability system, IPC, audit | ✅ | ✅ (compiled and tested; no *user* of them yet on a non-test boot) |
-| Debug shell | ✅ | reduced (11 of 28 commands) |
-| Ring-3 / EL0 | ✅ | deferred (8.4/8.5) |
+| Capability system, IPC, audit | ✅ | ✅ (and since 8.5d a real ring-3 *user* of them: a spawned server holds capabilities in its own CSpace) |
+| Debug shell | ✅ | reduced (13 of 28 commands — `procs` and `caps` joined at 8.5d) |
+| Ring-3 / EL0 | ✅ | ✅ (8.4 address spaces + syscalls, 8.5 servers) |
+| Process table, userspace servers | ✅ | ✅ (8.5d — `echo-server` spawns at EL0 and answers IPC) |
 | VirtIO transport | ✅ virtio-PCI | ✅ virtio-mmio (8.3) |
 | VirtIO block + network drivers | ✅ | ✅ (8.3 — the drivers themselves; the servers above them are ring-3) |
 | Filesystems, sockets | ✅ | deferred (8.6/8.7 — both need ring 3) |

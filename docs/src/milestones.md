@@ -216,10 +216,10 @@ scheduler, and an in-kernel shell. What it did not deliver is everything above E
 userspace, storage, networking, containers, the management API. Phase 8 closes that gap.
 
 Parity has one measurable definition: the kernel's 55-test suite runs **55/55 on amd64 and
-23/55 on aarch64**, with 32 tests carrying written skip reasons. Parity is that skip list
-reaching zero. Every sub-phase names which entries it retires, and three of the 32 cannot
-be retired by porting at all — they are retired by reframing, with the decision made in the
-sub-phase that owns each.
+29/55 on aarch64** as of sub-phase 8.5, with 26 tests carrying written skip reasons (it was
+16/55 when Phase 8 opened). Parity is that skip list reaching zero. Every sub-phase names
+which entries it retires, and three of the 26 cannot be retired by porting at all — they
+are retired by reframing, with the decision made in the sub-phase that owns each.
 
 **Ten sub-phases plus a throwaway spike**:
 - **8.1–8.3 — VirtIO transport.** An arch-neutral device-discovery seam, then a
@@ -227,10 +227,13 @@ sub-phase that owns each.
   with no intended behaviour change, each landing alone so "amd64 stays green" is a
   checkable claim about one change), then virtio-mmio on QEMU `virt` — rings as Normal
   memory, never Device, with explicit virtqueue barriers.
-- **8.4–8.5 — EL0.** User address spaces on `TTBR0_EL1`, SVC syscall entry, the drop to
-  EL0, per-task `SP_EL0`/`TPIDR_EL0`/FPSIMD state, `copy_from_user`/`copy_to_user`; then
-  `libthemelios`, six hand-written `_start` routines rewritten in aarch64 assembly, and the
-  server toolchain.
+- **8.4–8.5 — EL0** (done). User address spaces on `TTBR0_EL1`, SVC syscall entry, the drop
+  to EL0, per-task `SP_EL0`/`TPIDR_EL0`/FPSIMD state, `copy_from_user`/`copy_to_user`; then
+  `libthemelios`, the shared syscall-number list, the server toolchain, the process table,
+  and the userspace servers running at EL0 — `echo-server` answers IPC on aarch64. Five of
+  the six `_start` routines were *not* rewritten here: they issue Linux syscalls by their
+  x86_64 numbers, and the Linux personality does not exist on this architecture until 8.9,
+  so they moved there rather than being written against a table that is absent.
 - **8.6–8.7 — storage and networking** un-gated on aarch64.
 - **8.8–8.9 — the Linux personality** on the aarch64 syscall table (`asm-generic/unistd.h`),
   which is a second table rather than a tweak.

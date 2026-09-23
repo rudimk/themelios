@@ -37,7 +37,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use crate::println;
 use crate::sync::InterruptMutex;
-use crate::mm::page_table::{self, AddressSpace};
+use crate::mm::page_table::AddressSpace;
 use crate::cap::cspace::CSpace;
 use crate::cap::{Capability, CapType, CapRights, CapHandle};
 use crate::sched::task::TaskId;
@@ -262,7 +262,7 @@ pub fn create_process(name: &str, parent_cspace: Option<&mut CSpace>) -> (Proces
     // split replaced. Same shape as the two call sites in `test_runner`.
     #[cfg(target_arch = "x86_64")]
     let user_as = {
-        let kernel_as = page_table::kernel_address_space();
+        let kernel_as = crate::mm::page_table::kernel_address_space();
         let user_as = AddressSpace::new_user(&kernel_as);
         // Don't drop the kernel AddressSpace handle (it's a global reference).
         core::mem::forget(kernel_as);

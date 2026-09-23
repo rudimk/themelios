@@ -153,7 +153,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Complete (ring-0 core; EL0/storage/net/containers deferred) |
-| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.4 and 8.5a–c done) |
+| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.5 done) |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -176,10 +176,46 @@ hash manifest), ✅ 8.5b (the native syscall ABI on aarch64 — one number list 
 kernel and `libthemelios`, the IPC dispatcher, and `libthemelios`' 25 wrappers collapsed to
 three positional primitives per arch), ✅ 8.5c (**the userspace servers build for
 aarch64**: all seven flat servers plus `elf-smoke`, staged and hashed as
-`servers-arm64.sha256`), next 8.5d (un-gate `mod process`/`embedded.rs` on aarch64 so the
-kernel can embed and spawn them — which is what turns "echo-server links" into the plan's
-acceptance, "echo-server runs at EL0 and completes an IPC round trip" — then retire
-`test_process`, `test_userspace_init`, `test_server_spawn`, `test_registry_pull`).
+`servers-arm64.sha256`), ✅ 8.5d (**the servers actually run**) — which completes 8.5.
+Next is **GICv3 support** (see below), then 8.6 (storage).
+
+**8.5d — the process table and EL0 servers on aarch64.** `mod process` is un-gated on both
+architectures, `embedded.rs` picks its staging directory through a `#[cfg]`'d
+`server_blob!` macro (`concat!` needs literals, so a `const SERVER_ARCH` does not compose
+with `include_bytes!`), and `spawn_server`'s ring-3 entry is arch-split: x86 keeps its
+hand-built `iretq` frame, aarch64 calls `arch::aarch64::syscall::enter_el0`. The plan's
+acceptance — "echo-server runs at EL0 and completes an IPC round trip" — is met and is now
+a suite entry on both arches rather than a one-off: `test_server_spawn` passes on aarch64.
+
+Three things were needed beyond un-gating, and each is where a reviewer should look:
+
+  * **The scheduler resolves a task's address space differently per architecture.** x86
+    looks `process_id` up in the process table; aarch64 reads `Task::ttbr0_root` directly,
+    because 8.4d needed per-task EL0 spaces two sub-phases before `mod process` existed
+    here. So `spawn_in_process` copies the process's root+ASID into the task — **outside**
+    the scheduler lock, because taking `PROCESS_TABLE` under `SCHEDULER` inverts the order
+    `create_process` → `spawn_server` → `spawn_in_process` already establishes. Mutation-
+    tested: skip the copy and the arm64 boot dies with an instruction abort from a lower EL
+    at `FAR_EL1 = 0x400000`, the init code page, because nothing installed `TTBR0_EL1`.
+  * **`process::init()` had to join the aarch64 boot path**, right after `sched::init()`
+    as on x86. Everything above it — `user_selftest`, `el0_ipc`, the soak — deliberately
+    builds bare `AddressSpace`s and drops to EL0 with no process at all, and must keep
+    doing so, so that a fault in `mod process` cannot masquerade as an EL0 fault.
+  * **`process::init`'s payload is assembled, not hand-encoded, on aarch64.** The x86 blob
+    is hand-assembled bytes with the endpoint patched in as a `mov r13, imm64`; the A64
+    equivalent would need a `movz`/`movk` quartet with the value split across four
+    instructions' bit 20:5 fields, and a slip there yields a blob that runs, sends to the
+    wrong endpoint, and hangs. So it is a `global_asm!` blob (the `el0_ipc` mechanism) and
+    the endpoint arrives in `x0` via `enter_el0_with_args`. Mutation-tested: read it from
+    `x1` instead and the suite reports `[FAIL] test_userspace_init: init server never
+    received a message from userspace` — a failure, not a hang.
+
+Four skips retired, as planned: `test_process`, `test_userspace_init`, `test_server_spawn`,
+`test_registry_pull`. The last needed no porting at all — it was x86-gated only because its
+mock layer payload was `LINUX_SMOKE`, staged for amd64 alone; it is `ELF_SMOKE` now, which
+both arches stage, and the test never executed the payload in the first place. The shell
+also gained `procs` and `caps` (11 → **13 of 28** commands), since there is finally a
+process table to list.
 
 The a–d split is this session's decomposition of the plan's single 8.5 entry, not something
 the plan names. **One scope change is recorded in the plan**: 8.5 was to rewrite all six
@@ -209,7 +245,8 @@ configuration of the emulator this project tests on. As of the fix the kernel re
 `cargo xtask arm64-gicv3-smoke` pins that behaviour in CI — the "cheap genericity test"
 this file had recommended for two phases without wiring anything to it. **Actually
 supporting GICv3** (system-register CPU interface + redistributors) is its own sub-phase,
-scheduled after 8.5 rather than deferred to the unplanned hardware phase.
+scheduled after 8.5 rather than deferred to the unplanned hardware phase — and 8.5 closed
+at 8.5d, so **it is next**.
 
 **Real ARM server hardware is deliberately NOT planned.** The roadmap's Phase 8 label
 originally read "hyperscaler"; that work — platform discovery, GICv3 + ITS, PCIe ECAM +
@@ -222,14 +259,17 @@ of Phase 8's virtio work runs on any of them, and that `qemu-system-aarch64 -M s
 the cheap genericity test.
 
 Parity has one measurable definition — `test_runner`'s `SKIPPED` list empty on both
-architectures, i.e. 55/55 running on each. It is **23 running / 32 skipped** on aarch64
-today (16/39 before 8.3). Three of the 32 cannot be retired by porting (`test_pci_scan`,
-`test_syscall`, `test_linux_exec`'s TLS assertion) and are retired by reframing, each
-decided in the sub-phase that owns it.
+architectures, i.e. 55/55 running on each. It is **29 running / 26 skipped** on aarch64
+today (16/39 before 8.3, 23/32 after it, 25/30 after 8.4c). Three of the 26 cannot be
+retired by porting (`test_pci_scan`, `test_syscall`, `test_linux_exec`'s TLS assertion) and
+are retired by reframing, each decided in the sub-phase that owns it.
 
-Note the denominator: this block previously read "54/54" and "16 running / 38 skipped",
-which was wrong on both counts — `SUITE_SIZE` has been 55, and 16 + 38 does not reach it.
-The passing count was right; the skip count was not.
+Note the denominator, and note that this line goes stale silently. It previously read
+"54/54" and "16 running / 38 skipped", wrong on both counts — `SUITE_SIZE` has been 55, and
+16 + 38 does not reach it — and then sat at "23 running / 32 skipped" through 8.4c, which
+had un-gated two. The suite itself asserts `TESTS.len() + SKIPPED.len() == SUITE_SIZE`
+before running anything, so the *kernel* cannot drift; this sentence can, and only reading
+it against a run catches that.
 
 **Phase 7 — aarch64 port: COMPLETE (ring-0 core).** A ring-0 kernel-core port to QEMU `virt`
 (ARM64); EL0/userspace, storage, networking and containers on ARM are a separate,
@@ -328,7 +368,8 @@ parity — see above.**
   **before** draining — the reverse order can wedge the console permanently, since QEMU
   raises RX only on the FIFO's 0→1 transition, UART on **SPI 1 = INTID 33**, and 8 of the
   then-25 shell commands available, with the rest `#[cfg]`'d out of dispatcher, impls
-  *and* help text. (Now **11 of 28** — `shutdown`, `reboot` and `exit` are portable.) Three defects the tests
+  *and* help text. (Now **13 of 28** — `shutdown`, `reboot` and `exit` were portable at
+  7.4; `procs` and `caps` joined at 8.5d with the process table.) Three defects the tests
   caught: `test_page_tables` assumed 1 MiB is RAM (true on a PC, an unbacked hole on
   `virt`); the suite ran with interrupts in whatever state boot left them, enabled only
   as a side effect of the first `yield_now` (an order-dependent environment — real, but
