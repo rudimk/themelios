@@ -1546,6 +1546,131 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
     await_aarch64_banner(cmd, &sock, &serial_log, "ISO");
 }
 
+/// `cargo xtask arm64-gicv3-smoke` — boot the aarch64 ISO on a **GICv3** machine.
+///
+/// # Why this exists
+///
+/// Every other aarch64 invocation in this file pins `-M virt,gic-version=2`. QEMU's `virt`
+/// otherwise defaults to the newest GIC the host and CPU allow, which is normally **v3** —
+/// so the configuration this project had never once tested was the configuration an
+/// ordinary user gets by typing `qemu-system-aarch64 -M virt`, or by opening the shipped
+/// ISO in UTM.
+///
+/// It went unnoticed until someone did exactly that. The kernel wrote `GICC_PMR` at a fixed
+/// physical address that does not exist under GICv3 and took a synchronous external abort;
+/// under some firmware the failure surfaced as EDK2's own `Synchronous Exception at …`,
+/// with nothing identifying ThemeliOS at all. CI was green throughout, and correctly so:
+/// **a suite cannot fail on a configuration it never starts.**
+///
+/// `CLAUDE.md` had even recorded `-M sbsa-ref` as "the cheap genericity test" and nothing
+/// was ever wired to it. This job is the cheap genericity test, wired up.
+///
+/// # What it asserts, and how that changes
+///
+/// Today: that the kernel **detects GICv3 and says so**, rather than data-aborting. The
+/// sentinel is the halt line from `gic::unsupported_controller`, and the job also fails if
+/// any abort or panic marker appears — the point is a diagnosis, not merely a stop.
+///
+/// When GICv3 support lands, this flips to asserting a normal boot banner. That is a
+/// deliberate two-stage design: the failure mode is pinned *now*, so the day support
+/// arrives the assertion changes in one place and cannot be quietly forgotten.
+fn cmd_arm64_gicv3_smoke(_args: &[String]) {
+    let root = workspace_root();
+
+    let mut iso_args = Vec::new();
+    iso_args.push("--arch".to_string());
+    iso_args.push("aarch64".to_string());
+    cmd_build(&iso_args);
+
+    let kernel = root.join("target/aarch64-unknown-none-softfloat/debug/themelios");
+    let limine_dir = ensure_limine(&root);
+    let iso = create_iso(&root, &kernel, &limine_dir, "aarch64-unknown-none-softfloat");
+
+    let (code, vars) = match find_aavmf() {
+        Some(pair) => pair,
+        None => {
+            eprintln!(
+                "aarch64 UEFI firmware (AAVMF/edk2) not found. Install it — e.g.\n  \
+                 Debian/Ubuntu: apt-get install qemu-efi-aarch64"
+            );
+            process::exit(1);
+        }
+    };
+    let vars_copy = root.join("target/aarch64-gicv3-vars.fd");
+    fs::copy(&vars, &vars_copy).expect("copy AAVMF VARS flash");
+
+    let serial_log = root.join("target/aarch64-gicv3-smoke-serial.log");
+    let _ = fs::remove_file(&serial_log);
+
+    println!("Booting the aarch64 ISO on QEMU virt with GICv3 (headless)...");
+    let mut cmd = Command::new("qemu-system-aarch64");
+    // **`gic-version=3`, spelled out.** Not simply omitting the option: the default is
+    // "newest available", which is a moving target across QEMU versions and hosts. Naming
+    // v3 is what makes a failure here mean "GICv3 broke" rather than "the default moved".
+    cmd.args(["-M", "virt,gic-version=3", "-cpu", "cortex-a72", "-m", "512M", "-no-reboot"]);
+    cmd.args(virtio_mmio_modern_args());
+    cmd.arg("-drive")
+        .arg(format!("if=pflash,format=raw,readonly=on,file={}", code.display()));
+    cmd.arg("-drive")
+        .arg(format!("if=pflash,format=raw,file={}", vars_copy.display()));
+    cmd.arg("-drive")
+        .arg(format!("file={},format=raw,if=virtio,readonly=on", iso.display()));
+    cmd.args(["-display", "none", "-monitor", "none"]);
+    cmd.arg("-serial")
+        .arg(format!("file:{}", serial_log.display()));
+
+    let mut child = cmd.spawn().expect("Failed to launch qemu-system-aarch64");
+
+    // The kernel halts rather than exiting, so poll the serial capture for the verdict and
+    // kill QEMU once it appears. 90s is generous: the detection happens in `gic::init`,
+    // well inside the first second of kernel time, and the rest is firmware.
+    const SENTINEL: &str = "[gic] halted: GICv3 unsupported";
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut seen = false;
+    while Instant::now() < deadline {
+        if let Ok(s) = fs::read_to_string(&serial_log) {
+            if s.contains(SENTINEL) {
+                seen = true;
+                break;
+            }
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let serial = fs::read_to_string(&serial_log).unwrap_or_default();
+
+    // A clean stop is only half of it. The whole reason this exists is that the machine
+    // used to *abort*; if it still aborts, detecting is not what happened.
+    if let Some(bad) = AARCH64_BOOT_FAILURES
+        .iter()
+        .find(|f| serial.contains(**f))
+    {
+        eprintln!("arm64 GICv3 smoke FAILED: kernel reported {bad:?} (see serial above).");
+        eprintln!("{serial}");
+        process::exit(1);
+    }
+
+    if !seen {
+        eprintln!("arm64 GICv3 smoke FAILED: no GICv3 detection within 90s.");
+        eprintln!(
+            "Expected the kernel to recognise the GICv3 system-register interface and halt \n\
+             with {SENTINEL:?}. Serial follows."
+        );
+        eprintln!("{serial}");
+        process::exit(1);
+    }
+
+    println!(
+        "arm64 GICv3 smoke passed: the kernel detected the GICv3 system-register interface \n\
+         and halted with a diagnosis instead of taking a data abort on the absent GICC."
+    );
+}
+
 /// Run `cmd` (a configured headless `qemu-system-aarch64`) and wait for the kernel's
 /// boot banner to appear in `serial_log`, then terminate QEMU.
 ///
@@ -2718,6 +2843,8 @@ Commands:
     arm64-gate       Compile smoltcp + kernel for aarch64-unknown-none-softfloat (dependency gate)
     arm64-smoke      Boot the aarch64 kernel on QEMU virt from a UEFI ESP (banner smoke)
     arm64-iso-smoke  Boot the aarch64 ISO on QEMU virt (banner smoke)
+    arm64-gicv3-smoke  Boot the aarch64 ISO on QEMU virt with GICv3 — asserts the kernel
+                     detects it and says so rather than taking a data abort
 
 Options:
     --arch <ARCH>  Target architecture: amd64 (default) or arm64.
@@ -2756,6 +2883,7 @@ fn main() {
         "arm64-gate" => cmd_arm64_gate(rest),
         "arm64-smoke" => cmd_arm64_smoke(rest),
         "arm64-iso-smoke" => cmd_arm64_iso_smoke(rest),
+        "arm64-gicv3-smoke" => cmd_arm64_gicv3_smoke(rest),
         "help" | "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("Unknown command: {unknown}\n");
