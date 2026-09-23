@@ -139,7 +139,77 @@ fn gicc_write(off: usize, val: u32) {
 /// descriptor. If that attribute selection were wrong, GIC register accesses would be
 /// cached and reordered, and the symptom would be exactly the "configured correctly,
 /// no interrupts ever arrive" failure described above.
+/// Whether this CPU implements the **GICv3+ system-register interface**
+/// (`ID_AA64PFR0_EL1.GIC`, bits 27:24).
+///
+/// This is the one GIC question that can be asked without touching memory-mapped I/O, and
+/// that matters: under GICv3 the memory-mapped CPU interface this driver drives — `GICC`,
+/// at a fixed physical address supplied by [`crate::platform`] — **does not exist**. The
+/// registers move into `ICC_*_EL1` system registers and the distributor gains
+/// per-CPU redistributors elsewhere in the map.
+///
+/// Measured on QEMU `virt` with the two settings, booting the shipped ISO:
+///
+/// | `-M virt,gic-version=` | `ID_AA64PFR0_EL1` | GIC field |
+/// |---|---|---|
+/// | `2` | `0x0000000000000022` | **0** |
+/// | `3` | `0x0000000001000022` | **1** |
+///
+/// A non-zero field is therefore a reliable "the GICC you are about to write to is not
+/// there" signal, and it costs one `mrs`.
+fn gicv3_sysreg_interface_present() -> bool {
+    let pfr0: u64;
+    // SAFETY: reading a CPU feature-identification register has no side effects and is
+    // always permitted at EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, ID_AA64PFR0_EL1", out(reg) pfr0, options(nomem, nostack))
+    };
+    (pfr0 >> 24) & 0xf != 0
+}
+
+/// Report an unsupported interrupt controller and stop, **without** faulting.
+///
+/// Deliberately not a `panic!`. This is not a bug in the kernel; it is a machine the kernel
+/// does not support, and labelling it "KERNEL PANIC" invites it to be reported as a crash
+/// rather than as the missing feature it is.
+///
+/// What this replaces is worth recording. Until this check existed, booting on any GICv3
+/// machine ran straight into `gicc_write(GICC_PMR, 0xff)` — a `str` to unbacked MMIO — and
+/// took a synchronous external abort (`ESR_EL1=0x96000050`, `FAR_EL1` pointing at
+/// `GICC + 0x4`). The result was an unexplained data abort several frames from the cause,
+/// or, under some firmware, EDK2's own handler printing `Synchronous Exception at …` with
+/// no mention of ThemeliOS at all. That is the difference this function makes: the same
+/// machine now says why.
+fn unsupported_controller() -> ! {
+    crate::println!();
+    crate::println!("========================================");
+    crate::println!("  Unsupported interrupt controller");
+    crate::println!("========================================");
+    crate::println!("This CPU implements the GICv3 system-register interface");
+    crate::println!("(ID_AA64PFR0_EL1.GIC != 0), so there is no memory-mapped");
+    crate::println!("GICC CPU interface for this driver to use.");
+    crate::println!();
+    crate::println!("ThemeliOS currently supports GICv2 only.");
+    crate::println!();
+    crate::println!("QEMU note: `-M virt` defaults to the *newest* GIC the host");
+    crate::println!("and CPU allow, which is normally v3. Add `gic-version=2`:");
+    crate::println!("    qemu-system-aarch64 -M virt,gic-version=2 ...");
+    crate::println!("UTM and other front ends generally expose this as a machine");
+    crate::println!("or GIC setting.");
+    crate::println!();
+    crate::println!("[gic] halted: GICv3 unsupported");
+    loop {
+        crate::arch::aarch64::irq::halt();
+    }
+}
+
 pub fn init() {
+    // Asked **before** anything is mapped or written. The whole point is to get in front of
+    // the first `GICC` access, which is the one that aborts.
+    if gicv3_sysreg_interface_present() {
+        unsupported_controller();
+    }
+
     // Bases come from the platform description, not from constants beside this driver:
     // the point of `platform` is that a discovery phase can supply different ones
     // without editing the GIC code. Panics loudly on a platform whose controller is not

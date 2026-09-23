@@ -194,6 +194,23 @@ v1 claims and fourteen v2 claims were false, and the sub-phase order is reversed
 parity: VirtIO transport (8.1–8.3), EL0 (8.4–8.5), storage and networking (8.6–8.7), the
 Linux personality (8.8–8.9), containers and the management API (8.10).
 
+**GICv3 is NOT supported, and that is a shipped-artifact bug, not a future-hardware
+item.** The aarch64 `PlatformInfo` (`platform.rs`) is a hard-coded QEMU `virt` GICv2
+descriptor; 8.1 delivered a discovery *seam*, not discovery. Every aarch64 QEMU invocation
+in `xtask` pins `gic-version=2`, so CI had never once run any other configuration — while
+`-M virt` **defaults to GICv3**, which is what a user gets from plain QEMU or from UTM.
+Booting the shipped ISO that way wrote `GICC_PMR` at an address GICv3 does not implement
+and took a synchronous external abort; under some firmware EDK2's own handler reported it,
+naming nothing of ThemeliOS.
+
+This was misfiled below as hyperscaler hardware work. It is not: it is the default
+configuration of the emulator this project tests on. As of the fix the kernel reads
+`ID_AA64PFR0_EL1.GIC` before touching any GIC MMIO and halts with a diagnosis, and
+`cargo xtask arm64-gicv3-smoke` pins that behaviour in CI — the "cheap genericity test"
+this file had recommended for two phases without wiring anything to it. **Actually
+supporting GICv3** (system-register CPU interface + redistributors) is its own sub-phase,
+scheduled after 8.5 rather than deferred to the unplanned hardware phase.
+
 **Real ARM server hardware is deliberately NOT planned.** The roadmap's Phase 8 label
 originally read "hyperscaler"; that work — platform discovery, GICv3 + ITS, PCIe ECAM +
 MSI-X, SMP, cloud NICs and NVMe, secure boot, measured boot — gets its own phase, written
