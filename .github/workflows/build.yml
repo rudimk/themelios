@@ -143,6 +143,23 @@ jobs:
       - name: Boot the aarch64 ISO on QEMU virt (banner smoke)
         run: cargo xtask arm64-iso-smoke
 
+      # The genericity test. Every other aarch64 step here runs `-M virt,gic-version=2`,
+      # so until this existed CI had never once started the configuration an ordinary user
+      # gets — `-M virt` defaults to GICv3, which is what plain QEMU and UTM give you.
+      #
+      # That gap shipped a broken ISO. The kernel wrote GICC_PMR at a physical address
+      # GICv3 does not implement and took a synchronous external abort; under some firmware
+      # it surfaced as EDK2's own "Synchronous Exception at 0x…", naming nothing of
+      # ThemeliOS. CI was green throughout, and correctly so: a suite cannot fail on a
+      # configuration it never starts.
+      #
+      # Asserts today that the kernel *detects* GICv3 and says so — the job fails both if
+      # the diagnosis is missing and if any abort or panic marker appears, because the point
+      # is a diagnosis rather than merely a stop. When GICv3 support lands this flips to
+      # asserting a normal boot banner, in one place.
+      - name: Boot the aarch64 ISO on QEMU virt with GICv3 (genericity smoke)
+        run: cargo xtask arm64-gicv3-smoke
+
       - name: Run the kernel test suite on QEMU virt
         run: cargo xtask test --arch arm64
 
