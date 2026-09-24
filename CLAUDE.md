@@ -194,22 +194,82 @@ v1 claims and fourteen v2 claims were false, and the sub-phase order is reversed
 parity: VirtIO transport (8.1–8.3), EL0 (8.4–8.5), storage and networking (8.6–8.7), the
 Linux personality (8.8–8.9), containers and the management API (8.10).
 
-**GICv3 is NOT supported, and that is a shipped-artifact bug, not a future-hardware
-item.** The aarch64 `PlatformInfo` (`platform.rs`) is a hard-coded QEMU `virt` GICv2
-descriptor; 8.1 delivered a discovery *seam*, not discovery. Every aarch64 QEMU invocation
-in `xtask` pins `gic-version=2`, so CI had never once run any other configuration — while
-`-M virt` **defaults to GICv3**, which is what a user gets from plain QEMU or from UTM.
-Booting the shipped ISO that way wrote `GICC_PMR` at an address GICv3 does not implement
-and took a synchronous external abort; under some firmware EDK2's own handler reported it,
-naming nothing of ThemeliOS.
-
-This was misfiled below as hyperscaler hardware work. It is not: it is the default
-configuration of the emulator this project tests on. As of the fix the kernel reads
-`ID_AA64PFR0_EL1.GIC` before touching any GIC MMIO and halts with a diagnosis, and
-`cargo xtask arm64-gicv3-smoke` pins that behaviour in CI — the "cheap genericity test"
+**GICv3 is NOT supported.** The aarch64 `PlatformInfo` (`platform.rs`) is a hard-coded
+QEMU `virt` GICv2 descriptor; 8.1 delivered a discovery *seam*, not discovery. Every
+aarch64 QEMU invocation in `xtask` pinned `gic-version=2`, so CI had never once run any
+other configuration. Asked for `gic-version=3` explicitly, the kernel wrote `GICC_PMR` at
+an address GICv3 does not implement and took a synchronous external abort. That is real and
+is fixed: the kernel reads `ID_AA64PFR0_EL1.GIC` before touching any GIC MMIO and halts
+with a diagnosis, pinned by `cargo xtask arm64-gicv3-smoke` — the "cheap genericity test"
 this file had recommended for two phases without wiring anything to it. **Actually
 supporting GICv3** (system-register CPU interface + redistributors) is its own sub-phase,
 scheduled after 8.5 rather than deferred to the unplanned hardware phase.
+
+**Two claims that sat here were wrong — both measured false on 2026-09-24.** First, this
+paragraph said `-M virt` *defaults* to GICv3. It does not, on QEMU 8.2.2 under TCG: `-M
+virt` with `cortex-a72`, `max` and `neoverse-n1` all came up **GICv2** (the detection never
+fired; `[gic] GICv2 up:` in every log). The default is "newest available", which depends on
+QEMU version, CPU and accelerator — `cmd_arm64_gicv3_smoke`'s own comment says exactly
+that, and this paragraph contradicted it.
+
+Second, and the reason it matters: this was written as the diagnosis of a **UTM** boot
+failure, and it is not that. UTM still fails on an ISO built from `719453b`, which contains
+the fix. EDK2's `Synchronous Exception at 0x…` prints `ELR` — the faulting PC — and theirs
+is `0x47529074`, low physical RAM. ThemeliOS executes at `0xffffffff8…`, so the fault is
+**not in ThemeliOS at all**; it is in Limine or the firmware, before the kernel's first
+instruction. It reproduces at the same address across two different kernel builds, which is
+what one expects if the faulting code is one of the two parts that did not change.
+
+**Limine is pinned to v10.x (was v8.x), and the pin is now enforced.** Two separate
+things, both landed 2026-09-24 while investigating the UTM boot failure.
+
+*The bump.* We shipped v8.7.0; upstream is v11.4.1. v10.8.5 accepts the boot-protocol base
+revision the `limine` crate (0.5) asks for, needs no kernel change, and passes both suites
+and all three arm64 boot smokes (`arm64-smoke`, `arm64-iso-smoke`, `arm64-gicv3-smoke`),
+plus a by-hand OVMF boot of the amd64 ISO. v11 refuses outright — `Base revision 3 is no longer supported
+for aarch64 (minimum: 6)` — so going further means bumping the crate too and reading what
+revisions 4-6 changed about the aarch64 handoff. That is the blocker, and it is the
+bootloader's minimum rather than a crate build error.
+
+*The pin.* `ensure_limine` returned early the moment `target/limine/limine` existed, which
+made `LIMINE_BRANCH` a comment: editing it changed nothing wherever a checkout already sat.
+CI caches `target/limine` under a key of `hashFiles('**/Cargo.lock', 'rust-toolchain.toml')`
+— the branch is not in the key, and `restore-keys` falls back to any earlier entry — so the
+bump would have been silently ignored on every warm runner and the published ISO would have
+kept shipping v8 while the source said v10. The checkout is stamped with its branch now and
+re-cloned on a mismatch.
+
+**CI now boots the aarch64 ISO with a framebuffer** (`-device ramfb` in `arm64-iso-smoke`)
+and Limine runs with `verbose: yes`. Every aarch64 QEMU invocation in `xtask` had been
+display-less, so the project had never once run the configuration a desktop VM gives you —
+and it is not cosmetic. Limine probes each framebuffer with `AT S1E1W`, reads its attribute
+out of `PAR_EL1`, and installs it as **MAIR_EL1 index 1**: headless, MAIR arrives `0x…00ff`
+and Device-nGnRnE is index 1; with a framebuffer it arrives `0x…ffff` and Device moves to
+**index 2**. `paging::device_attr_index` searches rather than assumes, so it was already
+right — but nothing had demonstrated that, and the hard-coded index its comment records as
+the tempting shortcut would have mapped the PL011 **Normal write-back** for every desktop
+user: speculative register reads and coalesced writes, no fault, no message. Measured:
+`ramfb` exercises this path, `virtio-gpu-pci` does not (MAIR stays at the headless value
+under this firmware). Note Limine writes its own output to the framebuffer when one exists,
+so `verbose: yes` shows up on a desktop VM's display, not in a serial capture.
+
+**Still untested in CI: the amd64 ISO's UEFI path.** `cargo xtask test --arch amd64` boots
+the ISO, but with `-cdrom` and no pflash — that is SeaBIOS, so `BOOTX64.EFI` is published
+without ever being executed. It was verified by hand under OVMF for the Limine bump (boots
+to the shell), which is not the same as covered. Adding the smoke needs an OVMF install
+step in `build.yml`.
+
+**What the UTM failure is NOT.** Eighteen QEMU configurations were tried against the
+shipped arm64 ISO — GICv2 and v3, `cortex-a72`/`max`/`neoverse-n1`, 512M/4G/8G, 1 and 4
+CPUs, virtio-blk and USB CD, headless and two kinds of framebuffer, `virtualization=on`,
+Limine v8 and v10 — and **none reproduced it**. Ruled out with evidence: GICv3 (their ISO
+contains the fix), the framebuffer MAIR shift (handled), large RAM (both Limine versions
+boot at 4G and 8G), and ThemeliOS itself (faulting PC in low physical RAM, identical across
+two kernel builds). What is left is Limine or the firmware, on Apple Silicon under HVF with
+UTM's own EDK2 build — none of which is reproducible here. **The Limine bump is the
+best-supported candidate, not a confirmed fix**, and this entry should be corrected once
+there is a console or serial log from the failing machine showing what precedes the
+exception.
 
 **Real ARM server hardware is deliberately NOT planned.** The roadmap's Phase 8 label
 originally read "hyperscaler"; that work — platform discovery, GICv3 + ITS, PCIe ECAM +
