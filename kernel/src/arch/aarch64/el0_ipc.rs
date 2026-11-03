@@ -522,12 +522,21 @@ pub fn run() -> bool {
     crate::sched::spawn("el0-ipc-peer", kernel_peer);
 
     // Both halves block, so the timer must be running for either to be scheduled — the same
-    // reasoning as the 8.4b self-test's wait loop. The bound is in ticks, which only
-    // advance because interrupts are on here.
+    // reasoning as the 8.4b self-test's wait loop, and the same fix.
+    //
+    // The tick bound alone assumes interrupt delivery works. On Apple Silicon under HVF it
+    // does not: the GIC reads back sanely, `CNTVCT_EL0` advances, and no timer IRQ ever
+    // arrives — so a tick-only bound never expires and the boot hangs here instead of
+    // reporting. `CNTVCT_EL0` advances regardless of interrupt state, which is what makes
+    // it the sound timeout; the tick bound stays because on a healthy machine it is the
+    // tighter of the two and keeps the previous behaviour exactly.
     crate::arch::irq::enable();
     let start = crate::arch::time::tick_count();
+    let c_start = super::timer::read_cntvct();
+    let hang_bound = super::timer::reload() * 800;
     while !(EL0_EXITED.load(Ordering::Acquire) && KERNEL_SIDE_DONE.load(Ordering::Acquire))
         && crate::arch::time::tick_count() - start < 400
+        && super::timer::read_cntvct() - c_start < hang_bound
     {
         core::hint::spin_loop();
     }

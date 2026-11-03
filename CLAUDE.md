@@ -220,6 +220,10 @@ is `0x47529074`, low physical RAM. ThemeliOS executes at `0xffffffff8…`, so th
 instruction. It reproduces at the same address across two different kernel builds, which is
 what one expects if the faulting code is one of the two parts that did not change.
 
+**That conclusion is specific to UTM and does not generalise** — see the Apple Silicon
+entries below. On the same Mac, under plain QEMU + HVF, the kernel boots all the way; the
+"kernel never runs" inference was drawn from the UTM console alone and was wrong there.
+
 **Limine is pinned to v10.x (was v8.x), and the pin is now enforced.** Two separate
 things, both landed 2026-09-24 while investigating the UTM boot failure.
 
@@ -270,6 +274,35 @@ UTM's own EDK2 build — none of which is reproducible here. **The Limine bump i
 best-supported candidate, not a confirmed fix**, and this entry should be corrected once
 there is a console or serial log from the failing machine showing what precedes the
 exception.
+
+**But GICv3 is NOT the Apple Silicon unblocker, and it was queued partly on the belief
+that it was.** A boot log from a real Mac (QEMU + HVF, `-cpu host`) shows our GICv3
+detector **not firing** — so `ID_AA64PFR0_EL1.GIC == 0` and that CPU exposes no GICv3
+system-register interface at all. GICv2 comes up and reads back sanely there. Whatever is
+wrong on Apple Silicon, adding GICv3 support would not touch it. Re-prioritise on that
+basis rather than on the earlier assumption.
+
+**Apple Silicon under HVF delivers no timer interrupts, and that used to hang the boot.**
+Measured on the same log: GIC up (`1024 INTIDs, TYPER=0x0478001f` — our QEMU reports
+`288 / 0x00000008`), `CNTVCT_EL0` advancing at 24 MHz, and `timer: FAIL — 0 IRQs, 0
+spurious`. Everything downstream needs the tick, so the scheduler self-test scored
+`slices [0, 0, 0]`, and then boot **hung forever** at `Spawned task 6 ("el0-payload")`.
+
+The hang was ours and is fixed. `boot.rs` already states the principle — *"if delivery is
+broken the tick never moves and a loop waiting on it would hang the boot rather than fail
+it"* — and `sched_selftest`/`timer_selftest` pair every tick bound with a `CNTVCT_EL0`
+one. **Two loops did not**: the 8.4b EL0 wait and `el0_ipc`'s, each carrying a comment
+asserting the tick "is actually running", which is an assumption about the hardware rather
+than something the code establishes. Both now carry the counter bound, slack at 2x the
+tick bound so a healthy machine is unaffected. Reproduced locally by disabling the timer
+PPI: without the fix the last line is `Spawned task 6 ("el0-payload")`, matching the Mac
+exactly; with it, boot reports 8.4b/8.4d/8.5b FAILED and reaches the shell.
+
+Still unknown: *why* HVF delivers no IRQ, and whether UTM's failure is the same bug. They
+present differently — UTM shows a firmware-level synchronous exception with no kernel
+output at all, while plain QEMU+HVF boots the kernel fully. Possibly two problems. The
+next datum wanted is the same QEMU command with `-accel tcg`, which separates "HVF
+interrupt injection" from "firmware/bootloader".
 
 **Real ARM server hardware is deliberately NOT planned.** The roadmap's Phase 8 label
 originally read "hyperscaler"; that work — platform discovery, GICv3 + ITS, PCIe ECAM +
