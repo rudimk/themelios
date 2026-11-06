@@ -140,7 +140,25 @@ fn parse_options(args: &[String]) -> Options {
 // ============================================================================
 
 /// The git branch for pre-built Limine bootloader binaries.
-const LIMINE_BRANCH: &str = "v8.x-binary";
+///
+/// **v8 → v10 on 2026-09-24.** v8.x's last binary release is v8.7.0; upstream is on v11.
+/// The bump is two major versions of aarch64 and UEFI fixes, and it costs nothing here:
+/// v10.8.5 accepts the boot-protocol base revision the `limine` crate (0.5) requests, so no
+/// kernel change is needed. Verified on it before landing: both suites, `arm64-smoke`,
+/// `arm64-iso-smoke`, `arm64-gicv3-smoke`, and — by hand, because CI does not cover it —
+/// the amd64 ISO booted under OVMF, since `cargo xtask test --arch amd64` uses `-cdrom`
+/// with no pflash and so exercises SeaBIOS rather than `BOOTX64.EFI`.
+///
+/// **v11 is the ceiling until the crate moves.** It refuses outright —
+/// `PANIC: limine: Base revision 3 is no longer supported for aarch64 (minimum: 6)` —
+/// because upstream raised the aarch64 minimum. Going there means bumping the `limine`
+/// crate as well, and re-reading what revisions 4-6 changed about the aarch64 handoff.
+/// Recorded rather than attempted, so the next person knows the blocker is the crate and
+/// not the bootloader.
+const LIMINE_BRANCH: &str = "v10.x-binary";
+
+/// File recording which [`LIMINE_BRANCH`] the cached checkout was made from.
+const LIMINE_STAMP: &str = ".themelios-limine-branch";
 
 /// Ensure the Limine bootloader binaries are available locally.
 ///
@@ -148,11 +166,41 @@ const LIMINE_BRANCH: &str = "v8.x-binary";
 /// into `target/limine/`. On subsequent runs, it reuses the cached copy.
 /// After cloning, it builds the `limine` CLI tool (a small C program used
 /// to install BIOS boot sectors on the ISO).
+///
+/// ## The cached copy is checked against [`LIMINE_BRANCH`], not just for existence
+///
+/// This used to return early the moment `target/limine/limine` existed, which made
+/// [`LIMINE_BRANCH`] a **comment rather than a pin**: editing it did nothing wherever a
+/// checkout already existed. That is not a hypothetical on this project — CI caches
+/// `target/limine` under a key of `hashFiles('**/Cargo.lock', 'rust-toolchain.toml')`,
+/// which does not mention the branch at all, and `restore-keys` falls back to any earlier
+/// `-cargo-limine-` entry. So a bootloader bump would have been silently ignored on every
+/// warm cache, and the published ISO would have kept shipping the old bootloader while the
+/// source said otherwise — with nothing anywhere reporting the mismatch.
+///
+/// Stamping the checkout and re-cloning on a mismatch fixes it where the fix belongs. The
+/// alternative — remembering to bump the cache key — is a convention, and this is the kind
+/// of drift that is invisible precisely until someone is debugging a boot failure and
+/// reasoning about a bootloader version they are not actually running.
 fn ensure_limine(root: &Path) -> PathBuf {
     let limine_dir = root.join("target/limine");
 
+    // A cached checkout of the *wrong* branch is worse than none: it boots, and it is not
+    // what the source says. Discard it.
+    if limine_dir.exists() {
+        let stamped = fs::read_to_string(limine_dir.join(LIMINE_STAMP)).unwrap_or_default();
+        if stamped.trim() != LIMINE_BRANCH {
+            println!(
+                "Cached Limine is {} but {} is pinned — re-fetching.",
+                if stamped.trim().is_empty() { "unstamped" } else { stamped.trim() },
+                LIMINE_BRANCH
+            );
+            fs::remove_dir_all(&limine_dir).expect("failed to remove stale Limine checkout");
+        }
+    }
+
     if limine_dir.join("limine").exists() || limine_dir.join("limine.exe").exists() {
-        // Already set up — the CLI tool exists
+        // Already set up — the CLI tool exists, at the pinned branch.
         return limine_dir;
     }
 
@@ -177,6 +225,11 @@ fn ensure_limine(root: &Path) -> PathBuf {
             eprintln!("Check your internet connection and try again.");
             process::exit(1);
         }
+
+        // Stamp *after* a successful clone, so an interrupted one is re-fetched rather
+        // than inheriting a stamp it did not earn.
+        fs::write(limine_dir.join(LIMINE_STAMP), LIMINE_BRANCH)
+            .expect("failed to stamp the Limine checkout with its branch");
     }
 
     // Build the Limine CLI tool. This compiles a single C file (limine.c)
@@ -1522,9 +1575,31 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
     let serial_log = root.join("target/aarch64-iso-smoke-serial.log");
     let _ = fs::remove_file(&serial_log);
 
-    println!("Booting the aarch64 ISO on QEMU virt (headless)...");
+    println!("Booting the aarch64 ISO on QEMU virt, with a framebuffer (headless)...");
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-no-reboot"]);
+    // **A framebuffer, even though the console is serial.** Every other aarch64 QEMU
+    // invocation in this file boots with no display device at all, so until this line the
+    // project had never once run the configuration an ordinary user gets — a desktop VM
+    // (UTM, virt-manager, plain QEMU with a window) always has one.
+    //
+    // That is not a cosmetic difference; it changes the state the *bootloader* hands over.
+    // Limine probes each framebuffer with `AT S1E1W`, reads its memory attribute out of
+    // `PAR_EL1`, and installs it as **MAIR_EL1 index 1**. Headless, MAIR arrives as
+    // `0x00000000000000ff` and the first Device-nGnRnE (`0x00`) byte is at index 1. With a
+    // framebuffer it arrives as `0x000000000000ffff` and Device moves to **index 2**.
+    //
+    // `paging::device_attr_index` searches for the attribute rather than assuming an
+    // index, so it is already correct either way — but nothing proved that, because the
+    // only value CI had ever seen was the headless one. Had the index been hard-coded to 1
+    // (which the comment there records as the tempting shortcut), every desktop user would
+    // have had the PL011 mapped **Normal write-back** instead of Device: speculative reads
+    // of UART registers and coalesced writes, with no fault and no message.
+    //
+    // `ramfb` rather than `virtio-gpu-pci`: measured, only `ramfb` actually reaches Limine
+    // as a framebuffer under this firmware — `virtio-gpu-pci` leaves MAIR at the headless
+    // value, so it would have added a device and tested nothing.
+    cmd.args(["-device", "ramfb"]);
     // Without this every virtio-mmio device is presented as legacy (v1) — see
     // `virtio_mmio_modern_args`.
     cmd.args(virtio_mmio_modern_args());
