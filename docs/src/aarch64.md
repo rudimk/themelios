@@ -10,6 +10,30 @@ The port covers boot, memory management on kernel-owned page tables, exceptions,
 
 That boundary is visible in the test suite rather than left to prose: an aarch64 run reports **29 passed, 0 failed, 26 skipped**, and each skipped test names the subsystem that explains it. The total is 55 on both architectures, so the two runs are directly comparable.
 
+## It runs on real Apple Silicon, with one caveat
+
+Until recently the port had only ever run on this project's own QEMU invocations. It now
+boots to the ThemeliOS console on **Apple Silicon under UTM**, which is the first time the
+shipped image has started anywhere else.
+
+Getting there took two fixes, and they were separate problems that looked like one:
+
+* **A firmware-level fault before the kernel ran.** UTM showed EDK2's
+  `Synchronous Exception at 0x47529074` and no ThemeliOS output at all. The faulting PC was
+  low physical RAM while the kernel executes at `0xffffffff8…`, so the fault preceded the
+  kernel's first instruction. Fixed by moving the bootloader from **Limine v8.7.0 to
+  v10.8.5** — the only thing in the image that runs before the kernel.
+* **A hang after the kernel ran.** Separately, on plain QEMU + HVF, the kernel booted fully
+  and then hung forever: Apple Silicon under HVF delivered **no timer interrupts**, and two
+  boot self-test loops were bounded only on a tick that consequently never advanced. Both
+  now carry a `CNTVCT_EL0` bound, so a dead tick is reported rather than hung on.
+
+**The caveat:** timer-interrupt delivery under HVF is still unexplained. The hang is gone,
+but nothing has fixed delivery, so **do not assume preemption works on Apple Silicon**. A
+boot there may well report `timer: FAIL — 0 IRQs` and run cooperatively. The next diagnostic
+step is booting the same image with `-accel tcg` instead of `-accel hvf`: if the timer works
+under TCG, the problem is interrupt injection rather than this port's GIC or timer setup.
+
 (Phase 7 shipped this chapter saying 16 passed / 38 skipped. The passing count was right for the time; the skip count never was — 16 + 38 is 54, and the suite was 55. Corrected along with the 8.3 figures, and updated again at 8.5d.)
 
 | Subsystem | x86_64 | aarch64 |
