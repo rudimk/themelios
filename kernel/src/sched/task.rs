@@ -43,7 +43,6 @@
 
 use alloc::string::String;
 use crate::mm::addr::PhysAddr;
-#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessId;
 
 /// Unique identifier for each task.
@@ -142,7 +141,11 @@ pub struct Task {
     /// belong to PID 0 (the kernel process). User tasks belong to the process
     /// that spawned them. The scheduler uses this to determine whether a CR3
     /// switch is needed on context switch (different process → different address space).
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Un-gated for aarch64 in 8.5d along with `mod process`. The aarch64 analog of the
+    /// CR3 switch is the `TTBR0_EL1` install in `schedule()`, which keys off `ttbr0_root`
+    /// rather than this field — so this is ownership for `cap`/`audit` attribution here,
+    /// not a scheduling input.
     pub process_id: ProcessId,
 
     /// The x86-64 `IA32_FS_BASE` value for this task (Phase 5.1). Linux thread-

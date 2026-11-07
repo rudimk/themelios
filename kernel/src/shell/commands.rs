@@ -14,12 +14,7 @@ use crate::mm;
 use crate::println;
 use crate::sched;
 use crate::sched::task::TaskState;
-/// x86_64 only: aarch64 has `ProcessId` but no process table, and every command
-/// that reaches for one is gated out.
-#[cfg(target_arch = "x86_64")]
 use crate::process;
-/// The process table's per-process state enum — x86_64 only, like the table itself.
-#[cfg(target_arch = "x86_64")]
 use crate::process::ProcessState;
 use crate::cap::CapType;
 use crate::audit;
@@ -41,16 +36,18 @@ pub fn cmd_help(_args: &str) {
     println!("  reboot           — restart the machine");
     println!("  exit             — (there is no shell to exit; see 'shutdown')");
 
-    // The rest depend on the process table, the storage stack, the network stack or
-    // containers — all part of the ring-3/VirtIO-PCI surface deferred on aarch64.
+    // The rest depend on the storage stack, the network stack or containers — all part
+    // of the VirtIO-PCI surface still deferred on aarch64. The process-table commands
+    // left this list in 8.5d, when `mod process` un-gated.
     //
     // The list is `#[cfg]`'d rather than printed unconditionally because a help text
     // that advertises commands the dispatcher will reject as "Unknown command" is worse
     // than a shorter one: it sends the reader looking for a bug that is not there.
+    println!("  procs            — list all processes");
+    println!("  caps [pid]       — list capabilities in a process's CSpace");
+
     #[cfg(target_arch = "x86_64")]
     {
-        println!("  procs            — list all processes");
-        println!("  caps [pid]       — list capabilities in a process's CSpace");
         println!("  mount            — list mounted filesystems");
         println!("  ls <path>        — list a directory");
         println!("  cat <path>       — print file contents");
@@ -71,9 +68,9 @@ pub fn cmd_help(_args: &str) {
     #[cfg(not(target_arch = "x86_64"))]
     {
         println!();
-        println!("  (filesystem, network, container and process-table commands are");
-        println!("   x86_64-only for now — those subsystems are deferred on aarch64,");
-        println!("   which runs a ring-0 kernel core.)");
+        println!("  (filesystem, network and container commands are x86_64-only for");
+        println!("   now — those subsystems ride on VirtIO-PCI and are deferred on");
+        println!("   aarch64. Userspace servers and the process table are live here.)");
     }
 }
 
@@ -447,8 +444,10 @@ pub fn cmd_pgtable(args: &str) {
 }
 
 /// List all processes with PID, name, task count, capability count, and state.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
+///
+/// Portable as of Phase 8.5d, when `mod process` un-gated for aarch64. Both
+/// architectures now have a real process table to list, and on aarch64 it is the only
+/// way to see, from the shell, that a userspace server is actually resident.
 pub fn cmd_procs(_args: &str) {
     let procs = process::process_list();
 
@@ -469,7 +468,9 @@ pub fn cmd_procs(_args: &str) {
 ///
 /// Usage: `caps [pid]` — defaults to PID 0 (kernel process) if no PID given.
 /// Shows each capability's handle, type, rights, and parent relationship.
-#[cfg(target_arch = "x86_64")]
+///
+/// Portable as of Phase 8.5d — `cap` itself was already un-gated in 7.4; what was
+/// missing was a process whose CSpace to read.
 pub fn cmd_caps(args: &str) {
     let args = args.trim();
     let pid_val = if args.is_empty() {

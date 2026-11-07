@@ -33,7 +33,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cap::{Capability, CapRights, CapType};
 use crate::mm;
-use crate::mm::addr::{PhysAddr, VirtAddr};
+use crate::mm::addr::VirtAddr;
 use crate::mm::page_table::PageFlags;
 use crate::mm::shared::SharedRegion;
 use crate::process::{self, ProcessId};
@@ -368,15 +368,36 @@ pub fn spawn_server(config: ServerConfig) -> ProcessId {
     pid
 }
 
-/// Trampoline that drops the freshly-spawned task into ring 3 at the server's
-/// entry point. Runs in kernel mode within the server's address space; builds
-/// an `iretq` frame and never returns.
+/// Trampoline that drops the freshly-spawned task into userspace at the server's
+/// entry point. Runs in kernel mode within the server's address space and never
+/// returns.
 ///
 /// All servers share this trampoline because they all load at the same fixed
 /// `SERVER_CODE_VIRT` with the same `SERVER_STACK_TOP`.
+///
+/// ## Two mechanisms, one contract (Phase 8.5d)
+///
+/// The *contract* is architecture-neutral and is the reason one function serves both:
+/// enter at `SERVER_CODE_VIRT`, on `SERVER_STACK_TOP`, unprivileged, with interrupts
+/// enabled so the server stays preemptible. Everything below that line differs.
+///
+/// x86 builds a five-word `iretq` frame by hand and lets `iretq` consume it; the
+/// privilege change is encoded in the `cs` selector's RPL. aarch64 has no such frame —
+/// the target exception level is a *field* in `SPSR_EL1` and `eret` obeys whatever is
+/// there — so it calls [`enter_el0`](crate::arch::aarch64::syscall::enter_el0), which
+/// owns that register discipline (and the `DAIF` masking around it) in one place rather
+/// than repeating it at each entry site. Its `SPSR_EL0T` constant is `const`-asserted to
+/// be EL0t precisely because a one-field edit there would `eret` to **EL1** instead.
+///
+/// Note what is *absent* on the aarch64 side: no stack pointer is pushed anywhere. `eret`
+/// takes the user stack from `SP_EL0`, which the CPU swaps in as part of the return, and
+/// the kernel stack stays in `SP_EL1` for the next exception to land on. That is why
+/// `Task` has no `kernel_stack_top` field here — see `sched::schedule`.
 fn server_trampoline() {
-    let user_rip = SERVER_CODE_VIRT;
-    let user_rsp = SERVER_STACK_TOP;
+    let user_pc = SERVER_CODE_VIRT;
+    let user_sp = SERVER_STACK_TOP;
+
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: the code/stack pages are mapped USER in this process's address
     // space; the selectors match the ring-3 GDT entries (DPL=3).
     unsafe {
@@ -388,12 +409,20 @@ fn server_trampoline() {
             "push {rip}",
             "iretq",
             ss = in(reg) 0x1Bu64,       // USER_DATA_SELECTOR | RPL=3
-            rsp = in(reg) user_rsp,
+            rsp = in(reg) user_sp,
             rflags = in(reg) 0x202u64,  // IF=1 + reserved bit 1
             cs = in(reg) 0x23u64,       // USER_CODE_SELECTOR | RPL=3
-            rip = in(reg) user_rip,
+            rip = in(reg) user_pc,
             options(noreturn),
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the code and stack pages were mapped USER into this process's `TTBR0_EL1`
+    // tree above, and `sched::spawn_in_process` copied that tree's root into this task —
+    // so `schedule()` installed it before this trampoline ever ran. Never returns.
+    unsafe {
+        crate::arch::aarch64::syscall::enter_el0(user_pc, user_sp);
     }
 }
 

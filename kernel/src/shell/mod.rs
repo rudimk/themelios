@@ -74,9 +74,7 @@ fn shell_entry() {
             "kill" => commands::cmd_kill(args),
             "peek" => commands::cmd_peek(args),
             "pgtable" => commands::cmd_pgtable(args),
-            #[cfg(target_arch = "x86_64")]
             "procs" => commands::cmd_procs(args),
-            #[cfg(target_arch = "x86_64")]
             "caps" => commands::cmd_caps(args),
             "audit" => commands::cmd_audit(args),
             "shutdown" => commands::cmd_shutdown(args),

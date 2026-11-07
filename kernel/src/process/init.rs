@@ -28,6 +28,23 @@
 //! The init process doesn't load an ELF binary — the kernel directly writes
 //! machine code into the user code page. This is the minimal approach for
 //! Phase 2; ELF loading comes in Phase 5 with the Linux compat layer.
+//!
+//! ## Two blobs, two ways of producing them (Phase 8.5d)
+//!
+//! The x86_64 blob is hand-assembled byte by byte, in Rust, at runtime — including
+//! patching the endpoint id in as a `mov r13, imm64` operand. That is what Phase 2 wrote
+//! and it is left alone: it works, it is covered, and rewriting it would be churn.
+//!
+//! The aarch64 blob is **not** written that way, and the difference is deliberate rather
+//! than stylistic. Hand-encoding A64 is not meaningfully harder than x86 — the
+//! instructions are all four bytes — but the *endpoint patching* is: a 64-bit immediate
+//! needs a `movz`/`movk` quartet with the value split across four instructions' bit
+//! 20:5 fields, and an arithmetic slip there produces a blob that runs, sends to the
+//! wrong endpoint, and hangs. So the payload is assembled by the toolchain in a
+//! `global_asm!` block (the mechanism `arch::aarch64::el0_ipc` already uses) and the
+//! endpoint arrives **in a register**, placed there by `enter_el0_with_args` — no
+//! patching, nothing to get wrong, and a wrong register is a failure the test reports
+//! rather than a hang.
 
 use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
@@ -164,6 +181,7 @@ pub fn start() {
 ///   inc r12               ; counter++
 ///   jmp loop
 /// ```
+#[cfg(target_arch = "x86_64")]
 fn write_init_shellcode(code_phys: PhysAddr, endpoint_id: u64) {
     let code_ptr = code_phys.to_virt().as_u64() as *mut u8;
 
@@ -241,11 +259,102 @@ fn write_init_shellcode(code_phys: PhysAddr, endpoint_id: u64) {
     }
 }
 
+// --- The aarch64 init payload (Phase 8.5d) ---
+//
+// The same loop as the x86 shellcode above — SEND a counter, YIELD, increment, repeat —
+// assembled by the toolchain rather than by hand.
+//
+// It is **position-independent and branches only backwards by a literal offset**, because
+// it is copied to a user page at a fixed virtual address that has nothing to do with where
+// the assembler laid it out. No `adr`, no literal pool, no relocations: every instruction
+// here is self-contained.
+//
+// The endpoint id is *not* baked in. It arrives in `x0` from `enter_el0_with_args` and is
+// parked in `x19` before the first syscall. Contrast the x86 side, which patches it into a
+// `mov r13, imm64`; see the module docs for why the two differ.
+//
+// Register choice: `x19`/`x20` are callee-saved under AAPCS64, which is irrelevant here
+// (nothing is called) but is the convention `el0_ipc`'s payload follows, and the syscall
+// path restores all of `x0`-`x30` from the exception frame regardless.
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    r#"
+.section .rodata
+.balign 4
+.globl init_payload_start
+.globl init_payload_end
+init_payload_start:
+    mov  x19, x0            // endpoint id, handed over in x0
+    mov  x20, xzr           // counter = 0
+1:
+    mov  x8, #{nr_send}
+    mov  x0, x19            // endpoint
+    mov  x1, x20            // word0 = counter
+    mov  x2, xzr            // word1
+    mov  x3, xzr            // word2
+    mov  x4, xzr            // word3
+    mov  x5, xzr            // badge
+    svc  #0
+
+    mov  x8, #{nr_yield}
+    svc  #0
+
+    add  x20, x20, #1
+    b    1b
+init_payload_end:
+"#,
+    nr_send = const crate::arch::syscall::abi::SYS_SEND,
+    nr_yield = const crate::arch::syscall::abi::SYS_YIELD,
+);
+
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" {
+    static init_payload_start: u8;
+    static init_payload_end: u8;
+}
+
+/// Copy the assembled aarch64 init payload into the code page.
+///
+/// Takes `endpoint_id` only to keep one signature across the two architectures — this
+/// blob receives it in a register at entry, so there is nothing to patch. Named
+/// `_endpoint_id` rather than dropped from the signature so the two bodies stay
+/// interchangeable at the call site and a reader sees immediately that the parameter is
+/// unused *here*, not that the endpoint is ignored.
+#[cfg(target_arch = "aarch64")]
+fn write_init_shellcode(code_phys: PhysAddr, _endpoint_id: u64) {
+    // SAFETY: both symbols are defined by the `global_asm!` above and bracket a
+    // contiguous run of bytes in `.rodata`.
+    let blob = unsafe {
+        let start = &raw const init_payload_start;
+        let end = &raw const init_payload_end;
+        core::slice::from_raw_parts(start, end as usize - start as usize)
+    };
+    assert!(
+        blob.len() <= mm::PAGE_SIZE as usize,
+        "init payload does not fit in its single code page"
+    );
+
+    // SAFETY: `code_phys` is a freshly allocated frame reachable through the HHDM, and
+    // the assertion above bounds the copy to the page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            blob.as_ptr(),
+            code_phys.to_virt().as_mut_ptr::<u8>(),
+            blob.len(),
+        );
+    }
+}
+
 /// Trampoline function for the init task.
 ///
-/// This runs in kernel mode (ring 0) within the init process's address space.
-/// It builds an iretq frame on the kernel stack and transitions to ring 3
-/// at the init code page address. This function never returns.
+/// This runs in kernel mode (ring 0) within the init process's address space
+/// and transitions to userspace at the init code page address. Never returns.
+///
+/// As with `server::server_trampoline`, the contract is shared and the mechanism is not:
+/// x86 builds an `iretq` frame by hand, aarch64 hands the register discipline to
+/// `enter_el0_with_args` — which additionally delivers the endpoint id in `x0`, since the
+/// aarch64 payload is not patched with it.
+#[cfg(target_arch = "x86_64")]
 fn init_trampoline() {
     let user_rip = INIT_CODE_VIRT;
     let user_rsp = INIT_STACK_TOP;
@@ -276,6 +385,24 @@ fn init_trampoline() {
             user_rip = in(reg) user_rip,
             options(noreturn)
         );
+    }
+}
+
+/// The aarch64 half of [`init_trampoline`]. See the x86_64 sibling for the contract.
+#[cfg(target_arch = "aarch64")]
+fn init_trampoline() {
+    let endpoint_id = INIT_ENDPOINT_ID.load(Ordering::SeqCst);
+
+    // SAFETY: the code page is mapped USER (executable) and the stack pages USER|WRITABLE
+    // in this process's `TTBR0_EL1` tree, which `sched::spawn_in_process` attached to this
+    // task — so `schedule()` installed it before this ran. `x0` carries the endpoint the
+    // payload sends on. Never returns.
+    unsafe {
+        crate::arch::aarch64::syscall::enter_el0_with_args(
+            INIT_CODE_VIRT,
+            INIT_STACK_TOP,
+            [endpoint_id, 0, 0, 0],
+        )
     }
 }
 
