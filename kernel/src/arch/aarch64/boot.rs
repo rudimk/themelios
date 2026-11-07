@@ -323,6 +323,23 @@ pub fn kmain_aarch64(
     } else {
         crate::println!("[boot] Phase 7.2 FAILED self-test.");
     }
+    if !timer_ok {
+        // Name the causal chain once, here, rather than leaving a reader to infer it from
+        // the four derived failures below.
+        //
+        // Everything from the scheduler self-test onward needs the tick: preemption, the
+        // EL0 round trip, the soak and the IPC test all wait for tasks that only get the
+        // CPU because a timer IRQ took it away from someone else. With delivery broken
+        // they each time out on their `CNTVCT_EL0` bound and report FAIL, which reads like
+        // four independent bugs unless something says they are one.
+        //
+        // Observed on Apple Silicon under HVF: GIC up and reading back sanely, CNTVCT
+        // advancing at 24 MHz, zero IRQs ever delivered.
+        crate::println!(
+            "[boot] NOTE: no timer IRQs — the scheduler and EL0 self-tests below all \
+             depend on the tick and will FAIL for that reason, not independently."
+        );
+    }
 
     // --- Phase 7.3: preemptive scheduling ---
     crate::sched::init();
@@ -383,8 +400,11 @@ pub fn kmain_aarch64(
     // task time to be scheduled and make its three syscalls.
     //
     // Bounded on the tick, not on a spin count: if the drop to EL0 never happens, or the
-    // syscalls never arrive, this must *fail* rather than hang the boot.
+    // syscalls never arrive, this must *fail* rather than hang the boot. **And bounded on
+    // `CNTVCT_EL0` as well as the tick** — see the second bound below for why that is not
+    // belt-and-braces.
     let el0_ok = {
+        use crate::arch::aarch64::timer::{read_cntvct, reload};
         use crate::arch::time::tick_count;
         crate::sched::spawn("el0-payload", el0_task);
 
@@ -403,12 +423,39 @@ pub fn kmain_aarch64(
         //     failed on the missing shell banner rather than on any assertion.
         //
         // So: enable interrupts for the duration, wait on the condition, and restore the
-        // masked state afterwards so the rest of boot sees what it expects. The bound is
-        // now meaningful because the tick it counts is actually running.
+        // masked state afterwards so the rest of boot sees what it expects.
+        //
+        // ## The second bound, and the assumption it retires
+        //
+        // Until this was fixed the line above read "the bound is now meaningful because the
+        // tick it counts is actually running". Enabling interrupts makes the tick run *on a
+        // machine where interrupt delivery works*, and that is an assumption about the
+        // hardware, not something this code establishes.
+        //
+        // It is false on Apple Silicon under HVF, measured on a real Mac: the GIC comes up
+        // and reads back sanely, `CNTVCT_EL0` advances at 24 MHz, and **not one timer IRQ
+        // is ever delivered**. `timer_selftest` detects exactly that and reports
+        // `0 IRQs, 0 spurious` — and then boot walked into this loop, whose only bound was
+        // the tick that self-test had just proven dead, and hung forever. The last line on
+        // the console was `Spawned task 6 ("el0-payload")`.
+        //
+        // `sched_selftest` and `timer_selftest` already pair every tick bound with a
+        // `CNTVCT_EL0` one for this precise reason, and the comment there states the
+        // principle outright: the counter advances regardless of interrupt state, which is
+        // what makes it the only sound timeout for a test of the interrupt path. This loop
+        // and `el0_ipc`'s were the two that did not apply it.
+        //
+        // The counter bound is deliberately slack (2x the tick bound), so on a healthy
+        // machine the tick bound still decides and behaviour is unchanged; it only has an
+        // effect where the tick is dead, and there its effect is to turn a hang into a
+        // reported failure that boot continues past.
         crate::arch::irq::enable();
         let start = tick_count();
+        let c_start = read_cntvct();
+        let hang_bound = reload() * 400;
         while crate::arch::aarch64::syscall::exit_status().is_none()
             && tick_count() - start < 200
+            && read_cntvct() - c_start < hang_bound
         {
             core::hint::spin_loop();
         }
