@@ -1506,6 +1506,18 @@ fn qemu_aarch64_base(esp: &Path, code: &Path, vars: &Path) -> Command {
 fn cmd_arm64_smoke(_args: &[String]) {
     let root = workspace_root();
 
+    // Stage the servers first, for the reason spelled out in `cmd_arm64_gate`: as of
+    // 8.5d an aarch64 kernel `include_bytes!`s them, so a direct `cargo build` without
+    // staging fails.
+    //
+    // This command happens to work in CI today without it, because `verify-servers
+    // --arch arm64` runs earlier in the job and leaves the blobs behind. That is an
+    // order-dependency on a *different step*, not a property of this one — it breaks the
+    // moment the steps are reordered or this is run on its own, which is how anyone
+    // debugging locally will run it. Each command stages what it needs.
+    println!("Building the userspace servers for aarch64 (the kernel embeds them)...");
+    build_servers(&root, "aarch64-unknown-none-softfloat");
+
     println!("Building the aarch64 kernel for the boot smoke...");
     let status = Command::new("cargo")
         .current_dir(&root)
@@ -2567,8 +2579,22 @@ fn cmd_arm64_gate(_args: &[String]) {
     // Phase 7: also build the kernel itself for aarch64. From 7.0b the kernel boots on
     // aarch64 (QEMU virt), so this gate must catch any change that breaks the aarch64
     // build — "amd64 stays green" alone is insufficient once the arch seam is shared.
-    // The kernel embeds no userspace servers on aarch64 (they are cfg-gated out), so a
-    // direct `cargo build` needs no prior server staging.
+    //
+    // **The servers must be staged first, as of 8.5d.** Until then this comment read "the
+    // kernel embeds no userspace servers on aarch64 (they are cfg-gated out), so a direct
+    // `cargo build` needs no prior server staging" — true while `mod process` was
+    // x86-gated, and false the moment 8.5d un-gated it. `embedded.rs` now does thirteen
+    // `include_bytes!` against `target/servers/arm64/`, so an unstaged tree fails the
+    // build with eight "couldn't read" errors that name the blobs rather than the cause.
+    //
+    // Worth being precise about why the rest of the suite did not catch it: `build`,
+    // `test`, `iso` and the smokes all call `build_servers` themselves, so every command
+    // used during development staged the blobs as a side effect. This gate is the only
+    // one that invoked `cargo build` on the kernel directly — which is exactly what makes
+    // it a *gate*, and exactly what made it the one place the new dependency showed up.
+    println!("Building the userspace servers for aarch64 (the kernel embeds them)...");
+    build_servers(&root, "aarch64-unknown-none-softfloat");
+
     println!("Compiling the kernel for aarch64-unknown-none-softfloat (arm64 kernel gate)...");
     let kstatus = Command::new("cargo")
         .current_dir(&root)
