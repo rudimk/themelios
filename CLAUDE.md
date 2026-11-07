@@ -240,7 +240,14 @@ with a diagnosis, pinned by `cargo xtask arm64-gicv3-smoke` — the "cheap gener
 this file had recommended for two phases without wiring anything to it. **Actually
 supporting GICv3** (system-register CPU interface + redistributors) is its own sub-phase,
 scheduled after 8.5 rather than deferred to the unplanned hardware phase — and 8.5 closed
-at 8.5d, so **it is next**.
+at 8.5d, so **it is next in the queue**.
+
+**But read the GICv3 note further down before acting on that ordering.** It was placed next
+partly on the belief that it was the Apple Silicon unblocker, and a boot log from a real Mac
+disproved that: `ID_AA64PFR0_EL1.GIC == 0` there, so that CPU has no GICv3 system-register
+interface and GICv3 support would not help it at all. The sub-phase is still worth doing for
+QEMU and server-class parity; the *reason* it was prioritised is gone. Whether it still
+precedes 8.6 (storage) is an open call, not a settled one.
 
 **Two claims that sat here were wrong — both measured false on 2026-09-24.** First, this
 paragraph said `-M virt` *defaults* to GICv3. It does not, on QEMU 8.2.2 under TCG: `-M
@@ -300,17 +307,30 @@ without ever being executed. It was verified by hand under OVMF for the Limine b
 to the shell), which is not the same as covered. Adding the smoke needs an OVMF install
 step in `build.yml`.
 
-**What the UTM failure is NOT.** Eighteen QEMU configurations were tried against the
-shipped arm64 ISO — GICv2 and v3, `cortex-a72`/`max`/`neoverse-n1`, 512M/4G/8G, 1 and 4
-CPUs, virtio-blk and USB CD, headless and two kinds of framebuffer, `virtualization=on`,
-Limine v8 and v10 — and **none reproduced it**. Ruled out with evidence: GICv3 (their ISO
-contains the fix), the framebuffer MAIR shift (handled), large RAM (both Limine versions
-boot at 4G and 8G), and ThemeliOS itself (faulting PC in low physical RAM, identical across
-two kernel builds). What is left is Limine or the firmware, on Apple Silicon under HVF with
-UTM's own EDK2 build — none of which is reproducible here. **The Limine bump is the
-best-supported candidate, not a confirmed fix**, and this entry should be corrected once
-there is a console or serial log from the failing machine showing what precedes the
-exception.
+**The UTM failure is FIXED, and the Limine bump is what fixed it.** Confirmed on the
+machine that failed: the arm64 ISO from `e77a480` boots to the ThemeliOS console in UTM on
+Apple Silicon. It had previously died with EDK2's `Synchronous Exception at 0x47529074` and
+no kernel output at all, across two different kernel builds.
+
+The attribution is sound by elimination rather than by guess. The fault was *before the
+kernel's first instruction* — the faulting PC was low physical RAM while ThemeliOS executes
+at `0xffffffff8…` — so only something running before the kernel could be responsible, and
+the only such thing that changed is the bootloader: **Limine v8.7.0 → v10.8.5**. The kernel
+changes in the same ISO cannot explain it, because the old ISO never reached kernel code.
+
+**How it was found matters more than the fix, because the fix was a guess that happened to
+be right.** Eighteen QEMU configurations were tried and **none reproduced it** — GICv2 and
+v3, `cortex-a72`/`max`/`neoverse-n1`, 512M/4G/8G, 1 and 4 CPUs, virtio-blk and USB CD,
+headless and two framebuffers, `virtualization=on`, Limine v8 and v10. Apple Silicon under
+HVF with UTM's own EDK2 build was simply not reachable from this environment. So the bump
+shipped explicitly labelled *"the best-supported candidate, not a confirmed fix"*, and was
+only confirmed when the user booted it. Had it not worked, that labelling is what would
+have kept the search honest instead of closing the issue on a plausible story.
+
+Two earlier diagnoses of this same symptom were **wrong**, and both are worth remembering:
+GICv3 (the ISO under test already contained that fix and still failed), and "the kernel
+never runs" generalised from the UTM console to all of Apple Silicon (a plain QEMU + HVF
+boot log showed the kernel running fine).
 
 **But GICv3 is NOT the Apple Silicon unblocker, and it was queued partly on the belief
 that it was.** A boot log from a real Mac (QEMU + HVF, `-cpu host`) shows our GICv3
@@ -335,11 +355,21 @@ tick bound so a healthy machine is unaffected. Reproduced locally by disabling t
 PPI: without the fix the last line is `Spawned task 6 ("el0-payload")`, matching the Mac
 exactly; with it, boot reports 8.4b/8.4d/8.5b FAILED and reaches the shell.
 
-Still unknown: *why* HVF delivers no IRQ, and whether UTM's failure is the same bug. They
-present differently — UTM shows a firmware-level synchronous exception with no kernel
-output at all, while plain QEMU+HVF boots the kernel fully. Possibly two problems. The
-next datum wanted is the same QEMU command with `-accel tcg`, which separates "HVF
-interrupt injection" from "firmware/bootloader".
+**They were two problems, and one is now closed.** UTM's firmware-level exception is fixed
+by the Limine bump (above). The no-timer-IRQ behaviour under plain QEMU + HVF is a separate
+issue and is **still open**: the hang it caused is gone, but nothing has been done about
+delivery itself.
+
+Still unknown, and worth stating as unknown rather than inferred:
+
+  * **Why HVF delivers no timer IRQ.** The next datum is the same QEMU one-liner with
+    `-accel tcg` in place of `-accel hvf` — if the timer works under TCG and not HVF, it is
+    interrupt injection rather than our GIC or timer setup.
+  * **Whether the timer works in UTM.** UTM now reaches the console, but the boot output
+    was not captured, so we do not know whether `timer: FAIL — 0 IRQs` appeared there or
+    whether the tick is live. Both are consistent with reaching a prompt: a dead tick now
+    *reports and continues* rather than hanging. Reading one line of that boot log would
+    settle it, and until someone does, do not assume preemption works on Apple Silicon.
 
 **Real ARM server hardware is deliberately NOT planned.** The roadmap's Phase 8 label
 originally read "hyperscaler"; that work — platform discovery, GICv3 + ITS, PCIe ECAM +
