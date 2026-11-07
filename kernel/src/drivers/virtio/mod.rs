@@ -83,6 +83,66 @@ use crate::mm::{frame, PAGE_SIZE};
 pub mod blk;
 pub mod net;
 
+// ============================================================================
+// Threat model: is the device trusted?
+// ============================================================================
+
+/// Whether a VirtIO device is inside ThemeliOS's trusted computing base.
+///
+/// `true` today, and that is a statement about what we run on rather than an opinion
+/// about VirtIO: every device this kernel has ever seen is emulated by the hypervisor —
+/// QEMU's `virt`, or a cloud hypervisor — and a guest necessarily trusts the thing
+/// emulating its memory. A hypervisor that wanted to corrupt us does not need a crafted
+/// used-ring entry.
+///
+/// ## What this flag is load-bearing for
+///
+/// Two places take device-supplied values and use them without bounds-checking:
+///
+/// * [`Virtqueue::poll_used`] returns the used ring's `id` and `len` verbatim. The async
+///   RX path (`net::receive`) feeds `id` into `.add(id * RX_BUF_SIZE + …)` **and** into
+///   [`Virtqueue::write_desc`] — an out-of-bounds *write* past the descriptor table for
+///   any `id >= size`. `write_desc`'s SAFETY comment states `index < size` as an
+///   assumption, not a check.
+/// * The same path clamps the frame length only against the caller's buffer, never
+///   against `RX_BUF_SIZE - VIRTIO_NET_HDR_LEN`, so an over-long `len` over-reads
+///   adjacent RX buffers into a frame that is then delivered.
+///
+/// The **synchronous** path already validates: `submit_and_wait` compares the returned id
+/// against the chain it submitted and poisons the queue on a mismatch. So this is an
+/// asymmetry between two paths, not a considered policy — which is the main reason to
+/// expect it to be fixed rather than defended.
+///
+/// ## Why a flag and an assertion rather than a comment
+///
+/// Because a comment is what this project keeps discovering it already had. `CLAUDE.md`
+/// recommended `-M sbsa-ref` as "the cheap genericity test" for two phases with nothing
+/// wired to it; `LIMINE_BRANCH` read as a pin and was a comment; `boot.rs` stated the
+/// rule about tick-bounded waits in one place and two loops did not follow it. Each was
+/// written down and each still bit.
+///
+/// So the obligation is attached to the thing that changes. Declaring a device untrusted
+/// — passthrough, SR-IOV, a real NIC, anything in the hardware phase — means setting this
+/// to `false`, and the assertion below then **fails the build** and names both fixes.
+/// Flip it first; then make the build pass.
+///
+/// Same bug class as **CVE-2026-99999** (Linux `skb_checksum_help`, CWE-20, CVSS 9.3),
+/// whose own description argues for the check regardless of whether the bad input should
+/// have been possible: *"We really shouldn't allow such packets in, but as a defence in
+/// depth measure, let's also check."*
+pub const DEVICE_IN_TCB: bool = true;
+
+const _: () = assert!(
+    DEVICE_IN_TCB,
+    "A VirtIO device outside the TCB cannot be used with the current queue code. \
+     Before clearing DEVICE_IN_TCB, fix both: (1) Virtqueue::poll_used must reject \
+     an `id >= self.size` rather than return it — net::receive passes it to \
+     write_desc(), an out-of-bounds write; (2) net::receive must clamp the frame \
+     length to RX_BUF_SIZE - VIRTIO_NET_HDR_LEN, not only to the caller's buffer. \
+     See the DEVICE_IN_TCB docs and the Tier 5 stub in \
+     .sisyphus/plans/phase8-aarch64-parity.md."
+);
+
 // --- Device status bits (written to COMMON_DEVICE_STATUS) ---
 
 /// The guest has noticed the device.
@@ -538,6 +598,19 @@ impl Virtqueue {
     /// Non-blocking used-ring poll. If the device has returned a buffer since our
     /// last observation, returns `(descriptor head id, bytes written by device)`
     /// and advances our used cursor by one; otherwise returns `None`.
+    ///
+    /// # The returned `id` and `len` are **not validated**
+    ///
+    /// Both come straight out of the used ring, which the device writes. This function
+    /// hands them back as-is, and `net::receive` — the one asynchronous caller — uses
+    /// `id` for pointer arithmetic *and* for [`Virtqueue::write_desc`], which is an
+    /// out-of-bounds write past the descriptor table for any `id >= size`.
+    ///
+    /// That is sound only because the device is in the trusted computing base; see
+    /// [`DEVICE_IN_TCB`], which carries the full account and the build-time tripwire
+    /// that fires when the assumption stops holding. Note the **synchronous** path does
+    /// validate — `submit_and_wait` rejects a completion whose id is not the chain it
+    /// submitted — so this is an asymmetry to close, not a considered policy.
     fn poll_used(&mut self) -> Option<(u16, u32)> {
         // Completions on a desynchronised queue cannot be attributed to the right
         // request, so report "nothing waiting" forever rather than hand back a
