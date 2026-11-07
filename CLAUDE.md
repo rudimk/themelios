@@ -281,6 +281,29 @@ the three clouds runs virtio** (AWS is ENA, GCP gVNIC, Azure MANA, all with NVMe
 of Phase 8's virtio work runs on any of them, and that `qemu-system-aarch64 -M sbsa-ref` is
 the cheap genericity test.
 
+**Filed for that phase, and wired so it cannot be missed: the virtio drivers trust the
+device.** `Virtqueue::poll_used` returns the used ring's `id` and `len` unvalidated, and
+the async RX path (`virtio/net.rs::receive`) feeds `id` into pointer arithmetic *and* into
+`write_desc(id, …)` — an out-of-bounds **write** past the descriptor table for any
+`id >= size` — while clamping the frame length only against the caller's buffer, never
+against `RX_BUF_SIZE - VIRTIO_NET_HDR_LEN`. The **synchronous** path already validates
+(`submit_and_wait` rejects a completion id that is not the chain it submitted), so this is
+an asymmetry between two paths rather than a policy.
+
+Not a vulnerability today: the device is the hypervisor, which a guest necessarily trusts.
+It becomes one with passthrough, SR-IOV or a real NIC — i.e. in this phase. Same class as
+**CVE-2026-99999** (Linux `skb_checksum_help`, CWE-20, CVSS 9.3), whose own text argues for
+the check anyway: *"as a defence in depth measure, let's also check."*
+
+The reason it is not merely written here: this file has a track record of recording a
+precaution and never wiring it to anything — `-M sbsa-ref` sat in this very paragraph for
+two phases unconnected to any test, `LIMINE_BRANCH` read as a pin and was a comment, and
+`boot.rs` stated the tick-bound rule in one place while two loops ignored it. So the
+obligation is attached to the thing that changes: `virtio::DEVICE_IN_TCB` is `true` with a
+`const _: () = assert!(…)` beside it, and setting it to `false` — which is what declaring
+a device untrusted *means* — fails the build with a message naming both fixes.
+Mutation-tested: flipping it produces `error[E0080]` carrying those instructions.
+
 Parity has one measurable definition — `test_runner`'s `SKIPPED` list empty on both
 architectures, i.e. 55/55 running on each. It is **23 running / 32 skipped** on aarch64
 today (16/39 before 8.3). Three of the 32 cannot be retired by porting (`test_pci_scan`,

@@ -1036,6 +1036,32 @@ checked. **A stub saying "not planned" is more accurate than a plan that is wron
   the hardware phase therefore contains four device drivers, each comparable to Phase 3's
   entire storage bring-up. Azure's *block* device is the one item still unverified: Azure
   presents remote disks as NVMe **or** SCSI-over-VMBus depending on `DiskControllerType`.
+- **The virtio drivers trust the device, and the hardware phase is where that stops being
+  true.** `Virtqueue::poll_used` (`drivers/virtio/mod.rs`) returns the device's `id` and
+  `len` **unvalidated**, and the asynchronous RX path in `drivers/virtio/net.rs::receive`
+  feeds both into pointer arithmetic: `id` into `.add(id * RX_BUF_SIZE + …)` *and* into
+  `write_desc(id, …)`, which is an **out-of-bounds write** past the descriptor table for
+  any `id >= size`; `len` into a frame length clamped only against the caller's buffer,
+  never against `RX_BUF_SIZE - VIRTIO_NET_HDR_LEN`, so an over-long `len` over-reads
+  adjacent RX buffers into a delivered frame. `write_desc`'s own SAFETY comment states
+  `index < size` as an *assumption*, not a check.
+
+  Note the asymmetry, because it shows this is an oversight rather than a policy: the
+  **synchronous** path already validates. `submit_and_wait` compares the returned id to the
+  chain it submitted (`if id as u16 != head`) and poisons the queue on a mismatch. Only the
+  async poll skips it.
+
+  **Not a vulnerability today** — the only virtio devices ThemeliOS sees are emulated by
+  the hypervisor, which a guest necessarily trusts. It becomes one the moment this phase
+  introduces a device we do not trust: passthrough, SR-IOV, or a real NIC. Same bug class
+  as **CVE-2026-99999** (Linux `skb_checksum_help`, CWE-20, CVSS 9.3), whose own text makes
+  the argument for fixing it regardless: *"We really shouldn't allow such packets in, but
+  as a defence in depth measure, let's also check."*
+
+  **This item is wired to a build-time tripwire, not left to be remembered.**
+  `virtio::DEVICE_IN_TCB` is `true` with a `const _: () = assert!(…)` beside it; setting it
+  to `false` — which is what declaring a device untrusted means — fails the build with a
+  message naming both fixes. Flip it *first*, then make the build pass.
 - **`qemu-system-aarch64 -M sbsa-ref` is the cheap genericity test** — GICv3 + ITS, ACPI,
   TF-A + EDK2 firmware, a PCIe NIC, **no virtio-mmio at all**, RAM at `0x100_0000_0000`.
   Boot the same unmodified image there and on `-M virt`, have each print a `platform:` line
