@@ -97,23 +97,16 @@ static TESTS: &[TestCase] = &[
     TestCase { name: "test_fs_syscalls",      func: test_fs_syscalls },
     TestCase { name: "test_virtio_net",       func: test_virtio_net },
     TestCase { name: "test_net_service",      func: test_net_service },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_net_server_stack", func: test_net_server_stack },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_net_icmp_echo",    func: test_net_icmp_echo },
     // Runs before the other persistent net-server tests so it is the sole NIC
     // drainer (no inbound-frame competition) for the host-driven TCP handshake.
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_api_server",       func: test_api_server },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_dhcp",             func: test_dhcp },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_socket_capability", func: test_socket_capability },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_socket_list",      func: test_socket_list },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_udp_echo",         func: test_udp_echo },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_tcp_client",       func: test_tcp_client },
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_elf_exec",         func: test_elf_exec },
@@ -205,14 +198,6 @@ static SKIPPED: &[SkippedTest] = &[
     // lands in 8.4/8.5" — which also went stale, since that landed: the process table has
     // been un-gated since 8.5d. Un-gating it is 8.7's job, and as of 8.6 nothing below it
     // is missing.
-    SkippedTest { name: "test_net_server_stack", why: "net::socket is the last x86-gated part of mod net (8.7)" },
-    SkippedTest { name: "test_net_icmp_echo", why: "net::socket is the last x86-gated part of mod net (8.7)" },
-    SkippedTest { name: "test_api_server", why: "net::socket is the last x86-gated part of mod net (8.7)" },
-    SkippedTest { name: "test_dhcp", why: "net::socket is the last x86-gated part of mod net (8.7)" },
-    SkippedTest { name: "test_socket_capability", why: "net::socket is the last x86-gated part of mod net (8.7)" },
-    SkippedTest { name: "test_socket_list", why: "net::socket is the last x86-gated part of mod net (8.7)" },
-    SkippedTest { name: "test_udp_echo", why: "net::socket is the last x86-gated part of mod net (8.7)" },
-    SkippedTest { name: "test_tcp_client", why: "net::socket is the last x86-gated part of mod net (8.7)" },
     // **Reasons corrected in 8.6.** Both old ones named ring 3 as the blocker and both
     // were stale: EL0 landed in 8.4, the ring-3 servers run in 8.5, and `test_server_spawn`
     // plus all six storage tests now execute staged ELF servers at EL0 on this
@@ -251,6 +236,18 @@ static SKIPPED: &[SkippedTest] = &[
     SkippedTest { name: "test_container_confinement", why: "mod container is x86-gated on the Linux personality (8.10)" },
     SkippedTest { name: "test_container_registry", why: "mod container is x86-gated on the Linux personality (8.10)" },
     SkippedTest { name: "test_container_logs", why: "mod container is x86-gated on the Linux personality (8.10)" },
+    // Moved out of the networking group in 8.7. 8.6 filed this under `net::socket`, which
+    // is wrong: the test drives the ring-3 **api-server**, so it needs `mod container`
+    // (it reads `container::registry` for the state it asserts) and `mod mgmt` (the
+    // server holds the `Management` sentinel cap). Networking is a prerequisite it
+    // already has — `test_net_service` passes here — not its blocker.
+    //
+    // This is the mistake the group comments above warn about, made by the sub-phase that
+    // wrote the warning: eight net skips were corrected at once and this one was swept in
+    // with the other seven on the strength of having "server" in the name. The plan's
+    // ratchet had it right all along, assigning 7 to 8.7 and 7 to 8.10; reconciling the
+    // reasons against that table is what caught it.
+    SkippedTest { name: "test_api_server", why: "drives the api-server: needs mod container + mod mgmt (8.10)" },
     SkippedTest { name: "test_management_capability", why: "mod mgmt is x86-gated; the SYS_MGMT ABI lands with 8.10" },
 ];
 
@@ -3226,7 +3223,6 @@ fn test_net_service() -> Result<(), &'static str> {
 /// server's MAC and IP. Proves the whole 4.2 path — the net server boots in ring
 /// 3, initialises the Interface, and the IPC Device moves a frame in (MSG_POLL)
 /// and out (MSG_TX_FRAME) with smoltcp processing in between.
-#[cfg(target_arch = "x86_64")]
 fn test_net_server_stack() -> Result<(), &'static str> {
     use crate::arch::time as idt;
     use crate::ipc::{self, IpcMessage};
@@ -3342,7 +3338,6 @@ fn test_net_server_stack() -> Result<(), &'static str> {
 // ============================================================
 
 /// Standard 16-bit one's-complement Internet checksum.
-#[cfg(target_arch = "x86_64")]
 fn inet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
@@ -3368,7 +3363,6 @@ fn inet_checksum(data: &[u8]) -> u16 {
 /// request from 10.0.2.2 to the server's 10.0.2.15; the server auto-replies with
 /// an ICMP echo reply, transmitted straight back. Proves Ethernet + ARP + IPv4 +
 /// ICMP end to end through the ring-3 stack.
-#[cfg(target_arch = "x86_64")]
 fn test_net_icmp_echo() -> Result<(), &'static str> {
     use alloc::collections::VecDeque;
     use alloc::vec;
@@ -3517,7 +3511,6 @@ fn test_net_icmp_echo() -> Result<(), &'static str> {
 /// the interface is configured, then checks slirp's well-known assignment
 /// (`10.0.2.15`, gateway `10.0.2.2`). Proves address/gateway acquisition and the
 /// whole config-reporting path end to end.
-#[cfg(target_arch = "x86_64")]
 fn test_dhcp() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::virtio::net::VirtioNet;
@@ -3707,7 +3700,6 @@ fn await_server_ready(endpoint: u64, what: &'static str) -> Result<(), &'static 
 /// payload region, and register the kernel socket router — the same wiring
 /// `boot_net` does. Returns the net server's request endpoint. `dhcp` selects
 /// DHCP vs the static fallback address.
-#[cfg(target_arch = "x86_64")]
 fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u64, &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::virtio::net::VirtioNet;
@@ -3788,7 +3780,6 @@ fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u
 ///
 /// Deterministic — no external network is needed to create/bind/close a socket
 /// (the round-trip is exercised separately by `test_udp_echo`).
-#[cfg(target_arch = "x86_64")]
 fn test_socket_capability() -> Result<(), &'static str> {
     use crate::cap::{CapHandle, CapRights, CapType, Capability, SOCKET_FACTORY};
     use crate::net::socket::{self, SockError};
@@ -3855,7 +3846,6 @@ fn test_socket_capability() -> Result<(), &'static str> {
 /// back is left to the best-effort `ping` shell command (slirp's ICMP proxy may
 /// lack host privileges); here we assert the send is accepted, which exercises the
 /// whole ICMP socket build/bind/emit path in the ring-3 stack.
-#[cfg(target_arch = "x86_64")]
 fn test_socket_list() -> Result<(), &'static str> {
     use crate::net::socket;
 
@@ -5379,7 +5369,6 @@ fn test_management_capability() -> Result<(), &'static str> {
 }
 
 /// Build a minimal DNS A-record query for "example.com" (29 bytes).
-#[cfg(target_arch = "x86_64")]
 fn build_dns_query() -> [u8; 29] {
     let mut q = [0u8; 29];
     q[0] = 0x12; // transaction id (high)
@@ -5406,7 +5395,6 @@ fn build_dns_query() -> [u8; 29] {
 /// slirp's DNS proxy resolves via the host, which a sandboxed CI may not permit;
 /// the UDP transport round-trip itself is already proven deterministically by
 /// `test_dhcp` (DHCP is UDP). When a reply does arrive it is validated.
-#[cfg(target_arch = "x86_64")]
 fn test_udp_echo() -> Result<(), &'static str> {
     use crate::net::{net_service, socket};
 
@@ -5488,7 +5476,6 @@ fn test_udp_echo() -> Result<(), &'static str> {
 /// refusal / a silently-dropped SYN are all acceptable (a deterministic TCP
 /// round-trip against a real listener lands with the server path in 4.7). The
 /// probe budget is bounded so a dropped SYN cannot hang the test.
-#[cfg(target_arch = "x86_64")]
 fn test_tcp_client() -> Result<(), &'static str> {
     use crate::net::socket::SockError;
     use crate::net::{net_service, socket};

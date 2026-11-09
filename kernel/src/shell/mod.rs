@@ -86,15 +86,10 @@ fn shell_entry() {
             "stat" => commands::cmd_stat(args),
             "write" => commands::cmd_write(args),
             "mkdir" => commands::cmd_mkdir(args),
-            #[cfg(target_arch = "x86_64")]
             "ifconfig" => commands::cmd_ifconfig(args),
-            #[cfg(target_arch = "x86_64")]
             "sockets" => commands::cmd_sockets(args),
-            #[cfg(target_arch = "x86_64")]
             "ping" => commands::cmd_ping(args),
-            #[cfg(target_arch = "x86_64")]
             "udpsend" => commands::cmd_udpsend(args),
-            #[cfg(target_arch = "x86_64")]
             "tcpconnect" => commands::cmd_tcpconnect(args),
             #[cfg(target_arch = "x86_64")]
             "run" => commands::cmd_run(args),

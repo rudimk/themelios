@@ -44,11 +44,19 @@ pub mod net_service;
 /// Socket routing: the kernel's capability-checked UDP socket API (Phase 4.5).
 /// Routes socket syscalls to the ring-3 net server; never parses packets.
 ///
-/// The one submodule here that needs ring 3: it maps sockets to owning processes through
-/// `crate::process`, which does not exist on aarch64 until the EL0 port. [`device`] and
-/// [`net_service`] above are ring-0 and compile everywhere.
-#[cfg(target_arch = "x86_64")]
+/// Maps sockets to owning processes through `crate::process`, which is why this was the
+/// one submodule here gated to x86_64 — [`device`] and [`net_service`] above are ring-0
+/// and have compiled everywhere since 8.3. Un-gated in 8.7: the process table arrived on
+/// aarch64 in 8.5d, and `crate::process::{self, ProcessId}` is the whole of what this
+/// file needed from it.
 pub mod socket;
+
+/// The ring-3 socket syscall dispatcher (`SYS_SOCKET` … `SYS_ACCEPT`).
+///
+/// Arch-neutral since Phase 8.7 and called by both architectures' syscall dispatchers.
+/// See its module docs for the slot-4 ABI trap it has to navigate — the one `fs::syscall`
+/// warned about in 8.6 and did not itself hit.
+pub mod syscall;
 
 /// Pack a 6-byte MAC into a little-endian u64, for passing to the net server via
 /// `BootInfo.arg1`.
@@ -83,7 +91,6 @@ pub const NET_ARG_DHCP: u64 = 1 << 48;
 /// - `client_shared` region = TX frames (server → service)
 /// - `arg1` = the NIC's MAC (packed), so it can configure smoltcp's interface
 pub fn boot_net() {
-    #[cfg(target_arch = "x86_64")]
     {
         use crate::drivers::virtio::net::VirtioNet;
         use crate::drivers::virtio::{self, VirtioKind};

@@ -104,6 +104,24 @@ impl ExceptionFrame {
         self.x[5]
     }
 
+    /// Argument 4 under the **native ThemeliOS ABI** (`x4`).
+    ///
+    /// Identical to [`arg4`](Self::arg4) here, and that is the whole point of it existing:
+    /// aarch64 carries slots 0-5 in `x0`-`x5` for every ABI, so the native/Linux
+    /// distinction simply does not arise. On x86_64 it does — native slot 4 is `r9` while
+    /// Linux slot 4 is `r8`, crossed with slot 5 — so a shared dispatcher reading slot 4
+    /// has to say *which* ABI it means. See the x86 counterpart's docs for the full table
+    /// and for what breaks without it (`SYS_SENDTO` sending every datagram to port 0, on
+    /// amd64 only).
+    ///
+    /// The duplication is therefore load-bearing in one direction only: this method is
+    /// here so the arch-neutral caller has one spelling, not because aarch64 needs a
+    /// second register. Exercised by `test_udp_echo`.
+    #[inline]
+    pub fn arg_native4(&self) -> u64 {
+        self.x[4]
+    }
+
     /// Set the value userspace receives back (`x0`).
     #[inline]
     pub fn set_ret(&mut self, value: u64) {
@@ -284,7 +302,18 @@ pub const ENOSYS: u64 = u64::MAX - 37;
 /// When the arm is finally empty, this cannot be satisfied and the probe should be
 /// deleted rather than pointed at something implemented: by then there is no
 /// unimplemented number left to probe for, which is the point of the exercise.
-pub const ENOSYS_PROBE_NR: u64 = crate::arch::syscall::abi::SYS_SOCKET;
+///
+/// **8.7 moved it once, and the arrangement worked as designed.** It pointed at
+/// `SYS_SOCKET`, which 8.7 implemented; because the constant sits beside the list, the
+/// one-line edit happened while wiring the socket arm, rather than as a hash mismatch in
+/// `el0_ipc` discovered afterwards. That is the entire difference from 8.6, where the
+/// probe was hard-coded two files away and the self-test went red.
+///
+/// It now names `SYS_MGMT`, **the last number in that arm**. So 8.10 is the sub-phase that
+/// deletes this constant and `el0_ipc`'s `nr_unimpl` probe along with it: there will be no
+/// unimplemented native number left to point at, and pointing it at an implemented one
+/// would turn a real check into a tautology.
+pub const ENOSYS_PROBE_NR: u64 = crate::arch::syscall::abi::SYS_MGMT;
 
 /// A user pointer could not be accessed — [`super::uaccess`] rejected the range.
 ///
@@ -458,15 +487,14 @@ fn dispatch_native(frame: &mut SyscallFrame, nr: u64, a: [u64; 6]) -> bool {
         | abi::SYS_STAT
         | abi::SYS_READDIR => blocking(|| crate::fs::syscall::dispatch(frame)),
 
-        // The socket and management numbers. These are ABI — a server built against
-        // `libthemelios` may issue them — but aarch64 has no network stack (8.7) and no
-        // management ABI (8.10) to service them with.
+        // The socket syscalls, implemented in 8.7. Ten numbers left the `ENOSYS` list
+        // below to get here — the same mechanism that list's comment describes and that
+        // 8.6 used for the six filesystem numbers.
         //
-        // Named explicitly rather than left to the `_ => false` below, which would send
-        // them into the EL0 test range's `_ => ENOSYS` and reach the same value by
-        // accident. The distinction matters when those sub-phases land: deleting a number
-        // from this list is how it becomes implemented, and a list is something you can
-        // read to see what is missing. An accidental fall-through is not.
+        // `crate::net::syscall::dispatch` is the same function x86 calls. Interrupts are
+        // unmasked first for the same reason as the filesystem arm: every one of these can
+        // block on the ring-3 net server, and a task that blocks with `DAIF.I` set is
+        // never woken to be scheduled again.
         abi::SYS_SOCKET
         | abi::SYS_BIND
         | abi::SYS_SENDTO
@@ -476,8 +504,17 @@ fn dispatch_native(frame: &mut SyscallFrame, nr: u64, a: [u64; 6]) -> bool {
         | abi::SYS_LISTEN
         | abi::SYS_ACCEPT
         | abi::SYS_TCP_SEND
-        | abi::SYS_TCP_RECV
-        | abi::SYS_MGMT => frame.set_ret(ENOSYS),
+        | abi::SYS_TCP_RECV => blocking(|| crate::net::syscall::dispatch(frame)),
+
+        // The management ABI. Still unimplemented here — `mod mgmt` is x86-gated until
+        // 8.10 — and still named explicitly rather than left to the `_ => false` below,
+        // which would reach the same value by accident through the EL0 test range's
+        // `_ => ENOSYS`. Deleting a number from this arm is how it becomes implemented,
+        // and a list is something you can read to see what is missing.
+        //
+        // **`ENOSYS_PROBE_NR` must name a number in this arm**; it is the last one left,
+        // so 8.10 retires the probe rather than re-pointing it. See its declaration.
+        abi::SYS_MGMT => frame.set_ret(ENOSYS),
 
         // `ENOSYS_PROBE_NR` must name one of the numbers in the arm directly above; see
         // its declaration for why it lives next to this list rather than in the test that
