@@ -564,6 +564,26 @@ pub fn kmain_aarch64(
         crate::arch::irq::disable();
         crate::shell::init();
         crate::arch::irq::enable();
+
+        // Bring up the storage stack and register the "/" and "/data" mounts: discover
+        // the VirtIO disks, then block server → SquashFS server → overlay server for the
+        // root, and block server → ext2 server for the data volume. Phase 8.6, mirroring
+        // the x86 path in `kmain`.
+        //
+        // **Without this the six filesystem shell commands are inert**, and inert in the
+        // most misleading way available: `fs::root_mount()` returns `None`, so `ls /`
+        // reports no root mount rather than failing, and a reader concludes the storage
+        // port is incomplete when in fact nothing ever mounted anything. 8.6 attaching
+        // the real SquashFS and ext2 images to the interactive `run` path is necessary
+        // and was not sufficient — a disk the kernel never mounts is indistinguishable
+        // from a blank one at the shell prompt.
+        //
+        // After `shell::init`, not before, because `boot_storage` spawns ring-3 servers
+        // and blocks on IPC round trips with them; the shell task must already exist so
+        // the console is live while that happens. It is idempotent (it returns early if
+        // the root mount is already set), so this cannot double-mount.
+        crate::fs::boot_storage();
+        crate::fs::print_mount_status();
     }
 
     // Interrupts were unmasked above, so this is a live idle: the timer keeps firing

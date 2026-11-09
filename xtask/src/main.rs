@@ -794,6 +794,60 @@ fn virtio_net_args_mmio(id: &str, hostfwd: Option<&str>) -> Vec<String> {
 ///
 /// The boot self-tests and the test suite check different things and both are gates; one
 /// list, two readers.
+/// What the boot smokes type at the shell: one command, and a string that only its
+/// *output* can contain.
+///
+/// `help` proves the whole receive path — PL011 RX interrupt, GIC SPI route, ring buffer,
+/// wake, line editor, dispatcher — none of which booting alone touches.
+const HELP_DRIVE: &[(&str, &str)] = &[("help", "show memory statistics")];
+
+/// What `arm64-fs-smoke` types: the Phase 8.6 acceptance criterion, which is the storage
+/// stack driven from the shell over the serial console with its output asserted.
+///
+/// The plan asks for exactly this rather than for `ls` and `cat` being reported to "work
+/// interactively", because that phrasing is unfalsifiable and this project's own history
+/// is the argument against accepting it — `LIMINE_BRANCH` read as a pin and was a comment,
+/// `-M sbsa-ref` sat in CLAUDE.md for two phases wired to nothing, and the tick-bound rule
+/// was stated in one file while two loops ignored it. A claim with no test behind it
+/// decays into a false claim.
+///
+/// **Every marker here must be unique to the command's output, and the shell echoes what
+/// is typed, so a marker that also occurs in the typed line would pass against the echo
+/// alone** — proving the bytes arrived, not that anything ran. Two of these need care:
+///
+/// * The `ls` markers carry the two-space indent `cmd_ls` prints (`"  ovl.txt"`). The
+///   bare name would also match the echo of the `write` line that created it
+///   (`write /ovl.txt …`), so the indent is load-bearing, not decoration.
+/// * The write is asserted through `ls`, not through `cat /ovl.txt`. Reading the content
+///   back would match the echo of the `write` command that supplied it — the one check
+///   here that cannot be written the obvious way. Listing it instead proves more anyway:
+///   that the overlay merges its RAM upper layer into the root directory it serves from a
+///   read-only SquashFS lower.
+///
+/// Together these cross the whole stack, each step naming a different part of it: readdir
+/// and read through overlay → SquashFS → block server → virtio-mmio; nested path
+/// resolution; `stat`'s size against a known file; the ext2 data volume on a second disk;
+/// and a create+write landing in the overlay's upper layer.
+const FS_DRIVE: &[(&str, &str)] = &[
+    // readdir through the overlay onto the read-only SquashFS root.
+    ("ls /", "  hello.txt"),
+    // read: 15 bytes whose content is fixed by `build_rootfs_staging`.
+    ("cat /version", "THEMELIOS_ROOT"),
+    // the same, one directory down, so path resolution is not just the root inode.
+    ("cat /docs/readme.txt", "nested file in /docs"),
+    // stat, against a size the image generator fixes at 21 bytes ("Hello from SquashFS!\n").
+    ("stat /hello.txt", "/hello.txt: 21 bytes, file"),
+    // the *other* mount and the *other* filesystem: ext2 on a second virtio-mmio disk.
+    // Deliberately a file whose content differs from the SquashFS `hello.txt` above, so a
+    // mount mix-up cannot satisfy this.
+    ("cat /data/hello.txt", "Hello from ext2!"),
+    // create + write into the overlay's RAM upper layer over a read-only lower.
+    ("write /ovl.txt OVERLAY_UPPER_OK", "wrote 16 bytes to /ovl.txt"),
+    // and the upper layer shows up in the merged listing. See the note above on why this
+    // is an `ls` and not a `cat`.
+    ("ls /", "  ovl.txt"),
+];
+
 const AARCH64_BOOT_FAILURES: &[&str] = &[
     "KERNEL PANIC",
     "Phase 7.1 MMU/paging FAILED self-test",
@@ -1559,7 +1613,95 @@ fn cmd_arm64_smoke(_args: &[String]) {
         .arg(format!("socket,id=s0,path={},server=on,wait=off", sock.display()));
     cmd.args(["-serial", "chardev:s0"]);
 
-    await_aarch64_banner(cmd, &sock, &serial_log, "ESP");
+    await_aarch64_banner(cmd, &sock, &serial_log, "ESP", HELP_DRIVE, None);
+}
+
+/// `cargo xtask arm64-fs-smoke` — the **Phase 8.6 acceptance test**: boot aarch64 with
+/// the real SquashFS root and ext2 data volume attached, then drive the filesystem shell
+/// commands over the serial console and assert their output. See [`FS_DRIVE`].
+///
+/// ## Why this exists as well as the suite
+///
+/// `cargo xtask test --arch arm64` covers the storage stack thoroughly — six tests
+/// through the VFS and the ring-3 servers — but every one of them calls the servers from
+/// *kernel* code inside the test harness. None of them goes through `fs::boot_storage`,
+/// the mount registry, `resolve_mount`, the shell dispatcher, or the console. That is the
+/// path an operator actually uses, and on this architecture it had a genuine hole: the
+/// aarch64 boot path did not call `fs::boot_storage()` at all, so the six commands this
+/// sub-phase un-gated would have printed "no filesystem mounted" on a machine whose suite
+/// passed 35/35. Attaching the images to the `run` path was necessary and not sufficient.
+///
+/// It is a separate command rather than an extension of `arm64-smoke` because that smoke
+/// boots a diskless machine deliberately — proving the kernel comes up with no storage at
+/// all — and giving it disks would retire that coverage to gain this.
+fn cmd_arm64_fs_smoke(_args: &[String]) {
+    let root = workspace_root();
+
+    // Stage the servers before building the kernel: it `include_bytes!`s them, and this is
+    // the mistake `arm64-gate` shipped in 8.5d — a direct `cargo build` of the aarch64
+    // kernel with no prior staging fails, and every *other* command staged them as a side
+    // effect, so the one command that did not was the one CI ran.
+    //
+    // It matters twice over here, because this command's whole point is the filesystem
+    // servers: `squashfs-server`, `overlay-server` and `ext2-server` are the blobs
+    // `fs::boot_storage` spawns.
+    println!("Building the userspace servers for aarch64 (the kernel embeds them)...");
+    build_servers(&root, "aarch64-unknown-none-softfloat");
+
+    println!("Building the aarch64 kernel for the filesystem smoke...");
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args([
+            "build", "--package", "themelios", "--target", "aarch64-unknown-none-softfloat",
+            BUILD_STD, BUILD_STD_FEATURES,
+        ])
+        .status()
+        .expect("Failed to build the aarch64 kernel");
+    if !status.success() {
+        eprintln!("arm64 fs smoke FAILED: kernel did not build for aarch64.");
+        process::exit(1);
+    }
+
+    let kernel = root.join("target/aarch64-unknown-none-softfloat/debug/themelios");
+    let limine_dir = ensure_limine(&root);
+    let (esp, code, vars) = prepare_aarch64_boot(&root, &kernel, &limine_dir);
+
+    // Unlike the test path, the ext2 image is **not** regenerated here. Nothing in
+    // `FS_DRIVE` mutates it — the one write goes to `/ovl.txt`, which lands in the
+    // overlay's RAM upper layer and evaporates with the machine — so this run is
+    // idempotent against a persistent disk and re-creating a 16 MiB image each time would
+    // buy nothing. `test_ext2_write` is the test that needs the reset, and it says so.
+    let scratch = ensure_scratch_disk(&root);
+    let (squashfs, ext2) = ensure_images(&root);
+
+    let serial_log = root.join("target/aarch64-fs-smoke-serial.log");
+    let _ = fs::remove_file(&serial_log);
+
+    println!("Booting aarch64 with the SquashFS root and ext2 data volume attached...");
+    let sock = root.join("target/aarch64-fs-smoke.sock");
+    let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
+    cmd.args(["-display", "none", "-monitor", "none"]);
+    // Same three disks and same order as the test path. Each is identified by probing its
+    // content for a signature rather than by position, so the order fixes slot addresses
+    // only.
+    cmd.args(virtio_disk_args_mmio(&scratch, "blkscratch", false));
+    cmd.args(virtio_disk_args_mmio(&squashfs, "blkroot", true));
+    cmd.args(virtio_disk_args_mmio(&ext2, "blkdata", false));
+    cmd.arg("-chardev")
+        .arg(format!("socket,id=s0,path={},server=on,wait=off", sock.display()));
+    cmd.args(["-serial", "chardev:s0"]);
+
+    // The readiness gate: `print_mount_status` emits this only after the overlay →
+    // SquashFS → block chain answers a `stat /version`, so it proves the mounts are not
+    // merely registered but serving. 15 bytes is fixed by `build_rootfs_staging`.
+    await_aarch64_banner(
+        cmd,
+        &sock,
+        &serial_log,
+        "FS",
+        FS_DRIVE,
+        Some("/version: 15 bytes (readable)"),
+    );
 }
 
 /// `cargo xtask arm64-iso-smoke` — build the **arm64 ISO** and boot *it* on QEMU
@@ -1642,7 +1784,7 @@ fn cmd_arm64_iso_smoke(args: &[String]) {
         .arg(format!("socket,id=s0,path={},server=on,wait=off", sock.display()));
     cmd.args(["-serial", "chardev:s0"]);
 
-    await_aarch64_banner(cmd, &sock, &serial_log, "ISO");
+    await_aarch64_banner(cmd, &sock, &serial_log, "ISO", HELP_DRIVE, None);
 }
 
 /// `cargo xtask arm64-gicv3-smoke` — boot the aarch64 ISO on a **GICv3** machine.
@@ -1778,7 +1920,14 @@ fn cmd_arm64_gicv3_smoke(_args: &[String]) {
 /// the captured serial for the marker and kill QEMU once we see it. Absence of the
 /// marker within the window is a failure. `what` names the boot medium in the
 /// pass/fail message so the two smokes are distinguishable in CI logs.
-fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: &str) {
+fn await_aarch64_banner(
+    mut cmd: Command,
+    sock: &Path,
+    serial_log: &Path,
+    what: &str,
+    drive: &[(&str, &str)],
+    ready: Option<&str>,
+) {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex};
@@ -1888,21 +2037,64 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
     // It is here because that gap let two real defects ship: a handler that buffered
     // bytes without ever waking the shell, and an acknowledge ordering that could wedge
     // the console permanently. Both were found by hand; neither survives this.
-    let mut answered = false;
+    // Each step is typed only once its predecessor's expected output has appeared, so a
+    // later command cannot be credited with an earlier one's output and the sequence
+    // cannot race ahead of a shell that is still working. `unanswered` records the first
+    // step that never produced its marker.
+    //
+    // Before typing, wait for anything the commands depend on that boots *after* the
+    // banner. On aarch64 `fs::boot_storage` runs after `shell::init` — the shell task has
+    // to exist for the console to be live while it blocks on IPC with the servers it
+    // spawns — so the prompt appears before the mounts do. Without this gate the first
+    // `ls /` would be typed into a shell with no root mount, print "no filesystem
+    // mounted", and then the step would wait out its full budget for output that had
+    // already been missed: a timeout reported against `ls` for a race in the harness.
+    let mut not_ready = false;
     if found && failure.is_none() {
-        let mut tx = stream;
-        let _ = tx.write_all(b"help\r");
-        let _ = tx.flush();
-        for _ in 0..40 {
-            thread::sleep(Duration::from_millis(250));
-            // Match a line unique to the command's *output*, not the echoed input, so
-            // this proves the shell dispatched the command rather than merely echoing.
-            if seen("show memory statistics") {
-                answered = true;
-                break;
+        if let Some(sentinel) = ready {
+            let mut got = false;
+            for _ in 0..80 {
+                thread::sleep(Duration::from_millis(500));
+                if seen(sentinel) {
+                    got = true;
+                    break;
+                }
+                if let Some(f) = hit_failure() {
+                    failure = Some(f);
+                    break;
+                }
             }
-            if let Some(f) = hit_failure() {
-                failure = Some(f);
+            if !got {
+                not_ready = true;
+            }
+        }
+    }
+
+    let mut unanswered: Option<(&str, &str)> = None;
+    if found && failure.is_none() && !not_ready {
+        let mut tx = stream;
+        for &(line, want) in drive {
+            let _ = tx.write_all(line.as_bytes());
+            let _ = tx.write_all(b"\r");
+            let _ = tx.flush();
+            let mut ok = false;
+            for _ in 0..40 {
+                thread::sleep(Duration::from_millis(250));
+                // Match a string unique to the command's *output*, never one that also
+                // occurs in the echoed input — the shell echoes what is typed, so a
+                // marker that appears in both would pass against an echo alone and prove
+                // only that the line arrived, not that it was dispatched.
+                if seen(want) {
+                    ok = true;
+                    break;
+                }
+                if let Some(f) = hit_failure() {
+                    failure = Some(f);
+                    break;
+                }
+            }
+            if !ok {
+                unanswered = Some((line, want));
                 break;
             }
         }
@@ -1961,18 +2153,45 @@ fn await_aarch64_banner(mut cmd: Command, sock: &Path, serial_log: &Path, what: 
         }
         process::exit(1);
     }
-    if !answered {
+    if not_ready {
+        let sentinel = ready.unwrap_or("");
         eprintln!(
-            "arm64 {what} smoke FAILED: the shell started but did not answer a typed \
-             command — serial input is not reaching it (check the PL011 receive \
-             interrupt, the GIC SPI route, and that the handler wakes the shell task)."
+            "arm64 {what} smoke FAILED: the shell came up but the readiness sentinel \
+             {sentinel:?} never appeared, so the commands were never typed. The storage \
+             stack did not finish mounting — check `fs::boot_storage` and the \
+             squashfs/overlay/ext2 servers it spawns."
         );
+        process::exit(1);
+    }
+    if let Some((line, want)) = unanswered {
+        // Which step failed changes the diagnosis entirely, so name it. A failure on the
+        // *first* step means serial input is not reaching the shell at all; a failure on
+        // a later one means input works and that particular command did not produce its
+        // output, which is a kernel bug in the subsystem behind it rather than a console
+        // problem.
+        let first = drive.first().map(|(l, _)| *l == line).unwrap_or(false);
+        if first {
+            eprintln!(
+                "arm64 {what} smoke FAILED: the shell started but did not answer the \
+                 first typed command ('{line}', expecting {want:?}) — serial input is not \
+                 reaching it (check the PL011 receive interrupt, the GIC SPI route, and \
+                 that the handler wakes the shell task)."
+            );
+        } else {
+            eprintln!(
+                "arm64 {what} smoke FAILED: the shell answered earlier commands but \
+                 '{line}' never produced {want:?} — serial input works, so this is the \
+                 subsystem behind that command, not the console."
+            );
+        }
         process::exit(1);
     }
     println!(
         "arm64 {what} smoke passed: booted, switched to kernel page tables, passed the \
          paging, exception, timer and scheduler self-tests, started the shell, and \
-         answered a typed command on QEMU virt."
+         answered {} typed command(s) on QEMU virt ({}).",
+        drive.len(),
+        drive.iter().map(|(l, _)| *l).collect::<Vec<_>>().join("; "),
     );
 }
 
@@ -2958,6 +3177,9 @@ Commands:
     arm64-iso-smoke  Boot the aarch64 ISO on QEMU virt (banner smoke)
     arm64-gicv3-smoke  Boot the aarch64 ISO on QEMU virt with GICv3 — asserts the kernel
                      detects it and says so rather than taking a data abort
+    arm64-fs-smoke   Boot aarch64 with the SquashFS root + ext2 data volume attached, then
+                     drive ls/cat/stat/write at the shell over serial and assert the
+                     output (the Phase 8.6 acceptance test)
 
 Options:
     --arch <ARCH>  Target architecture: amd64 (default) or arm64.
@@ -2997,6 +3219,7 @@ fn main() {
         "arm64-smoke" => cmd_arm64_smoke(rest),
         "arm64-iso-smoke" => cmd_arm64_iso_smoke(rest),
         "arm64-gicv3-smoke" => cmd_arm64_gicv3_smoke(rest),
+        "arm64-fs-smoke" => cmd_arm64_fs_smoke(rest),
         "help" | "--help" | "-h" => print_usage(),
         unknown => {
             eprintln!("Unknown command: {unknown}\n");
