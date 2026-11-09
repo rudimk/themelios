@@ -247,9 +247,24 @@ they read as ready-to-un-gate while blocked on `mod linux`. **8.7's only remaini
 is `net::socket`**, the last `#[cfg]`'d part of `mod net`; its own gate comment still says
 it waits for "the EL0 port … in 8.4/8.5", which landed.
 
-**Requires a `build.yml` change this session could not push** (no `workflow` scope): the
-arm64 job needs `squashfs-tools e2fsprogs` on its apt line, and should run the new
-`arm64-fs-smoke` step.
+**CI is updated** (`9db4e8e`): the arm64 job carries `squashfs-tools e2fsprogs` on its apt
+line and runs `arm64-fs-smoke` between the GICv3 smoke and the suite.
+
+**One claim made while asking for that change was wrong, and the correction is the useful
+part.** I said the apt line was a *hard blocker* — that the arm64 job would fail in
+`ensure_images` on a missing `mksquashfs` until it landed. It would not have: PR #50's CI
+ran the full arm64 suite with real SquashFS and ext2 images on the **old** workflow and
+passed, because GitHub's `ubuntu-latest` image already ships both tools. The claim was
+asserted without checking the runner image.
+
+Keep the apt line regardless — an implicit runner package is exactly the unstated
+dependency that breaks on an image refresh, and naming it is the point. But note the
+sequencing lesson, because 8.7 adds QEMU plumbing of its own and will face the same
+question: **a CI step that invokes a new `xtask` command must land with or after the code,
+never before it.** Landing the `arm64-fs-smoke` step on `main` ahead of the merge broke
+`main`'s own build for two runs — `xtask` exits 1 on an unknown command — and the two
+changes were handed over as one block without flagging that only one of them was safe to
+land early.
 
 **8.5d — the process table and EL0 servers on aarch64.** `mod process` is un-gated on both
 architectures, `embedded.rs` picks its staging directory through a `#[cfg]`'d
