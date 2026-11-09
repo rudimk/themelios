@@ -114,10 +114,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-arm64-
 
-      - name: Install aarch64 QEMU + UEFI firmware
+      - name: Install aarch64 QEMU + UEFI firmware + image tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 xorriso
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 xorriso squashfs-tools e2fsprogs
 
       - name: Compile-gate smoltcp + kernel for aarch64
         run: cargo xtask arm64-gate
@@ -160,6 +160,9 @@ jobs:
       - name: Boot the aarch64 ISO on QEMU virt with GICv3 (genericity smoke)
         run: cargo xtask arm64-gicv3-smoke
 
+      - name: Drive the filesystem shell commands over serial
+        run: cargo xtask arm64-fs-smoke
+      
       - name: Run the kernel test suite on QEMU virt
         run: cargo xtask test --arch arm64
 
