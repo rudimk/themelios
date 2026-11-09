@@ -652,29 +652,16 @@ fn build_detached_elf(root: &Path, out_dir: &Path, name: &str, kernel_target: &s
 /// returns devices in. Kept in sync with `SCRATCH_SIGNATURE` in `kernel/src/test_runner.rs`.
 const SCRATCH_SIGNATURE: &[u8] = b"THEMELIOS-SCRATCH-V1";
 
-/// Create a blank raw disk image if it is not already there, and return its path.
-///
-/// Used by the aarch64 test path to make up the device *count*
-/// `test_virtio_discovery` asserts without pulling in `mksquashfs`/`mkfs.ext2` for
-/// content no test on that architecture reads yet.
-///
-/// **Deliberately unsigned.** `open_scratch_disk` identifies the one disk destructive
-/// tests may overwrite by the [`SCRATCH_SIGNATURE`] in sector 0; a filler that carried it
-/// would make that probe ambiguous and put a destructive write on an arbitrary disk. Zeros
-/// also mean it matches no filesystem probe — not SquashFS's `hsqs`, not ext2's 0xEF53 —
-/// so a future mount attempt fails cleanly rather than half-recognising it.
-fn ensure_filler_disk(root: &Path, name: &str) -> PathBuf {
-    /// Same 4 MiB as the scratch disk: large enough for a sane reported capacity, small
-    /// enough to be free to create.
-    const SIZE_BYTES: usize = 4 * 1024 * 1024;
+// `ensure_filler_disk` lived here until 8.6. It made up the device *count*
+// `test_virtio_discovery` asserts on aarch64 with two blank images, so that 8.3 could
+// attach three disks without making `mksquashfs`/`mkfs.ext2` prerequisites of the arm64
+// CI job for content no test on that architecture could read. 8.6 un-gates `mod fs` and
+// the storage tests, so both slots now carry the real SquashFS and ext2 images and the
+// fillers have no remaining caller. Deleted rather than left behind `allow(dead_code)`:
+// a second, *unsigned* disk-creation path is exactly the kind of thing that later gets
+// reached for by accident, and `open_scratch_disk`'s signature probe is what keeps
+// destructive tests off the wrong disk.
 
-    let disk_path = root.join("target").join(name);
-    if fs::metadata(&disk_path).map(|m| m.len() as usize).ok() != Some(SIZE_BYTES) {
-        fs::write(&disk_path, vec![0u8; SIZE_BYTES]).expect("Failed to create filler disk image");
-        println!("Created blank VirtIO filler disk: {}", disk_path.display());
-    }
-    disk_path
-}
 
 fn ensure_scratch_disk(root: &Path) -> PathBuf {
     let disk_path = root.join("target/themelios-scratch.img");
@@ -916,27 +903,34 @@ fn cmd_test_aarch64(root: &Path, target: &str) {
     // it had none — only the firmware pflash pair and the boot ESP — which is why every
     // storage and network test was skipped there.
     //
-    // The *same count* as amd64 (three disks, one NIC), because `test_virtio_discovery`
-    // asserts the multiset, but deliberately **not the same images**. amd64 attaches the
-    // SquashFS root and the ext2 data volume; nothing that runs on aarch64 today reads
-    // either — the filesystem tests all still need `mod fs` and ring 3 — so building them
-    // here would make `mksquashfs` and `mkfs.ext2` prerequisites of the arm64 CI job to
-    // produce two disks no test opens. Two blank fillers give discovery the same shape at
-    // no cost. 8.6 swaps them for the real images when the storage stack ports, and
-    // declares the tools then, as part of the change that actually needs them.
+    // The same three disks and one NIC as amd64, and **as of 8.6 the same images**.
+    //
+    // 8.3 attached two blank fillers here instead, on the reasoning that nothing on
+    // aarch64 could read a SquashFS root or an ext2 volume yet — `mod fs` was x86-gated
+    // and there was no ring 3 — so building them would have made `mksquashfs` and
+    // `mkfs.ext2` prerequisites of the arm64 CI job to produce two disks no test opened.
+    // It recorded that 8.6 would swap them "and declare the tools then, as part of the
+    // change that actually needs them". This is that change: `mod fs` is un-gated, the
+    // filesystem servers run at EL0, and the six storage tests open these two disks.
+    //
+    // The arm64 CI job's package list grows by `squashfs-tools e2fsprogs` to match, which
+    // is the declaration 8.3 deferred. Without it the job fails in `ensure_images` on a
+    // missing binary rather than in any test — noisy, but at the right moment and naming
+    // the right thing.
     let scratch = ensure_scratch_disk(root);
-    let filler_a = ensure_filler_disk(root, "themelios-arm64-filler-a.img");
-    let filler_b = ensure_filler_disk(root, "themelios-arm64-filler-b.img");
+    let (squashfs, ext2) = ensure_images(root);
 
     println!("Running the suite on QEMU virt (headless)...");
     let mut cmd = qemu_aarch64_base(&esp, &code, &vars);
 
     // Three disks, scratch first, mirroring the amd64 command-line order. Note that on
     // `virt` this maps to *decreasing* mmio slot addresses, so the resulting discovery
-    // order is the reverse of amd64's — deliberately not something any test depends on.
+    // order is the reverse of amd64's — deliberately not something any test depends on,
+    // because each of the three is found by probing its content for a signature
+    // (`hsqs`, 0xEF53, `THEMELIOS-SCRATCH-V1`) rather than by position.
     cmd.args(virtio_disk_args_mmio(&scratch, "blkscratch", false));
-    cmd.args(virtio_disk_args_mmio(&filler_a, "blkfilla", true));
-    cmd.args(virtio_disk_args_mmio(&filler_b, "blkfillb", false));
+    cmd.args(virtio_disk_args_mmio(&squashfs, "blkroot", true));
+    cmd.args(virtio_disk_args_mmio(&ext2, "blkdata", false));
 
     // A NIC on user-mode networking, with the same host-forward rule the amd64 path uses.
     let hostfwd = format!(
@@ -1419,12 +1413,14 @@ fn run_aarch64(root: &Path, kernel: &Path, limine_dir: &Path, display: bool) {
     // reports `0 device(s), 32 empty` and the shell has nothing to inspect — which made
     // 8.3's "VirtIO works on arm64" true only of `cargo xtask test`, a distinction the
     // docs did not draw. Cheap, and it means the shell and the suite see the same machine.
+    // Real images as of 8.6, matching the test path — an interactive arm64 boot can now
+    // `mount`, `ls` and `cat` the SquashFS root and the ext2 volume, which is the whole
+    // point of the sub-phase and would be invisible if this path kept the blank fillers.
     let scratch = ensure_scratch_disk(root);
-    let filler_a = ensure_filler_disk(root, "themelios-arm64-filler-a.img");
-    let filler_b = ensure_filler_disk(root, "themelios-arm64-filler-b.img");
+    let (squashfs, ext2) = ensure_images(root);
     cmd.args(virtio_disk_args_mmio(&scratch, "blkscratch", false));
-    cmd.args(virtio_disk_args_mmio(&filler_a, "blkfilla", true));
-    cmd.args(virtio_disk_args_mmio(&filler_b, "blkfillb", false));
+    cmd.args(virtio_disk_args_mmio(&squashfs, "blkroot", true));
+    cmd.args(virtio_disk_args_mmio(&ext2, "blkdata", false));
     cmd.args(virtio_net_args_mmio("net0", None));
     cmd.args(virtio_mmio_modern_args());
 

@@ -89,17 +89,11 @@ static TESTS: &[TestCase] = &[
     // Un-gated in 8.5d: `spawn_server` drops into EL0 through `enter_el0` now, and this is
     // the first aarch64 test to execute a staged server blob rather than merely link one.
     TestCase { name: "test_server_spawn",     func: test_server_spawn },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_squashfs_server",  func: test_squashfs_server },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_overlay_server",   func: test_overlay_server },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_ext2_read",        func: test_ext2_read },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_ext2_write",       func: test_ext2_write },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_vfs_capability",   func: test_vfs_capability },
-    #[cfg(target_arch = "x86_64")]
     TestCase { name: "test_fs_syscalls",      func: test_fs_syscalls },
     TestCase { name: "test_virtio_net",       func: test_virtio_net },
     TestCase { name: "test_net_service",      func: test_net_service },
@@ -184,12 +178,6 @@ static SKIPPED: &[SkippedTest] = &[
     // exact VA this test maps at. 8.4a gave `new_user` an empty low half by
     // construction, which is what the old skip reason said would unblock it.
     SkippedTest { name: "test_pci_scan", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
-    SkippedTest { name: "test_squashfs_server", why: "the storage stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_overlay_server", why: "the storage stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_ext2_read", why: "the storage stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_ext2_write", why: "the storage stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_vfs_capability", why: "the storage stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_fs_syscalls", why: "the storage stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_net_server_stack", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_net_icmp_echo", why: "the network stack rides on VirtIO-PCI" },
     SkippedTest { name: "test_api_server", why: "the network stack rides on VirtIO-PCI" },
@@ -2011,7 +1999,6 @@ fn test_server_spawn() -> Result<(), &'static str> {
 /// acts as a client: STATs, OPENs/READs files (small fragment-packed and large
 /// multi-block), and READDIRs directories — verifying bytes match what
 /// `cargo xtask image` packed.
-#[cfg(target_arch = "x86_64")]
 fn test_squashfs_server() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
@@ -2232,7 +2219,6 @@ fn test_squashfs_server() -> Result<(), &'static str> {
 ///    (the lower image is untouched)
 /// 4. Whiteout: deleting a lower file hides it from the merged view
 /// 5. Readdir merge: listing shows lower + upper entries, minus whiteouts
-#[cfg(target_arch = "x86_64")]
 fn test_overlay_server() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
@@ -2443,7 +2429,6 @@ fn test_overlay_server() -> Result<(), &'static str> {
 /// Probes the VirtIO disks for the ext2 magic, brings up the ext2 server, and
 /// verifies: STAT, file read (small + a large file spanning direct AND
 /// single-indirect blocks), directory listing, and nested-path resolution.
-#[cfg(target_arch = "x86_64")]
 fn test_ext2_read() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
@@ -2623,7 +2608,6 @@ fn test_ext2_read() -> Result<(), &'static str> {
 
 /// Test the ext2 server's write path: create, write (incl. indirect blocks),
 /// mkdir, unlink, and inode/block reuse after unlink.
-#[cfg(target_arch = "x86_64")]
 fn test_ext2_write() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
@@ -2808,7 +2792,6 @@ fn test_ext2_write() -> Result<(), &'static str> {
 
 /// Test the kernel VFS layer: capability-checked open/read/stat that route to a
 /// filesystem server through the mount table, and denial without the capability.
-#[cfg(target_arch = "x86_64")]
 fn test_vfs_capability() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::cap::{Capability, CapHandle, CapRights, CapType};
@@ -2925,7 +2908,6 @@ fn test_vfs_capability() -> Result<(), &'static str> {
 /// `Filesystem` capability, and waits for its result code. The client performs
 /// `stat`/`open`/`read_file` syscalls (exercising user-pointer copy in/out and
 /// capability checks) and confirms a null-capability call is rejected.
-#[cfg(target_arch = "x86_64")]
 fn test_fs_syscalls() -> Result<(), &'static str> {
     use alloc::boxed::Box;
     use crate::drivers::block::BlockDevice;
