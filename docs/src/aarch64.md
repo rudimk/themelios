@@ -2,7 +2,7 @@
 
 ThemeliOS targets x86_64 first and aarch64 second. This chapter describes what the ARM64 port *is*, what it deliberately is not, and the handful of architectural differences that shaped it.
 
-> **Status**: Phase 8 in progress. The port has a **ring-0 kernel core** plus **EL0 userspace** on QEMU `virt`: as of 8.5d the kernel spawns its embedded userspace servers at EL0 and they answer IPC. Storage, networking, the Linux personality and containers on ARM are still deferred.
+> **Status**: Phase 8 in progress. The port has a **ring-0 kernel core**, **EL0 userspace** and, as of 8.6, a **working storage stack** on QEMU `virt`: the kernel mounts a SquashFS root under a RAM overlay plus an ext2 data volume, served by ring-3 filesystem servers, and `ls`/`cat`/`stat`/`write` work at the shell. Networking, the Linux personality and containers on ARM are still deferred.
 
 ## Scope, stated plainly
 
@@ -34,7 +34,9 @@ boot there may well report `timer: FAIL — 0 IRQs` and run cooperatively. The n
 step is booting the same image with `-accel tcg` instead of `-accel hvf`: if the timer works
 under TCG, the problem is interrupt injection rather than this port's GIC or timer setup.
 
-(Phase 7 shipped this chapter saying 16 passed / 38 skipped. The passing count was right for the time; the skip count never was — 16 + 38 is 54, and the suite was 55. Corrected along with the 8.3 figures, and updated again at 8.5d.)
+The suite runs **35 of 55** here as of 8.6, with 20 written skips (16 when Phase 8 opened, 29 after 8.5). amd64 runs 55/55.
+
+(Phase 7 shipped this chapter saying 16 passed / 38 skipped. The passing count was right for the time; the skip count never was — 16 + 38 is 54, and the suite was 55. Corrected along with the 8.3 figures, and updated again at 8.5d and 8.6. These numbers are prose and go stale silently; the suite asserts its own arithmetic at startup, so trust a run over this paragraph.)
 
 | Subsystem | x86_64 | aarch64 |
 |---|---|---|
@@ -44,12 +46,13 @@ under TCG, the problem is interrupt injection rather than this port's GIC or tim
 | Exceptions, interrupts, timer | ✅ | ✅ |
 | Preemptive scheduler | ✅ | ✅ |
 | Capability system, IPC, audit | ✅ | ✅ (and since 8.5d a real ring-3 *user* of them: a spawned server holds capabilities in its own CSpace) |
-| Debug shell | ✅ | reduced (13 of 28 commands — `procs` and `caps` joined at 8.5d) |
+| Debug shell | ✅ | reduced (**19 of 28** commands — `procs`/`caps` joined at 8.5d, `mount`/`ls`/`cat`/`stat`/`write`/`mkdir` at 8.6) |
 | Ring-3 / EL0 | ✅ | ✅ (8.4 address spaces + syscalls, 8.5 servers) |
 | Process table, userspace servers | ✅ | ✅ (8.5d — `echo-server` spawns at EL0 and answers IPC) |
 | VirtIO transport | ✅ virtio-PCI | ✅ virtio-mmio (8.3) |
 | VirtIO block + network drivers | ✅ | ✅ (8.3 — the drivers themselves; the servers above them are ring-3) |
-| Filesystems, sockets | ✅ | deferred (8.6/8.7 — both need ring 3) |
+| Filesystems | ✅ | ✅ (8.6 — SquashFS root + RAM overlay + ext2 `/data`, ring-3 servers, FS syscalls from EL0) |
+| Sockets | ✅ | deferred (8.7 — `net::socket` is the last x86-gated part of `mod net`; the NIC driver and frame bridge already work) |
 | Containers, management API | ✅ | deferred (8.10) |
 
 ## How the code is organised
@@ -116,6 +119,39 @@ The intuitive order — drain the FIFO, then clear the interrupt — can wedge t
 
 Acknowledging first has no such window. `RTIM` is enabled anyway, because real PL011 parts trigger at a configurable FIFO level and need the timeout to deliver the tail of a short burst — but it is inert on the one platform this port currently runs on, and an earlier version of this chapter claimed the opposite as an observed fact.
 
+### Two functions with the same name and different security guarantees (8.6)
+
+The most instructive thing the storage port turned up was not about ARM at all.
+
+x86 and aarch64 had each grown a `user_range_ok` / `copy_from_user` / `copy_to_user`
+triple. Same three names; different arity, argument order, return type and safety — and,
+far worse, a different guarantee. x86's range check walked the page tables and proved every
+page of the range was mapped. aarch64's checked that the address was numerically inside the
+EL0 regime and nothing more.
+
+That difference is not a style question. An in-range-but-unmapped pointer passes a bounds
+check, and the read then takes a data abort at EL1, which the Phase 7.2 handler treats as
+fatal. `SYS_STAT` takes a user pointer from ring 3. So porting the filesystem dispatcher to
+the aarch64 triple — which compiles, because the names match, and passes, because no test
+hands it a bad pointer — would have given any ring-3 process a one-syscall node halt.
+
+What prevented it was documentation that refused to round the difference off. `arch::syscall`
+re-exported the x86 triple *only*, and said why: an earlier version had re-exported the
+aarch64 pair under the same names and claimed the facade "flattens that difference away",
+which it did not — "the two are unrelated functions that happen to share a spelling". It
+also said unification was real work that "wants a live consumer to design against".
+
+The filesystem syscalls were that consumer, one sub-phase later than predicted. There is now
+one `arch::uaccess` with the stronger guarantee on both architectures, using the page-table
+walk from x86 and the volatile byte-wise copies from aarch64 — the latter being the better
+half too, since a `&[u8]` over user memory asserts that bytes another task may write will not
+change. What remains of the old aarch64 pair is renamed `*_bounds_only`, because it cannot be
+deleted: the strong check resolves through the process table, and the bare-EL0 self-tests drop
+to EL0 with no process on purpose, so for them the strong check is not stricter — it is wrong.
+
+Still missing on **both** architectures: the fixup. There is no exception table, so a user
+copy that faults is fatal. The merge gave both the check; neither has the recovery.
+
 ## Stopping the machine
 
 x86's test harness writes to QEMU's `isa-debug-exit` device and the verdict arrives as a process exit code. The `virt` machine has no such device, and aarch64 has no I/O ports for one to live behind.
@@ -142,9 +178,19 @@ cargo xtask run --arch aarch64
 # Run the kernel test suite on QEMU virt
 cargo xtask test --arch aarch64
 
-# Boot smokes — from a UEFI ESP, and from the shipped ISO
+# Boot smokes — from a UEFI ESP, and from the shipped ISO. Both boot a *diskless*
+# machine on purpose, which is why the filesystem smoke below is separate.
 cargo xtask arm64-smoke
 cargo xtask arm64-iso-smoke
+
+# The storage stack driven from the shell: boots with the real SquashFS root and ext2
+# data volume attached, types ls/cat/stat/write over the serial console, and asserts
+# the output (the Phase 8.6 acceptance test)
+cargo xtask arm64-fs-smoke
+
+# Does the kernel survive the GIC it was not written for? Asserts it detects a GICv3
+# system-register interface and says so, rather than aborting on an absent GICC
+cargo xtask arm64-gicv3-smoke
 
 # Build the arm64 ISO
 cargo xtask iso --arch aarch64
@@ -154,6 +200,38 @@ The aarch64 ISO is UEFI-only (`BOOTAA64.EFI`); the amd64 one is a hybrid BIOS+UE
 
 ## What comes next
 
-Ring-3/EL0 is the next substantial piece, and it is what unlocks most of the deferred list. It brings `TTBR0_EL1` into use, gives `TPIDR_EL0` something to hold, turns `SVC` into the syscall path, and lets `Task::process_id` and the process table un-gate. The per-CPU block reached through `TPIDR_EL1` is already in place for the EL0 entry stub to read by offset.
+This section said for two sub-phases that "ring-3/EL0 is the next substantial piece" and
+listed "the VirtIO stack that storage, networking and containers all ride on" as still to
+come. Both were done by the time anyone read it — EL0 in 8.4/8.5, virtio-mmio in 8.3 — and
+the paragraph is reproduced in the previous sentence rather than quietly replaced, because
+the pattern is the point: prose about what is unfinished is exactly the prose that nothing
+checks.
 
-After that: GICv3 (Graviton uses it), MMIO ECAM for PCI, and the VirtIO stack that storage, networking and containers all ride on.
+As of 8.6 the remaining work on this architecture is three sub-phases and one open bug:
+
+- **8.7 — sockets.** `net::socket` is the last `#[cfg(target_arch = "x86_64")]` part of
+  `mod net`. Everything under it already works here: the VirtIO NIC driver and the ring-0
+  frame bridge run over virtio-mmio and are covered by `test_virtio_net` and
+  `test_net_service`, both passing. Its own gate comment still says it waits on
+  `crate::process` "until the EL0 port lands in 8.4/8.5" — that landed, so the gate is the
+  only thing left.
+- **8.8–8.9 — the Linux personality.** `mod linux` is x86-gated in its entirety and holds
+  both the ELF loader and the syscall personality. 8.8 makes it arch-neutral; 8.9 builds
+  the aarch64 number table, which is `asm-generic/unistd.h` and a genuinely second table
+  rather than a tweak. Five of the staged servers' `_start` routines also still issue Linux
+  syscalls by their x86_64 numbers and are rewritten here.
+- **8.10 — containers and the management API.** The parity gate. `mod container` cannot
+  un-gate before `mod linux` does, because a container's whole job is to execute an
+  unmodified Linux binary.
+
+The open bug is **timer-interrupt delivery under HVF on Apple Silicon** — see the caveat
+near the top. It is not on the parity path (QEMU/TCG and UTM both tick), and it is not
+fixed, only made non-fatal.
+
+Deliberately *not* on this list: real ARM server hardware. GICv3 proper, PCIe ECAM with
+MSI-X, SMP, cloud NICs and NVMe get their own phase, written when parity lands. GICv3 was
+briefly scheduled right after 8.5 on the belief that it was the Apple Silicon unblocker; a
+boot log from a real Mac disproved that (`ID_AA64PFR0_EL1.GIC == 0` there, so that CPU
+exposes no GICv3 system-register interface at all), and the reason for the priority went
+with it. It is still worth doing for QEMU and server-class parity, which is a weaker claim
+than the one that put it there.

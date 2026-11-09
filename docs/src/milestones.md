@@ -216,10 +216,17 @@ scheduler, and an in-kernel shell. What it did not deliver is everything above E
 userspace, storage, networking, containers, the management API. Phase 8 closes that gap.
 
 Parity has one measurable definition: the kernel's 55-test suite runs **55/55 on amd64 and
-29/55 on aarch64** as of sub-phase 8.5, with 26 tests carrying written skip reasons (it was
-16/55 when Phase 8 opened). Parity is that skip list reaching zero. Every sub-phase names
-which entries it retires, and three of the 26 cannot be retired by porting at all — they
-are retired by reframing, with the decision made in the sub-phase that owns each.
+35/55 on aarch64** as of sub-phase 8.6, with 20 tests carrying written skip reasons (it was
+16/55 when Phase 8 opened, and 29/55 after 8.5). Parity is that skip list reaching zero.
+Every sub-phase names which entries it retires, and three of the 20 cannot be retired by
+porting at all — they are retired by reframing, with the decision made in the sub-phase
+that owns each.
+
+A caution about that sentence, because it has been wrong before and goes stale silently:
+it has read "54/54" and "16 running / 38 skipped" in the past, wrong on both counts, and
+sat at 29/55 through a sub-phase that had already moved it. The suite itself asserts
+`TESTS.len() + SKIPPED.len() == SUITE_SIZE` before running anything, so the *kernel* cannot
+drift — only this prose can, and only reading it against a run catches that.
 
 **Ten sub-phases plus a throwaway spike**:
 - **8.1–8.3 — VirtIO transport.** An arch-neutral device-discovery seam, then a
@@ -234,7 +241,34 @@ are retired by reframing, with the decision made in the sub-phase that owns each
   the six `_start` routines were *not* rewritten here: they issue Linux syscalls by their
   x86_64 numbers, and the Linux personality does not exist on this architecture until 8.9,
   so they moved there rather than being written against a table that is absent.
-- **8.6–8.7 — storage and networking** un-gated on aarch64.
+- **8.6 — storage** (done). `mod fs` un-gated with no code changes — the dependency was
+  never the filesystem code but `mod process` and ring 3, which 8.5d delivered — and the
+  arm64 QEMU paths swapped from blank filler disks to the real SquashFS root and ext2 data
+  volume. Six skips retired: `test_squashfs_server`, `test_overlay_server`,
+  `test_ext2_read`, `test_ext2_write`, `test_vfs_capability`, `test_fs_syscalls`.
+
+  Two pieces of real work sat behind the un-gating. The filesystem **syscalls** were
+  answered with `ENOSYS` on aarch64 from a list 8.5b wrote to be deleted, so
+  `dispatch_fs_syscall` moved out of `arch::x86_64::syscall` and became arch-neutral
+  (`fs::syscall`), read through the frame's positional accessors. And the **user-memory
+  chokepoint** was merged: there had been two `user_range_ok`/`copy_from_user`/
+  `copy_to_user` triples sharing three names, where x86's walked the page tables and
+  aarch64's was a bounds check only. Routing `SYS_STAT` at the weaker one would have given
+  ring 3 a one-syscall node halt, since an in-range-but-unmapped pointer passes a bounds
+  check and the resulting data abort is fatal. `arch::uaccess` is now one implementation
+  with the stronger guarantee on both architectures. What is still missing on both is the
+  *fixup*: there is no exception table, so a user copy that faults remains fatal.
+
+  Acceptance was the shell, not the suite — `cargo xtask arm64-fs-smoke` drives
+  `ls`/`cat`/`stat`/`write` over the serial console and asserts their output. Writing it
+  found that the aarch64 boot path never called `fs::boot_storage()`, so all six
+  filesystem shell commands were inert while the suite read 35/35: every storage test
+  calls the servers from kernel code inside the harness, so none of them touches the mount
+  registry, the shell dispatcher or the console. The shell goes from 13 to **19 of 28**
+  commands.
+- **8.7 — networking** un-gated on aarch64. As of 8.6 the only thing in the way is
+  `net::socket`, the last `#[cfg]`'d part of `mod net`; the NIC driver and the ring-0
+  frame bridge already work over virtio-mmio and are covered by passing tests.
 - **8.8–8.9 — the Linux personality** on the aarch64 syscall table (`asm-generic/unistd.h`),
   which is a second table rather than a tweak.
 - **8.10 — containers and the management API** — the parity gate.
