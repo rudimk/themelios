@@ -263,6 +263,29 @@ pub mod nr {
 /// two apart.
 pub const ENOSYS: u64 = u64::MAX - 37;
 
+/// A native ABI number this dispatcher still answers with [`ENOSYS`], for the EL0 IPC
+/// self-test's unimplemented-number probe (`el0_ipc`'s `nr_unimpl`).
+///
+/// **It must name one of the numbers in `dispatch_native`'s `ENOSYS` arm**, and it lives
+/// here, beside that list, rather than in the test — because the two have to change
+/// together and the list is what moves. 8.6 is the demonstration: the probe was
+/// hard-coded to `SYS_OPEN`, 8.6 implemented `SYS_OPEN`, and the self-test went red with
+/// `accumulator … xor 0x800000000000007d` — the bit-63 error return of a real `vfs_open`
+/// failure replacing `ENOSYS` in the rolling hash.
+///
+/// That red was **correct and useful**: a probe asserting "this number is unimplemented"
+/// *should* fail the moment it stops being true, and the diagnosis took one grep because
+/// the accumulator names which slot moved. The cost is that the fix lived two files away
+/// from the change that caused it. Pointing it at the list's own module means the next
+/// sub-phase to empty part of that arm — 8.7 for the sockets, 8.10 for `SYS_MGMT` — edits
+/// this constant while it is looking at the list, rather than discovering it from a hash
+/// mismatch in an unrelated self-test.
+///
+/// When the arm is finally empty, this cannot be satisfied and the probe should be
+/// deleted rather than pointed at something implemented: by then there is no
+/// unimplemented number left to probe for, which is the point of the exercise.
+pub const ENOSYS_PROBE_NR: u64 = crate::arch::syscall::abi::SYS_SOCKET;
+
 /// A user pointer could not be accessed — [`super::uaccess`] rejected the range.
 ///
 /// Distinct from [`ENOSYS`] deliberately. An earlier version returned `ENOSYS` for a bad
@@ -414,22 +437,37 @@ fn dispatch_native(frame: &mut SyscallFrame, nr: u64, a: [u64; 6]) -> bool {
             crate::sched::block_current_task();
         }
 
-        // The filesystem, socket and management numbers. These are ABI — a server built
-        // against `libthemelios` may issue them — but aarch64 has no VFS (8.6), no network
-        // stack (8.7) and no management ABI (8.10) to service them with.
+        // The filesystem syscalls, implemented in 8.6. Six numbers left the `ENOSYS` list
+        // below to get here, which is exactly the mechanism that list's comment described:
+        // *"deleting a number from this list is how it becomes implemented, and a list is
+        // something you can read to see what is missing."*
         //
-        // Named explicitly rather than left to the `_ => false` below, which would send
-        // them into the EL0 test range's `_ => ENOSYS` and reach the same value by
-        // accident. The distinction matters when 8.6 lands: deleting a number from this
-        // list is how it becomes implemented, and a list is something you can read to see
-        // what is missing. An accidental fall-through is not.
+        // `crate::fs::syscall::dispatch` is the same function x86 calls — it moved out of
+        // `arch::x86_64::syscall` in this sub-phase and reads its arguments through the
+        // frame's positional accessors, so there is no aarch64 copy to drift.
+        //
+        // Interrupts are unmasked first and for the same reason as x86's `sti()` here:
+        // every arm blocks on the ring-3 filesystem server through `vfs_*`, and a task
+        // that blocks with `DAIF.I` set is never woken to be scheduled again. `blocking`
+        // is the local helper that pairs the unmask with restoring the entry mask
+        // afterwards.
         abi::SYS_OPEN
         | abi::SYS_READ_FILE
         | abi::SYS_WRITE_FILE
         | abi::SYS_CLOSE
         | abi::SYS_STAT
-        | abi::SYS_READDIR
-        | abi::SYS_SOCKET
+        | abi::SYS_READDIR => blocking(|| crate::fs::syscall::dispatch(frame)),
+
+        // The socket and management numbers. These are ABI — a server built against
+        // `libthemelios` may issue them — but aarch64 has no network stack (8.7) and no
+        // management ABI (8.10) to service them with.
+        //
+        // Named explicitly rather than left to the `_ => false` below, which would send
+        // them into the EL0 test range's `_ => ENOSYS` and reach the same value by
+        // accident. The distinction matters when those sub-phases land: deleting a number
+        // from this list is how it becomes implemented, and a list is something you can
+        // read to see what is missing. An accidental fall-through is not.
+        abi::SYS_SOCKET
         | abi::SYS_BIND
         | abi::SYS_SENDTO
         | abi::SYS_RECVFROM
@@ -441,6 +479,9 @@ fn dispatch_native(frame: &mut SyscallFrame, nr: u64, a: [u64; 6]) -> bool {
         | abi::SYS_TCP_RECV
         | abi::SYS_MGMT => frame.set_ret(ENOSYS),
 
+        // `ENOSYS_PROBE_NR` must name one of the numbers in the arm directly above; see
+        // its declaration for why it lives next to this list rather than in the test that
+        // uses it.
         _ => return false,
     }
     true
@@ -579,12 +620,19 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
         return EINVAL;
     }
     let mut buf = [0u8; MAX];
-    // SAFETY: `copy_from_user` is unsafe because a validated range is not a *mapped*
-    // range — see its docs. The obligation discharged here is the caller-context one: this
-    // runs on the syscall path, so the address space the pointer belongs to is the one
-    // currently installed in `TTBR0_EL1`. The fault risk is the documented open hole, not
-    // something this call site can close.
-    let copied = unsafe { super::uaccess::copy_from_user(&mut buf[..len as usize], ptr) };
+    // SAFETY: `copy_from_user_bounds_only` is unsafe because a range inside the EL0 regime
+    // is not a *mapped* range — see its docs. The obligation discharged here is the
+    // caller-context one: this runs on the syscall path, so the address space the pointer
+    // belongs to is the one currently installed in `TTBR0_EL1`. The fault risk is the
+    // documented open hole, not something this call site can close.
+    //
+    // **The bounds-only pair is correct here and the strong one would be wrong.** This is
+    // an EL0 *test* syscall, reached by payloads that run with no process-table entry (see
+    // that module's docs); `arch::uaccess::user_range_ok` resolves through the process
+    // table and would reject every pointer they pass, turning the self-tests red for a
+    // reason unrelated to what they test.
+    let copied =
+        unsafe { super::uaccess::copy_from_user_bounds_only(&mut buf[..len as usize], ptr) };
     match copied {
         Ok(()) => {
             // Only valid UTF-8 is printed; anything else is reported rather than passed

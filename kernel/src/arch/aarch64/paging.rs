@@ -482,6 +482,30 @@ pub fn user_va_bits() -> u32 {
     64 - t0sz as u32
 }
 
+/// One past the highest address a ring-3 (EL0) pointer may name: `2^user_va_bits`.
+///
+/// The arch-neutral spelling of this bound, so [`crate::arch::uaccess`] can check a user
+/// range without naming an architecture; x86_64's counterpart returns its fixed
+/// canonical-half limit.
+///
+/// **Saturates to `u64::MAX` rather than overflowing** when `user_va_bits()` reports 64,
+/// i.e. `T0SZ == 0`. That cannot happen while [`verify_tcr`] asserts `T0SZ == 16`, but the
+/// direction of the fallback is the point: `1u64 << 64` is UB in release and a panic in
+/// debug, and a saturating bound is the *weakest* claim available here — it rejects
+/// nothing extra, and the per-page translation walk in `arch::uaccess::user_range_ok` is
+/// what actually keeps an unmapped address out. Returning 0 would have been the
+/// fail-closed choice for a bounds-only check, and was what this module's older
+/// bounds-only `user_range_ok` effectively did by refusing outright; it is the wrong
+/// choice *here* only because the walk now backs it. See the note in `arch::uaccess`.
+#[inline]
+pub fn user_addr_limit() -> u64 {
+    let bits = user_va_bits();
+    if bits >= 64 {
+        return u64::MAX;
+    }
+    1u64 << bits
+}
+
 // --- Descriptor encode / decode ---
 
 /// Encode an L3 leaf descriptor mapping `phys` with `flags`.

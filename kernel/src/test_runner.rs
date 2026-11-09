@@ -150,9 +150,23 @@ static TESTS: &[TestCase] = &[
 /// Tests the running architecture cannot execute, with the reason.
 ///
 /// Empty on x86_64, which runs the whole suite. On aarch64 these name the deferred
-/// subsystems — ring-3/EL0, VirtIO-PCI and everything downstream of it — rather than
-/// the individual tests, because that is the actual reason and it is a handful of
-/// decisions, not one per skipped test.
+/// subsystem rather than the individual test, because that is the actual reason and it is
+/// a handful of decisions, not one per skipped test. As of 8.6 the subsystems are
+/// `net::socket` (8.7), `mod linux` (8.8/8.9) and `mod container` / `mod mgmt` (8.10),
+/// plus three entries that porting cannot retire at all.
+///
+/// **These strings go stale silently and have done so repeatedly** — a `why` is not
+/// compiled against anything, so it keeps asserting a dependency long after the
+/// dependency is satisfied. 8.6 had to correct eighteen of them at once: eight blamed
+/// "VirtIO-PCI" for a TCP/IP stack on an architecture that has had virtio-mmio since 8.3
+/// and passes `test_virtio_net`, four blamed ring 3 two sub-phases after EL0 landed, and
+/// six listed "ring-3 and the storage stack" as missing when this very sub-phase had just
+/// delivered the second and 8.5 the first — i.e. they read as ready-to-un-gate when they
+/// are blocked on something else entirely.
+///
+/// So: when a sub-phase retires a skip, re-read the *reasons* of the ones it did not
+/// retire. The failure mode is not an incorrect skip, it is a correct skip with a reason
+/// that sends the next reader to the wrong module.
 #[cfg(target_arch = "aarch64")]
 static SKIPPED: &[SkippedTest] = &[
     // Corrected twice. The original reason ("ring-3/EL0 is deferred on aarch64") went
@@ -178,24 +192,66 @@ static SKIPPED: &[SkippedTest] = &[
     // exact VA this test maps at. 8.4a gave `new_user` an empty low half by
     // construction, which is what the old skip reason said would unblock it.
     SkippedTest { name: "test_pci_scan", why: "PCI enumeration is x86-only (aarch64 uses MMIO ECAM)" },
-    SkippedTest { name: "test_net_server_stack", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_net_icmp_echo", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_api_server", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_dhcp", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_socket_capability", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_socket_list", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_udp_echo", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_tcp_client", why: "the network stack rides on VirtIO-PCI" },
-    SkippedTest { name: "test_elf_exec", why: "ring-3/EL0 is deferred on aarch64" },
-    SkippedTest { name: "test_linux_exec", why: "the Linux personality needs ring-3" },
-    SkippedTest { name: "test_linux_fs", why: "the Linux personality needs ring-3" },
-    SkippedTest { name: "test_linux_threads", why: "the Linux personality needs ring-3" },
-    SkippedTest { name: "test_container_run", why: "containers need ring-3 and the storage stack" },
-    SkippedTest { name: "test_container_isolation", why: "containers need ring-3 and the storage stack" },
-    SkippedTest { name: "test_container_confinement", why: "containers need ring-3 and the storage stack" },
-    SkippedTest { name: "test_container_registry", why: "containers need ring-3 and the storage stack" },
-    SkippedTest { name: "test_container_logs", why: "containers need ring-3 and the storage stack" },
-    SkippedTest { name: "test_management_capability", why: "containers need ring-3 and the storage stack" },
+    // **Reason corrected in 8.6; the old one ("the network stack rides on VirtIO-PCI")
+    // was false twice over.** It was false about the transport from 8.3, which gave
+    // aarch64 virtio-mmio — and the proof is in this very suite, where `test_virtio_net`
+    // and `test_net_service` both *pass* on aarch64, so the NIC driver and the ring-0
+    // frame bridge demonstrably work over mmio. And it was false about the layer: a TCP/IP
+    // stack does not ride on a bus at all.
+    //
+    // What these eight actually wait on is `net::socket`, the capability-checked socket
+    // layer, which is the one part of `mod net` still `#[cfg]`'d to x86_64. Its own gate
+    // comment says it needs `crate::process` and "stays x86_64-only until the EL0 port
+    // lands in 8.4/8.5" — which also went stale, since that landed: the process table has
+    // been un-gated since 8.5d. Un-gating it is 8.7's job, and as of 8.6 nothing below it
+    // is missing.
+    SkippedTest { name: "test_net_server_stack", why: "net::socket is the last x86-gated part of mod net (8.7)" },
+    SkippedTest { name: "test_net_icmp_echo", why: "net::socket is the last x86-gated part of mod net (8.7)" },
+    SkippedTest { name: "test_api_server", why: "net::socket is the last x86-gated part of mod net (8.7)" },
+    SkippedTest { name: "test_dhcp", why: "net::socket is the last x86-gated part of mod net (8.7)" },
+    SkippedTest { name: "test_socket_capability", why: "net::socket is the last x86-gated part of mod net (8.7)" },
+    SkippedTest { name: "test_socket_list", why: "net::socket is the last x86-gated part of mod net (8.7)" },
+    SkippedTest { name: "test_udp_echo", why: "net::socket is the last x86-gated part of mod net (8.7)" },
+    SkippedTest { name: "test_tcp_client", why: "net::socket is the last x86-gated part of mod net (8.7)" },
+    // **Reasons corrected in 8.6.** Both old ones named ring 3 as the blocker and both
+    // were stale: EL0 landed in 8.4, the ring-3 servers run in 8.5, and `test_server_spawn`
+    // plus all six storage tests now execute staged ELF servers at EL0 on this
+    // architecture. Ring 3 is not what is missing.
+    //
+    // The real blocker for all four is `mod linux`, still `#[cfg]`'d to x86_64 in its
+    // entirety — it holds both the ELF loader (which is what `test_elf_exec` exercises,
+    // despite the name suggesting otherwise) and the Linux syscall personality. 8.8
+    // makes that module arch-neutral and 8.9 builds the aarch64 number table.
+    //
+    // Note the five servers whose `_start` still issues x86_64 Linux personality syscall
+    // numbers: that is the same dependency seen from the userspace side, recorded as 8.5's
+    // one scope change, and 8.9's Deliver list names them.
+    SkippedTest { name: "test_elf_exec", why: "the ELF loader lives in mod linux, x86-gated until 8.8/8.9" },
+    SkippedTest { name: "test_linux_exec", why: "mod linux is x86-gated (8.8 neutral, 8.9 aarch64 table)" },
+    SkippedTest { name: "test_linux_fs", why: "mod linux is x86-gated (8.8 neutral, 8.9 aarch64 table)" },
+    SkippedTest { name: "test_linux_threads", why: "mod linux is x86-gated (8.8 neutral, 8.9 aarch64 table)" },
+    // **Reason corrected in 8.6, and this is the group the correction matters most for.**
+    // The old reason named two prerequisites, "ring-3 and the storage stack", and aarch64
+    // now has both — ring 3 since 8.5, the storage stack as of this sub-phase. A reason
+    // that lists only satisfied prerequisites reads as "this is ready to un-gate", and it
+    // is not.
+    //
+    // `mod container` and `mod mgmt` are both still `#[cfg]`'d to x86_64, and what holds
+    // them there is the Linux personality: a container's whole job is to execute an
+    // unmodified Linux binary, so `mod container` cannot un-gate before `mod linux` does.
+    // That ordering is why 8.10 is last in the phase rather than adjacent to this one.
+    //
+    // `test_container_registry` is listed here but is the odd one out, and worth knowing
+    // about before 8.10: `test_registry_pull` covers the same registry/image path and was
+    // retired in 8.5d by changing one constant, because it was x86-gated only for its mock
+    // payload's architecture and never executed the payload at all. Check this one for the
+    // same shape before assuming it needs the runtime.
+    SkippedTest { name: "test_container_run", why: "mod container is x86-gated on the Linux personality (8.10)" },
+    SkippedTest { name: "test_container_isolation", why: "mod container is x86-gated on the Linux personality (8.10)" },
+    SkippedTest { name: "test_container_confinement", why: "mod container is x86-gated on the Linux personality (8.10)" },
+    SkippedTest { name: "test_container_registry", why: "mod container is x86-gated on the Linux personality (8.10)" },
+    SkippedTest { name: "test_container_logs", why: "mod container is x86-gated on the Linux personality (8.10)" },
+    SkippedTest { name: "test_management_capability", why: "mod mgmt is x86-gated; the SYS_MGMT ABI lands with 8.10" },
 ];
 
 /// x86_64 runs everything, so nothing is skipped.

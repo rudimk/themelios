@@ -1,13 +1,47 @@
-//! # Copying across the EL0 boundary
+//! # Copying across the EL0 boundary — the **bounds-only** pair
 //!
-//! `copy_from_user` / `copy_to_user` and the range check they share. This is the surface
-//! where a user-supplied pointer first reaches the kernel, and the only place in the
-//! aarch64 port where "the caller is hostile" is the operating assumption.
+//! `copy_from_user_bounds_only` / `copy_to_user_bounds_only` and the range check they
+//! share, [`user_range_in_bounds`].
+//!
+//! ## Read this before using anything in here (Phase 8.6)
+//!
+//! **This is not the kernel's user-memory chokepoint.** That is
+//! [`crate::arch::uaccess`], which serves both architectures, and which every syscall
+//! path — native and Linux — goes through. Use that one.
+//!
+//! What survives here is the strictly weaker pair: a range check that proves an address
+//! is *numerically* inside the EL0 regime and nothing else. It does **not** prove the
+//! range is mapped, so a copy through it can take a fatal data abort on a pointer that
+//! passed the check.
+//!
+//! Until 8.6 these were spelled `user_range_ok` / `copy_from_user` / `copy_to_user` —
+//! the same three names the x86 chokepoint used for functions that walked the page
+//! tables. `arch::syscall`'s docs called that out at the time: "the two are unrelated
+//! functions that happen to share a spelling", differing in "arity, argument order,
+//! return type, and safety — and, worst of the four, a different *security guarantee*".
+//! The names now carry the guarantee, so picking the wrong one is a visible choice at
+//! the call site rather than an invisible one.
+//!
+//! ## So why does it still exist?
+//!
+//! Because the strong check cannot answer for these callers, and the reason is
+//! structural rather than incidental. `arch::uaccess::user_range_ok` proves a range is
+//! mapped by resolving it **through the process table** —
+//! `process::with_address_space(current_process_id())` — and returns false when the
+//! current task has no process. The aarch64 EL0 self-tests (`user_selftest`, `el0_ipc`,
+//! the 8.4d soak) deliberately build bare `AddressSpace`s and drop to EL0 **with no
+//! process at all**, precisely so that a fault in `mod process` cannot masquerade as an
+//! EL0 fault. They are their own address space's owner and have no table entry to be
+//! found in, so for them the strong check is not stricter, it is simply wrong.
+//!
+//! That makes the remaining callers a closed set — the pre-`mod process` EL0 tests — and
+//! the right thing for this file is to stay small and stay named for what it does. A new
+//! caller outside that set is a mistake; it wants [`crate::arch::uaccess`].
 //!
 //! ## The bound is derived from `TCR_EL1`, not written down
 //!
 //! The user regime spans `[0, 2^(64 - T0SZ))`. That is a hardware-configured quantity, so
-//! [`user_range_ok`] reads it through [`crate::arch::paging::user_va_bits`] rather than
+//! [`user_range_in_bounds`] reads it through [`crate::arch::paging::user_va_bits`] rather than
 //! hard-coding 48 bits.
 //!
 //! The two failure directions are not symmetric, which is why this matters. A bound that
@@ -75,7 +109,7 @@ pub enum UserCopyError {
 /// Rejects, in order: an overflowing end (so a huge `len` cannot wrap past the check), and
 /// an end above the top of the regime. A zero-length range at a valid base is accepted —
 /// callers pass empty slices, and rejecting them would push the special case outward.
-pub fn user_range_ok(base: u64, len: usize) -> bool {
+pub fn user_range_in_bounds(base: u64, len: usize) -> bool {
     let Some(end) = base.checked_add(len as u64) else {
         return false;
     };
@@ -102,7 +136,7 @@ pub fn user_range_ok(base: u64, len: usize) -> bool {
 /// safe `fn` whose docs said it was "safe to *call* — it validates the range first … not
 /// safe in the stronger sense that the read cannot fault". That is a category error: a
 /// safe function that can read an unmapped address and take a fatal abort is unsound, not
-/// safe-in-a-weaker-sense. [`user_range_ok`] establishes that the address is *numerically*
+/// safe-in-a-weaker-sense. [`user_range_in_bounds`] establishes that the address is *numerically*
 /// inside the EL0 regime and nothing more — not that it is mapped, not that the tree
 /// currently in `TTBR0_EL1` belongs to the calling task, not that any user space is
 /// installed at all.
@@ -111,8 +145,8 @@ pub fn user_range_ok(base: u64, len: usize) -> bool {
 /// in `TTBR0_EL1` — which on the syscall path is true by construction, and off it is not.
 /// The fault risk itself cannot be discharged by any caller until there is an exception
 /// table; see the module docs.
-pub unsafe fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), UserCopyError> {
-    if !user_range_ok(src, dst.len()) {
+pub unsafe fn copy_from_user_bounds_only(dst: &mut [u8], src: u64) -> Result<(), UserCopyError> {
+    if !user_range_in_bounds(src, dst.len()) {
         return Err(UserCopyError::OutOfRange);
     }
     // SAFETY: the range lies inside the user regime. Note what this does *not* claim — an
@@ -132,12 +166,12 @@ pub unsafe fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), UserCopyErr
 ///
 /// # Safety
 ///
-/// As [`copy_from_user`], and the write direction makes the obligation sharper: this
+/// As [`copy_from_user_bounds_only`], and the write direction makes the obligation sharper: this
 /// writes to whatever the installed `TTBR0_EL1` maps at `dst`. The caller must ensure that
 /// tree is the intended task's.
 #[allow(dead_code)] // first consumer arrives with the ring-3 servers in 8.5
-pub unsafe fn copy_to_user(dst: u64, src: &[u8]) -> Result<(), UserCopyError> {
-    if !user_range_ok(dst, src.len()) {
+pub unsafe fn copy_to_user_bounds_only(dst: u64, src: &[u8]) -> Result<(), UserCopyError> {
+    if !user_range_in_bounds(dst, src.len()) {
         return Err(UserCopyError::OutOfRange);
     }
     // SAFETY: as above, in the other direction.

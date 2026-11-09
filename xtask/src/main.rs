@@ -917,6 +917,22 @@ fn cmd_test_aarch64(root: &Path, target: &str) {
     // is the declaration 8.3 deferred. Without it the job fails in `ensure_images` on a
     // missing binary rather than in any test — noisy, but at the right moment and naming
     // the right thing.
+    // Regenerate the ext2 data image fresh for every run, exactly as the amd64 test path
+    // does and for the same reason: `test_ext2_write` mutates it and does not clean up
+    // after itself. It creates `/wdir`, `/wbig` and `/wtest2`, unlinks only `/wtest`, and
+    // its step 3 asserts `OP_MKDIR /wdir` *succeeds* — so against a disk a previous run
+    // already wrote, it fails with `ext2 mkdir /wdir failed`.
+    //
+    // Measured, not anticipated: attaching the real images without this line passed on
+    // the first arm64 run and failed on the second, from the same binary. `ensure_images`
+    // reuses any image already on disk, which is right for the read-only SquashFS root
+    // (left cached deliberately, it is expensive to build and nothing writes it) and
+    // wrong for this one. The amd64 path has carried the same `remove_file` since Phase 3
+    // with a comment saying why; the honest description of this bug is that I attached
+    // the images and did not read the four lines above the attach site that already
+    // solved this.
+    let _ = fs::remove_file(data_image_path(root));
+
     let scratch = ensure_scratch_disk(root);
     let (squashfs, ext2) = ensure_images(root);
 

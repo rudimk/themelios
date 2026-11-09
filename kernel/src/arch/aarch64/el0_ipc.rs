@@ -334,7 +334,11 @@ ipc_payload_end:
     nr_uptime = const crate::arch::syscall::abi::SYS_UPTIME_MS,
     nr_print = const crate::arch::syscall::abi::SYS_DEBUG_PRINT,
     nr_null = const crate::arch::syscall::abi::SYS_NULL,
-    nr_unimpl = const crate::arch::syscall::abi::SYS_OPEN,
+    // Not a literal ABI number: the dispatcher owns which numbers are still
+    // unimplemented, and naming one here duplicated that knowledge. 8.6 implemented
+    // `SYS_OPEN`, which this used to name, and the probe correctly went red — see
+    // `ENOSYS_PROBE_NR`'s docs, which record the episode and why the constant moved there.
+    nr_unimpl = const super::syscall::ENOSYS_PROBE_NR,
     nr_exit = const crate::arch::syscall::abi::SYS_EXIT,
     mul = const HASH_MUL,
     print_ch = const PRINT_CH,

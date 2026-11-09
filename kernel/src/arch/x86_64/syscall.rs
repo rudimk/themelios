@@ -726,7 +726,9 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
         SYS_OPEN | SYS_READ_FILE | SYS_WRITE_FILE | SYS_CLOSE | SYS_STAT | SYS_READDIR => {
             // Filesystem syscalls block on the FS server, so enable interrupts.
             cpu::sti();
-            dispatch_fs_syscall(frame);
+            // Arch-neutral since 8.6 — the same function aarch64 calls. See
+            // `crate::fs::syscall`.
+            crate::fs::syscall::dispatch(frame);
         }
         SYS_UPTIME_MS => {
             // Monotonic milliseconds since boot: 100 Hz tick × 10. A plain
@@ -800,164 +802,27 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
 // capability-checked VFS operations in `crate::fs`. They run with interrupts
 // enabled (the VFS calls block on the ring-3 filesystem servers).
 
-/// Upper bound on the non-canonical user/kernel split — any user pointer at or
-/// above this is rejected. Userspace lives strictly in the lower half.
-const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
-/// Cap on a single filesystem syscall transfer, to bound kernel allocation
-/// against a hostile or buggy user length.
-const FS_MAX_XFER: usize = 256 * 1024;
+// The user-memory chokepoint used to live here: `USER_ADDR_LIMIT`, `FS_MAX_XFER`,
+// `user_range_ok`, `copy_from_user`, `copy_to_user`. Phase 8.6 moved all five to
+// `crate::arch::uaccess`, as ONE implementation serving both architectures, because
+// aarch64 had grown a second set under the same names with a weaker security guarantee —
+// a bounds check where this one walks the page tables. See that module's docs, and the
+// superseded note kept verbatim in `crate::arch::syscall`, for why that mattered the
+// moment the filesystem syscalls reached aarch64.
+//
+// The limit itself now lives in `arch::paging::user_addr_limit()`, which is where a
+// property of the paging regime belongs; on aarch64 it must be a runtime read of
+// `TCR_EL1.T0SZ`, so it is a function on both.
+use crate::arch::uaccess::{copy_from_user, copy_to_user, user_range_ok, FS_MAX_XFER};
 
-/// Validate that `[uptr, uptr+len)` is wholly mapped in the current process's
-/// address space and lies in the user half. Returns false on any gap.
-pub(crate) fn user_range_ok(uptr: u64, len: usize) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let end = match uptr.checked_add(len as u64) {
-        Some(e) => e,
-        None => return false,
-    };
-    if uptr == 0 || end > USER_ADDR_LIMIT {
-        return false;
-    }
-    let pid = crate::sched::current_process_id();
-    crate::process::with_address_space(pid, |a| {
-        let mut page = uptr & !0xFFF;
-        while page < end {
-            if a.translate(crate::mm::addr::VirtAddr::new(page)).is_none() {
-                return false;
-            }
-            page += 0x1000;
-        }
-        true
-    })
-    .unwrap_or(false)
-}
-
-/// Copy `len` bytes from a validated user pointer into a kernel `Vec`.
-pub(crate) fn copy_from_user(uptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
-    // A zero-length transfer touches no memory — never dereference the pointer
-    // (which may be null): `from_raw_parts(null, 0)` is UB even for len 0.
-    if len == 0 {
-        return Some(alloc::vec::Vec::new());
-    }
-    if len > FS_MAX_XFER || !user_range_ok(uptr, len) {
-        return None;
-    }
-    // SAFETY: we are in the calling process's address space (its CR3 is active
-    // during the syscall) and have verified every page of the range is mapped.
-    let slice = unsafe { core::slice::from_raw_parts(uptr as *const u8, len) };
-    Some(slice.to_vec())
-}
-
-/// Copy `data` to a validated user pointer. Returns false if the range is bad.
-pub(crate) fn copy_to_user(uptr: u64, data: &[u8]) -> bool {
-    // Nothing to copy → success without dereferencing a possibly-null pointer.
-    if data.is_empty() {
-        return true;
-    }
-    if !user_range_ok(uptr, data.len()) {
-        return false;
-    }
-    // SAFETY: validated mapped user range in the active address space.
-    let dst = unsafe { core::slice::from_raw_parts_mut(uptr as *mut u8, data.len()) };
-    dst.copy_from_slice(data);
-    true
-}
-
-/// Dispatch a filesystem syscall (SYS_OPEN .. SYS_READDIR) from `frame`.
-fn dispatch_fs_syscall(frame: &mut SyscallFrame) {
-    use crate::cap::CapHandle;
-    use crate::fs::{self, FsError};
-
-    let pid = crate::sched::current_process_id();
-    crate::audit::log_event(pid, crate::audit::AuditOp::FsAccess, crate::cap::CapType::Null, frame.rax);
-    let bad_arg = FsError::InvalidArgument.as_syscall_ret();
-
-    match frame.rax {
-        SYS_OPEN => {
-            let fs_handle = CapHandle::from_raw(frame.rdi as u32);
-            match copy_from_user(frame.rsi, frame.rdx as usize) {
-                Some(path) => match fs::vfs_open(pid, fs_handle, &path) {
-                    Ok(fd_raw) => frame.rax = fd_raw as u64,
-                    Err(e) => frame.rax = e.as_syscall_ret(),
-                },
-                None => frame.rax = bad_arg,
-            }
-        }
-        SYS_READ_FILE => {
-            let fd = CapHandle::from_raw(frame.rdi as u32);
-            let len = (frame.rdx as usize).min(FS_MAX_XFER);
-            let off = frame.r10;
-            if !user_range_ok(frame.rsi, len) {
-                frame.rax = bad_arg;
-                return;
-            }
-            let mut kbuf = alloc::vec![0u8; len];
-            match fs::vfs_read(pid, fd, off, &mut kbuf) {
-                Ok(n) if copy_to_user(frame.rsi, &kbuf[..n]) => frame.rax = n as u64,
-                Ok(_) => frame.rax = bad_arg,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_WRITE_FILE => {
-            let fd = CapHandle::from_raw(frame.rdi as u32);
-            let off = frame.r10;
-            match copy_from_user(frame.rsi, frame.rdx as usize) {
-                Some(data) => match fs::vfs_write(pid, fd, off, &data) {
-                    Ok(n) => frame.rax = n as u64,
-                    Err(e) => frame.rax = e.as_syscall_ret(),
-                },
-                None => frame.rax = bad_arg,
-            }
-        }
-        SYS_CLOSE => {
-            let fd = CapHandle::from_raw(frame.rdi as u32);
-            match fs::vfs_close(pid, fd) {
-                Ok(()) => frame.rax = 0,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_STAT => {
-            let fs_handle = CapHandle::from_raw(frame.rdi as u32);
-            let stat_ptr = frame.r10;
-            match copy_from_user(frame.rsi, frame.rdx as usize) {
-                Some(path) => match fs::vfs_stat(pid, fs_handle, &path) {
-                    Ok((size, is_dir)) => {
-                        // Write [size:u64, is_dir:u64] to the user stat buffer.
-                        let mut out = [0u8; 16];
-                        out[0..8].copy_from_slice(&size.to_le_bytes());
-                        out[8..16].copy_from_slice(&(is_dir as u64).to_le_bytes());
-                        if copy_to_user(stat_ptr, &out) {
-                            frame.rax = 0;
-                        } else {
-                            frame.rax = bad_arg;
-                        }
-                    }
-                    Err(e) => frame.rax = e.as_syscall_ret(),
-                },
-                None => frame.rax = bad_arg,
-            }
-        }
-        SYS_READDIR => {
-            let fd = CapHandle::from_raw(frame.rdi as u32);
-            let entries_ptr = frame.rsi;
-            let max = frame.rdx;
-            let out_len = (frame.r10 as usize).min(FS_MAX_XFER);
-            if !user_range_ok(entries_ptr, out_len) {
-                frame.rax = bad_arg;
-                return;
-            }
-            let mut kbuf = alloc::vec![0u8; out_len];
-            match fs::vfs_readdir(pid, fd, max, &mut kbuf) {
-                Ok(count) if copy_to_user(entries_ptr, &kbuf) => frame.rax = count,
-                Ok(_) => frame.rax = bad_arg,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        _ => frame.rax = bad_arg,
-    }
-}
+// `dispatch_fs_syscall` lived here until Phase 8.6 and is now `crate::fs::syscall`,
+// arch-neutral and shared with aarch64. It was ~100 lines naming `frame.rdi`/`rsi`/`rdx`/
+// `r10`, which is the whole reason a second copy would have been needed on arm64; read
+// through the frame's positional accessors there is nothing architecture-specific left in
+// it. See that module's docs, including the one trap the move introduced: the positional
+// `arg4`/`arg5` implement the *Linux* ABI's slots, which the native ABI crosses on x86 —
+// harmless for the filesystem calls, which use slots 0-3 only, and a live hazard for any
+// native syscall that does not.
 
 // --- Socket syscall dispatch (Phase 4.5) ---
 //

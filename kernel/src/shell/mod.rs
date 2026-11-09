@@ -80,17 +80,11 @@ fn shell_entry() {
             "shutdown" => commands::cmd_shutdown(args),
             "reboot" => commands::cmd_reboot(args),
             "exit" => commands::cmd_exit(args),
-            #[cfg(target_arch = "x86_64")]
             "mount" => commands::cmd_mount(args),
-            #[cfg(target_arch = "x86_64")]
             "ls" => commands::cmd_ls(args),
-            #[cfg(target_arch = "x86_64")]
             "cat" => commands::cmd_cat(args),
-            #[cfg(target_arch = "x86_64")]
             "stat" => commands::cmd_stat(args),
-            #[cfg(target_arch = "x86_64")]
             "write" => commands::cmd_write(args),
-            #[cfg(target_arch = "x86_64")]
             "mkdir" => commands::cmd_mkdir(args),
             #[cfg(target_arch = "x86_64")]
             "ifconfig" => commands::cmd_ifconfig(args),

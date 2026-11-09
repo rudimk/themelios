@@ -53,7 +53,32 @@
 //! x86_64 has `(flags, newsp, parent_tid, child_tid, tls)`). A positional facade cannot
 //! fix that and does not try to; see the note in [`crate::linux::thread`].
 //!
-//! ## User-memory access is NOT yet portable, and this module does not pretend it is
+//! ## User-memory access IS portable as of 8.6 — and the history is the point
+//!
+//! [`copy_from_user`], [`copy_to_user`] and [`user_range_ok`] are re-exported here for
+//! both architectures. They are not a facade: there is **one** implementation, in
+//! [`crate::arch::uaccess`], which this module merely re-exports so the 21 call sites in
+//! [`crate::linux`] keep the import they already had.
+//!
+//! The note this section used to carry is kept verbatim below, because the gap it
+//! describes is what made the merge necessary rather than merely tidy, and because the
+//! shape of the mistake recurs. Read it before changing anything here.
+//!
+//! The consumer it said to wait for arrived one sub-phase later than predicted, with the
+//! *filesystem* syscalls in 8.6
+//! rather than the servers in 8.5, and the consumer did the job a consumer is supposed
+//! to do: it made the difference load-bearing. Had 8.6 ported `dispatch_fs_syscall` to
+//! the aarch64 pair as it stood — same spelling, compiles, tests pass — ring 3 would
+//! have gained a one-syscall node halt, because a bounds-only check admits an unmapped
+//! pointer and the ensuing data abort is fatal under the Phase 7.2 handler. The thing
+//! that prevented it was this section saying plainly that the two were not equivalent.
+//!
+//! One half of the old note still stands and has moved rather than been resolved: there
+//! is still no exception table, so a user copy that faults is still fatal on aarch64.
+//! The merge gave both architectures the *check*; neither has the *fixup*. See
+//! [`crate::arch::uaccess`] for the narrow statement of what is now guaranteed.
+//!
+//! ## The superseded note, verbatim
 //!
 //! [`copy_from_user`] and [`copy_to_user`] are re-exported **on x86_64 only**. An earlier
 //! version of this file re-exported an aarch64 pair under the same names and claimed the
@@ -79,6 +104,11 @@
 //! its absence: aarch64 code that needs these reaches for
 //! [`crate::arch::aarch64::uaccess`] by name and is thereby reminded that it is using the
 //! architecture-specific one.
+//!
+//! *(End of the superseded note. Its final instruction is now inverted: code wanting a
+//! user copy uses [`crate::arch::uaccess`], and what remains in
+//! [`crate::arch::aarch64::uaccess`] is the deliberately weaker bounds-only pair, under
+//! names that say so, for the bare-EL0 self-tests that run with no process attached.)*
 
 /// The ThemeliOS native syscall numbers — **one list, every consumer**.
 ///
@@ -149,8 +179,17 @@ pub use crate::arch::x86_64::syscall::SyscallFrame;
 #[allow(unused_imports)]
 pub use crate::arch::aarch64::syscall::SyscallFrame;
 
-// x86_64 only — see the table above. `pub(crate)` because that is the visibility of the
+// Both architectures, since 8.6 — see the "User-memory access" section above, which this
+// line is the resolution of. `pub(crate)` because that is the visibility of the
 // underlying items, and because the last thing a user-memory chokepoint should become is
 // part of a public API surface.
-#[cfg(target_arch = "x86_64")]
-pub(crate) use crate::arch::x86_64::syscall::{copy_from_user, copy_to_user, user_range_ok};
+//
+// Re-exported through this module purely so the 21 call sites in `crate::linux` keep the
+// import they already have; the implementation lives in `crate::arch::uaccess` and is not
+// per-architecture at all.
+//
+// `FS_MAX_XFER` rides along for the same reason: `fs::syscall` needs it and reaching it
+// through the facade keeps that module free of any `arch::` path but this one.
+pub(crate) use crate::arch::uaccess::{
+    copy_from_user, copy_to_user, user_range_ok, FS_MAX_XFER,
+};
