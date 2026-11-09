@@ -55,6 +55,18 @@ pub mod context;
 /// Machine power control (`power_off`, `reset`) — how the node stops and restarts.
 pub mod power;
 
-/// Syscall frame (`SyscallFrame`, positional `nr`/`arg0`-`arg5`/`set_ret`/`user_pc`) and
-/// the user-memory chokepoint (`copy_from_user`, `copy_to_user`, `user_range_ok`).
+/// Syscall frame (`SyscallFrame`, positional `nr`/`arg0`-`arg5`/`set_ret`/`user_pc`).
+///
+/// Re-exports the active architecture's frame. The user-memory chokepoint used to be
+/// described here too and is now its own module — see [`uaccess`], which unlike this one
+/// is a single implementation rather than a per-arch re-export.
 pub mod syscall;
+
+/// The user-memory chokepoint: `copy_from_user`, `copy_to_user`, `user_range_ok`.
+///
+/// **Not a facade.** Every other module in this directory re-exports one of two
+/// architecture-specific implementations; this one *is* the implementation, shared, with
+/// the single per-arch quantity it needs (`paging::user_addr_limit`) reached through the
+/// facade above it. Phase 8.6 merged two divergent copies that had different signatures
+/// and, more importantly, different security guarantees.
+pub mod uaccess;

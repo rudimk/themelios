@@ -183,7 +183,6 @@ mod drivers;
 /// Filesystem layer.
 /// Read-only root filesystem for the immutable OS image, plus ephemeral
 /// writable layers for container runtime state.
-#[cfg(target_arch = "x86_64")]
 mod fs;
 
 /// Network stack.

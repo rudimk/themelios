@@ -36,9 +36,15 @@ pub fn cmd_help(_args: &str) {
     println!("  reboot           — restart the machine");
     println!("  exit             — (there is no shell to exit; see 'shutdown')");
 
-    // The rest depend on the storage stack, the network stack or containers — all part
-    // of the VirtIO-PCI surface still deferred on aarch64. The process-table commands
-    // left this list in 8.5d, when `mod process` un-gated.
+    // The rest depend on the network stack or containers, still deferred on aarch64
+    // (8.7 and 8.10). Two groups have already left this list: the process-table commands
+    // in 8.5d, when `mod process` un-gated, and the filesystem commands in 8.6.
+    //
+    // Note what that leaves behind — the old version of this comment blamed the whole
+    // remainder on "the VirtIO-PCI surface", which was never the real dependency and is
+    // now demonstrably not: 8.3 gave aarch64 virtio-mmio and the storage commands below
+    // work over it. What the network and container commands actually wait on is the
+    // network stack and the Linux personality, neither of which is about transport.
     //
     // The list is `#[cfg]`'d rather than printed unconditionally because a help text
     // that advertises commands the dispatcher will reject as "Unknown command" is worse
@@ -46,14 +52,17 @@ pub fn cmd_help(_args: &str) {
     println!("  procs            — list all processes");
     println!("  caps [pid]       — list capabilities in a process's CSpace");
 
+    // The filesystem commands joined this list in 8.6, when `mod fs` and the ring-3
+    // filesystem servers un-gated on aarch64.
+    println!("  mount            — list mounted filesystems");
+    println!("  ls <path>        — list a directory");
+    println!("  cat <path>       — print file contents");
+    println!("  stat <path>      — show file size and type");
+    println!("  write <path> <s> — create/write a file (overlay or /data)");
+    println!("  mkdir <path>     — create a directory");
+
     #[cfg(target_arch = "x86_64")]
     {
-        println!("  mount            — list mounted filesystems");
-        println!("  ls <path>        — list a directory");
-        println!("  cat <path>       — print file contents");
-        println!("  stat <path>      — show file size and type");
-        println!("  write <path> <s> — create/write a file (overlay or /data)");
-        println!("  mkdir <path>     — create a directory");
         println!("  ifconfig         — show network interface configuration");
         println!("  sockets          — list open sockets and their state");
         println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
@@ -607,7 +616,6 @@ extern crate alloc;
 // volume; everything else routes to the overlay/SquashFS root.
 
 /// Resolve a shell path to (mount_id, path-within-mount).
-#[cfg(target_arch = "x86_64")]
 fn resolve_mount(path: &str) -> Option<(u64, alloc::string::String)> {
     use crate::fs;
     if path == "/data" {
@@ -620,15 +628,11 @@ fn resolve_mount(path: &str) -> Option<(u64, alloc::string::String)> {
 }
 
 /// `mount` — list mounted filesystems.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_mount(_args: &str) {
     crate::fs::print_mount_status();
 }
 
 /// `ls <path>` — list a directory's entries.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_ls(args: &str) {
     use crate::fs;
     let path = args.trim();
@@ -676,8 +680,6 @@ pub fn cmd_ls(args: &str) {
 }
 
 /// `cat <path>` — print a file's contents to serial.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_cat(args: &str) {
     use crate::fs;
     let path = args.trim();
@@ -723,8 +725,6 @@ pub fn cmd_cat(args: &str) {
 }
 
 /// `stat <path>` — show a file's size and type.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_stat(args: &str) {
     let path = args.trim();
     if path.is_empty() {
@@ -747,8 +747,6 @@ pub fn cmd_stat(args: &str) {
 }
 
 /// `write <path> <content>` — create and write a file.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_write(args: &str) {
     use crate::fs;
     let args = args.trim();
@@ -781,8 +779,6 @@ pub fn cmd_write(args: &str) {
 }
 
 /// `mkdir <path>` — create a directory.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_mkdir(args: &str) {
     let path = args.trim();
     if path.is_empty() {

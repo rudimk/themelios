@@ -922,6 +922,51 @@ precisely the shape of claim invariant 6 forbids, since nothing checks it.
 **Riskiest unknown:** the memory-ordering half. 8.3 got the attributes right; the barrier
 discipline is only *exercised* here, under load, and TCG will not expose a missing one.
 
+---
+
+**OUTCOME — 8.6 COMPLETE.** All six retired; **35 running / 20 skipped** on aarch64, which
+is exactly what the ratchet table predicted. amd64 stays 55/55, 0 skipped. Acceptance met
+by a new command, `cargo xtask arm64-fs-smoke`, which drives seven shell commands over the
+serial console with asserted output — the plan asked for this against `cmd_test`, and a
+dedicated smoke was used instead because `cmd_test` runs the `feature = "test"` build,
+which never starts a shell at all.
+
+Where the plan was right, wrong, and silent:
+
+* **Right about the xtask plumbing**, in full detail: no `ensure_images`, no
+  `ensure_scratch_disk`, no disk `-drive` on either aarch64 path, and the arm64 CI job
+  missing `squashfs-tools e2fsprogs`. All as described.
+* **Wrong about the size of the kernel work.** `mod fs` un-gated with **zero code changes**
+  and five of the six tests passed immediately. The plan budgeted a port; the dependency
+  was `mod process` and ring 3, delivered in 8.5d.
+* **The riskiest unknown did not materialise, and this is not evidence that it was not a
+  risk.** No ordering defect appeared. The plan said TCG would not expose a missing
+  barrier, so a clean run here is *consistent with* a latent bug and does not refute one.
+  Recorded as unresolved rather than closed; the hardware phase is where it gets tested.
+* **Silent on the two things that actually took the work**, both found by running it:
+  1. The FS **syscalls** were `ENOSYS` on aarch64. `dispatch_fs_syscall` is now
+     arch-neutral in `fs::syscall`.
+  2. The **user-copy chokepoint** differed in its *security guarantee* between
+     architectures — x86 walked the page tables, aarch64 bounds-checked only. Porting the
+     dispatcher onto the weaker one would have given ring 3 a one-syscall node halt.
+     Merged into `arch::uaccess`. This is the item to carry into 8.9/8.10, because every
+     Linux path syscall uses it: both arches now have the *check* and neither has the
+     *fixup*, so a faulting user copy is still fatal on aarch64.
+* **Also silent on the acceptance gap that mattered most.** The aarch64 boot path never
+  called `fs::boot_storage()`, so the six shell commands this sub-phase un-gated were inert
+  while the suite read 35/35 — the storage tests all call the servers from kernel code
+  inside the harness and touch neither the mount registry nor the shell. Invariant 6 earned
+  its keep here: the suite was green, the feature did not work, and only the asserted-output
+  requirement caught it.
+
+**For 8.7, from this sub-phase:** `test_ext2_write` mutates the ext2 image and does not
+clean up, so any new QEMU path attaching it must delete and regenerate it per run as the
+amd64 test path has since Phase 3 — it passed on the first arm64 run and failed on the
+second from the same binary. And when retiring a skip, **correct the reasons of the ones
+left behind**: eighteen were asserting dependencies satisfied sub-phases earlier, eight of
+them blaming "VirtIO-PCI" for a TCP/IP stack on an architecture that has had virtio-mmio
+since 8.3.
+
 #### 8.7 — Networking on aarch64
 
 Un-gate the rest of `mod net` — 8.3 already took `net::device` and `net::net_service`, so
@@ -1141,7 +1186,7 @@ The 39 entries, assigned. This table is the phase's progress bar and must sum to
 | ✅ **8.3 virtio-mmio** | **7** | **23** | **32** |
 | ✅ 8.4 user AS + SVC + EL0 | **2** (projected 3) | **25** | **30** |
 | ✅ **8.5 libthemelios + smokes** | **4** | **29** | **26** |
-| 8.6 storage | 6 | 35 | 20 |
+| ✅ **8.6 storage** | **6** (as projected) | **35** | **20** |
 | 8.7 networking | 7 | 42 | 13 |
 | 8.8 Linux dispatcher (amd64) | 0 | 42 | 13 |
 | 8.9 aarch64 Linux table | 4 | 46 | 9 |

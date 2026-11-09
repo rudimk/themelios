@@ -153,7 +153,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Complete (ring-0 core; EL0/storage/net/containers deferred) |
-| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.5 done) |
+| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.6 done) |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -176,8 +176,80 @@ hash manifest), ✅ 8.5b (the native syscall ABI on aarch64 — one number list 
 kernel and `libthemelios`, the IPC dispatcher, and `libthemelios`' 25 wrappers collapsed to
 three positional primitives per arch), ✅ 8.5c (**the userspace servers build for
 aarch64**: all seven flat servers plus `elf-smoke`, staged and hashed as
-`servers-arm64.sha256`), ✅ 8.5d (**the servers actually run**) — which completes 8.5.
-Next is **GICv3 support** (see below), then 8.6 (storage).
+`servers-arm64.sha256`), ✅ 8.5d (**the servers actually run**) — which completes 8.5 —
+and ✅ **8.6 (storage)**. Next is **8.7 (networking)**; GICv3 was *not* done before 8.6 and
+should not be next either, for the reason in the GICv3 note further down.
+
+**8.6 — storage on aarch64: COMPLETE.** The ratchet moves **29 → 35 of 55** (20 skips left,
+3 of them unretirable by porting); amd64 stays **55/55, 0 skipped**. Six skips retired:
+`test_squashfs_server`, `test_overlay_server`, `test_ext2_read`, `test_ext2_write`,
+`test_vfs_capability`, `test_fs_syscalls`. The shell goes **13 → 19 of 28** (`mount`, `ls`,
+`cat`, `stat`, `write`, `mkdir`). New command: `cargo xtask arm64-fs-smoke`.
+
+`mod fs` un-gated with **zero code changes** — it built for aarch64 on the first try. The
+plan budgeted porting work for it; the real dependency was never the filesystem code but
+`mod process` and ring 3, which 8.5d delivered. Five of the six storage tests passed on
+that alone. Four things were actually needed, and a reviewer should look at each:
+
+  * **The FS syscalls were `ENOSYS` on aarch64**, from a list 8.5b wrote to be deleted:
+    *"deleting a number from this list is how it becomes implemented, and a list is
+    something you can read to see what is missing."* That is how `[FAIL] test_fs_syscalls:
+    SYS_STAT failed` was diagnosed — one grep. `dispatch_fs_syscall` moved out of
+    `arch::x86_64::syscall` (where it named `frame.rdi`/`rsi`/`rdx`/`r10`) into
+    arch-neutral `fs::syscall`, read through the frame's positional accessors, so both
+    arches call one function instead of two that can drift.
+  * **The user-memory chokepoint was merged, and this is the part that mattered.** There
+    were two `user_range_ok`/`copy_from_user`/`copy_to_user` triples sharing three names:
+    x86's walked the page tables, aarch64's was a bounds check only. Routing `SYS_STAT` at
+    the weaker one **would have handed ring 3 a one-syscall node halt** — an
+    in-range-but-unmapped pointer passes a bounds check and the resulting data abort is
+    fatal under the 7.2 handler. `arch::uaccess` is now one implementation with x86's walk
+    and aarch64's volatile byte-wise copies (the better half: a `&[u8]` over user memory
+    asserts bytes another task may write will not change). What `arch::syscall`'s docs had
+    said for two phases is what prevented it — that the two "are unrelated functions that
+    happen to share a spelling", and that unification "wants a live consumer to design
+    against". **Still missing on both arches: the fixup.** No exception table, so a user
+    copy that faults is fatal; both now have the *check*, neither the *recovery*. The
+    TOCTOU window between walk and copy is likewise open, as it has been on x86 since
+    Phase 3. What survives as `arch::aarch64::uaccess::*_bounds_only` cannot be deleted:
+    the strong check resolves through the process table, and the bare-EL0 self-tests drop
+    to EL0 with no process on purpose, so for them it is not stricter but wrong.
+  * **The aarch64 boot path never called `fs::boot_storage()`**, so all six new shell
+    commands were inert *while the suite read 35/35*. Every storage test calls the servers
+    from kernel code inside the harness, so none of them touches `boot_storage`, the mount
+    registry, `resolve_mount`, the shell dispatcher or the console. And the failure is
+    silent in the worst way: `root_mount()` returns `None`, so `ls /` prints "no filesystem
+    mounted" rather than failing, which reads as "the port is incomplete". Attaching the
+    real images to the `run` path was necessary and not sufficient.
+  * **`test_ext2_write` is not idempotent against a persistent disk** — it creates
+    `/wdir`, `/wbig`, `/wtest2` and unlinks only `/wtest`. It passed on the first arm64 run
+    and failed on the second *from the same binary*. The amd64 test path has deleted the
+    data image before every run since Phase 3 with a comment saying why; I attached the
+    images and did not read the four lines above the attach site that already solved this.
+
+**Acceptance was the shell, not the suite.** `cargo xtask arm64-fs-smoke` boots with the
+real SquashFS root and ext2 volume, types seven commands over the serial console and
+asserts their output — the plan's criterion, as against reporting that `ls` and `cat` "work
+interactively", which is the unfalsifiable form this file has a track record of accepting.
+**Mutation-tested**: remove the `boot_storage()` call and it exits 1 naming that function,
+with `/ : not mounted` in the captured log, while the suite stays green. Two marker rules
+in `FS_DRIVE` are load-bearing and non-obvious: the shell **echoes what is typed**, so a
+marker occurring in the typed line passes against the echo alone (hence the `ls` markers
+carry `cmd_ls`'s two-space indent), and the write is asserted through `ls` rather than
+`cat /ovl.txt` for exactly that reason.
+
+**Eighteen stale skip reasons corrected** — same class as the `LIMINE_BRANCH` pin: a string
+that keeps asserting a dependency after it is satisfied, compiled against nothing. Eight
+blamed "VirtIO-PCI" for a TCP/IP stack, on an arch with virtio-mmio since 8.3 that passes
+`test_virtio_net`; four blamed ring 3 two sub-phases after EL0 landed; six listed "ring-3
+and the storage stack" as missing when 8.5 delivered the first and 8.6 the second — i.e.
+they read as ready-to-un-gate while blocked on `mod linux`. **8.7's only remaining blocker
+is `net::socket`**, the last `#[cfg]`'d part of `mod net`; its own gate comment still says
+it waits for "the EL0 port … in 8.4/8.5", which landed.
+
+**Requires a `build.yml` change this session could not push** (no `workflow` scope): the
+arm64 job needs `squashfs-tools e2fsprogs` on its apt line, and should run the new
+`arm64-fs-smoke` step.
 
 **8.5d — the process table and EL0 servers on aarch64.** `mod process` is un-gated on both
 architectures, `embedded.rs` picks its staging directory through a `#[cfg]`'d
@@ -239,8 +311,11 @@ is fixed: the kernel reads `ID_AA64PFR0_EL1.GIC` before touching any GIC MMIO an
 with a diagnosis, pinned by `cargo xtask arm64-gicv3-smoke` — the "cheap genericity test"
 this file had recommended for two phases without wiring anything to it. **Actually
 supporting GICv3** (system-register CPU interface + redistributors) is its own sub-phase,
-scheduled after 8.5 rather than deferred to the unplanned hardware phase — and 8.5 closed
-at 8.5d, so **it is next in the queue**.
+scheduled after 8.5 rather than deferred to the unplanned hardware phase. **That ordering
+did not survive: 8.6 went first and GICv3 is still not done.** It retires zero skips, so it
+moves the parity measure not at all, and the reason it was prioritised turned out to be
+false (see below). Treat it as unscheduled hardware-phase work unless someone makes a fresh
+case for it.
 
 **But read the GICv3 note further down before acting on that ordering.** It was placed next
 partly on the belief that it was the Apple Silicon unblocker, and a boot log from a real Mac
@@ -405,17 +480,24 @@ a device untrusted *means* — fails the build with a message naming both fixes.
 Mutation-tested: flipping it produces `error[E0080]` carrying those instructions.
 
 Parity has one measurable definition — `test_runner`'s `SKIPPED` list empty on both
-architectures, i.e. 55/55 running on each. It is **29 running / 26 skipped** on aarch64
-today (16/39 before 8.3, 23/32 after it, 25/30 after 8.4c). Three of the 26 cannot be
-retired by porting (`test_pci_scan`, `test_syscall`, `test_linux_exec`'s TLS assertion) and
-are retired by reframing, each decided in the sub-phase that owns it.
+architectures, i.e. 55/55 running on each. It is **35 running / 20 skipped** on aarch64
+today (16/39 before 8.3, 23/32 after it, 25/30 after 8.4c, 29/26 after 8.5d). Three of the
+20 cannot be retired by porting (`test_pci_scan`, `test_syscall`, `test_linux_exec`'s TLS
+assertion) and are retired by reframing, each decided in the sub-phase that owns it.
+
+The 17 that can be: 8 on `net::socket` (8.7), 4 on `mod linux` (8.8/8.9), 5 on
+`mod container`/`mod mgmt` (8.10). **Correcting the skip *reasons* is part of retiring
+skips** — 8.6 found eighteen of them asserting dependencies that had been satisfied for
+sub-phases, which is worse than a vague reason because it sends the next reader to the
+wrong module. Re-read the survivors whenever one is retired.
 
 Note the denominator, and note that this line goes stale silently. It previously read
 "54/54" and "16 running / 38 skipped", wrong on both counts — `SUITE_SIZE` has been 55, and
 16 + 38 does not reach it — and then sat at "23 running / 32 skipped" through 8.4c, which
 had un-gated two. The suite itself asserts `TESTS.len() + SKIPPED.len() == SUITE_SIZE`
 before running anything, so the *kernel* cannot drift; this sentence can, and only reading
-it against a run catches that.
+it against a run catches that. (It then sat at "29 running / 26 skipped" through 8.6, which
+retired six. Three for three.)
 
 **Phase 7 — aarch64 port: COMPLETE (ring-0 core).** A ring-0 kernel-core port to QEMU `virt`
 (ARM64); EL0/userspace, storage, networking and containers on ARM are a separate,

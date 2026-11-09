@@ -39,6 +39,12 @@
 //! a [`CapType::FileDescriptor`] capability bound to that process. There is no
 //! ambient authority to touch storage.
 
+/// The ring-3 filesystem syscall dispatcher (`SYS_OPEN` … `SYS_READDIR`).
+///
+/// Arch-neutral since Phase 8.6, and called by both architectures' syscall dispatchers;
+/// see its module docs for why it is one implementation rather than two.
+pub mod syscall;
+
 use alloc::vec::Vec;
 
 use crate::cap::{Capability, CapHandle, CapRights, CapType};

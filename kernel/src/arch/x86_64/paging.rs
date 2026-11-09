@@ -71,6 +71,25 @@ pub const LEVEL_NAMES: [&str; 4] = ["PML4", "PDP", "PD", "PT"];
 /// Costs at most 256 frames (1 MiB), allocated once.
 pub const PREPOPULATE_KERNEL_ROOT: bool = true;
 
+/// One past the highest address a ring-3 pointer may name.
+///
+/// x86_64's canonical-address rule splits the 64-bit space in two halves; the low half
+/// ends at 2^47, and everything at or above that is either non-canonical (a `#GP` on
+/// use) or kernel space. So this is the bound a user pointer is checked against.
+///
+/// A function rather than a `const` because the aarch64 counterpart *must* be one — it
+/// derives its bound from `TCR_EL1.T0SZ` at runtime — and
+/// [`crate::arch::uaccess`] calls one spelling on both architectures. On x86 the value
+/// is fixed by the architecture, so this compiles to a constant anyway.
+///
+/// It lived in `arch::x86_64::syscall` as `USER_ADDR_LIMIT` until 8.6, which is the
+/// wrong module for it: the quantity is a property of the paging regime, and the user
+/// range check that consumes it is no longer x86-specific.
+#[inline]
+pub fn user_addr_limit() -> u64 {
+    0x0000_8000_0000_0000
+}
+
 /// Mask selecting the physical address bits (12-51) of a descriptor.
 ///
 /// Physical addresses in page-table entries are always page-aligned, so the low 12
