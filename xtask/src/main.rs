@@ -2233,14 +2233,45 @@ fn await_aarch64_banner(
     // mounted", and then the step would wait out its full budget for output that had
     // already been missed: a timeout reported against `ls` for a race in the harness.
     let mut not_ready = false;
+    let mut ready_quiet_for = Duration::from_secs(0);
+    let mut ready_waited = Duration::from_secs(0);
     if found && failure.is_none() {
         if let Some(sentinel) = ready {
+            // **Progress-bounded, not a fixed deadline, and the history is the argument.**
+            //
+            // This gate waits for the whole userspace bring-up, whose cost is dominated by
+            // mapping an 8 MiB ring-3 net server a page at a time with TLB maintenance.
+            // That is memory-bound emulation, so it varies far more between hosts than the
+            // rest of the suite does: 40 s was too short, then 90 s passed locally and
+            // still expired on a CI runner. Guessing a third number would be the same
+            // mistake again — and a gate that is merely *too short* fails a healthy build,
+            // which is the expensive direction.
+            //
+            // So: keep waiting as long as the guest is still emitting, and give up only
+            // once it has gone quiet without the sentinel. A booting kernel prints
+            // steadily, so silence is the signal that it has stopped making progress
+            // rather than that it is slow. The absolute cap exists purely so a wedged
+            // guest cannot hold the job open forever.
+            // 120 s of silence, which is generous on purpose and needs to be. The
+            // expensive step here — mapping the net server — emits **nothing while it
+            // runs**: locally there is a ~20 s gap between `Created process PID(5)` and
+            // the task actually spawning. So "still emitting" is not available as a
+            // progress signal *inside* that operation, and the threshold has to clear the
+            // whole of it on the slowest host rather than on this one. A CI runner took
+            // over 90 s where this container took ~20 s, which is the measurement that
+            // sets the margin.
+            //
+            // Erring long is the cheap direction: a threshold that is too short fails a
+            // healthy build, while one that is too long only wastes time on a build that
+            // is already broken.
+            const QUIET_GIVE_UP: Duration = Duration::from_secs(120);
+            const ABSOLUTE_CAP: Duration = Duration::from_secs(300);
+
             let mut got = false;
-            // 90 s (180 x 500 ms), raised from 40 s in 8.7. The gate now waits for the
-            // *whole* userspace bring-up, and spawning the ring-3 net server alone — an
-            // ELF with smoltcp plus an 8 MiB heap, mapped a page at a time with TLB
-            // maintenance — takes around 20 s under TCG on aarch64, on top of storage.
-            for _ in 0..180 {
+            let gate_start = Instant::now();
+            let mut last_len = 0usize;
+            let mut last_growth = Instant::now();
+            while gate_start.elapsed() < ABSOLUTE_CAP {
                 thread::sleep(Duration::from_millis(500));
                 if seen(sentinel) {
                     got = true;
@@ -2250,9 +2281,19 @@ fn await_aarch64_banner(
                     failure = Some(f);
                     break;
                 }
+                let len = captured.lock().unwrap().len();
+                if len > last_len {
+                    last_len = len;
+                    last_growth = Instant::now();
+                }
+                if last_growth.elapsed() >= QUIET_GIVE_UP {
+                    break;
+                }
             }
             if !got {
                 not_ready = true;
+                ready_quiet_for = last_growth.elapsed();
+                ready_waited = gate_start.elapsed();
             }
         }
     }
@@ -2348,11 +2389,13 @@ fn await_aarch64_banner(
         let sentinel = ready.unwrap_or("");
         eprintln!(
             "arm64 {what} smoke FAILED: the shell came up but the readiness sentinel \
-             {sentinel:?} never appeared within the gate's budget, so the commands were \
-             never typed. Userspace bring-up did not finish — check `boot_userspace` and \
-             the ring-3 servers it spawns (storage, then the net server), and note the \
-             gate waits a fixed time, so a merely slower host wants a bigger budget \
-             rather than a bug hunt."
+             {sentinel:?} never appeared. Waited {:.0}s, and the guest last emitted \
+             anything {:.0}s ago — so it had stopped making progress, not merely been \
+             slow. Userspace bring-up did not finish: check `boot_userspace` and the \
+             ring-3 servers it spawns (storage, then the net server). The last line of \
+             the log above is where it stopped.",
+            ready_waited.as_secs_f32(),
+            ready_quiet_for.as_secs_f32()
         );
         process::exit(1);
     }
