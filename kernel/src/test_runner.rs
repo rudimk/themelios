@@ -1908,11 +1908,9 @@ fn test_block_server_ipc() -> Result<(), &'static str> {
     let blk = open_scratch_disk()?;
     let idx = block::register("virtio-blk-srv", Box::new(blk));
 
-    // Start the server (spawns its task) and let it reach its receive loop.
+    // Start the server (spawns its task) and wait until it is parked in `ipc_receive`.
     let handle = block_server::start(idx);
-    for _ in 0..50 {
-        sched::yield_now();
-    }
+    await_server_ready(handle.endpoint, "block-server never reached its receive loop")?;
 
     const BLOCK_SIZE: usize = 512;
     const TEST_LBA: u64 = 50;
@@ -2014,11 +2012,10 @@ fn test_server_spawn() -> Result<(), &'static str> {
         grant_management: false,
     });
 
-    // Let the ring-3 server reach its receive loop. It must be scheduled, run
-    // _start (heap init), and block in SYS_RECEIVE.
-    for _ in 0..500 {
-        sched::yield_now();
-    }
+    // Wait until the ring-3 server is parked in SYS_RECEIVE. It must be scheduled, run
+    // _start (heap init), and block — so this asks rather than guessing; see
+    // `await_server_ready`.
+    await_server_ready(endpoint, "echo-server never reached its receive loop")?;
 
     // Call the echo server: it returns [word0+1, word1, word2, heap_probe].
     let reply = ipc::ipc_call(endpoint, IpcMessage::new([10, 20, 30, 0]), 0)
@@ -2110,10 +2107,8 @@ fn test_squashfs_server() -> Result<(), &'static str> {
         grant_management: false,
     });
 
-    // Let the server boot and parse the superblock.
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the server is parked, which is after it has parsed the superblock.
+    await_server_ready(fs_ep, "squashfs-server never reached its receive loop")?;
 
     // Helper: place a path in the client region and return its byte length.
     let put_path = |path: &str| -> u64 {
@@ -2346,10 +2341,9 @@ fn test_overlay_server() -> Result<(), &'static str> {
         grant_management: false,
     });
 
-    // Let both servers boot (SquashFS parses its superblock; overlay is ready).
-    for _ in 0..2000 {
-        sched::yield_now();
-    }
+    // Wait until the overlay server is parked. It is the one this test calls, and it
+    // cannot serve before the SquashFS server beneath it does, so one wait covers both.
+    await_server_ready(ovl_ep, "overlay-server never reached its receive loop")?;
 
     let put = |bytes: &[u8]| -> u64 {
         let s = unsafe { ovl_client.as_slice_mut() };
@@ -2536,9 +2530,9 @@ fn test_ext2_read() -> Result<(), &'static str> {
         grant_management: false,
     });
 
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the server is parked in SYS_RECEIVE rather than guessing a
+    // yield count; see `await_server_ready`.
+    await_server_ready(fs_ep, "ext2-server never reached its receive loop")?;
 
     let put = |bytes: &[u8]| -> u64 {
         let s = unsafe { client.as_slice_mut() };
@@ -2715,9 +2709,9 @@ fn test_ext2_write() -> Result<(), &'static str> {
         filesystem_mount: None,
         grant_management: false,
     });
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the server is parked in SYS_RECEIVE rather than guessing a
+    // yield count; see `await_server_ready`.
+    await_server_ready(fs_ep, "ext2-server never reached its receive loop")?;
 
     let put = |bytes: &[u8]| -> u64 {
         let s = unsafe { client.as_slice_mut() };
@@ -2891,9 +2885,9 @@ fn test_vfs_capability() -> Result<(), &'static str> {
         filesystem_mount: None,
         grant_management: false,
     });
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the server is parked in SYS_RECEIVE rather than guessing a
+    // yield count; see `await_server_ready`.
+    await_server_ready(sqfs_ep, "squashfs-server never reached its receive loop")?;
 
     // Register the mount. The kernel↔server channel is the server's client region.
     let mount_id = fs::register_mount(sqfs_ep, sqfs_client);
@@ -3006,9 +3000,9 @@ fn test_fs_syscalls() -> Result<(), &'static str> {
         filesystem_mount: None,
         grant_management: false,
     });
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the server is parked in SYS_RECEIVE rather than guessing a
+    // yield count; see `await_server_ready`.
+    await_server_ready(sqfs_ep, "squashfs-server never reached its receive loop")?;
     let mount_id = fs::register_mount(sqfs_ep, sqfs_client);
 
     // Spawn the ring-3 client, granting it a Filesystem capability for the mount
@@ -3153,10 +3147,10 @@ fn test_net_service() -> Result<(), &'static str> {
     let index = device::register("virtio-net-svc", Box::new(nic));
     let handle = net_service::start(index).ok_or("net_service start failed")?;
 
-    // Let the service task reach its receive loop.
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the service task is parked in `ipc_receive`. It is a kernel task rather
+    // than a ring-3 server, but it parks on an endpoint just the same, so the same
+    // readiness question applies.
+    await_server_ready(handle.endpoint, "net service never reached its receive loop")?;
 
     // --- Stage an ARP request for the gateway in the TX shared region ---
     {
@@ -3541,10 +3535,8 @@ fn test_dhcp() -> Result<(), &'static str> {
     let index = device::register("virtio-net-dhcp", Box::new(nic));
     let handle = net_service::start(index).ok_or("net_service start failed")?;
 
-    // Let the service task reach its receive loop and publish MAC/MTU.
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the service task is parked, which is after it has published MAC/MTU.
+    await_server_ready(handle.endpoint, "net service never reached its receive loop")?;
 
     // Spawn the real ring-3 net server in DHCP mode. arg1 packs the MAC in the
     // low 48 bits with NET_ARG_DHCP (bit 48) set — the same wiring `boot_net`
@@ -3619,7 +3611,6 @@ fn test_dhcp() -> Result<(), &'static str> {
 /// Bounding by the tick makes "wait up to N seconds" mean the same thing on every
 /// host, so a wait that really does fail returns a clean, fast test failure instead of
 /// silently eating the budget.
-#[cfg(target_arch = "x86_64")]
 fn wait_ticks(timeout_ticks: u64, mut ready: impl FnMut() -> bool) -> bool {
     use crate::arch::time::tick_count;
     use crate::sched;
@@ -3657,6 +3648,61 @@ fn wait_ticks(timeout_ticks: u64, mut ready: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// How long to wait for a freshly spawned server to reach its receive loop.
+///
+/// 100 Hz tick, so 1000 ticks is 10 s. Generous on purpose: a ring-3 server has to be
+/// scheduled, run `_start` (heap init), and block in `SYS_RECEIVE`, and some parse a
+/// SquashFS or ext2 superblock on the way — measured at over a second on a loaded CI
+/// runner. It is still two orders of magnitude inside the harness's whole-suite budget, so
+/// exceeding it is a real failure rather than a slow host.
+const SERVER_READY_TIMEOUT_TICKS: u64 = 1_000;
+
+/// Wait until a task is parked in `ipc_receive` on `endpoint`, or fail.
+///
+/// ## The bug this exists to remove
+///
+/// Every server test used to guess, with `for _ in 0..N { sched::yield_now() }` followed
+/// by a blocking `ipc_call`. The iteration count is not a time bound — `wait_ticks`' own
+/// docs above explain why — but the failure here is worse than a slow wait, because of
+/// what comes *after* it: if N yields were not enough and the server is not yet parked,
+/// the `ipc_call` blocks **forever**. There is no deadline on it and no second sender to
+/// wake it.
+///
+/// So a merely slow host did not produce a slow test or a failing test. It produced a
+/// hung kernel, reported by the harness as a QEMU timeout, which is indistinguishable
+/// from a genuine deadlock — and arrives with no `[FAIL]` line naming the test.
+///
+/// ## It does not apply to polling servers
+///
+/// `endpoint_has_receiver` reports tasks parked in `ipc_receive`. A server that drives its
+/// endpoint with `SYS_TRY_RECEIVE` instead — the net server, which must also pump RX
+/// frames and smoltcp timers — never parks there, so this would wait out its full
+/// deadline on a healthy server. Such a site keeps a head start and says so; the hang this
+/// guards against cannot happen to it anyway, because a sender to a polling server is
+/// picked up on the next poll rather than waiting for a rendezvous.
+///
+/// Measured, not theorised: `test_overlay_server` hung the amd64 suite in CI at
+/// `46f6044`, whose kernel code is identical to the green run before it (the commit
+/// between them changes one paragraph of `CLAUDE.md`), and `test_fs_syscalls` hung the
+/// aarch64 suite locally on a loaded machine after passing throughout 8.6. Same shape,
+/// different tests, both architectures.
+///
+/// ## Why asking is better than waiting longer
+///
+/// Raising N would have made the window smaller without closing it, and would have cost
+/// every fast run the extra yields. `ipc::endpoint_has_receiver` answers the actual
+/// question — *is the server parked?* — so the common case returns as soon as it is true,
+/// and the bad case ends in a named failure at a fixed wall-clock bound.
+fn await_server_ready(endpoint: u64, what: &'static str) -> Result<(), &'static str> {
+    if wait_ticks(SERVER_READY_TIMEOUT_TICKS, || {
+        crate::ipc::endpoint_has_receiver(endpoint)
+    }) {
+        Ok(())
+    } else {
+        Err(what)
+    }
+}
+
 /// Bring up a NIC + kernel net service + ring-3 net server, map the socket
 /// payload region, and register the kernel socket router — the same wiring
 /// `boot_net` does. Returns the net server's request endpoint. `dhcp` selects
@@ -3679,9 +3725,7 @@ fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u
     let mac = nic.mac();
     let index = device::register(nic_name, Box::new(nic));
     let handle = net_service::start(index).ok_or("net_service start failed")?;
-    for _ in 0..500 {
-        sched::yield_now();
-    }
+    await_server_ready(handle.endpoint, "net service never reached its receive loop")?;
 
     let fs_ep = crate::ipc::create_endpoint("test-sock-net");
     let mut packed = 0u64;
@@ -3715,7 +3759,23 @@ fn spawn_net_server_with_sockets(dhcp: bool, nic_name: &'static str) -> Result<u
     socket::init(fs_ep, sock_region);
 
     // Let the net server reach its poll/serve loop.
-    for _ in 0..2000 {
+    // **Deliberately NOT `await_server_ready` — the net server is a polling server.**
+    //
+    // It drives its request endpoint with `SYS_TRY_RECEIVE` (`servers/net-server`'s loop
+    // is `if let Some(req) = syscall::try_receive(socket_ep)`), because it must also pump
+    // RX frames and smoltcp timers rather than parking on one endpoint. So it never
+    // enters `ipc_receive` and never appears in an endpoint's receiver queue:
+    // `endpoint_has_receiver` is structurally blind to it and would time out after ten
+    // seconds on a perfectly healthy server. Measured — converting this site turned five
+    // passing amd64 tests into "net-server never reached its receive loop".
+    //
+    // It also does not need the barrier that `await_server_ready` provides. The hang it
+    // prevents is a blocking `ipc_call` to a server that never parks; a sender to a
+    // *polling* server is picked up on its next poll instead of waiting for a rendezvous
+    // that never comes. So this stays a head start rather than a precondition, and the
+    // tests downstream carry their own tick-bounded waits (DHCP, DNS reply) for the
+    // things that actually have to happen.
+    for _ in 0..500 {
         sched::yield_now();
     }
     Ok(fs_ep)
@@ -4067,9 +4127,9 @@ fn test_linux_fs() -> Result<(), &'static str> {
         filesystem_mount: None,
         grant_management: false,
     });
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the server is parked in SYS_RECEIVE rather than guessing a
+    // yield count; see `await_server_ready`.
+    await_server_ready(fs_ep, "ext2-server never reached its receive loop")?;
     let mount = crate::fs::register_mount(fs_ep, client);
 
     // --- Stage /hello.txt with known content (overwrite if it already exists) ---
@@ -4346,9 +4406,9 @@ fn bring_up_ext2_mount(block_name: &'static str, ep_name: &'static str) -> Resul
         filesystem_mount: None,
         grant_management: false,
     });
-    for _ in 0..1000 {
-        sched::yield_now();
-    }
+    // Wait until the server is parked in SYS_RECEIVE rather than guessing a
+    // yield count; see `await_server_ready`.
+    await_server_ready(fs_ep, "ext2-server never reached its receive loop")?;
     Ok(crate::fs::register_mount(fs_ep, client))
 }
 

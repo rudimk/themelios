@@ -496,6 +496,40 @@ pub fn ipc_reply(endpoint_id: u64, reply_token: u64, reply_msg: IpcMessage) -> R
 }
 
 /// Get the number of registered endpoints (for diagnostics).
+/// Is a task currently blocked in [`ipc_receive`] on this endpoint?
+///
+/// Read-only, non-blocking, and does not disturb the rendezvous: it only reports whether
+/// the endpoint's receiver queue is non-empty.
+///
+/// ## What this is for, and why it is not a general-purpose predicate
+///
+/// It answers one question the test suite needs and could not ask before: **has the
+/// server I just spawned reached its receive loop yet?** Without it, every server test
+/// guessed, with `for _ in 0..N { sched::yield_now() }` followed by a blocking
+/// `ipc_call`. When N yields were not enough on a loaded host, the call blocked forever —
+/// so a merely slow machine produced a *hang* rather than a failure, and the harness
+/// reported a QEMU timeout that reads exactly like a wedged kernel. That bit CI on amd64
+/// in `test_overlay_server` and locally on aarch64 in `test_fs_syscalls`, from commits
+/// whose kernel code was identical to a green run.
+///
+/// **It is a readiness hint, not a lock.** A `true` can go stale the instant it is
+/// returned (the server could be woken by someone else), and a `false` only means "not
+/// parked *right now*". It is sound for the "wait until ready, then proceed" use above,
+/// where a stale `true` costs nothing because the subsequent `ipc_call` is exactly what
+/// would have been done anyway. Do not build mutual exclusion on it.
+///
+/// Returns `false` for an unknown or destroyed endpoint, which keeps a caller waiting on
+/// a bad id bounded by its own deadline rather than looping on an error.
+pub fn endpoint_has_receiver(endpoint_id: u64) -> bool {
+    let registry = ENDPOINT_REGISTRY.lock();
+    registry
+        .endpoints
+        .iter()
+        .flatten()
+        .find(|ep| ep.id == endpoint_id)
+        .is_some_and(|ep| !ep.receivers.is_empty())
+}
+
 pub fn endpoint_count() -> usize {
     let registry = ENDPOINT_REGISTRY.lock();
     registry.endpoints.iter().filter(|s| s.is_some()).count()
