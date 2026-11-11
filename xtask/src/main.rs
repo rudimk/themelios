@@ -1064,10 +1064,23 @@ fn cmd_test_aarch64(root: &Path, target: &str) {
     // around 20 s. amd64 does the same work in a fraction of the time because its TCG
     // path is much cheaper, so this is an emulation cost, not a kernel regression.
     //
-    // 600 s is ~1.75x the measured figure. Note the workflow's `timeout-minutes` must stay
-    // above it, or GitHub kills the job before the harness can time out and dump the
-    // serial log — a worse diagnostic than the harness's own.
-    let deadline = Duration::from_secs(600);
+    // **1200 s, and the third number here is the one measured on the slowest host rather
+    // than on a dev box.** 120 s went under water at 8.6, 300 s at 8.7, and 600 s was
+    // measured at 1.75x *this container's* ~340 s — then a CI runner ran the same suite in
+    // **568 s**, leaving 5% headroom. That is a flake waiting for a slightly busier
+    // runner.
+    //
+    // The useful correction is about which host to size against: CI is **slower** than
+    // this container for this workload, not faster. An earlier note here assumed the
+    // reverse, generalising from the 35-test suite before the networking tests existed —
+    // and those tests are exactly the memory-bound emulation (mapping 8 MiB ring-3 servers
+    // a page at a time with TLB maintenance) where runner-to-runner variance is widest.
+    //
+    // So this is ~2.1x the CI figure, matching the ratio amd64 has (180 s for an ~83 s
+    // suite). Note the workflow's `timeout-minutes` must stay above it, or GitHub kills
+    // the job before the harness can time out and dump the serial log — a worse diagnostic
+    // than the harness's own. At this budget that means **30 minutes**, not 20.
+    let deadline = Duration::from_secs(1200);
     let start = Instant::now();
     let mut exited = false;
     // Progress tracking, so the verdict below can distinguish "stalled" from "still
