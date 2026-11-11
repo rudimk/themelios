@@ -1017,16 +1017,41 @@ fn cmd_test_aarch64(root: &Path, target: &str) {
     // itself takes a couple of seconds; the budget is generous because a CI runner
     // building nothing but still emulating every instruction is slow, and the cost of
     // being wrong here is a spurious red build.
-    let deadline = Duration::from_secs(120);
+    // **Raised from 120 s, which was under water.** Measured on a 4-CPU container: the
+    // suite needs ~128 s of QEMU time since 8.6 attached real storage, so a 120 s budget
+    // expired *mid-test* and the harness called it a hang. It was not one — the same tree
+    // passes 35/35 given room — and the diagnosis cost real time because the message
+    // asserted a conclusion the harness cannot reach. amd64 carries 180 s for a ~97 s
+    // suite; this is the same ratio of headroom for a slower emulation target.
+    //
+    // Note the workflow's `timeout-minutes` must stay above this, or GitHub kills the job
+    // before the harness can time out and dump the serial log — a worse diagnostic than
+    // the harness's own.
+    let deadline = Duration::from_secs(300);
     let start = Instant::now();
     let mut exited = false;
+    // Progress tracking, so the verdict below can distinguish "stalled" from "still
+    // working when the budget ran out". Those have different causes and different fixes,
+    // and the old message ("the kernel hung") named only the first.
+    let mut last_len = 0usize;
+    let mut last_growth = Instant::now();
     while start.elapsed() < deadline {
         if let Ok(Some(_)) = child.try_wait() {
             exited = true;
             break;
         }
+        // The serial log is the only progress signal available: QEMU writes it as the
+        // suite runs, so a growing file means the guest is executing and emitting.
+        if let Ok(meta) = fs::metadata(&serial_log) {
+            let len = meta.len() as usize;
+            if len > last_len {
+                last_len = len;
+                last_growth = Instant::now();
+            }
+        }
         thread::sleep(Duration::from_millis(250));
     }
+    let quiet_for = last_growth.elapsed();
     if !exited {
         let _ = child.kill();
     }
@@ -1081,10 +1106,27 @@ fn cmd_test_aarch64(root: &Path, target: &str) {
             "aarch64 suite FAILED: QEMU exited without printing a verdict — the kernel \
              died partway through the suite (look for a panic or an exception above)."
         );
+    } else if quiet_for < Duration::from_secs(10) {
+        // Still emitting when the budget ran out. That is a suite too slow for its
+        // deadline, not a wedged kernel, and the two want opposite responses: raise the
+        // budget, or find out what got slower. Saying "hung" here sends the reader
+        // looking for a deadlock that does not exist — which is exactly what the previous
+        // version of this message did when 8.6's real storage pushed the suite past 120 s.
+        eprintln!(
+            "aarch64 suite FAILED: no verdict within {}s, but the guest was still \
+             producing serial output {:.1}s ago — this is a suite that OUTRAN ITS BUDGET, \
+             not a hang. Check the tail of the log above for how far it got, then either \
+             raise `deadline` here or work out what became slower.",
+            deadline.as_secs(),
+            quiet_for.as_secs_f32()
+        );
     } else {
         eprintln!(
-            "aarch64 suite FAILED: no verdict and no exit within {}s — the kernel hung.",
-            deadline.as_secs()
+            "aarch64 suite FAILED: no verdict and no exit within {}s, and the guest \
+             emitted nothing for the last {:.0}s — this one really does look like a hang. \
+             The last line of the log above is where it stopped.",
+            deadline.as_secs(),
+            quiet_for.as_secs_f32()
         );
     }
     process::exit(1);
