@@ -153,7 +153,7 @@ When starting or completing a phase, update all three locations (this table, the
 | **5** | OCI containers, Linux syscall compat, exec, registries | Complete (core; real-image busybox, live registry transport, ring-3 oci-server deferred) |
 | **6** | Docker-compatible management API | Complete (core; TLS/mTLS, exec/streaming, live docker CLI, networks/images deferred) |
 | **7** | aarch64 port (boot, memory, scheduler, shell) | Complete (ring-0 core; EL0/storage/net/containers deferred) |
-| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.6 done) |
+| **8** | aarch64 parity (EL0, storage, net, containers) | In progress (8.spike, 8.1–8.7 done) |
 | **9** | Testing and benchmarks | Not started |
 | **10** | Kubernetes worker node (full parity) | Not started |
 | **11** | GPU support across clouds | Not started |
@@ -177,8 +177,81 @@ kernel and `libthemelios`, the IPC dispatcher, and `libthemelios`' 25 wrappers c
 three positional primitives per arch), ✅ 8.5c (**the userspace servers build for
 aarch64**: all seven flat servers plus `elf-smoke`, staged and hashed as
 `servers-arm64.sha256`), ✅ 8.5d (**the servers actually run**) — which completes 8.5 —
-and ✅ **8.6 (storage)**. Next is **8.7 (networking)**; GICv3 was *not* done before 8.6 and
-should not be next either, for the reason in the GICv3 note further down.
+✅ **8.6 (storage)** and ✅ **8.7 (networking)**. Next is **8.8** (the arch-neutral Linux
+dispatcher, amd64-only, retires zero skips) then **8.9** (the aarch64 Linux table); GICv3
+was *not* done before 8.6 or 8.7 and should not be next either, for the reason in the
+GICv3 note further down.
+
+**8.7 — networking on aarch64: COMPLETE.** **35 → 42 of 55** (13 skips left, 2 of them
+unretirable by porting); amd64 stays **55/55, 0 skipped**. Seven retired:
+`test_net_server_stack`, `test_net_icmp_echo`, `test_dhcp`, `test_socket_capability`,
+`test_socket_list`, `test_udp_echo`, `test_tcp_client`. Shell **19 → 24 of 28**.
+`arm64-fs-smoke` is now `arm64-shell-smoke` (old name aliased, so no workflow edit).
+
+`net::socket` and `boot_net`'s body un-gated with **zero code changes**, as `mod fs` was in
+8.6. The socket dispatcher is arch-neutral in `net::syscall`. Four things are worth a
+reviewer's attention:
+
+  * **`boot_userspace` — the structural half, and it matters more than the un-gating.** The
+    aarch64 interactive path did not call `net::boot_net()`, so all five network shell
+    commands would have been inert while the suite read 42/42. That is the **second
+    sub-phase running** with that exact defect: 8.6 un-gated the filesystem commands and
+    the same path was missing `fs::boot_storage()`. It was also still missing
+    `process::init::start()` from 8.5d. The cause is structural — aarch64 reconstructed
+    `kmain`'s tail by hand, so each bring-up step had to be remembered twice — so that
+    sequence is now **one arch-neutral function both paths call**. 8.10 gets the
+    api-server on aarch64 by deleting one `cfg` inside it. **The suite structurally cannot
+    catch this**: test mode never runs `boot_userspace`, and every storage and socket test
+    drives the servers from kernel code inside the harness, touching neither the mount
+    registry, the socket router registration, nor the shell.
+  * **`SyscallFrame::arg_native4`.** 8.6 warned that "any native syscall that needs
+    positions 4 or 5 must get its own accessors first": on x86_64 the native ABI carries
+    slot 4 in `r9` and slot 5 in `r8`, crossed against the Linux ABI `arg4()`/`arg5()`
+    implement. `SYS_SENDTO` takes its port in slot 4. Through `arg4()` it reads `r8`, which
+    `libthemelios::sendto` leaves as slot 5's zero — **every UDP datagram to port 0**, on
+    amd64 only, invisible to an arm64-only run. `test_udp_echo` covers it on both. No
+    `arg_native5` yet: nothing reads native slot 5 through the positional API until
+    `SYS_MGMT` in 8.10, and an accessor no test can distinguish from `arg5` is the
+    inert-accessor mistake again.
+  * **The arm64 suite needs ~340 s under TCG now**, not a bug: each of the seven net tests
+    spawns a fresh ring-3 net server (smoltcp plus an 8 MiB heap, mapped a page at a time
+    with TLB maintenance), and a single such spawn is silent for ~20 s. The harness budget
+    is 600 s against that measurement, and #52's quiet-threshold is 60 s for the same
+    reason — silence has to clear the slowest *single operation*, not the average rate. A
+    10 s threshold reported a healthy suite as a probable hang.
+  * **`ENOSYS_PROBE_NR` now names `SYS_MGMT`, the last number in that arm**, so 8.10
+    deletes the probe rather than moving it. The 8.6 arrangement worked: the constant sits
+    beside the list, so this was a one-line edit while wiring the socket arm instead of a
+    hash mismatch in `el0_ipc` discovered afterwards.
+
+**Acceptance was the shell again.** `cargo xtask arm64-shell-smoke` drives ten commands
+over serial with asserted output: the storage six, plus `ifconfig` showing a
+**DHCP-assigned gateway**, `ping 10.0.2.2 2` reporting **2 transmitted, 2 received**, and a
+TCP handshake to a host listener returning 22 bytes. Two corrections came out of writing
+it. The plan asks that "a guest answers a host ping" — **not available on either arch**,
+since slirp has no host→guest ICMP route and amd64 does not do it either, so the ping is
+outbound. And the first TCP target was slirp's DNS at 10.0.2.3:53, which **speaks UDP only
+and answers a SYN with a RST**; the suite's `test_tcp_client` tolerates that (it accepts
+established *or* refused), which is fine for plumbing but cannot show a round trip, so the
+smoke dials a host listener through slirp's gateway instead.
+
+**One mid-diagnosis claim of mine was wrong and is worth recording.** Filesystem commands
+came back wrong under the smoke — `cat /version` printing nothing, `stat` reporting 0 bytes
+— and I concluded `boot_net` had permanently broken the FS read path. It had not: the smoke
+was typing into a *half-booted* machine, because its readiness gate was the mount line,
+which prints before `boot_net` spawns its server. Gating on the end of bring-up makes every
+step pass repeatably. A corruption window during a concurrent ring-3 spawn is real and
+deserves its own look, but it is far narrower than I claimed.
+
+Two reassignments: **`test_api_server` moved from 8.7 to 8.10** (it drives the api-server,
+so it needs `mod container` and `mod mgmt`; networking is a prerequisite it already has),
+and 8.7's Deliver list asked for the amd64 host-peer thread, which serves that same test
+and moves with it.
+
+**Still covered by nothing automated: the amd64 *interactive* path.** `boot_userspace`
+moves that code without reordering it, but no amd64 shell smoke exists, so the x86 side of
+the function this sub-phase added is unverified by CI. That gap predates 8.7 and closing it
+wants an amd64 counterpart to `arm64-shell-smoke`.
 
 **8.6 — storage on aarch64: COMPLETE.** The ratchet moves **29 → 35 of 55** (20 skips left,
 3 of them unretirable by porting); amd64 stays **55/55, 0 skipped**. Six skips retired:
@@ -495,13 +568,15 @@ a device untrusted *means* — fails the build with a message naming both fixes.
 Mutation-tested: flipping it produces `error[E0080]` carrying those instructions.
 
 Parity has one measurable definition — `test_runner`'s `SKIPPED` list empty on both
-architectures, i.e. 55/55 running on each. It is **35 running / 20 skipped** on aarch64
-today (16/39 before 8.3, 23/32 after it, 25/30 after 8.4c, 29/26 after 8.5d). Three of the
-20 cannot be retired by porting (`test_pci_scan`, `test_syscall`, `test_linux_exec`'s TLS
-assertion) and are retired by reframing, each decided in the sub-phase that owns it.
+architectures, i.e. 55/55 running on each. It is **42 running / 13 skipped** on aarch64
+today (16/39 before 8.3, 23/32 after it, 25/30 after 8.4c, 29/26 after 8.5d, 35/20 after
+8.6). Two of the 13 cannot be retired by porting (`test_pci_scan` and `test_syscall`) and
+are retired by reframing, each decided in the sub-phase that owns it; `test_linux_exec`'s
+TLS assertion is a third such decision, but that test is counted under 8.9 because the
+rest of it does need porting.
 
-The 17 that can be: 8 on `net::socket` (8.7), 4 on `mod linux` (8.8/8.9), 5 on
-`mod container`/`mod mgmt` (8.10). **Correcting the skip *reasons* is part of retiring
+The 11 that can be: 4 on `mod linux` (8.8/8.9), 7 on `mod container`/`mod mgmt` (8.10 —
+including `test_api_server`, which 8.6 misfiled under `net::socket` and 8.7 moved back). **Correcting the skip *reasons* is part of retiring
 skips** — 8.6 found eighteen of them asserting dependencies that had been satisfied for
 sub-phases, which is worse than a vague reason because it sends the next reader to the
 wrong module. Re-read the survivors whenever one is retired.

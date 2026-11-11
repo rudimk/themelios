@@ -216,8 +216,8 @@ scheduler, and an in-kernel shell. What it did not deliver is everything above E
 userspace, storage, networking, containers, the management API. Phase 8 closes that gap.
 
 Parity has one measurable definition: the kernel's 55-test suite runs **55/55 on amd64 and
-35/55 on aarch64** as of sub-phase 8.6, with 20 tests carrying written skip reasons (it was
-16/55 when Phase 8 opened, and 29/55 after 8.5). Parity is that skip list reaching zero.
+42/55 on aarch64** as of sub-phase 8.7, with 13 tests carrying written skip reasons (it was
+16/55 when Phase 8 opened, 29/55 after 8.5, 35/55 after 8.6). Parity is that skip list reaching zero.
 Every sub-phase names which entries it retires, and three of the 20 cannot be retired by
 porting at all — they are retired by reframing, with the decision made in the sub-phase
 that owns each.
@@ -266,9 +266,31 @@ drift — only this prose can, and only reading it against a run catches that.
   calls the servers from kernel code inside the harness, so none of them touches the mount
   registry, the shell dispatcher or the console. The shell goes from 13 to **19 of 28**
   commands.
-- **8.7 — networking** un-gated on aarch64. As of 8.6 the only thing in the way is
-  `net::socket`, the last `#[cfg]`'d part of `mod net`; the NIC driver and the ring-0
-  frame bridge already work over virtio-mmio and are covered by passing tests.
+- **8.7 — networking** (done). `net::socket` and `boot_net`'s body un-gated with no code
+  changes, and the socket syscall dispatcher became arch-neutral (`net::syscall`) as the
+  filesystem one did in 8.6. Seven skips retired: the two net-stack tests, DHCP, the two
+  socket-capability tests, UDP echo and the TCP client.
+
+  Two findings outweigh the un-gating. First, **`arg_native4`**: on x86_64 the native
+  syscall ABI carries argument slot 4 in `r9` and slot 5 in `r8`, crossed relative to the
+  Linux ABI the frame's `arg4()`/`arg5()` implement. `SYS_SENDTO` passes its destination
+  port in slot 4, so reading it through `arg4()` would have sent every UDP datagram to
+  port 0 — on amd64 only, and invisible to an arm64-only test run. 8.6's `fs::syscall`
+  docs had predicted exactly this.
+
+  Second, **`boot_userspace`**: the aarch64 interactive boot path was not calling
+  `net::boot_net()`, so the five network shell commands would have been inert while the
+  suite read 42/42 — the second sub-phase in a row with that defect, after 8.6's missing
+  `fs::boot_storage()`. Both came from aarch64 reconstructing `kmain`'s tail by hand, so
+  the bring-up sequence is now one arch-neutral function both architectures call. The
+  suite cannot catch this class at all: in test mode that sequence never runs, and every
+  storage and socket test drives the servers from kernel code inside the harness.
+
+  Acceptance was the shell, as in 8.6: `cargo xtask arm64-shell-smoke` asserts a
+  DHCP-assigned gateway from `ifconfig`, two ICMP echo replies from `ping`, and a TCP
+  handshake carrying data. The plan asked for a *host-to-guest* ping, which is not
+  available on either architecture — slirp has no inbound ICMP route — so the ping runs
+  outbound, over the same stack.
 - **8.8–8.9 — the Linux personality** on the aarch64 syscall table (`asm-generic/unistd.h`),
   which is a second table rather than a tweak.
 - **8.10 — containers and the management API** — the parity gate.
