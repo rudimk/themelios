@@ -572,46 +572,7 @@ fn kmain_x86_64() -> ! {
         // The shell task blocks until input arrives via IRQ4.
         shell::init();
 
-        // Boot the first userspace init process. This creates a ring 3 process
-        // with its own address space, maps code and stack pages, grants IPC
-        // capabilities, and spawns the init task plus a kernel-side server.
-        process::init::start();
-
-        // Bring up the storage stack: discover the VirtIO disks, spawn the
-        // block + filesystem servers (SquashFS root under an overlay, ext2
-        // data volume), and register the "/" and "/data" mounts. The debug
-        // shell's filesystem commands operate on these mounts.
-        fs::boot_storage();
-        fs::print_mount_status();
-
-        // Bring up the network stack: discover the VirtIO NIC, start the kernel
-        // net service, and spawn the ring-3 net server (smoltcp).
-        net::boot_net();
-
-        // Bring up the container management API (Phase 6.5): a ring-3 server
-        // holding the Management sentinel cap, serving the Docker Engine API on the
-        // default port. It listens via the management ABI once the net server is up
-        // (it retries while that comes up). Only reachable when a route/hostfwd is
-        // configured — unauthenticated for now (auth lands in 6.6), so it must not
-        // be exposed on a real NIC until then. This spawn is not exercised by CI
-        // (the test path runs `test_api_server` instead); the binary, grant, listen,
-        // and serve are all covered there.
-        {
-            let api_ep = ipc::create_endpoint("api-server");
-            process::server::spawn_server(process::server::ServerConfig {
-                name: "api-server",
-                binary: process::embedded::API_SERVER,
-                fs_endpoint: api_ep,
-                block_endpoint: 0,
-                shared: None,
-                client_shared: None,
-                heap_bytes: 256 * 1024,
-                arg0: 0, // 0 → the api-server's default Docker port (2375)
-                arg1: 0,
-                filesystem_mount: None,
-                grant_management: true,
-            });
-        }
+        boot_userspace();
 
         println!();
         println!("Interrupts enabled — scheduler is running.");
@@ -622,6 +583,81 @@ fn kmain_x86_64() -> ! {
         loop {
             crate::arch::irq::halt();
         }
+    }
+}
+
+/// Bring up the userspace stack: the init process, storage, networking, and the
+/// management API. Called by **both** architectures' interactive boot paths.
+///
+/// ## Why this is one function and not two call sites (Phase 8.7)
+///
+/// It used to be the tail of `kmain`, which aarch64 does not run — that architecture has
+/// its own boot path in `arch::aarch64::boot` and reconstructs this sequence by hand. The
+/// result was that every sub-phase which added a bring-up step had to remember to add it
+/// in a second place, and **twice in a row nobody did**:
+///
+/// * 8.6 un-gated `mod fs` and the six filesystem shell commands, and the aarch64 path did
+///   not call `fs::boot_storage()`. The commands were inert while the suite read 35/35.
+/// * 8.7 un-gated `net::socket` and the five network shell commands, and the aarch64 path
+///   did not call `net::boot_net()`. Same outcome, same shape, one sub-phase later. It
+///   also still was not calling `process::init::start()`, missed at 8.5d.
+///
+/// That failure mode is nasty precisely because the *suite* cannot see it. Every storage
+/// and socket test drives the servers from kernel code inside the test harness, so none of
+/// them touches this sequence, the mount registry, the socket router registration or the
+/// shell. The tests pass; the machine an operator boots has no filesystems and no network.
+/// And it fails quietly — `root_mount()` returns `None` and `ls /` prints "no filesystem
+/// mounted", which reads as an unfinished port rather than a missing call.
+///
+/// So the obligation is attached to the thing that changes. A sub-phase adding a bring-up
+/// step edits this function, and both architectures get it. Nothing to remember.
+///
+/// ## Ordering, which is load-bearing
+///
+/// The caller must have started the shell first. Everything here spawns ring-3 servers and
+/// blocks on IPC round trips with them, so the console has to be live while it happens —
+/// otherwise a server that fails to come up takes the boot down in silence.
+#[cfg(not(feature = "test"))]
+fn boot_userspace() {
+    // The first userspace process: a ring-3 process with its own address space, mapped
+    // code and stack, granted IPC capabilities, plus a kernel-side server task.
+    process::init::start();
+
+    // Storage: discover the VirtIO disks, spawn block + filesystem servers (SquashFS root
+    // under a RAM overlay, ext2 data volume), register the "/" and "/data" mounts. The
+    // shell's filesystem commands operate on these.
+    fs::boot_storage();
+    fs::print_mount_status();
+
+    // Networking: discover the VirtIO NIC, start the kernel net service, spawn the ring-3
+    // net server (smoltcp), and register the capability-checked socket router. The shell's
+    // `ifconfig`/`ping`/`sockets`/`udpsend`/`tcpconnect` operate on this.
+    net::boot_net();
+
+    // The container management API (Phase 6.5): a ring-3 server holding the Management
+    // sentinel cap, serving the Docker Engine API on the default port. It listens via the
+    // management ABI once the net server is up, retrying while that comes up.
+    //
+    // x86-only because `mod mgmt` and `mod container` are, until 8.10 — which is the
+    // sub-phase that deletes this `cfg` and thereby gets the aarch64 side for free, this
+    // function being shared. Not exercised by CI (the test path runs `test_api_server`
+    // instead); the binary, grant, listen and serve are all covered there.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let api_ep = ipc::create_endpoint("api-server");
+        process::server::spawn_server(process::server::ServerConfig {
+            name: "api-server",
+            binary: process::embedded::API_SERVER,
+            fs_endpoint: api_ep,
+            block_endpoint: 0,
+            shared: None,
+            client_shared: None,
+            heap_bytes: 256 * 1024,
+            arg0: 0, // 0 → the api-server's default Docker port (2375)
+            arg1: 0,
+            filesystem_mount: None,
+            grant_management: true,
+        });
     }
 }
 

@@ -407,6 +407,49 @@ impl SyscallFrame {
         self.r9
     }
 
+    /// Argument 4 under the **native ThemeliOS ABI** (`r9`) — *not* [`arg4`](Self::arg4).
+    ///
+    /// # The one place the positional API is per-ABI
+    ///
+    /// Slots 0-3 are the same registers under both ABIs this kernel serves
+    /// (`rdi`, `rsi`, `rdx`, `r10`). **Slots 4 and 5 are not.**
+    ///
+    /// | slot | Linux x86-64 | native (what `libthemelios` emits) |
+    /// |---|---|---|
+    /// | 4 | `r8`  | **`r9`** |
+    /// | 5 | `r9`  | **`r8`** |
+    ///
+    /// The crossing is deliberate and predates the positional accessors: `libthemelios`
+    /// preserved it verbatim from the 25 hand-written `asm!` blocks it replaced in 8.5b,
+    /// and its own comment flags it — *"the in and out mappings genuinely differ for those
+    /// two registers"*. [`arg4`](Self::arg4) and [`arg5`](Self::arg5) implement the
+    /// **Linux** mapping, because [`crate::linux`] is what needs them and that is correct
+    /// there.
+    ///
+    /// So a *native* syscall reading slot 4 must call this, and `fs::syscall`'s module
+    /// docs said so in 8.6 — "any native syscall that needs positions 4 or 5 must get its
+    /// own accessors first" — while using only slots 0-3 itself. 8.7 is where that came
+    /// due: `SYS_SENDTO` passes the destination port in slot 4. Through `arg4()` it would
+    /// read `r8`, which `libthemelios::sendto` leaves as slot 5's zero — so every UDP
+    /// datagram would go to **port 0**. It compiles, and on aarch64 (where both ABIs use
+    /// `x0`-`x5`) it would even be correct, so the defect would have been amd64-only.
+    ///
+    /// Covered by `test_udp_echo` on both architectures: get this register wrong and the
+    /// echo never comes back. That matters because on aarch64 this accessor is
+    /// *indistinguishable* from `arg4` — identical register — and 8.4's review found six
+    /// accessors here that were inert precisely because nothing called them.
+    ///
+    /// **There is no `arg_native5` yet, on purpose.** Nothing reads native slot 5 through
+    /// the positional API today: `SYS_SEND`/`SYS_CALL` take their badge from it but are
+    /// handled per-arch by register name, and `SYS_MGMT` — which passes an out-pointer
+    /// there — is x86-only until 8.10. Adding it now would add an accessor no test can
+    /// distinguish from `arg5` on either architecture, which is the inert-accessor
+    /// mistake with extra steps. 8.10 adds it, with `SYS_MGMT` to exercise it.
+    #[inline]
+    pub fn arg_native4(&self) -> u64 {
+        self.r9
+    }
+
     /// Set the value userspace receives back.
     #[inline]
     pub fn set_ret(&mut self, value: u64) {
@@ -758,7 +801,9 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
         | SYS_TCP_SEND | SYS_TCP_RECV | SYS_LISTEN | SYS_ACCEPT => {
             // Socket syscalls block on the net server, so enable interrupts.
             cpu::sti();
-            dispatch_socket_syscall(frame);
+            // Arch-neutral since 8.7 — the same function aarch64 calls. See
+            // `crate::net::syscall`.
+            crate::net::syscall::dispatch(frame);
         }
         SYS_MGMT => {
             // Management ABI (Phase 6.4). The `listen` verb blocks on the net
@@ -813,7 +858,11 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
 // The limit itself now lives in `arch::paging::user_addr_limit()`, which is where a
 // property of the paging regime belongs; on aarch64 it must be a runtime read of
 // `TCR_EL1.T0SZ`, so it is a function on both.
-use crate::arch::uaccess::{copy_from_user, copy_to_user, user_range_ok, FS_MAX_XFER};
+// Only the two copy helpers are still reached from this file, by the `SYS_MGMT` dispatcher
+// below. `user_range_ok` and `FS_MAX_XFER` left with the socket dispatcher in 8.7 (the
+// filesystem one took them in 8.6), so they are no longer imported here — both now have
+// their callers in `crate::fs::syscall` and `crate::net::syscall`.
+use crate::arch::uaccess::{copy_from_user, copy_to_user};
 
 // `dispatch_fs_syscall` lived here until Phase 8.6 and is now `crate::fs::syscall`,
 // arch-neutral and shared with aarch64. It was ~100 lines naming `frame.rdi`/`rsi`/`rdx`/
@@ -836,160 +885,16 @@ fn unpack_ipv4_arg(w: u64) -> [u8; 4] {
     [(w >> 24) as u8, (w >> 16) as u8, (w >> 8) as u8, w as u8]
 }
 
-/// Dispatch a socket syscall (SYS_SOCKET .. SYS_SOCKET_CLOSE) from `frame`.
-fn dispatch_socket_syscall(frame: &mut SyscallFrame) {
-    use crate::cap::CapHandle;
-    use crate::net::socket::{self, SockError};
-
-    let pid = crate::sched::current_process_id();
-    crate::audit::log_event(pid, crate::audit::AuditOp::NetAccess, crate::cap::CapType::Null, frame.rax);
-    let bad_arg = SockError::InvalidArgument.as_syscall_ret();
-    let num = frame.rax;
-
-    match num {
-        SYS_SOCKET => {
-            // RDI = socket type, RSI = network-authority (factory) cap handle.
-            let sock_type = frame.rdi;
-            let factory = CapHandle::from_raw(frame.rsi as u32);
-            match socket::sys_socket(pid, factory, sock_type, num) {
-                Ok(handle) => frame.rax = handle as u64,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_BIND => {
-            // RDI = socket cap, RSI = local IPv4 (packed), RDX = port.
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            let ip = unpack_ipv4_arg(frame.rsi);
-            let port = frame.rdx as u16;
-            match socket::sys_bind(pid, handle, ip, port, num) {
-                Ok(()) => frame.rax = 0,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_SENDTO => {
-            // RDI = socket cap, RSI = buf ptr, RDX = len, R10 = dest IPv4, R9 = port.
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            let ip = unpack_ipv4_arg(frame.r10);
-            let port = frame.r9 as u16;
-            match copy_from_user(frame.rsi, frame.rdx as usize) {
-                Some(data) => match socket::sys_sendto(pid, handle, &data, ip, port, num) {
-                    Ok(n) => frame.rax = n as u64,
-                    Err(e) => frame.rax = e.as_syscall_ret(),
-                },
-                None => frame.rax = bad_arg,
-            }
-        }
-        SYS_RECVFROM => {
-            // RDI = socket cap, RSI = buf ptr, RDX = len, R10 = source-out ptr.
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            let len = (frame.rdx as usize).min(FS_MAX_XFER);
-            let src_ptr = frame.r10;
-            if !user_range_ok(frame.rsi, len) {
-                frame.rax = bad_arg;
-                return;
-            }
-            let mut kbuf = alloc::vec![0u8; len];
-            match socket::sys_recvfrom(pid, handle, &mut kbuf, num) {
-                Ok((n, ip, port)) => {
-                    if !copy_to_user(frame.rsi, &kbuf[..n]) {
-                        frame.rax = bad_arg;
-                        return;
-                    }
-                    // Write [ip:u32_le, port:u16_le] to the source-out buffer if
-                    // the caller supplied one (src_ptr != 0).
-                    if src_ptr != 0 {
-                        let mut out = [0u8; 8];
-                        out[0..4].copy_from_slice(&ip);
-                        out[4..6].copy_from_slice(&port.to_le_bytes());
-                        if !copy_to_user(src_ptr, &out) {
-                            frame.rax = bad_arg;
-                            return;
-                        }
-                    }
-                    frame.rax = n as u64;
-                }
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_SOCKET_CLOSE => {
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            match socket::sys_close(pid, handle, num) {
-                Ok(()) => frame.rax = 0,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_CONNECT => {
-            // RDI = socket cap, RSI = dest IPv4 (packed), RDX = dest port.
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            let ip = unpack_ipv4_arg(frame.rsi);
-            let port = frame.rdx as u16;
-            match socket::sys_connect(pid, handle, ip, port, num) {
-                Ok(()) => frame.rax = 0,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_TCP_SEND => {
-            // RDI = socket cap, RSI = buf ptr, RDX = len (stream send).
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            match copy_from_user(frame.rsi, frame.rdx as usize) {
-                Some(data) => match socket::sys_send(pid, handle, &data, num) {
-                    Ok(n) => frame.rax = n as u64,
-                    Err(e) => frame.rax = e.as_syscall_ret(),
-                },
-                None => frame.rax = bad_arg,
-            }
-        }
-        SYS_TCP_RECV => {
-            // RDI = socket cap, RSI = buf ptr, RDX = len (stream recv).
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            let len = (frame.rdx as usize).min(FS_MAX_XFER);
-            if !user_range_ok(frame.rsi, len) {
-                frame.rax = bad_arg;
-                return;
-            }
-            let mut kbuf = alloc::vec![0u8; len];
-            match socket::sys_recv(pid, handle, &mut kbuf, num) {
-                Ok(n) if copy_to_user(frame.rsi, &kbuf[..n]) => frame.rax = n as u64,
-                Ok(_) => frame.rax = bad_arg,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_LISTEN => {
-            // RDI = socket cap, RSI = backlog.
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            match socket::sys_listen(pid, handle, frame.rsi, num) {
-                Ok(()) => frame.rax = 0,
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        SYS_ACCEPT => {
-            // RDI = listening socket cap, RSI = peer-out ptr (8 bytes, 0 to skip).
-            let handle = CapHandle::from_raw(frame.rdi as u32);
-            let peer_ptr = frame.rsi;
-            // Validate the peer buffer BEFORE accepting: sys_accept promotes the
-            // connection and mints its capability, so a copy failure afterwards
-            // would orphan a live connection the caller never learns the handle of.
-            if peer_ptr != 0 && !user_range_ok(peer_ptr, 8) {
-                frame.rax = bad_arg;
-                return;
-            }
-            match socket::sys_accept(pid, handle, num) {
-                Ok((conn_handle, ip, port)) => {
-                    if peer_ptr != 0 {
-                        let mut out = [0u8; 8];
-                        out[0..4].copy_from_slice(&ip);
-                        out[4..6].copy_from_slice(&port.to_le_bytes());
-                        // Range already validated above, so this write succeeds.
-                        copy_to_user(peer_ptr, &out);
-                    }
-                    frame.rax = conn_handle as u64;
-                }
-                Err(e) => frame.rax = e.as_syscall_ret(),
-            }
-        }
-        _ => frame.rax = bad_arg,
-    }
-}
+// `dispatch_socket_syscall` and `unpack_ipv4_arg` lived here until Phase 8.7 and are now
+// `crate::net::syscall`, arch-neutral and shared with aarch64 — the same move 8.6 made for
+// the filesystem calls.
+//
+// One thing changed in the move rather than merely relocating, and it is the reason to read
+// that module: `SYS_SENDTO`'s port arrives in NATIVE ABI slot 4, which is `r9` here. The
+// frame's `arg4()` returns `r8`, because that is Linux's slot 4 and `crate::linux` is what
+// those accessors serve. So the shared dispatcher reads it through `arg_native4()`, added in
+// this sub-phase. Through `arg4()` it would have compiled, passed on aarch64, and sent every
+// datagram to port 0 on amd64 alone.
 
 /// Dispatch a `SYS_MGMT` invocation (Phase 6.4) to the kernel `mgmt` module.
 ///

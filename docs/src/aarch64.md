@@ -2,7 +2,7 @@
 
 ThemeliOS targets x86_64 first and aarch64 second. This chapter describes what the ARM64 port *is*, what it deliberately is not, and the handful of architectural differences that shaped it.
 
-> **Status**: Phase 8 in progress. The port has a **ring-0 kernel core**, **EL0 userspace** and, as of 8.6, a **working storage stack** on QEMU `virt`: the kernel mounts a SquashFS root under a RAM overlay plus an ext2 data volume, served by ring-3 filesystem servers, and `ls`/`cat`/`stat`/`write` work at the shell. Networking, the Linux personality and containers on ARM are still deferred.
+> **Status**: Phase 8 in progress. The port has a **ring-0 kernel core**, **EL0 userspace**, a **working storage stack** (8.6) and, as of 8.7, **working networking**: the kernel mounts a SquashFS root under a RAM overlay plus an ext2 data volume, obtains a DHCP lease through a ring-3 smoltcp server, and answers `ls`/`cat`/`stat`/`write` and `ifconfig`/`ping`/`tcpconnect` at the shell. The Linux personality and containers on ARM are still deferred.
 
 ## Scope, stated plainly
 
@@ -34,7 +34,7 @@ boot there may well report `timer: FAIL — 0 IRQs` and run cooperatively. The n
 step is booting the same image with `-accel tcg` instead of `-accel hvf`: if the timer works
 under TCG, the problem is interrupt injection rather than this port's GIC or timer setup.
 
-The suite runs **35 of 55** here as of 8.6, with 20 written skips (16 when Phase 8 opened, 29 after 8.5). amd64 runs 55/55.
+The suite runs **42 of 55** here as of 8.7, with 13 written skips (16 when Phase 8 opened, 29 after 8.5, 35 after 8.6). amd64 runs 55/55.
 
 (Phase 7 shipped this chapter saying 16 passed / 38 skipped. The passing count was right for the time; the skip count never was — 16 + 38 is 54, and the suite was 55. Corrected along with the 8.3 figures, and updated again at 8.5d and 8.6. These numbers are prose and go stale silently; the suite asserts its own arithmetic at startup, so trust a run over this paragraph.)
 
@@ -46,13 +46,13 @@ The suite runs **35 of 55** here as of 8.6, with 20 written skips (16 when Phase
 | Exceptions, interrupts, timer | ✅ | ✅ |
 | Preemptive scheduler | ✅ | ✅ |
 | Capability system, IPC, audit | ✅ | ✅ (and since 8.5d a real ring-3 *user* of them: a spawned server holds capabilities in its own CSpace) |
-| Debug shell | ✅ | reduced (**19 of 28** commands — `procs`/`caps` joined at 8.5d, `mount`/`ls`/`cat`/`stat`/`write`/`mkdir` at 8.6) |
+| Debug shell | ✅ | reduced (**24 of 28** commands — `procs`/`caps` at 8.5d, the six filesystem commands at 8.6, `ifconfig`/`sockets`/`ping`/`udpsend`/`tcpconnect` at 8.7) |
 | Ring-3 / EL0 | ✅ | ✅ (8.4 address spaces + syscalls, 8.5 servers) |
 | Process table, userspace servers | ✅ | ✅ (8.5d — `echo-server` spawns at EL0 and answers IPC) |
 | VirtIO transport | ✅ virtio-PCI | ✅ virtio-mmio (8.3) |
 | VirtIO block + network drivers | ✅ | ✅ (8.3 — the drivers themselves; the servers above them are ring-3) |
 | Filesystems | ✅ | ✅ (8.6 — SquashFS root + RAM overlay + ext2 `/data`, ring-3 servers, FS syscalls from EL0) |
-| Sockets | ✅ | deferred (8.7 — `net::socket` is the last x86-gated part of `mod net`; the NIC driver and frame bridge already work) |
+| Sockets, TCP/IP | ✅ | ✅ (8.7 — `net::socket` un-gated, ring-3 smoltcp server, DHCP, socket syscalls from EL0) |
 | Containers, management API | ✅ | deferred (8.10) |
 
 ## How the code is organised
@@ -207,14 +207,8 @@ the paragraph is reproduced in the previous sentence rather than quietly replace
 the pattern is the point: prose about what is unfinished is exactly the prose that nothing
 checks.
 
-As of 8.6 the remaining work on this architecture is three sub-phases and one open bug:
+As of 8.7 the remaining work on this architecture is two sub-phase pairs and one open bug:
 
-- **8.7 — sockets.** `net::socket` is the last `#[cfg(target_arch = "x86_64")]` part of
-  `mod net`. Everything under it already works here: the VirtIO NIC driver and the ring-0
-  frame bridge run over virtio-mmio and are covered by `test_virtio_net` and
-  `test_net_service`, both passing. Its own gate comment still says it waits on
-  `crate::process` "until the EL0 port lands in 8.4/8.5" — that landed, so the gate is the
-  only thing left.
 - **8.8–8.9 — the Linux personality.** `mod linux` is x86-gated in its entirety and holds
   both the ELF loader and the syscall personality. 8.8 makes it arch-neutral; 8.9 builds
   the aarch64 number table, which is `asm-generic/unistd.h` and a genuinely second table

@@ -988,6 +988,60 @@ finally surface it. That would be a good outcome; budget for it landing here.
 
 ---
 
+**OUTCOME — 8.7 COMPLETE.** All seven retired; **42 running / 13 skipped**, exactly as the
+ratchet projected. amd64 stays 55/55, 0 skipped.
+
+* **Right about the blocker**: `net::socket` was the only `#[cfg]`'d part left, and it
+  un-gated with zero code changes, as did `boot_net`'s body.
+* **The riskiest unknown did not materialise.** No RX-recycling defect surfaced. As with
+  8.6's memory-ordering unknown, that is recorded as *unresolved rather than cleared* —
+  the shell smoke opens one connection and the suite's tests are sequential, so nothing
+  here exercised the multi-connection path the Phase 6 deferral describes.
+* **Wrong about the host peer.** This Deliver list asks for "the host-side peer thread the
+  amd64 path has". That thread serves `test_api_server`, which is 8.10 work, and
+  `test_tcp_client` needs no host cooperation. A host peer *was* written, but for the
+  shell smoke's TCP step and for a different reason — see below.
+* **Wrong about the acceptance, in two ways.** "An aarch64 guest answers a host `ping`" is
+  not available on either architecture: slirp has no host→guest ICMP route, and the amd64
+  path does not do it either. The ping is outbound. And the obvious TCP peer — slirp's DNS
+  at 10.0.2.3:53, which `test_tcp_client` uses — **speaks UDP only and answers a SYN with a
+  RST**. The suite's test tolerates that (established *or* refused), which is fine for a
+  plumbing check and cannot demonstrate a round trip, so the smoke dials a host listener
+  through slirp's gateway and asserts bytes coming back.
+* **Silent on the thing that would have shipped broken**, and this is the second
+  consecutive sub-phase for it: the aarch64 interactive boot path was not calling
+  `net::boot_net()`, exactly as 8.6 was not calling `fs::boot_storage()`. Five shell
+  commands would have been inert with the suite at 42/42. Fixed structurally rather than
+  per-instance — the bring-up sequence is now one arch-neutral `boot_userspace()` both
+  paths call, so **8.10 should expect to edit that function rather than two boot paths**,
+  and gets the api-server spawn on aarch64 by deleting one `cfg` inside it.
+
+**For 8.8/8.9/8.10, from this sub-phase:**
+
+1. **`arg_native5` does not exist yet, and `SYS_MGMT` needs it.** It passes an out-pointer
+   in native slot 5, which is `r8` on x86 while the frame's `arg5()` is `r9`. 8.7 added
+   only `arg_native4` (for `SYS_SENDTO`) deliberately, because an accessor no test can
+   distinguish from `arg5` on either architecture is the inert-accessor mistake this plan
+   has already caught six instances of. 8.10 adds it *with* `SYS_MGMT` to exercise it.
+2. **`ENOSYS_PROBE_NR` names `SYS_MGMT`, the last number in the `ENOSYS` arm.** 8.10
+   deletes the probe and `el0_ipc`'s `nr_unimpl` fold rather than re-pointing it: there
+   will be no unimplemented native number left, and pointing it at an implemented one
+   turns a real check into a tautology.
+3. **The arm64 suite now needs ~340 s under TCG** (budget 600 s). Each net test spawns a
+   fresh ring-3 net server — smoltcp plus an 8 MiB heap, mapped a page at a time with TLB
+   maintenance — and one such spawn is silent for ~20 s. Sub-phases that add more ring-3
+   servers should expect to move that budget again, and to check the harness's
+   quiet-threshold (60 s) still clears the slowest single operation.
+4. **A corruption window during concurrent ring-3 spawns is open and uninvestigated.**
+   Filesystem commands typed *while* `boot_net` was spawning its server returned wrong
+   results intermittently and silently — `cat` printing nothing, `stat` reporting 0 bytes,
+   no error from either. Gating the smoke on the end of bring-up makes it reproducibly
+   clean, so nothing depends on this, and my first diagnosis of it (that `boot_net`
+   permanently broke the FS read path) was wrong. It is still a real window and worth a
+   look before anything starts spawning servers on demand at runtime.
+
+---
+
 ### Tier 4 — Linux personality and containers
 
 #### 8.8 — Arch-neutral Linux dispatcher
@@ -1187,7 +1241,7 @@ The 39 entries, assigned. This table is the phase's progress bar and must sum to
 | ✅ 8.4 user AS + SVC + EL0 | **2** (projected 3) | **25** | **30** |
 | ✅ **8.5 libthemelios + smokes** | **4** | **29** | **26** |
 | ✅ **8.6 storage** | **6** (as projected) | **35** | **20** |
-| 8.7 networking | 7 | 42 | 13 |
+| ✅ **8.7 networking** | **7** (as projected) | **42** | **13** |
 | 8.8 Linux dispatcher (amd64) | 0 | 42 | 13 |
 | 8.9 aarch64 Linux table | 4 | 46 | 9 |
 | **8.10 containers + mgmt** | **7** | **53** | **2** |

@@ -61,13 +61,16 @@ pub fn cmd_help(_args: &str) {
     println!("  write <path> <s> — create/write a file (overlay or /data)");
     println!("  mkdir <path>     — create a directory");
 
+    // The network commands joined this list in 8.7, when `net::socket` un-gated and the
+    // ring-3 net server started on aarch64.
+    println!("  ifconfig         — show network interface configuration");
+    println!("  sockets          — list open sockets and their state");
+    println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
+    println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
+    println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
+
     #[cfg(target_arch = "x86_64")]
     {
-        println!("  ifconfig         — show network interface configuration");
-        println!("  sockets          — list open sockets and their state");
-        println!("  ping <ip> [n]    — send ICMP echo requests (default 4)");
-        println!("  udpsend <ip> <port> <msg> — send a UDP datagram");
-        println!("  tcpconnect <ip> <port> — open a TCP connection and exchange a line");
         println!("  run [image]      — create + launch a container (default: demo)");
         println!("  ps               — list containers and their state");
         println!("  logs <id>        — print a container's captured stdout/stderr");
@@ -804,8 +807,6 @@ pub fn cmd_mkdir(args: &str) {
 /// NIC's MAC and MTU, the IPv4 address/gateway/DNS the ring-3 stack acquired via
 /// DHCP, and the RX-overflow drop counter. The kernel does not parse packets — it
 /// only reports what the net server told it over `MSG_CONFIG`.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_ifconfig(_args: &str) {
     let st = crate::net::net_service::status();
     if !st.present {
@@ -858,8 +859,6 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 /// ephemeral local port, sends `msg`, and closes. Uses the kernel-internal
 /// socket ops (the shell runs in the kernel); userspace goes through the
 /// capability-checked syscalls instead.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_udpsend(args: &str) {
     use crate::net::socket;
 
@@ -914,8 +913,6 @@ pub fn cmd_udpsend(args: &str) {
 /// socket, connect (non-blocking; poll until established or refused), send a
 /// short request, and print whatever comes back. Uses the kernel-internal socket
 /// ops (the shell runs in the kernel).
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_tcpconnect(args: &str) {
     use crate::net::socket::{self, SockError};
 
@@ -1041,8 +1038,6 @@ fn sock_state_name(state: u8) -> &'static str {
 /// socket table: each socket's id, transport, TCP state (or `-`/`icmp`), bound
 /// local port, and connected peer. The kernel only relays the listing — the
 /// socket state lives entirely in the net server.
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_sockets(_args: &str) {
     use crate::net::socket;
     let list = match socket::ksocket_list() {
@@ -1084,8 +1079,6 @@ pub fn cmd_sockets(_args: &str) {
 /// slirp proxies guest ICMP to host pings, which needs host raw-socket/ping
 /// privileges that may be unavailable — a timeout there is an environment limit,
 /// not a stack bug (`ifconfig` + `udpsend` still prove the stack is live).
-/// x86_64 only — the subsystem behind this command is deferred on aarch64.
-#[cfg(target_arch = "x86_64")]
 pub fn cmd_ping(args: &str) {
     use crate::net::socket::{self, SockError};
 
